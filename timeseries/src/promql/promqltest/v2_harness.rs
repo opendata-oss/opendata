@@ -299,6 +299,95 @@ mod tests {
         );
     }
 
+    /// A/B perf: runs the same `sum by (pod) (rate(http_requests_total[5m]))`
+    /// over the same 6 h / 300-series synthetic dataset through both the
+    /// legacy v1 engine (`Tsdb::eval_query_range`) and the new v2 engine
+    /// (`Tsdb::eval_query_range_v2`) in a single process, reporting median
+    /// wall-times. Kept ignored so it doesn't gate CI. Invoke with
+    /// `cargo test --features promql-v2 v2_vs_v1_perf_smoke -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn v2_vs_v1_perf_smoke() {
+        use crate::model::QueryOptions;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let tsdb = new_test_storage();
+        let step_secs = 30u64;
+        let range_secs = 6 * 3600u64;
+        let num_steps = range_secs / step_secs;
+        let num_pods = 100usize;
+        let num_instances = 3usize;
+
+        let mut series: Vec<SeriesLoad> = Vec::with_capacity(num_pods * num_instances);
+        for pod_idx in 0..num_pods {
+            for inst_idx in 0..num_instances {
+                let labels = std::collections::HashMap::from([
+                    ("__name__".to_string(), "http_requests_total".to_string()),
+                    ("pod".to_string(), format!("pod-{pod_idx}")),
+                    ("instance".to_string(), format!("inst-{inst_idx}")),
+                ]);
+                let mut values = Vec::with_capacity(num_steps as usize);
+                for step in 0..num_steps {
+                    values.push((step as i64, step as f64));
+                }
+                series.push(SeriesLoad { labels, values });
+            }
+        }
+        load_series(&tsdb, Duration::from_secs(step_secs), &series)
+            .await
+            .expect("load_series failed");
+
+        let query = "sum by (pod) (rate(http_requests_total[5m]))";
+        let start = UNIX_EPOCH;
+        let end = UNIX_EPOCH + Duration::from_secs(range_secs);
+        let step = Duration::from_secs(step_secs);
+        let opts = QueryOptions::default();
+
+        async fn measure<F, Fut, T>(label: &str, iters: usize, mut run: F) -> u128
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = T>,
+            T: 'static,
+        {
+            // Warmup.
+            let _ = run().await;
+            let mut samples: Vec<u128> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                let _r = run().await;
+                samples.push(t0.elapsed().as_millis());
+            }
+            samples.sort();
+            let median = samples[samples.len() / 2];
+            eprintln!("{label}: median={median} ms, samples={samples:?}");
+            median
+        }
+
+        let v1_median = measure("v1 (eval_query_range)   ", 5, || async {
+            tsdb.eval_query_range(query, start..=end, step, &opts)
+                .await
+                .expect("v1 range eval failed")
+        })
+        .await;
+
+        let v2_median = measure("v2 (eval_query_range_v2)", 5, || async {
+            tsdb.eval_query_range_v2(query, start..=end, step, &opts)
+                .await
+                .expect("v2 range eval failed")
+        })
+        .await;
+
+        let speedup = v1_median as f64 / v2_median.max(1) as f64;
+        eprintln!(
+            "A/B {} steps × {} series: v1 {} ms / v2 {} ms ({:.2}× speedup)",
+            num_steps,
+            num_pods * num_instances,
+            v1_median,
+            v2_median,
+            speedup,
+        );
+    }
+
     /// Surfaces every `.test` file we haven't hand-wired above. Fails loudly
     /// if a new fixture is added, so the v2 harness keeps up with the v1
     /// corpus without silent drift.
