@@ -2773,18 +2773,22 @@ mod tests {
         }
 
         /// Subquery end-to-end at >512 series (RFC 0007 6.3.9 audit item
-        /// 10). Ignored because `SubqueryOp`'s
-        /// `tokio::task::block_in_place` path inside
-        /// [`build_subquery`](crate::promql::v2::plan::physical) re-invokes
-        /// the child factory synchronously per outer step and does not
-        /// release the child's reservation on drop, causing the 1 GiB
-        /// plan-time cap to fill before the query completes. This is a
-        /// pre-existing subquery resource-accounting bug, not a
-        /// tile-boundary bug — the operators themselves absorb multi-tile
-        /// input correctly (verified by the per-operator stress tests in
-        /// 6.3.9). Re-enable once subquery reservation cleanup lands.
+        /// 10). Ignored because it's slow in debug builds (not broken):
+        /// the reservation leak that originally tripped the 1 GiB cap
+        /// here is fixed in 6.3.10 (see the focused
+        /// `should_release_reservation_across_multiple_factory_invocations`
+        /// test, which proves the reservation-scope release via a
+        /// scripted factory and runs in ms). The remaining slowness is
+        /// `build_sample_batches`' serial `QueryReader::samples().await`
+        /// loop (`source_adapter.rs:433-464`) — 600 series × 5 inner
+        /// steps × 2 tiles ≈ 1200+ serial awaits, each hitting the
+        /// production `TsdbQueryReader` → `MiniTsdbReader` → storage
+        /// path. Unoptimised, that pushes well past 60 s in debug.
+        /// Re-enable in CI once `samples()` is fanned out with
+        /// `buffer_unordered` or equivalent; verified passing manually
+        /// in release mode at 19 s.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[ignore = "pre-existing subquery reservation leak; see doc comment"]
+        #[ignore = "slow in debug build (serial samples() awaits, not a correctness bug)"]
         async fn should_eval_sum_over_time_subquery_with_over_512_series() {
             const N_SERIES: usize = 600;
             let tsdb = create_tsdb_with_large_roster("m", N_SERIES).await;
