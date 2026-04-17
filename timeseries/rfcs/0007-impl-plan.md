@@ -271,7 +271,7 @@ return structurally-identical `QueryValue`s.
 | 6.3.7 | Restore `timestamp()` source-sample semantics (StepBatch ABI extension) | Architect | done | 6.2 | `timeseries/src/promql/v2/batch.rs`, `timeseries/src/promql/v2/operators/{vector_selector,instant_fn}.rs`, `timeseries/src/promql/v2/reshape.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.8 | Fix `MatrixSelectorOp` + `rate()` + `@` / `offset` window math (per-step effective-time threaded into `RollupOp`) | Architect | done | 6.2 | `timeseries/src/promql/v2/operators/{matrix_selector,subquery,rollup}.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
 | 6.3.9 | Stress-test every operator against `>series_chunk` (>512-series) inputs; fix any latent tile-boundary bugs surfaced | Operator Implementor | done | 6.3.8 | `timeseries/src/promql/v2/operators/{aggregate,binary,instant_fn,coercion,rechunk,concurrent,coalesce,label_manip,count_values,rollup}.rs`, `timeseries/src/tsdb.rs`, `timeseries/rfcs/0007-impl-plan.md` | |
-| 6.3.10 | Fix `SubqueryOp` reservation leak across factory rebuilds (child-operator bytes accumulate across outer steps; flagged by 6.3.9's `#[ignore]`d subquery stress) | Operator Implementor | done | 6.3.9 | `timeseries/src/promql/v2/operators/subquery.rs`, `timeseries/src/tsdb.rs` (doc comment), `timeseries/rfcs/0007-impl-plan.md` | |
+| 6.3.10 | Fix `SubqueryOp` reservation leak across factory rebuilds (child-operator bytes accumulate across outer steps; flagged by 6.3.9's `#[ignore]`d subquery stress) | | ready | 6.3.9 | | `SubqueryOp::build_outer_step_batch` invokes the planner-supplied `ChildFactory` once per outer step, each call builds a fresh child sub-tree that reserves memory. The child is drained and dropped at end of scope, but some reservations held by the child (constructor-time scratch in `AggregateOp::new`, hint-series clones, inner physical-plan intermediate allocations) do not release on `Drop` — they were `try_grow`ed but never paired with `release`. Accumulates linearly with outer step count; trips the 1 GiB plan-time cap at ~600+ series × many outer steps. Reproduction test already committed under `#[ignore]` as `should_eval_sum_over_time_subquery_with_over_512_series`. |
 
 **Acceptance**: zero failures on the unmodified `promqltest` corpus. Perf profile taken on a
 representative range query (e.g., `sum by (pod) (rate(http_requests_total[5m]))` over 6h) —
@@ -364,14 +364,13 @@ layouts) lives in git history — use `git log -- <path>` to retrieve it.
 
 ### 5.4 Open items needing follow-up
 
-- **Serial `samples()` await in `source_adapter.rs::build_sample_batches`.** The
-  loop at `source_adapter.rs:433-464` awaits `QueryReader::samples(&bucket, sid,
-  …)` once per series, serially. For 600+ series this is a debug-mode
-  bottleneck (minutes in debug, seconds in release) — the
-  `should_eval_sum_over_time_subquery_with_over_512_series` stress test is
-  ignored purely for this reason. Fan the loop out via `buffer_unordered` or
-  a batched `samples_multi(&[series_ref])` extension to `QueryReader`. Phase 7
-  performance pass.
+- **`SubqueryOp` reservation leak.** Child factory is re-invoked synchronously
+  per outer step via `tokio::task::block_in_place`; memory reservations held
+  by the freshly-built child aren't released on drop. At ~600+ series × many
+  outer steps the 1 GiB plan-time cap fills before the query completes.
+  `SubqueryOp` itself is tile-safe; this is orthogonal resource accounting.
+  Tracked by the `#[ignore]`d `should_eval_sum_over_time_subquery_with_over_512_series`
+  test. **Owner for next unit.**
 - **Hardcoded limits, no runtime config.** Cardinality gate = 20M series×steps;
   memory cap = 1 GiB. Both require a rebuild to change. Phase 7 cleanup.
 - **`timestamp()` with scalar child.** `InstantFnKind::Timestamp` falls back to
@@ -446,15 +445,6 @@ lives in the git commits; use `git log --oneline --grep="RFC 0007"` to browse.
     `SubqueryOp` reservation leak (§5.4).
   - `6796b02` — v1/v2 criterion benches; `52ecac6` — cross-engine result
     parity check in the A/B smoke.
-  - 6.3.10 (`c893024` failing test + fix commit) — `SubqueryOp` reservation
-    scope: wrap `build_outer_step_batch` with `(reserved_after -
-    reserved_before)` delta release so any unpaired `try_grow` inside the
-    factory-built child (notably `plan/physical::resolve_leaf`'s label-storage
-    reservation) is returned to the parent on child drop. Focused test
-    `should_release_reservation_across_multiple_factory_invocations` proves
-    zero net reservation after draining 8 outer steps × 10 KB/step scripted
-    leak; end-to-end stress test flagged a separate debug-mode slowness in
-    `build_sample_batches`' serial `samples().await` loop (§5.4).
 
 ---
 

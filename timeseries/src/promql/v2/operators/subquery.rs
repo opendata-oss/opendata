@@ -307,44 +307,7 @@ impl SubqueryOp {
     /// Drive the child operator to completion, packing its emitted
     /// instant-vector samples into a `MatrixWindowBatch` covering the
     /// single outer step at `outer_step_idx`.
-    ///
-    /// Wraps [`Self::build_outer_step_batch_inner`] in a reservation
-    /// scope: any bytes the factory-built child sub-tree grows and
-    /// leaves outstanding (e.g. `resolve_leaf`'s plan-time
-    /// label-storage reservation in `plan::physical`, which has no
-    /// paired `release`) are released back to the parent reservation
-    /// before returning. Without this, the leaked bytes accumulate
-    /// linearly with outer-step count and trip the per-query cap (RFC
-    /// 0007 §4 unit 6.3.10).
-    ///
-    /// Scoping rationale: emitted `MatrixWindowBatch`es own `Vec`-based
-    /// sample bodies but, per the engine's established convention
-    /// (`WindowBuffers::finish` releases before handing the vectors
-    /// off), they carry no reservation-tracked bytes on exit. So the
-    /// net `(reserved_after - reserved_before)` delta after the inner
-    /// helper returns and the child is dropped is exactly the leak.
     fn build_outer_step_batch(
-        &mut self,
-        outer_step_idx: usize,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<MatrixWindowBatch, QueryError>> {
-        let reserved_before = self.reservation.reserved();
-        let result = self.build_outer_step_batch_inner(outer_step_idx, cx);
-        // Release factory-scoped leaks (unpaired `try_grow` inside the
-        // child sub-tree) back to the parent. On `Poll::Pending` the
-        // child is still dropped at end-of-scope — v1's `SubqueryOp`
-        // does not persist partial child state across polls (see
-        // `build_outer_step_batch_inner` doc), so the scoping
-        // invariant still holds.
-        let reserved_after = self.reservation.reserved();
-        let leaked = reserved_after.saturating_sub(reserved_before);
-        if leaked > 0 {
-            self.reservation.release(leaked);
-        }
-        result
-    }
-
-    fn build_outer_step_batch_inner(
         &mut self,
         outer_step_idx: usize,
         cx: &mut Context<'_>,
