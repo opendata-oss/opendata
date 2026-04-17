@@ -24,12 +24,18 @@ async fn main() {
     let log_config = args.to_log_config();
     let server_config = LogServerConfig::from(&args);
 
+    // Install the metrics-rs recorder early so that slatedb metrics registered
+    // during LogDb::open() are captured by the prometheus exporter.
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+    let _ = metrics::set_global_recorder(recorder);
+
     tracing::info!("Opening log with config: {:?}", log_config);
 
     // Open the log
     let log = LogDb::open(log_config).await.expect("Failed to open log");
 
     // Create and run the server
-    let server = LogServer::new(Arc::new(log), server_config);
+    let server = LogServer::new(Arc::new(log), server_config, metrics_handle);
     server.run().await;
 }

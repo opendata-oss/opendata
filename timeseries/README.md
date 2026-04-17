@@ -1,33 +1,39 @@
 # OpenData Timeseries
 
-OpenData Timeseries is a time series database with prometheus-like APIs which
-uses SlateDB as the underlying storage engine.
+OpenData Timeseries is a Prometheus-compatible time series database built on
+[SlateDB](https://www.slatedb.io), an object-store-native LSM tree. It
+supports PromQL, Prometheus scraping, Prometheus remote write, OTLP metrics
+ingest, and Grafana through the Prometheus data source.
+
+Most Prometheus-compatible systems still rely on stateful storage nodes and the
+operational work that comes with them. Timeseries takes the object-store-native
+route instead: durable state lives in object storage, local disks are caches,
+and you can separate the writer from the reader without building around a
+replicated TSDB cluster.
+
+For development, that means you can run a single server locally and work
+against the same API surface you would use in production.
 
 ## Quickstart
 
-This quickstart runs Timeseries locally, scraping metrics from a mock server and
-prometheus node exporter, and storing them in a local SlateDB instance on disk.
-You can then query the data using the Prometheus-compatible API. It also runs
-Grafana so that you can visualize the collected metrics.
+Use the docs quickstart for the fastest path from install to querying real
+metrics:
 
-### Prerequisites
+- [Timeseries quickstart](https://www.opendata.dev/docs/timeseries/quickstart)
 
-- Docker and Docker Compose installed
-- `curl` and `jq` for API examples
+That guide installs Timeseries locally, scrapes metrics, walks through the
+built-in query UI, and shows how to add an external target.
 
-### Local binary (no Docker)
+## Local Development
 
-Run the HTTP server directly from source:
+Run the server directly from source:
 
 ```bash
 cargo run -p opendata-timeseries --features remote-write -- --port 9090
 ```
 
-### OTLP ingest config
-
-To enable OTLP/HTTP metrics ingest (`POST /v1/metrics`), include the `otel`
-feature when starting the server and configure OTEL label behavior in
-`prometheus.yaml`:
+To enable OTLP/HTTP metrics ingest (`POST /v1/metrics`), start the server with
+the `otel` feature and configure OTEL label handling in `prometheus.yaml`:
 
 ```bash
 cargo run -p opendata-timeseries --features "http-server,otel" -- --config ./prometheus.yaml --port 9090
@@ -35,79 +41,24 @@ cargo run -p opendata-timeseries --features "http-server,otel" -- --config ./pro
 
 ```yaml
 otel:
-  include_resource_attrs: true  # default: true
-  include_scope_attrs: true     # default: true
+  include_resource_attrs: true
+  include_scope_attrs: true
 ```
 
-### 1. Start the quickstart stack
+## Learn More
 
-```bash
-$ docker compose -f ./quickstart/docker-compose.yml up -d --build
-$ docker ps
-CONTAINER ID   IMAGE                           COMMAND                  CREATED          STATUS                    PORTS                       NAMES
-09cda30803cb   quickstart-timeseries-server    "./timeseries --conf…"   16 seconds ago   Up 15 seconds (healthy)   0.0.0.0:9090->9090/tcp      quickstart-timeseries-server-1
-c404ef4b389a   grafana/grafana-oss:latest      "/run.sh"                16 seconds ago   Up 9 seconds              0.0.0.0:3001->3000/tcp      quickstart-grafana-1
-b13121a0f5ab   quickstart-mock-metrics         "python3 mock_metric…"   16 seconds ago   Up 15 seconds (healthy)   0.0.0.0:8080->8080/tcp      quickstart-mock-metrics-1
-af78174f4c32   prom/node-exporter:latest       "/bin/node_exporter …"   16 seconds ago   Up 15 seconds             0.0.0.0:9100->9100/tcp      quickstart-node-exporter-1
-```
-
-### 2. Query the Data
-
-Wait about 15-30 seconds for Timeseries to scrape and index the metrics, then query
-the data using curl.
-
-**List all label names:**
-
-```bash
-curl 'http://localhost:9090/api/v1/labels' | jq .
-```
-
-**Get values for a specific label:**
-
-```bash
-curl 'http://localhost:9090/api/v1/label/job/values' | jq .
-```
-
-**Instant query (current value of a metric):**
-
-```bash
-curl 'http://localhost:9090/api/v1/query?query=mock_uptime_seconds' | jq .
-```
-
-**Range query (values over the last 5 minutes):**
-
-```bash
-START=$(($(date +%s) - 300))
-END=$(date +%s)
-curl "http://localhost:9090/api/v1/query_range?query=node_cpu_seconds&start=${START}&end=${END}&step=15s" | jq .
-```
-
-### 3. Open Grafana and Explore Metrics
-
-Open the address `localhost:3001` in a browser and login with username `admin` and password `admin`. You can then navigate to `http://localhost:3001/a/grafana-metricsdrilldown-app/drilldown` to see an overview of all the scraped metrics. Navigate to `http://localhost:3001/d/node-exporter-overview/node-exporter-overview` to see an example dashboard that plots some metrics collected from the Prometheus node exporter.
-
-### 4. Cleanup
-
-```bash
-$ docker compose -f ./quickstart/docker-compose.yml down
-```
-
-## Storage Design
-
-Timeseries uses SlateDB's LSM tree to store time series data organized into time
-buckets. Each bucket contains indexes for efficient label-based querying
-(inverted index mapping label/value pairs to series IDs) and Gorilla-compressed
-time series samples. For detailed storage specifications, see [RFC 0001: Timeseries
-Storage](rfcs/0001-tsdb-storage.md).
+- [Introducing OpenData Timeseries](https://www.opendata.dev/blog/introducing-timeseries)
+- [Storage design](rfcs/0001-tsdb-storage.md)
+- [Write API](rfcs/0002-write-api.md)
 
 ## Roadmap
 
-- [ ] **Full PromQL Compatibility** - Support the full PromQL query specification (in-progress)
-- [ ] **Full Prometheus API Compatibility** - Support the full Prometheus API specification (in-progress)
-- [ ] **Retention Policies/Rollups** - Specify policies for cleaning up or rolling up old data
-- [ ] **Bucket Compaction** - Compact adjacent buckets together to reduce index overhead
-- [ ] **Recording Rules** - Prometheus-style recording rules to manage high-cardinality data
-- [ ] **Service Discovery for Targets** - Support Prometheus-style target service discovery
-- [ ] **OTLP Export Protocol Ingestion** - Support accepting samples over the OTLP export protocol
-- [ ] **Log Native Ingestion** - Ingest directly from OpenData Log
-- [ ] **Read-Only Clients** - Support read-only clients that can run queries decoupled from ingest
+- [ ] Full PromQL compatibility
+- [ ] Full Prometheus API compatibility
+- [ ] Retention policies and rollups
+- [ ] Bucket compaction
+- [ ] Recording rules
+- [ ] Service discovery for targets
+- [ ] OTLP export protocol ingestion
+- [ ] Log-native ingestion
+- [ ] Read-only clients

@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use common::Storage;
-use futures::TryStreamExt;
+use common::{Storage, StorageRead};
+use futures::stream;
+use futures::{StreamExt, TryStreamExt};
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
@@ -18,8 +19,10 @@ use crate::model::{
     InstantSample, Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample,
     Series, SeriesId, TimeBucket,
 };
-use crate::promql::evaluator::{CachedQueryReader, Evaluator, ExprResult, compute_preload_ranges};
-use crate::promql::selector::evaluate_selector_with_reader;
+use crate::promql::evaluator::{
+    Evaluator, ExprResult, QueryReaderEvalCache, compute_preload_ranges,
+};
+use crate::promql::pipeline::{METADATA_STAGE_READAHEAD, resolve_metadata_parallel};
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::tsdb_metrics;
@@ -43,51 +46,21 @@ pub(crate) fn preload_ranges(
     }
 }
 
-/// Parse a match[] selector string into a VectorSelector
-fn parse_selector(selector: &str) -> std::result::Result<VectorSelector, String> {
-    let expr = promql_parser::parser::parse(selector).map_err(|e| e.to_string())?;
-    match expr {
-        Expr::VectorSelector(vs) => Ok(vs),
-        _ => Err("Expected a vector selector".to_string()),
-    }
-}
-
-/// Get all series IDs matching any of the given selectors (UNION)
-async fn get_matching_series<R: QueryReader>(
-    reader: &R,
-    bucket: TimeBucket,
-    matches: &[String],
-) -> std::result::Result<HashSet<SeriesId>, String> {
-    let mut all_series = HashSet::new();
-
-    let cached_reader = CachedQueryReader::new(reader);
-    for selector_str in matches {
-        let selector = parse_selector(selector_str)?;
-        let series = evaluate_selector_with_reader(&cached_reader, bucket, &selector)
-            .await
-            .map_err(|e| e.to_string())?;
-        all_series.extend(series);
-    }
-
-    Ok(all_series)
-}
-
-/// Get all series across multiple buckets, with fingerprint-based deduplication
-async fn get_matching_series_multi_bucket<R: QueryReader>(
-    reader: &R,
-    buckets: &[TimeBucket],
-    matches: &[String],
-) -> std::result::Result<HashMap<TimeBucket, HashSet<SeriesId>>, String> {
-    let mut bucket_series_map = HashMap::new();
-
-    for &bucket in buckets {
-        let series = get_matching_series(reader, bucket, matches).await?;
-        if !series.is_empty() {
-            bucket_series_map.insert(bucket, series);
-        }
-    }
-
-    Ok(bucket_series_map)
+/// Parse multiple match[] selector strings into VectorSelectors.
+fn parse_selectors(matchers: &[&str]) -> std::result::Result<Vec<VectorSelector>, QueryError> {
+    matchers
+        .iter()
+        .map(|s| {
+            let expr = promql_parser::parser::parse(s)
+                .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+            match expr {
+                Expr::VectorSelector(vs) => Ok(vs),
+                _ => Err(QueryError::InvalidQuery(
+                    "Expected a vector selector".to_string(),
+                )),
+            }
+        })
+        .collect()
 }
 
 // ── TsdbReadEngine trait ─────────────────────────────────────────────────
@@ -411,8 +384,8 @@ pub(crate) async fn evaluate_range(
 }
 
 /// Discover series matching any of the given selectors.
-pub(crate) async fn discover_series(
-    reader: &impl QueryReader,
+pub(crate) async fn discover_series<R: QueryReader>(
+    reader: &R,
     matchers: &[&str],
 ) -> std::result::Result<Vec<Labels>, QueryError> {
     if matchers.is_empty() {
@@ -426,20 +399,13 @@ pub(crate) async fn discover_series(
         return Ok(vec![]);
     }
 
-    let matches: Vec<String> = matchers.iter().map(|s| s.to_string()).collect();
-    let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
-        .await
-        .map_err(QueryError::InvalidQuery)?;
+    let selectors = parse_selectors(matchers)?;
+    let cache = Arc::new(QueryReaderEvalCache::new());
+    let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
 
     let mut unique_series: HashSet<Labels> = HashSet::new();
-
-    for (bucket, series_ids) in bucket_series_map {
-        let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-        if series_ids_vec.is_empty() {
-            continue;
-        }
-        let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-        for (_id, spec) in forward_index.all_series() {
+    for bm in metadata {
+        for (_id, spec) in bm.forward_index.all_series() {
             let mut sorted_labels = spec.labels.clone();
             sorted_labels.sort();
             unique_series.insert(Labels::new(sorted_labels));
@@ -452,8 +418,8 @@ pub(crate) async fn discover_series(
 }
 
 /// Discover label names, optionally filtered by matchers.
-pub(crate) async fn discover_labels(
-    reader: &impl QueryReader,
+pub(crate) async fn discover_labels<R: QueryReader>(
+    reader: &R,
     matchers: Option<&[&str]>,
 ) -> std::result::Result<Vec<String>, QueryError> {
     let buckets = reader.list_buckets().await?;
@@ -465,18 +431,12 @@ pub(crate) async fn discover_labels(
 
     match matchers {
         Some(matches) if !matches.is_empty() => {
-            let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-            let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
-                .await
-                .map_err(QueryError::InvalidQuery)?;
+            let selectors = parse_selectors(matches)?;
+            let cache = Arc::new(QueryReaderEvalCache::new());
+            let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
 
-            for (bucket, series_ids) in bucket_series_map {
-                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                if series_ids_vec.is_empty() {
-                    continue;
-                }
-                let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-                for (_id, spec) in forward_index.all_series() {
+            for bm in metadata {
+                for (_id, spec) in bm.forward_index.all_series() {
                     for attr in &spec.labels {
                         label_names.insert(attr.name.clone());
                     }
@@ -484,8 +444,13 @@ pub(crate) async fn discover_labels(
             }
         }
         _ => {
-            for bucket in buckets {
-                let inverted_index = reader.all_inverted_index(&bucket).await?;
+            let width = buckets.len().clamp(1, METADATA_STAGE_READAHEAD);
+            let results: Vec<_> = stream::iter(buckets)
+                .map(|bucket| async move { reader.all_inverted_index(&bucket).await })
+                .buffer_unordered(width)
+                .try_collect()
+                .await?;
+            for inverted_index in results {
                 for attr in inverted_index.all_keys() {
                     label_names.insert(attr.name);
                 }
@@ -499,8 +464,8 @@ pub(crate) async fn discover_labels(
 }
 
 /// Discover values for a specific label, optionally filtered by matchers.
-pub(crate) async fn discover_label_values(
-    reader: &impl QueryReader,
+pub(crate) async fn discover_label_values<R: QueryReader>(
+    reader: &R,
     label_name: &str,
     matchers: Option<&[&str]>,
 ) -> std::result::Result<Vec<String>, QueryError> {
@@ -513,18 +478,12 @@ pub(crate) async fn discover_label_values(
 
     match matchers {
         Some(matches) if !matches.is_empty() => {
-            let matches: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-            let bucket_series_map = get_matching_series_multi_bucket(reader, &buckets, &matches)
-                .await
-                .map_err(QueryError::InvalidQuery)?;
+            let selectors = parse_selectors(matches)?;
+            let cache = Arc::new(QueryReaderEvalCache::new());
+            let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
 
-            for (bucket, series_ids) in bucket_series_map {
-                let series_ids_vec: Vec<SeriesId> = series_ids.iter().copied().collect();
-                if series_ids_vec.is_empty() {
-                    continue;
-                }
-                let forward_index = reader.forward_index(&bucket, &series_ids_vec).await?;
-                for (_id, spec) in forward_index.all_series() {
+            for bm in metadata {
+                for (_id, spec) in bm.forward_index.all_series() {
                     for attr in &spec.labels {
                         if attr.name == label_name {
                             values.insert(attr.value.clone());
@@ -534,8 +493,13 @@ pub(crate) async fn discover_label_values(
             }
         }
         _ => {
-            for bucket in buckets {
-                let label_vals = reader.label_values(&bucket, label_name).await?;
+            let width = buckets.len().clamp(1, METADATA_STAGE_READAHEAD);
+            let results: Vec<_> = stream::iter(buckets)
+                .map(|bucket| async move { reader.label_values(&bucket, label_name).await })
+                .buffer_unordered(width)
+                .try_collect()
+                .await?;
+            for label_vals in results {
                 values.extend(label_vals);
             }
         }
@@ -553,15 +517,9 @@ pub(crate) async fn discover_label_values(
 pub(crate) struct Tsdb {
     storage: Arc<dyn Storage>,
 
-    // TODO(rohan): weird things can happen if these get out of sync
-    //  (e.g. ingest cache purged while query cache is present)
     /// TTI cache (15 min idle) for buckets being actively ingested into.
-    /// Also used during queries - checked first before query_cache.
+    /// Also used during queries so that unflushed data is visible.
     ingest_cache: Cache<TimeBucket, Arc<MiniTsdb>>,
-
-    /// LRU cache (50 max) for read-only query buckets.
-    /// Only populated for buckets NOT in ingest_cache.
-    query_cache: Cache<TimeBucket, Arc<MiniTsdb>>,
 
     // Metadata catalog (keyed by metric name)
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
@@ -574,15 +532,17 @@ impl Tsdb {
             .time_to_idle(Duration::from_secs(15 * 60))
             .build();
 
-        // LRU cache: max 50 buckets for query
-        let query_cache = Cache::builder().max_capacity(50).build();
-
         Self {
             storage,
             ingest_cache,
-            query_cache,
             metadata_catalog: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+        self.storage.clone() as Arc<dyn StorageRead>
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
@@ -602,53 +562,25 @@ impl Tsdb {
         Ok(mini)
     }
 
-    /// Get a MiniTsdb for a bucket, checking ingest cache first, then query cache.
-    async fn get_bucket(&self, bucket: TimeBucket) -> Result<Arc<MiniTsdb>> {
-        // 1. Check ingest cache first (has freshest data)
-        if let Some(mini) = self.ingest_cache.get(&bucket).await {
-            return Ok(mini);
-        }
-
-        // 2. Check query cache
-        if let Some(mini) = self.query_cache.get(&bucket).await {
-            return Ok(mini);
-        }
-
-        // 3. Load from storage into query cache (NOT ingest cache)
-        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone()).await?);
-        self.query_cache.insert(bucket, mini.clone()).await;
-        Ok(mini)
-    }
-
     /// Create a QueryReader for a time range.
-    /// This discovers all buckets covering the range and returns a TsdbQueryReader
-    /// that properly handles bucket-scoped series IDs.
+    /// For buckets in the ingest cache, uses the write coordinator's view
+    /// (includes unflushed data). For all other buckets, constructs a
+    /// lightweight reader directly from the storage snapshot.
     pub(crate) async fn query_reader(
         &self,
         start_secs: i64,
         end_secs: i64,
     ) -> Result<TsdbQueryReader> {
-        // TODO(rohan): its weird that we use a snapshot here and the minitsdbs have a different snapshot
         let snapshot = self.storage.snapshot().await?;
-
-        // Discover buckets that cover the query range
         let buckets = snapshot
             .get_buckets_in_range(Some(start_secs), Some(end_secs))
             .await?;
 
-        // Load MiniTsdbs for each bucket (from cache or storage)
-        let mut readers = Vec::new();
-        for bucket in buckets {
-            let mini = self.get_bucket(bucket).await?;
-            let reader = mini.query_reader();
-            readers.push((bucket, reader));
-        }
-
+        let readers = self.build_readers(&snapshot, buckets).await;
         Ok(TsdbQueryReader::new(readers))
     }
 
     /// Create a QueryReader for a set of disjoint time ranges.
-    /// Discovers all buckets overlapping any range and returns a TsdbQueryReader.
     pub(crate) async fn query_reader_for_ranges(
         &self,
         ranges: &[(i64, i64)],
@@ -656,14 +588,27 @@ impl Tsdb {
         let snapshot = self.storage.snapshot().await?;
         let buckets = snapshot.get_buckets_for_ranges(ranges).await?;
 
-        let mut readers = Vec::new();
+        let readers = self.build_readers(&snapshot, buckets).await;
+        Ok(TsdbQueryReader::new(readers))
+    }
+
+    /// Build readers for a set of buckets. Uses the ingest cache when
+    /// available, otherwise constructs a reader directly from the snapshot.
+    async fn build_readers(
+        &self,
+        snapshot: &Arc<dyn common::storage::StorageSnapshot>,
+        buckets: Vec<TimeBucket>,
+    ) -> Vec<(TimeBucket, MiniQueryReader)> {
+        let mut readers = Vec::with_capacity(buckets.len());
         for bucket in buckets {
-            let mini = self.get_bucket(bucket).await?;
-            let reader = mini.query_reader();
+            let reader = if let Some(mini) = self.ingest_cache.get(&bucket).await {
+                mini.query_reader()
+            } else {
+                MiniQueryReader::new(bucket, snapshot.clone() as Arc<dyn StorageRead>)
+            };
             readers.push((bucket, reader));
         }
-
-        Ok(TsdbQueryReader::new(readers))
+        readers
     }
 
     /// Flush all dirty buckets to durable storage.
@@ -683,7 +628,7 @@ impl Tsdb {
         Ok(())
     }
 
-    pub(crate) async fn close(self) -> Result<()> {
+    pub(crate) async fn close(&self) -> Result<()> {
         self.flush().await?;
         self.storage.close().await?;
         Ok(())
@@ -869,6 +814,15 @@ impl TsdbEngine {
         matches!(self, Self::ReadOnly(_))
     }
 
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.storage_read(),
+            Self::ReadOnly(reader) => reader.storage_read(),
+        }
+    }
+
     /// Returns a clone of the inner `Arc<Tsdb>` if this is a read-write engine.
     pub(crate) fn as_tsdb(&self) -> Option<Arc<Tsdb>> {
         match self {
@@ -979,6 +933,13 @@ impl TsdbEngine {
         match self {
             Self::ReadWrite(tsdb) => tsdb.flush().await,
             Self::ReadOnly(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn close(&self) -> Result<()> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.close().await,
+            Self::ReadOnly(reader) => reader.close().await,
         }
     }
 }
@@ -1114,11 +1075,8 @@ mod tests {
         let tsdb = Tsdb::new(storage);
 
         // then: tsdb is created successfully
-        // Sync caches to ensure counts are accurate
         tsdb.ingest_cache.run_pending_tasks().await;
-        tsdb.query_cache.run_pending_tasks().await;
         assert_eq!(tsdb.ingest_cache.entry_count(), 0);
-        assert_eq!(tsdb.query_cache.entry_count(), 0);
     }
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
@@ -1139,39 +1097,21 @@ mod tests {
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
     async fn should_use_ingest_cache_during_queries(storage: Arc<dyn Storage>) {
-        // given: a bucket in the ingest cache
+        // given: a bucket in the ingest cache with ingested data
         let tsdb = Tsdb::new(storage);
-        let bucket = TimeBucket::hour(1000);
+        let bucket = TimeBucket::hour(60);
+        let mini = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
 
-        // Put bucket in ingest cache
-        let mini_ingest = tsdb.get_or_create_for_ingest(bucket).await.unwrap();
+        let sample = create_sample("test_metric", vec![("env", "prod")], 4_000_000, 1.0);
+        mini.ingest(&sample).await.unwrap();
+        tsdb.flush().await.unwrap();
 
-        // when: getting the same bucket for query
-        let mini_query = tsdb.get_bucket(bucket).await.unwrap();
+        // when: building a query reader that covers this bucket
+        let reader = tsdb.query_reader(3600, 7200).await.unwrap();
 
-        // then: should return the same instance from ingest cache
-        assert!(Arc::ptr_eq(&mini_ingest, &mini_query));
-        // Query cache should still be empty
-        tsdb.query_cache.run_pending_tasks().await;
-        assert_eq!(tsdb.query_cache.entry_count(), 0);
-    }
-
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_use_query_cache_for_non_ingest_buckets(storage: Arc<dyn Storage>) {
-        // given
-        let tsdb = Tsdb::new(storage);
-        let bucket = TimeBucket::hour(1000);
-
-        // when: getting a bucket not in ingest cache
-        let mini1 = tsdb.get_bucket(bucket).await.unwrap();
-        let mini2 = tsdb.get_bucket(bucket).await.unwrap();
-
-        // then: same Arc is returned (cached in query cache)
-        assert!(Arc::ptr_eq(&mini1, &mini2));
-        tsdb.query_cache.run_pending_tasks().await;
-        tsdb.ingest_cache.run_pending_tasks().await;
-        assert_eq!(tsdb.query_cache.entry_count(), 1);
-        assert_eq!(tsdb.ingest_cache.entry_count(), 0);
+        // then: reader should see the ingested data (via ingest cache)
+        let buckets = reader.list_buckets().await.unwrap();
+        assert_eq!(buckets.len(), 1);
     }
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
@@ -1327,21 +1267,13 @@ mod tests {
         // Flush buckets 3 & 4 to storage (data is now visible for queries)
         tsdb.flush().await.unwrap();
 
-        // Verify cache state: 2 in ingest cache, 0 in query cache (query cache populated on read)
+        // Verify cache state: 2 in ingest cache (buckets 3 & 4)
         tsdb.ingest_cache.run_pending_tasks().await;
-        tsdb.query_cache.run_pending_tasks().await;
         assert_eq!(tsdb.ingest_cache.entry_count(), 2);
-        assert_eq!(tsdb.query_cache.entry_count(), 0);
 
         // when: query across all 4 buckets using the evaluator
         // Query range: seconds 3600-18000 covers all 4 buckets
         let reader = tsdb.query_reader(3600, 18000).await.unwrap();
-
-        // Verify cache state after query: 2 in ingest cache, 2 in query cache
-        tsdb.ingest_cache.run_pending_tasks().await;
-        tsdb.query_cache.run_pending_tasks().await;
-        assert_eq!(tsdb.ingest_cache.entry_count(), 2);
-        assert_eq!(tsdb.query_cache.entry_count(), 2);
 
         // Use the evaluator to run 4 separate instant queries, one per bucket
         let mut evaluator = Evaluator::new(&reader);
@@ -2133,6 +2065,9 @@ mod tests {
             object_store: common::ObjectStoreConfig::InMemory,
             manifest_path: manifest,
             poll_interval: Duration::from_millis(10),
+            data_path_prefix: "ingest".to_string(),
+            gc_interval: Duration::from_secs(300),
+            gc_grace_period: Duration::from_secs(600),
         };
         let consumer = Arc::new(crate::server::ingest_consumer::IngestConsumer::new(
             tsdb.clone(),

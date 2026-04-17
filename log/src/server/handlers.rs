@@ -390,10 +390,6 @@ mod tests {
             async fn flush(&self) -> common::StorageResult<()> {
                 self.check_failure()
             }
-
-            async fn close(&self) -> common::StorageResult<()> {
-                self.check_failure()
-            }
         }
 
         // given - a log backed by configurable storage

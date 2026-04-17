@@ -8,8 +8,11 @@ use vector::{Config, DistanceMetric, Query, SearchOptions, Vector, VectorDb, Vec
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_test_writer()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("opendata_vector=info,vector=info")),
+        )
+        .with_writer(std::io::stdout)
         .try_init();
 }
 
@@ -220,6 +223,9 @@ async fn sift100k_recall() {
     }
     db.flush().await.expect("failed to flush");
     println!("Ingested all base vectors");
+
+    db.validate_cache().await;
+    println!("validated cache");
 
     // Query and measure recall using first 1000 queries
     let nqueries = 100;

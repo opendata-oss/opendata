@@ -31,9 +31,11 @@
 //! # }
 //! ```
 
+extern crate core;
+
+pub mod admin;
 pub mod db;
 pub(crate) mod error;
-pub mod hnsw;
 pub mod math;
 pub mod model;
 pub(crate) mod query_engine;
@@ -48,6 +50,7 @@ pub(crate) mod test_utils;
 pub(crate) mod write;
 
 // Public API exports
+pub use admin::VectorDbAdmin;
 pub use db::{VectorDb, VectorDbRead};
 pub use error::{Error, Result};
 pub use model::{

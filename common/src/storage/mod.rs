@@ -2,6 +2,7 @@ pub mod config;
 pub mod factory;
 pub mod in_memory;
 pub mod loader;
+pub mod metrics_recorder;
 pub mod slate;
 pub mod util;
 
@@ -235,6 +236,18 @@ pub trait StorageRead: Send + Sync {
         }
         Ok(records)
     }
+
+    /// Closes the storage, releasing any resources.
+    ///
+    /// This method should be called before dropping the storage to ensure
+    /// proper cleanup. For SlateDB, this releases the database fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if resource shutdown fails.
+    async fn close(&self) -> StorageResult<()> {
+        Ok(())
+    }
 }
 
 /// A point-in-time snapshot of the storage layer.
@@ -348,16 +361,6 @@ pub trait Storage: StorageRead {
     /// Returns an error if durability cannot be established.
     async fn flush(&self) -> StorageResult<()>;
 
-    /// Closes the storage, releasing any resources.
-    ///
-    /// This method should be called before dropping the storage to ensure
-    /// proper cleanup. For SlateDB, this releases the database fence.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if resource shutdown fails.
-    async fn close(&self) -> StorageResult<()>;
-
     /// Subscribes to the durable sequence watermark.
     ///
     /// Returns a `watch::Receiver<u64>` that tracks the highest sequence number
@@ -365,12 +368,4 @@ pub trait Storage: StorageRead {
     /// `DbStatus::durable_seq`. For in-memory storage, writes are immediately
     /// "durable" so the watermark matches the latest written seqnum.
     fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64>;
-
-    /// Registers storage engine metrics into the given Prometheus registry.
-    ///
-    /// The default implementation is a no-op. Storage backends that expose
-    /// internal metrics (e.g., SlateDB) override this to register gauges
-    /// that read live values on each scrape.
-    #[cfg(feature = "metrics")]
-    fn register_metrics(&self, _registry: &mut prometheus_client::registry::Registry) {}
 }

@@ -1,6 +1,6 @@
 [package]
 name = "opendata-timeseries"
-version = "0.1.12"
+version = "0.2.1"
 edition.workspace = true
 description = "Prometheus-compatible time series database built on SlateDB"
 license = "MIT"
@@ -26,7 +26,6 @@ http-server = [
     "dep:tower",
     "dep:tower-http",
     "dep:clap",
-    "dep:prometheus-client",
     "dep:metrics-exporter-prometheus",
 ]
 testing = []
@@ -45,7 +44,7 @@ config.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 moka.workspace = true
-common = { workspace = true, features = ["metrics"] }
+common.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -65,7 +64,6 @@ blake3 = "1.8.2"
 metrics.workspace = true
 metrics-exporter-prometheus = { workspace = true, optional = true }
 mime_guess = "2"
-prometheus-client = { version = "0.22", optional = true }
 promql-parser = "0.8"
 regex = "1.0"
 ryu = "1"

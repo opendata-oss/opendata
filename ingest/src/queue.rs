@@ -525,13 +525,13 @@ enum ManifestWriteError {
 }
 
 #[derive(Clone)]
-struct ManifestStore {
-    object_store: Arc<dyn ObjectStore>,
-    manifest_path: String,
+pub(crate) struct ManifestStore {
+    pub(crate) object_store: Arc<dyn ObjectStore>,
+    pub(crate) manifest_path: String,
 }
 
 impl ManifestStore {
-    async fn read(&self) -> Result<(Manifest, Option<UpdateVersion>)> {
+    pub(crate) async fn read(&self) -> Result<(Manifest, Option<UpdateVersion>)> {
         let path = Path::from(self.manifest_path.as_str());
         match self.object_store.get(&path).await {
             Ok(result) => {

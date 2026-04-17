@@ -20,12 +20,13 @@ required-features = ["http-server"]
 
 [features]
 default = []
-http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "common/metrics"]
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "dep:metrics-exporter-prometheus"]
 
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
 common.workspace = true
+metrics.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -40,10 +41,12 @@ axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 prometheus-client = { version = "0.22", optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64.workspace = true
 common = { workspace = true, features = ["test-utils"] }
+metrics-exporter-prometheus.workspace = true
 proptest.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true

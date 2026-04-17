@@ -2,16 +2,18 @@
 //!
 //! This module implements the key/value encoding scheme defined in RFC 0001.
 
-pub mod centroid_chunk;
+pub mod centroid_info;
 pub mod centroid_stats;
+pub mod centroids;
 pub mod collection_meta;
-pub mod deletions;
 pub mod id_dictionary;
 pub mod key;
 pub mod metadata_index;
 pub mod posting_list;
 pub mod vector_bitmap;
 pub mod vector_data;
+pub(crate) mod vector_id;
+pub mod vector_index_data;
 
 use bytes::BytesMut;
 
@@ -32,14 +34,17 @@ pub const SUBSYSTEM: u8 = 0x02;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
     CollectionMeta = 0x01,
-    Deletions = 0x02,
-    CentroidChunk = 0x03,
+    // TODO: reset these IDs
     PostingList = 0x04,
     IdDictionary = 0x05,
     VectorData = 0x06,
+    VectorIndexData = 0x0D,
     MetadataIndex = 0x07,
     SeqBlock = 0x08,
     CentroidStats = 0x09,
+    Centroids = 0x0A,
+    CentroidInfo = 0x0B,
+    CentroidSeqBlock = 0x0C,
 }
 
 impl RecordType {
@@ -52,14 +57,16 @@ impl RecordType {
     pub fn from_id(id: u8) -> Result<Self, EncodingError> {
         match id {
             0x01 => Ok(RecordType::CollectionMeta),
-            0x02 => Ok(RecordType::Deletions),
-            0x03 => Ok(RecordType::CentroidChunk),
             0x04 => Ok(RecordType::PostingList),
             0x05 => Ok(RecordType::IdDictionary),
             0x06 => Ok(RecordType::VectorData),
+            0x0D => Ok(RecordType::VectorIndexData),
             0x07 => Ok(RecordType::MetadataIndex),
             0x08 => Ok(RecordType::SeqBlock),
             0x09 => Ok(RecordType::CentroidStats),
+            0x0A => Ok(RecordType::Centroids),
+            0x0B => Ok(RecordType::CentroidInfo),
+            0x0C => Ok(RecordType::CentroidSeqBlock),
             _ => Err(EncodingError {
                 message: format!("Invalid record type: 0x{:02x}", id),
             }),
@@ -699,8 +706,6 @@ mod tests {
         // given
         let types = [
             RecordType::CollectionMeta,
-            RecordType::Deletions,
-            RecordType::CentroidChunk,
             RecordType::PostingList,
             RecordType::IdDictionary,
             RecordType::VectorData,
@@ -708,6 +713,9 @@ mod tests {
             RecordType::MetadataIndex,
             RecordType::SeqBlock,
             RecordType::CentroidStats,
+            RecordType::Centroids,
+            RecordType::CentroidInfo,
+            RecordType::CentroidSeqBlock,
         ];
 
         for record_type in types {

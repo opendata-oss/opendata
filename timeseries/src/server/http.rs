@@ -113,36 +113,25 @@ pub(crate) fn build_router(
 pub(crate) struct TimeSeriesHttpServer {
     tsdb: Arc<TsdbEngine>,
     config: ServerConfig,
-    storage: Option<Arc<dyn common::Storage>>,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 impl TimeSeriesHttpServer {
     pub(crate) fn new(
         tsdb: Arc<TsdbEngine>,
         config: ServerConfig,
-        storage: Option<Arc<dyn common::Storage>>,
+        metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     ) -> Self {
         Self {
             tsdb,
             config,
-            storage,
+            metrics_handle,
         }
     }
 
     /// Run the HTTP server
     pub(crate) async fn run(self) {
-        // Install the metrics-rs recorder and create the rendering handle
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        // Install globally — if a recorder is already installed (e.g. tests), this is a no-op
-        let _ = metrics::set_global_recorder(recorder);
-
-        // Create metrics container with optional storage engine metrics
-        let mut metrics = Metrics::new(handle);
-        if let Some(storage) = &self.storage {
-            storage.register_metrics(metrics.storage_registry_mut());
-        }
-        let metrics = Arc::new(metrics);
+        let metrics = Arc::new(Metrics::new(self.metrics_handle));
 
         // Start the scraper if there are scrape configs (requires read-write mode)
         if !self.config.prometheus_config.scrape_configs.is_empty() {
@@ -198,6 +187,22 @@ impl TimeSeriesHttpServer {
             handle
         };
 
+        // Start the cache warmer if configured
+        let warmer_handle =
+            self.config
+                .prometheus_config
+                .cache_warmer
+                .as_ref()
+                .map(|warmer_config| {
+                    let storage = self.tsdb.storage_read();
+                    tracing::info!(
+                        warm_range = ?warmer_config.warm_range,
+                        include_samples = warmer_config.include_samples,
+                        "Starting cache warmer"
+                    );
+                    super::cache_warmer::start(storage, warmer_config.clone())
+                });
+
         // Build router with metrics middleware
         let app = build_router(
             self.tsdb.clone(),
@@ -221,10 +226,16 @@ impl TimeSeriesHttpServer {
             handle.shutdown().await;
         }
 
-        // Flush TSDB on shutdown to persist any buffered data
-        tracing::info!("Flushing TSDB before shutdown...");
-        if let Err(e) = self.tsdb.flush().await {
-            tracing::error!("Failed to flush TSDB on shutdown: {}", e);
+        // Stop the cache warmer before closing storage
+        if let Some(handle) = warmer_handle {
+            tracing::info!("Shutting down cache warmer...");
+            handle.shutdown().await;
+        }
+
+        // Close TSDB on shutdown to flush buffered data and release resources
+        tracing::info!("Closing TSDB before shutdown...");
+        if let Err(e) = self.tsdb.close().await {
+            tracing::error!("Failed to close TSDB on shutdown: {}", e);
         }
 
         tracing::info!("Server shut down gracefully");

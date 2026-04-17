@@ -20,20 +20,26 @@ use crate::LogDb;
 pub struct LogServer {
     log: Arc<LogDb>,
     config: LogServerConfig,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 impl LogServer {
     /// Create a new log server.
-    pub fn new(log: Arc<LogDb>, config: LogServerConfig) -> Self {
-        Self { log, config }
+    pub fn new(
+        log: Arc<LogDb>,
+        config: LogServerConfig,
+        metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    ) -> Self {
+        Self {
+            log,
+            config,
+            metrics_handle,
+        }
     }
 
     /// Run the HTTP server.
     pub async fn run(self) {
-        // Create metrics registry and register storage engine metrics
-        let mut metrics = Metrics::new();
-        self.log.register_metrics(metrics.registry_mut());
-        let metrics = Arc::new(metrics);
+        let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(self.metrics_handle)));
 
         // Create app state
         let state = AppState {

@@ -621,8 +621,8 @@ impl Default for QueryOptions {
     fn default() -> Self {
         Self {
             lookback_delta: Duration::from_secs(5 * 60),
-            metadata_concurrency: 4,
-            sample_concurrency: 4,
+            metadata_concurrency: 64,
+            sample_concurrency: 384,
         }
     }
 }

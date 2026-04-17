@@ -79,16 +79,17 @@ async fn find_candidates_with_reader<'reader, R: QueryReader>(
 
     for matcher in &selector.matchers.matchers {
         match &matcher.op {
-            MatchOp::Equal => {
+            MatchOp::Equal
                 // For empty string matchers, we skip adding them to and_terms
                 // and handle them later with post-filtering
-                if !matcher.value.is_empty() {
-                    and_terms.push(Label {
-                        name: matcher.name.clone(),
-                        value: matcher.value.clone(),
-                    });
-                }
+                if !matcher.value.is_empty() =>
+            {
+                and_terms.push(Label {
+                    name: matcher.name.clone(),
+                    value: matcher.value.clone(),
+                });
             }
+            MatchOp::Equal => {}
             MatchOp::Re(_) => {
                 let values = parse_limited_regex(&matcher.value)
                     .map_err(crate::error::Error::InvalidInput)?;
@@ -260,16 +261,17 @@ fn find_candidates_with_regex_support(
     // Process matchers
     for matcher in &selector.matchers.matchers {
         match &matcher.op {
-            MatchOp::Equal => {
+            MatchOp::Equal
                 // For empty string matchers, we skip adding them to and_terms
                 // and handle them later with post-filtering
-                if !matcher.value.is_empty() {
-                    and_terms.push(Label {
-                        name: matcher.name.clone(),
-                        value: matcher.value.clone(),
-                    });
-                }
+                if !matcher.value.is_empty() =>
+            {
+                and_terms.push(Label {
+                    name: matcher.name.clone(),
+                    value: matcher.value.clone(),
+                });
             }
+            MatchOp::Equal => {}
             MatchOp::Re(_) => {
                 // Validate and expand regex pattern
                 let values = parse_limited_regex(&matcher.value)?;
@@ -347,16 +349,18 @@ fn extract_equality_terms(selector: &VectorSelector) -> std::result::Result<Vec<
 
     for matcher in &selector.matchers.matchers {
         match &matcher.op {
-            MatchOp::Equal => {
+            MatchOp::Equal
                 // For empty string matchers, we skip adding them to terms
                 // and handle them later with post-filtering
-                if !matcher.value.is_empty() {
-                    terms.push(Label {
-                        name: matcher.name.clone(),
-                        value: matcher.value.clone(),
-                    });
-                }
+                if !matcher.value.is_empty() =>
+            {
+                terms.push(Label {
+                    name: matcher.name.clone(),
+                    value: matcher.value.clone(),
+                });
             }
+            MatchOp::Equal => {}
+
             MatchOp::Re(_) => {
                 // Regex validation only - actual handling done in find_candidates_with_regex_support
                 let _values = parse_limited_regex(&matcher.value)?;

@@ -1,17 +1,19 @@
 use crate::error::{Error, Result};
-use crate::hnsw::CentroidGraph;
 use crate::math::distance;
 use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
-use crate::serde::posting_list::PostingList;
 use crate::serde::vector_data::VectorDataValue;
+use crate::serde::vector_id::VectorId;
 use crate::storage::VectorDbStorageReadExt;
+use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
+use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::{Attribute, Vector};
 use common::storage::StorageRead;
 use roaring::RoaringTreemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 /// The subset of configuration needed by the query engine.
@@ -25,26 +27,26 @@ pub(crate) struct QueryEngineOptions {
 /// Read-only query engine for the vector database.
 ///
 /// `QueryEngine` holds the immutable state needed to execute search queries:
-/// a centroid graph for ANN routing, a storage reader for reading posting
+/// a centroid index for ANN routing, a storage reader for reading posting
 /// lists and vector data, and the options for dimensions/distance metric.
 ///
 /// Each query on `VectorDb` creates a short-lived `QueryEngine` from the current
 /// snapshot. `QueryEngine` is also used by `VectorDbReader` for read-only access.
 pub(crate) struct QueryEngine {
     options: QueryEngineOptions,
-    centroid_graph: Arc<dyn CentroidGraph>,
+    centroid_index: Arc<LeveledCentroidIndex<'static>>,
     storage: Arc<dyn StorageRead>,
 }
 
 impl QueryEngine {
     pub(crate) fn new(
         options: QueryEngineOptions,
-        centroid_graph: Arc<dyn CentroidGraph>,
+        centroid_index: Arc<LeveledCentroidIndex<'static>>,
         storage: Arc<dyn StorageRead>,
     ) -> Self {
         Self {
             options,
-            centroid_graph,
+            centroid_index,
             storage,
         }
     }
@@ -108,24 +110,24 @@ impl QueryEngine {
         let query_vector = self.normalize_query_if_needed(&query.vector);
 
         // Brute-force: compute distance from query to every live centroid
-        let all_centroid_ids = self.centroid_graph.all_centroid_ids();
-        let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
+        let centroid_candidates = self.search_centroids(&query_vector, usize::MAX).await?;
+        let centroid_ids: Vec<VectorId> = centroid_candidates
             .iter()
-            .filter_map(|&cid| {
-                let cv = self.centroid_graph.get_centroid_vector(cid)?;
-                let d =
-                    distance::compute_distance(&query_vector, &cv, self.options.distance_metric);
-                Some((cid, d))
-            })
+            .take(nprobe)
+            .map(|posting| posting.id())
             .collect();
-        scored.sort_by(|a, b| a.1.cmp(&b.1));
-        let centroid_ids: Vec<u64> = scored.iter().take(nprobe).map(|(id, _)| *id).collect();
 
         if centroid_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query_vector);
+        let centroid_ids = self.prune_centroids(
+            &centroid_candidates
+                .into_iter()
+                .take(nprobe)
+                .collect::<Vec<_>>(),
+            &query_vector,
+        );
 
         let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
         if sorted_lists.is_empty() {
@@ -162,23 +164,24 @@ impl QueryEngine {
 
         // 3. Search HNSW for nearest centroids
         let num_centroids = nprobe;
-        let centroid_ids = self.centroid_graph.search(&query_vector, num_centroids);
+        let t = Instant::now();
+        let centroid_candidates = self.search_centroids(&query_vector, num_centroids).await?;
         debug!(
-            "searched for {} centroids, found: {}",
+            "searched for {} centroids, found: {}, elapsed_ms: {:?}",
             num_centroids,
-            centroid_ids.len()
+            centroid_candidates.len(),
+            t.elapsed().as_millis()
         );
 
-        if centroid_ids.is_empty() {
+        if centroid_candidates.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 4. Dynamic pruning: skip posting lists whose centroids are far from query
-        let original_ncentroids = centroid_ids.len();
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query_vector);
+        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
+        let original_ncentroids = centroid_candidates.len();
+        let centroid_ids = self.prune_centroids(&centroid_candidates, &query_vector);
         debug!(
-            "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
-            query_vector,
+            "before pruning: {} centroids, after dynamic pruning: {} centroids",
             original_ncentroids,
             centroid_ids.len()
         );
@@ -198,6 +201,10 @@ impl QueryEngine {
         // 7. K-way merge and resolve top-k forward index lookups
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
         Self::apply_field_selection(&mut results, &query.include_fields);
+        debug!(
+            op = "search_with_options",
+            elapsed_ms = t.elapsed().as_millis()
+        );
         Ok(results)
     }
 
@@ -210,21 +217,22 @@ impl QueryEngine {
     ///
     /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
     /// the input unchanged.
-    pub(crate) fn prune_centroids(&self, centroid_ids: &[u64], query: &[f32]) -> Vec<u64> {
+    pub(crate) fn prune_centroids(&self, centroid_ids: &[Posting], query: &[f32]) -> Vec<VectorId> {
         let epsilon = match self.options.query_pruning_factor {
             Some(e) => e,
-            None => return centroid_ids.to_vec(),
+            None => return centroid_ids.iter().map(|posting| posting.id()).collect(),
         };
 
         let metric = self.options.distance_metric;
 
         // Compute raw distance (lower = closer) from query to each centroid.
-        let mut scored: Vec<(u64, f32)> = centroid_ids
+        let mut scored: Vec<(VectorId, f32)> = centroid_ids
             .iter()
-            .filter_map(|&cid| {
-                let cv = self.centroid_graph.get_centroid_vector(cid)?;
-                let d = distance::raw_distance(query, &cv, metric);
-                Some((cid, d))
+            .map(|posting| {
+                (
+                    posting.id(),
+                    distance::raw_distance(query, posting.vector(), metric),
+                )
             })
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -253,24 +261,29 @@ impl QueryEngine {
             .collect()
     }
 
+    async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<Posting>> {
+        search_centroids(self.centroid_index.as_ref(), query, k).await
+    }
+
     /// Spawn a task per centroid to load its posting list and score all candidates
     /// against the query vector. Returns per-centroid sorted candidate lists.
     async fn load_and_score(
         &self,
-        centroid_ids: &[u64],
+        centroid_ids: &[VectorId],
         query: &[f32],
     ) -> Result<Vec<Vec<ScoredCandidate>>> {
         let dimensions = self.options.dimensions as usize;
         let metric = self.options.distance_metric;
         let query_vec: Vec<f32> = query.to_vec();
 
+        let t = Instant::now();
         let mut handles = Vec::with_capacity(centroid_ids.len());
         for &cid in centroid_ids {
             let snap = self.storage.clone();
             let q = query_vec.clone();
             handles.push(tokio::spawn(async move {
-                let posting_list: PostingList =
-                    snap.get_posting_list(cid, dimensions).await?.into();
+                let posting_list =
+                    PostingList::from_value(snap.get_posting_list(cid, dimensions).await?);
                 let mut scored: Vec<ScoredCandidate> = posting_list
                     .iter()
                     .map(|posting| {
@@ -281,12 +294,17 @@ impl QueryEngine {
                         }
                     })
                     .collect();
-                scored.sort_unstable_by(|a, b| a.distance.cmp(&b.distance));
+                scored.sort_unstable_by_key(|a| a.distance);
                 Ok::<_, Error>(scored)
             }));
         }
 
         let results = futures::future::join_all(handles).await;
+        let elapsed = t.elapsed();
+        debug!(
+            op = "search/load_and_score/load",
+            elapsed_ms = elapsed.as_millis()
+        );
         let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
         for result in results {
             let scored =
@@ -343,11 +361,17 @@ impl QueryEngine {
             }
 
             // Resolve forward index lookups for the batch concurrently.
+            let t = Instant::now();
             let futures: Vec<_> = batch
                 .iter()
                 .map(|sr| self.storage.get_vector_data(sr.internal_id, dimensions))
                 .collect();
             let loaded = futures::future::join_all(futures).await;
+            let elapsed = t.elapsed();
+            debug!(
+                op = "query/resolve_top_k/load",
+                elapsed_ms = elapsed.as_millis() as u64,
+            );
 
             for (sr, vector_data) in batch.iter().zip(loaded) {
                 let Some(vector_data) = vector_data? else {
@@ -400,7 +424,7 @@ impl QueryEngine {
         let mut candidates = RoaringTreemap::new();
         for list in sorted_lists.iter() {
             for candidate in list {
-                candidates.insert(candidate.internal_id);
+                candidates.insert(candidate.internal_id.id());
             }
         }
 
@@ -409,7 +433,7 @@ impl QueryEngine {
 
         // Filter each list
         for list in sorted_lists.iter_mut() {
-            list.retain(|c| allowed.contains(c.internal_id));
+            list.retain(|c| allowed.contains(c.internal_id.id()));
         }
 
         Ok(())
@@ -430,13 +454,13 @@ impl QueryEngine {
                 Filter::Eq(field, value) => {
                     let field_value: crate::serde::FieldValue = value.clone().into();
                     let bitmap = storage.get_metadata_index(field, field_value).await?;
-                    Ok(bitmap.vector_ids)
+                    Ok(bitmap.effective_vector_ids())
                 }
                 Filter::Neq(field, value) => {
                     let field_value: crate::serde::FieldValue = value.clone().into();
                     let bitmap = storage.get_metadata_index(field, field_value).await?;
                     let mut result = candidates.clone();
-                    result -= &bitmap.vector_ids;
+                    result -= &bitmap.effective_vector_ids();
                     Ok(result)
                 }
                 Filter::In(field, values) => {
@@ -444,7 +468,7 @@ impl QueryEngine {
                     for value in values {
                         let field_value: crate::serde::FieldValue = value.clone().into();
                         let bitmap = storage.get_metadata_index(field, field_value).await?;
-                        result |= &bitmap.vector_ids;
+                        result |= &bitmap.effective_vector_ids();
                     }
                     Ok(result)
                 }
@@ -474,7 +498,7 @@ impl QueryEngine {
 }
 
 struct ScoredCandidate {
-    internal_id: u64,
+    internal_id: VectorId,
     distance: distance::VectorDistance,
 }
 
@@ -507,7 +531,13 @@ mod tests {
     use crate::db::{VectorDb, VectorDbRead};
     use crate::model::{Config, Query, VECTOR_FIELD_NAME, Vector};
     use crate::serde::collection_meta::DistanceMetric;
+    use crate::serde::vector_id::VectorId;
+    use crate::write::indexer::tree::posting_list::Posting;
     use common::{StorageBuilder, StorageConfig};
+
+    fn data_id(id: u64) -> VectorId {
+        VectorId::data_vector_id(id)
+    }
 
     fn create_config(dimensions: u16, metric: DistanceMetric) -> Config {
         Config {
@@ -548,15 +578,21 @@ mod tests {
         .unwrap();
 
         let query = [0.0, 0.0, 0.0];
-        let all_ids: Vec<u64> = (0..4).collect();
+        let engine = db.query_engine();
+        let all_centroids = vec![
+            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
+            Posting::new(data_id(2), vec![1.4, 0.0, 0.0]),
+            Posting::new(data_id(3), vec![2.0, 0.0, 0.0]),
+            Posting::new(data_id(4), vec![5.0, 0.0, 0.0]),
+        ];
 
         // when
-        let pruned = db.query_engine().prune_centroids(&all_ids, &query);
+        let pruned = engine.prune_centroids(&all_centroids, &query);
 
         // then
         assert_eq!(pruned.len(), 2);
-        assert_eq!(pruned[0], 0); // closest
-        assert_eq!(pruned[1], 1); // within threshold
+        assert_eq!(pruned[0], data_id(1)); // closest
+        assert_eq!(pruned[1], data_id(2)); // within threshold
     }
 
     #[tokio::test]
@@ -572,10 +608,14 @@ mod tests {
         .unwrap();
 
         let query = [0.0, 0.0, 0.0];
-        let all_ids: Vec<u64> = (0..2).collect();
+        let engine = db.query_engine();
+        let all_centroids = vec![
+            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
+            Posting::new(data_id(2), vec![100.0, 0.0, 0.0]),
+        ];
 
         // when
-        let result = db.query_engine().prune_centroids(&all_ids, &query);
+        let result = engine.prune_centroids(&all_centroids, &query);
 
         // then - all centroids returned regardless of distance
         assert_eq!(result.len(), 2);
@@ -601,14 +641,19 @@ mod tests {
         .unwrap();
 
         let query = [0.0, 0.0, 0.0];
-        // pass IDs in reverse distance order
-        let ids: Vec<u64> = vec![0, 2, 1];
+        let engine = db.query_engine();
+        // pass centroids in reverse distance order: far, medium, close
+        let ids = vec![
+            Posting::new(data_id(1), vec![5.0, 0.0, 0.0]),
+            Posting::new(data_id(3), vec![3.0, 0.0, 0.0]),
+            Posting::new(data_id(2), vec![1.0, 0.0, 0.0]),
+        ];
 
         // when
-        let result = db.query_engine().prune_centroids(&ids, &query);
+        let result = engine.prune_centroids(&ids, &query);
 
         // then - sorted by ascending distance: c1 (1.0), c2 (3.0), c0 (5.0)
-        assert_eq!(result, vec![1, 2, 0]);
+        assert_eq!(result, vec![data_id(2), data_id(3), data_id(1)]);
     }
 
     // --- Search tests ---

@@ -1,6 +1,7 @@
 //! Prometheus metrics for the log server.
 
 use axum::http::Method;
+use metrics_exporter_prometheus::PrometheusHandle;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -52,8 +53,12 @@ pub struct HttpLabels {
 }
 
 /// Container for all Prometheus metrics.
+///
+/// Combines `prometheus_client`-based log metrics with `metrics-rs` output
+/// (used by slatedb via the `MetricsRsRecorder` bridge).
 pub struct Metrics {
     registry: Registry,
+    metrics_rs_handle: Option<PrometheusHandle>,
 
     /// Counter of records successfully appended.
     pub log_append_records_total: Counter,
@@ -86,6 +91,12 @@ impl Default for Metrics {
 impl Metrics {
     /// Create a new metrics registry with all metrics registered.
     pub fn new() -> Self {
+        Self::with_metrics_rs_handle(None)
+    }
+
+    /// Create a new metrics registry with a `metrics-rs` handle for
+    /// rendering slatedb metrics alongside log-server metrics.
+    pub fn with_metrics_rs_handle(handle: Option<PrometheusHandle>) -> Self {
         let mut registry = Registry::default();
 
         // Log append records counter
@@ -149,6 +160,7 @@ impl Metrics {
 
         Self {
             registry,
+            metrics_rs_handle: handle,
             log_append_records_total,
             log_append_bytes_total,
             log_records_scanned_total,
@@ -159,19 +171,17 @@ impl Metrics {
         }
     }
 
-    /// Returns a mutable reference to the underlying Prometheus registry.
-    ///
-    /// Use this to register additional metrics (e.g. storage engine metrics)
-    /// before wrapping `Metrics` in an `Arc`.
-    pub fn registry_mut(&mut self) -> &mut Registry {
-        &mut self.registry
-    }
-
     /// Encode all metrics to Prometheus text format.
+    ///
+    /// Combines `prometheus_client` log metrics with `metrics-rs` output
+    /// (slatedb metrics registered via `MetricsRsRecorder`).
     pub fn encode(&self) -> String {
         let mut buffer = String::new();
         prometheus_client::encoding::text::encode(&mut buffer, &self.registry)
             .expect("encoding metrics should not fail");
+        if let Some(handle) = &self.metrics_rs_handle {
+            buffer.push_str(&handle.render());
+        }
         buffer
     }
 }

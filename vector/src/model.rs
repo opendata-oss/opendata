@@ -256,7 +256,7 @@ impl Default for Config {
             flush_interval: Duration::from_secs(60),
             split_threshold_vectors: 2_000,
             merge_threshold_vectors: 500,
-            split_search_neighbourhood: 16,
+            split_search_neighbourhood: 0,
             max_pending_and_running_rebalance_tasks: 16,
             rebalance_backpressure_resume_threshold: 8,
             max_rebalance_tasks: 8,

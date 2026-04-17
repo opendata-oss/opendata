@@ -72,7 +72,7 @@ The test format follows [Prometheus's promqltest specification](https://promethe
 
 ### Ignore and Resume Directives
 
-The `ignore` directive skips all subsequent commands until `resume` or `clear`. This allows copying test files directly from Prometheus's test suite while marking unimplemented features.
+The `ignore` directive skips all subsequent commands until `resume`. This allows copying test files directly from Prometheus's test suite while marking unimplemented features.
 
 ```
 # Working features

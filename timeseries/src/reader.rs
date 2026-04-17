@@ -186,6 +186,12 @@ impl TimeSeriesDbReader {
         }
     }
 
+    /// Returns a read handle to the underlying storage, for background tasks
+    /// like the cache warmer.
+    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+        self.storage.clone()
+    }
+
     /// Get a cached bucket reader, loading from storage if needed.
     async fn get_or_load_bucket(&self, bucket: TimeBucket) -> Arc<MiniQueryReader> {
         let storage = self.storage.clone();
@@ -235,6 +241,12 @@ impl TimeSeriesDbReader {
         range: impl RangeBounds<SystemTime>,
     ) -> std::result::Result<Vec<String>, QueryError> {
         find_labels_in_range(self, matchers, range).await
+    }
+
+    /// Closes the underlying storage reader, flushing any caches to disk.
+    pub async fn close(&self) -> Result<()> {
+        self.storage.close().await?;
+        Ok(())
     }
 
     /// Returns the set of values for a given label name.

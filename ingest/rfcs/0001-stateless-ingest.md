@@ -404,6 +404,9 @@ after the last acked sequence returns an error. To amortize the cost of manifest
 the collector batches acks and only calls `dequeue()` on the queue consumer every 100 acks.
 This acknowledged position is tracked separately from the internal read cursor so the
 collector can read ahead while still preserving in-order acknowledgements and resume semantics.
+The `dequeue()` call removes acknowledged entries from the queue manifest but does not delete
+the corresponding data batch files from object storage. Deletion of batch files is handled
+exclusively by the garbage collector (see below).
 
 By calling `flush()` the caller forces the collector to dequeue all acked entries from the
 queue manifest immediately.
@@ -412,6 +415,58 @@ If the collector fails, a new collector can be started. It will increment the ep
 fencing the old consumer. If the caller tracks the last acked sequence, it can pass it to
 `initialize(Some(seq))` to resume where it left off. Otherwise, `initialize(None)` starts
 from the earliest unprocessed entry.
+
+
+### Garbage Collection
+
+When the collector dequeues acknowledged entries from the queue manifest, the corresponding
+data batch files remain in object storage. A background garbage collector periodically
+identifies and deletes these orphaned files.
+
+#### Mechanism
+
+The garbage collector runs as a background task within the collector process. On each cycle it:
+
+1. **Reads a snapshot of the queue manifest** to obtain the set of all currently referenced
+   batch locations and the oldest entry's location.
+2. **Lists all `.batch` files** under the configured `data_path_prefix` in object storage.
+3. **Filters candidates for deletion.** A file is eligible for deletion only if all of the
+   following hold:
+   - It is **not referenced** in the current manifest snapshot.
+   - Its ULID timestamp is **older than the oldest manifest entry's ULID timestamp**.
+     This prevents deleting a file that a producer has written to object storage but has
+     not yet enqueued in the manifest.
+   - Its ULID timestamp is **older than the configured grace period** relative to the
+     current wall-clock time. This is to protect against the scenario where there is lag between updating the manifest after uploading a batch file. 
+     The uploaded file's timestamp could be older than the most earliest recorded file in the manifest, due to the lag. This means that the previous file deletion criteria would be true. The grace period gives us a buffer
+     to allow for manifest conflicts to be resolved before cleaning up the old files.
+   - Its filename matches the expected `{ULID}.batch` format. Non-batch files are skipped.
+4. **Bulk-deletes** all eligible files using a streaming delete. Individual delete failures
+   are logged as warnings but do not abort the cycle — the files will be retried on the
+   next GC pass.
+
+If the manifest is empty, there is no oldest manifest entry. If there are batch files in object storage, the garbage collector checks all conditions except for "older than the oldest manifest entry's ULID timestamp". The batch files are clearly not referenced by the empty manifest. All batch files that are older than the grace period and whose name matches the format, are removed.
+
+The manifest snapshot is read without epoch-based fencing since the garbage collector is a
+read-only observer of the manifest and does not modify it.
+
+Note: the `object_store` crate's `list()` does not guarantee lexicographic ordering on all
+backends (e.g., S3 Express). The garbage collector lists all files and filters in memory,
+which is acceptable for the expected volume of orphaned files.
+
+#### Configuration
+
+```rust
+pub struct GarbageCollectorConfig {
+    pub manifest_path: String,       // path to the queue manifest, default: "ingest/manifest"
+    pub data_path_prefix: String,    // batch file prefix, default: "ingest"
+    pub gc_interval: Duration,       // how often GC runs, default: 5 minutes
+    pub gc_grace_period: Duration,   // minimum age before deletion, default: 10 minutes
+}
+```
+
+These fields are also available on `CollectorConfig` so that the collector can configure and
+spawn the garbage collector automatically.
 
 ### Delivery guarantees
 
@@ -509,5 +564,6 @@ None at this time.
 | 2026-03-11 | Replaced IngestEntry with ingest(entries: Vec\<Bytes\>, metadata: Bytes) |
 | 2026-03-30 | Added native compression support to data batch format |
 | 2026-03-30 | Added metadata field to CollectedBatch and documented public Metadata struct |
+| 2026-04-06 | Added Garbage Collection section; collector no longer deletes batch files directly |
 
 

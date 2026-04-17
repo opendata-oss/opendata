@@ -1,7 +1,6 @@
 //! Prometheus metrics for the timeseries server.
 
 use metrics_exporter_prometheus::PrometheusHandle;
-use prometheus_client::registry::Registry;
 
 // ── Metric name constants ──
 
@@ -42,12 +41,10 @@ fn describe_metrics() {
 /// Container for metrics rendering.
 ///
 /// Uses `metrics-rs` for recording (callers use `metrics::counter!()` etc.)
-/// and `metrics-exporter-prometheus` for rendering. A separate
-/// `prometheus_client::Registry` is kept for storage engine metrics that are
-/// registered via the `common::StorageRead::register_metrics` bridge.
+/// and `metrics-exporter-prometheus` for rendering. SlateDB metrics are
+/// also routed through `metrics-rs` via the `MetricsRsRecorder`.
 pub struct Metrics {
     handle: PrometheusHandle,
-    storage_registry: Registry,
 }
 
 impl Metrics {
@@ -57,31 +54,12 @@ impl Metrics {
     /// (e.g. in tests) reuse the existing one but get their own handle.
     pub fn new(handle: PrometheusHandle) -> Self {
         describe_metrics();
-        Self {
-            handle,
-            storage_registry: Registry::default(),
-        }
-    }
-
-    /// Returns a mutable reference to the storage engine Prometheus registry.
-    ///
-    /// Use this to register SlateDB / storage-level metrics before wrapping
-    /// `Metrics` in an `Arc`.
-    pub fn storage_registry_mut(&mut self) -> &mut Registry {
-        &mut self.storage_registry
+        Self { handle }
     }
 
     /// Encode all metrics to Prometheus text format.
-    ///
-    /// Combines `metrics-rs` output (via the exporter handle) with any
-    /// storage engine metrics registered in the `prometheus_client` registry.
     pub fn encode(&self) -> String {
-        let mut output = self.handle.render();
-        let mut storage_buf = String::new();
-        prometheus_client::encoding::text::encode(&mut storage_buf, &self.storage_registry)
-            .expect("encoding storage metrics should not fail");
-        output.push_str(&storage_buf);
-        output
+        self.handle.render()
     }
 }
 

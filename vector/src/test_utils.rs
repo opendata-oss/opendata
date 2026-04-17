@@ -4,8 +4,6 @@
 //! setting up test databases.
 
 #[cfg(test)]
-use crate::serde::centroid_chunk::CentroidEntry;
-#[cfg(test)]
 use rand::Rng;
 
 /// Generate random unit vectors for testing.
@@ -100,22 +98,6 @@ pub fn generate_centroids(vectors: &[Vec<f32>], k: usize) -> Vec<Vec<f32>> {
     centroids
 }
 
-/// Create centroid entries with sequential IDs.
-///
-/// # Arguments
-/// * `vectors` - Centroid vectors
-///
-/// # Returns
-/// Vector of CentroidEntry with IDs starting from 1
-#[cfg(test)]
-pub fn create_centroid_entries(vectors: Vec<Vec<f32>>) -> Vec<CentroidEntry> {
-    vectors
-        .into_iter()
-        .enumerate()
-        .map(|(i, vec)| CentroidEntry::new((i + 1) as u64, vec))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,23 +152,5 @@ mod tests {
         let vectors = random_unit_vectors(3, 2);
         let centroids = generate_centroids(&vectors, 10);
         assert_eq!(centroids.len(), 3); // Can't generate more centroids than vectors
-    }
-
-    #[test]
-    fn should_create_centroid_entries_with_sequential_ids() {
-        // given
-        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
-
-        // when
-        let entries = create_centroid_entries(vectors.clone());
-
-        // then
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].centroid_id, 1);
-        assert_eq!(entries[1].centroid_id, 2);
-        assert_eq!(entries[2].centroid_id, 3);
-        assert_eq!(entries[0].vector, vec![1.0, 2.0]);
-        assert_eq!(entries[1].vector, vec![3.0, 4.0]);
-        assert_eq!(entries[2].vector, vec![5.0, 6.0]);
     }
 }

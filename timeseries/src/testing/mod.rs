@@ -15,6 +15,24 @@ use common::{StorageBuilder, StorageConfig, StorageSemantics};
 
 use common::Storage;
 
+/// Install a global metrics-rs recorder once for the test process.
+///
+/// Must be called before constructing any SlateDB instances so that
+/// metrics registered via `MetricsRsRecorder` are captured.
+#[cfg(feature = "http-server")]
+pub fn ensure_metrics_recorder() -> metrics_exporter_prometheus::PrometheusHandle {
+    use std::sync::OnceLock;
+    static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _ = metrics::set_global_recorder(recorder);
+            handle
+        })
+        .clone()
+}
+
 use crate::model::Series;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
@@ -66,6 +84,11 @@ pub async fn create_test_tsdb() -> TestTsdb {
 /// This allows benchmarks to use production-like storage backends
 /// such as local filesystem or S3 instead of in-memory.
 pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> TestTsdb {
+    // Ensure the metrics-rs recorder is installed before building the DB
+    // so that slatedb metrics registered via MetricsRsRecorder are captured.
+    #[cfg(feature = "http-server")]
+    ensure_metrics_recorder();
+
     let config = StorageConfig::SlateDb(SlateDbStorageConfig {
         path: "bench-data".to_string(),
         object_store,
