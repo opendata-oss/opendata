@@ -300,7 +300,7 @@ impl Indexer {
             "completed"
         );
         let root = self.state.centroid_cache().root(u64::MAX).unwrap();
-        info!(
+        debug!(
             "root: {:?}",
             root.iter().map(|p| p.id()).collect::<Vec<_>>()
         );
