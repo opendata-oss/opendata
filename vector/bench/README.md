@@ -552,6 +552,7 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 | `dataset`           | string | Dataset name (`sift1m`, `cohere1m`, `deep10m`, `deep1b`, `wikipedia_bge_m3_en`, `sift10m`, etc.) |
 | `dimensions`        | u16    | Vector dimensions (default: from dataset)                          |
 | `distance_metric`   | string | `l2`, `cosine`, or `dot_product` (default: from dataset)           |
+| `root_threshold`    | usize  | Root posting list split threshold (default: from dataset)          |
 | `split_threshold`   | usize  | Centroid split threshold (default: from dataset)                   |
 | `merge_threshold`   | usize  | Centroid merge threshold (default: from dataset)                   |
 | `nprobe`            | usize  | Number of centroids to probe at query time (default: from dataset) |

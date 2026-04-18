@@ -282,6 +282,7 @@ struct Dataset {
     base_file: &'static str,
     query_file: &'static str,
     ground_truth_file: &'static str,
+    root_threshold: usize,
     split_threshold: usize,
     merge_threshold: usize,
     query_pruning_factor: Option<f32>,
@@ -463,6 +464,7 @@ impl From<&Dataset> for Params {
         p.insert("base_file", d.base_file);
         p.insert("query_file", d.query_file);
         p.insert("ground_truth_file", d.ground_truth_file);
+        p.insert("root_threshold", d.root_threshold.to_string());
         p.insert("split_threshold", d.split_threshold.to_string());
         p.insert("merge_threshold", d.merge_threshold.to_string());
         p.insert("nprobe", d.nprobe.to_string());
@@ -517,6 +519,9 @@ impl From<Params> for Dataset {
             base_file: default.base_file,
             query_file: default.query_file,
             ground_truth_file: default.ground_truth_file,
+            root_threshold: p
+                .get_parse("root_threshold")
+                .unwrap_or(default.root_threshold),
             split_threshold: p
                 .get_parse("split_threshold")
                 .unwrap_or(default.split_threshold),
@@ -553,6 +558,7 @@ const SIFT1M: Dataset = Dataset {
     base_file: "sift/sift_base.fvecs",
     query_file: "sift/sift_query.fvecs",
     ground_truth_file: "sift/sift_groundtruth.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     nprobe: 15,
@@ -574,6 +580,7 @@ const COHERE1M: Dataset = Dataset {
     base_file: "cohere/cohere_base.fvecs",
     query_file: "cohere/cohere_query.fvecs",
     ground_truth_file: "cohere/cohere_groundtruth.ivecs",
+    root_threshold: 200,
     split_threshold: 200,
     merge_threshold: 50,
     query_pruning_factor: Some(0.5),
@@ -595,6 +602,7 @@ const DEEP10M: Dataset = Dataset {
     base_file: "deep/deep_base.fvecs",
     query_file: "deep/deep_query.fvecs",
     ground_truth_file: "deep/deep_groundtruth_10M.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     query_pruning_factor: Some(0.5),
@@ -616,6 +624,7 @@ const DEEP1B: Dataset = Dataset {
     base_file: "deep/deep_base.fvecs",
     query_file: "deep/deep_query.fvecs",
     ground_truth_file: "deep/deep_groundtruth_1B.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     query_pruning_factor: Some(0.5),
@@ -637,6 +646,7 @@ const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
     base_file: "wikipedia-bge-m3/en/base.fvecs",
     query_file: "wikipedia-bge-m3/en/query.fvecs",
     ground_truth_file: "wikipedia-bge-m3/en/groundtruth.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     query_pruning_factor: Some(0.5),
@@ -661,6 +671,7 @@ const SIFT10M: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_10M.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     query_pruning_factor: Some(0.5),
@@ -682,6 +693,7 @@ const SIFT50M: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_50M.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     query_pruning_factor: Some(0.5),
@@ -703,6 +715,7 @@ const SIFT100M: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_100M.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     query_pruning_factor: Some(0.5),
@@ -724,6 +737,7 @@ const SIFT1B: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_1B.ivecs",
+    root_threshold: 1500,
     split_threshold: 1500,
     merge_threshold: 500,
     query_pruning_factor: Some(0.5),
@@ -801,6 +815,7 @@ impl Benchmark for RecallBenchmark {
                 storage: bench.spec().data().storage.clone(),
                 dimensions: dataset.dimensions,
                 distance_metric: dataset.distance_metric,
+                root_threshold_vectors: dataset.root_threshold,
                 split_threshold_vectors: dataset.split_threshold,
                 merge_threshold_vectors: dataset.merge_threshold,
                 query_pruning_factor: dataset.query_pruning_factor,
