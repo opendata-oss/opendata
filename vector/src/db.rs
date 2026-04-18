@@ -149,7 +149,7 @@ impl VectorDb {
         IndexerOpts {
             dimensions: config.dimensions as usize,
             distance_metric: config.distance_metric,
-            root_threshold_vectors: config.split_threshold_vectors,
+            root_threshold_vectors: config.root_threshold_vectors,
             merge_threshold_vectors: config.merge_threshold_vectors,
             split_threshold_vectors: config.split_threshold_vectors,
             split_search_neighbourhood: config.split_search_neighbourhood,
@@ -845,7 +845,6 @@ mod tests {
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
-            chunk_target: 4096,
             metadata_fields: vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
                 MetadataFieldSpec::new("price", FieldType::Int64, true),
