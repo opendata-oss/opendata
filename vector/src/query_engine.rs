@@ -5,11 +5,13 @@ use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::VectorId;
 use crate::storage::VectorDbStorageReadExt;
+use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::{Attribute, Vector};
 use common::storage::StorageRead;
 use common::tracing::{trace_instrument, trace_span};
+use futures::future::BoxFuture;
 use roaring::RoaringTreemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -398,20 +400,35 @@ impl QueryEngine {
                 break;
             }
 
-            // Resolve forward index lookups for the batch concurrently.
+            // Resolve forward index lookups for the batch concurrently via
+            // AsyncBatchDriver, which spawns each read as its own tokio task.
             let load_span = trace_span!("forward_index_read", batch_size = batch.len());
-            let loaded = async {
-                let futures: Vec<_> = batch
-                    .iter()
-                    .map(|sr| self.storage.get_vector_data(sr.internal_id, dimensions))
-                    .collect();
-                futures::future::join_all(futures).await
-            }
-            .instrument(load_span)
-            .await;
+            let futures: Vec<_> = batch
+                .into_iter()
+                .map(|sr| {
+                    let storage = self.storage.clone();
+                    Box::pin(async move {
+                        let data = storage.get_vector_data(sr.internal_id, dimensions).await?;
+                        Ok((sr, data))
+                    })
+                        as BoxFuture<'static, Result<(ScoredCandidate, Option<VectorDataValue>)>>
+                })
+                .collect();
+            let results_out = AsyncBatchDriver::execute(futures)
+                .instrument(load_span)
+                .await;
 
-            for (sr, vector_data) in batch.iter().zip(loaded) {
-                let Some(vector_data) = vector_data? else {
+            // Tasks complete out of order; re-sort by candidate distance so
+            // the top-k early exit preserves score ordering.
+            let mut loaded: Vec<(ScoredCandidate, Option<VectorDataValue>)> =
+                Vec::with_capacity(results_out.len());
+            for r in results_out {
+                loaded.push(r?);
+            }
+            loaded.sort_by_key(|(sr, _)| sr.distance);
+
+            for (sr, vector_data) in loaded {
+                let Some(vector_data) = vector_data else {
                     continue;
                 };
                 results.push(SearchResult {
