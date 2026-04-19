@@ -661,6 +661,14 @@ pub struct AggregateOp<C: Operator> {
     breaker_step_timestamps: Option<Arc<[i64]>>,
     /// `true` once the breaker path has emitted its final output batch.
     breaker_emitted: bool,
+    /// `true` once the streaming path has absorbed at least one child
+    /// batch. Tracked on `self` (not as a `next()`-local) so the flag
+    /// survives `Poll::Pending` re-entries — under a `Concurrent`
+    /// producer, `next()` is entered once per child batch, so a local
+    /// flag would reset between absorb and EOS and skip `finalise`.
+    streaming_saw_any_batch: bool,
+    /// Analogous to [`Self::streaming_saw_any_batch`] for breaker kinds.
+    breaker_saw_any_batch: bool,
     done: bool,
     errored: bool,
 }
@@ -831,6 +839,8 @@ impl<C: Operator> AggregateOp<C> {
             breaker_grid_bytes,
             breaker_step_timestamps: None,
             breaker_emitted: false,
+            streaming_saw_any_batch: false,
+            breaker_saw_any_batch: false,
             done: false,
             errored: false,
         })
@@ -1415,13 +1425,12 @@ impl<C: Operator> Operator for AggregateOp<C> {
                 self.done = true;
                 return Poll::Ready(None);
             }
-            let mut saw_any_batch = false;
             loop {
                 match self.child.next(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(None) => {
                         self.breaker_emitted = true;
-                        if !saw_any_batch {
+                        if !self.breaker_saw_any_batch {
                             self.done = true;
                             return Poll::Ready(None);
                         }
@@ -1438,7 +1447,7 @@ impl<C: Operator> Operator for AggregateOp<C> {
                         return Poll::Ready(Some(Err(err)));
                     }
                     Poll::Ready(Some(Ok(input))) => {
-                        saw_any_batch = true;
+                        self.breaker_saw_any_batch = true;
                         self.absorb_batch_breaker(&input);
                     }
                 }
@@ -1453,7 +1462,6 @@ impl<C: Operator> Operator for AggregateOp<C> {
                 self.done = true;
                 return Poll::Ready(None);
             }
-            let mut saw_any_batch = false;
             loop {
                 match self.child.next(cx) {
                     Poll::Pending => return Poll::Pending,
@@ -1464,7 +1472,7 @@ impl<C: Operator> Operator for AggregateOp<C> {
                         // when a selector has no series and preserves
                         // parity with the v1 engine (no empty grid
                         // trailing after an empty selector).
-                        if !saw_any_batch {
+                        if !self.streaming_saw_any_batch {
                             self.done = true;
                             return Poll::Ready(None);
                         }
@@ -1481,7 +1489,7 @@ impl<C: Operator> Operator for AggregateOp<C> {
                         return Poll::Ready(Some(Err(err)));
                     }
                     Poll::Ready(Some(Ok(input))) => {
-                        saw_any_batch = true;
+                        self.streaming_saw_any_batch = true;
                         self.absorb_batch_streaming(&input);
                     }
                 }
@@ -2207,6 +2215,164 @@ mod tests {
         .unwrap();
         let results = drive(&mut op);
         assert!(results.is_empty());
+    }
+
+    /// Scripted child action for the [`PendingMockOp`] reproducer: either
+    /// yield a batch on this poll, return `Poll::Pending` once (mirroring a
+    /// `Concurrent` exchange with an empty channel), or signal EOS.
+    enum Action {
+        Batch(StepBatch),
+        Pending,
+        Eos,
+    }
+
+    /// Mock child that interleaves `Poll::Pending` with batches and EOS.
+    /// Each `Pending` response self-wakes via the context waker so the
+    /// [`drive_with_pending`] driver re-polls immediately, emulating the
+    /// pattern produced by `ConcurrentOp` under non-trivial schedules
+    /// (see trace in RFC 0008 stress harness).
+    struct PendingMockOp {
+        schema: OperatorSchema,
+        actions: std::collections::VecDeque<Action>,
+    }
+
+    impl PendingMockOp {
+        fn new(schema: Arc<SeriesSchema>, grid: StepGrid, actions: Vec<Action>) -> Self {
+            Self {
+                schema: OperatorSchema::new(SchemaRef::Static(schema), grid),
+                actions: actions.into(),
+            }
+        }
+    }
+
+    impl Operator for PendingMockOp {
+        fn schema(&self) -> &OperatorSchema {
+            &self.schema
+        }
+        fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>> {
+            match self.actions.pop_front() {
+                Some(Action::Batch(b)) => Poll::Ready(Some(Ok(b))),
+                Some(Action::Pending) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Action::Eos) | None => Poll::Ready(None),
+            }
+        }
+    }
+
+    /// Drive an operator that may return `Pending`, polling again on each
+    /// `Pending` until `Ready(None)`.
+    fn drive_with_pending<C: Operator>(
+        op: &mut AggregateOp<C>,
+    ) -> Vec<Result<StepBatch, QueryError>> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut out = Vec::new();
+        loop {
+            match op.next(&mut cx) {
+                Poll::Ready(None) => return out,
+                Poll::Ready(Some(r)) => out.push(r),
+                Poll::Pending => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn should_finalise_streaming_aggregate_when_child_interleaves_pending() {
+        // given: 2 input series grouped into 1 group over 1 step.
+        //   Child emits: [Batch(s0=3), Pending, Batch(s1=4), Pending, Eos]
+        //   Each Pending forces AggregateOp::next to return Pending and
+        //   be re-entered — under the bug, the local `saw_any_batch`
+        //   resets on every re-entry, so the final `Eos` poll is entered
+        //   with `saw_any_batch=false` and `finalise_streaming` is
+        //   skipped, yielding an empty stream even though the grid has
+        //   accumulated 3+4=7.
+        let in_schema = mk_schema("in", 2);
+        let out_schema = mk_schema("out", 1);
+        let grid = mk_grid(1);
+        let b1 = mk_batch_with_series_range(in_schema.clone(), 1, 0..1, vec![3.0], vec![true]);
+        let b2 = mk_batch_with_series_range(in_schema.clone(), 1, 1..2, vec![4.0], vec![true]);
+        let child = PendingMockOp::new(
+            in_schema,
+            grid,
+            vec![
+                Action::Batch(b1),
+                Action::Pending,
+                Action::Batch(b2),
+                Action::Pending,
+                Action::Eos,
+            ],
+        );
+        let gmap = GroupMap::new(vec![Some(0), Some(0)], 1);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Sum,
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive_with_pending(&mut op)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // then: one batch with the grouped sum s0+s1 = 7.
+        assert_eq!(outs.len(), 1, "aggregate emitted empty stream");
+        assert_eq!(outs[0].get(0, 0), Some(7.0));
+    }
+
+    #[test]
+    fn should_finalise_breaker_aggregate_when_child_interleaves_pending() {
+        // given: the same scripted Pending interleaving but for a
+        // breaker-kind aggregate (topk). The bug at `saw_any_batch` in
+        // the breaker branch mirrors the streaming path.
+        let in_schema = mk_schema("in", 2);
+        let grid = mk_grid(1);
+        let b1 = mk_batch_with_series_range(in_schema.clone(), 1, 0..1, vec![3.0], vec![true]);
+        let b2 = mk_batch_with_series_range(in_schema.clone(), 1, 1..2, vec![4.0], vec![true]);
+        let child = PendingMockOp::new(
+            in_schema.clone(),
+            grid,
+            vec![
+                Action::Batch(b1),
+                Action::Pending,
+                Action::Batch(b2),
+                Action::Pending,
+                Action::Eos,
+            ],
+        );
+        // one group containing both series — topk(1) picks the larger.
+        let gmap = GroupMap::new(vec![Some(0), Some(0)], 1);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Topk(1),
+            gmap,
+            in_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive_with_pending(&mut op)
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // then: one batch with the top-1 series (s1 = 4.0).
+        assert_eq!(outs.len(), 1, "breaker aggregate emitted empty stream");
+        // topk(1) over [3.0, 4.0] → 4.0 survives at its original slot.
+        let observed: Vec<Option<f64>> = (0..outs[0].series_count())
+            .map(|s| outs[0].get(0, s))
+            .collect();
+        assert!(
+            observed.contains(&Some(4.0)),
+            "expected topk winner 4.0 in output, got {:?}",
+            observed
+        );
     }
 
     #[test]
