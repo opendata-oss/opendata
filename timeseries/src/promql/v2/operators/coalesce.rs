@@ -1,40 +1,21 @@
-//! `Coalesce` exchange operator — unit 3c.5.
+//! `CoalesceOp` — the fan-in side of vertical parallelism. When the
+//! planner shards a subplan across series, each shard gets a disjoint slice
+//! of the shared series roster; `CoalesceOp` multiplexes their output
+//! streams back into a single stream on that shared schema.
 //!
-//! Fan-in for parallel subplan copies. The planner assigns each child a
-//! disjoint `series_range` slice of the same output schema. `CoalesceOp`
-//! merges their batch streams via fair round-robin — the simplest correct
-//! shape (thanos-io/promql-engine calls this same operator by the same
-//! name).
+//! Scheduling is a fair round-robin — each poll starts one past the last
+//! child that emitted, so no child can starve its siblings.
 //!
-//! # Merge semantics
+//! Batches from different children are **not merged within a step**:
+//! consumers may see multiple batches for the same step range, each
+//! covering a different `series_range`. Planners insert
+//! [`super::rechunk::RechunkOp`] downstream when a single-batch-per-step
+//! shape is needed.
 //!
-//! Children own disjoint `series_range`s, so output batches from different
-//! children are **not mergeable within a step** — consumers may see
-//! multiple batches covering the same step range, each with a different
-//! `series_range`. That is a batch-shape concern, not a correctness one:
-//! any operator that iterates cells via `series_range` (the vast majority)
-//! consumes this stream verbatim. If a downstream needs a single batch
-//! per step covering every series, the planner inserts a [`super::rechunk::RechunkOp`]
-//! after `CoalesceOp`.
-//!
-//! # Fairness
-//!
-//! A simple round-robin over children: poll each in turn, emit the first
-//! `Ready(Some)` encountered in the round; if a child is `Pending`, try
-//! the next; if exhausted (`Ready(None)`), mark done and move on; when
-//! all children are exhausted, emit `Ready(None)`. `Pending` is bubbled
-//! up only when *every* un-exhausted child returned `Pending` in the
-//! same round — otherwise we'd starve a ready child behind a pending
-//! sibling.
-//!
-//! Round-robin fairness is chosen over merge-sorted-by-step because the
-//! children's step ordering is plan-time known to overlap (they share
-//! the grid); consumers do not rely on batch ordering.
-//!
-//! # Memory accounting
-//!
-//! No reservation at this layer. Children's batches are already counted
-//! by their producers; `CoalesceOp` just forwards `Arc`-shared handles.
+//! `Pending` bubbles up only when every un-exhausted child returned
+//! `Pending` in the same round, so a ready child can't be starved behind a
+//! pending sibling. No memory reservation at this layer — batches in
+//! flight are already accounted for by their producers.
 
 use std::task::{Context, Poll};
 
@@ -42,33 +23,22 @@ use super::super::batch::StepBatch;
 use super::super::memory::QueryError;
 use super::super::operator::{Operator, OperatorSchema};
 
-/// Fan-in exchange operator.
-///
-/// Takes N children producing batches over disjoint `series_range`s of a
-/// shared output schema and merges their streams via round-robin.
+/// Fan-in operator over N parallel children that share an output schema
+/// but each emit a disjoint `series_range` slice. Polls children
+/// round-robin, re-emitting batches unchanged.
 pub struct CoalesceOp {
     children: Vec<Box<dyn Operator + Send>>,
-    /// `done[i] == true` once `children[i]` has returned `Ready(None)`.
-    /// Exhausted children are not polled again.
     done: Vec<bool>,
-    /// Index of the child polled first on the next call to `next`. Advances
-    /// after every successful emission so no child is starved.
+    /// Next child to poll first. Advances after each successful emission.
     cursor: usize,
-    /// Plan-time output schema (the roster is the union of the children's
-    /// series, but since children share a single output schema and only
-    /// differ in which `series_range` slice they emit, this is passed in
-    /// directly by the planner).
+    /// Plan-time output schema. Children share it; they differ only in the
+    /// `series_range` slice each emits.
     output_schema: OperatorSchema,
 }
 
 impl CoalesceOp {
-    /// Build a coalescer.
-    ///
-    /// - `children`: the N parallel subplans. Each produces batches over a
-    ///   disjoint `series_range` slice of the shared roster.
-    /// - `output_schema`: the plan-time schema every child agrees on. Used
-    ///   as the operator's own schema — no per-child widening happens at
-    ///   runtime.
+    /// `children`: N parallel subplans, each emitting over a disjoint
+    /// `series_range` slice of `output_schema`.
     pub fn new(children: Vec<Box<dyn Operator + Send>>, output_schema: OperatorSchema) -> Self {
         let done = vec![false; children.len()];
         Self {

@@ -1,15 +1,15 @@
-//! Per-query tracing for the v2 PromQL engine.
+//! Per-query tracing — the "where did this query spend its time" view
+//! callers want when a PromQL request is slow.
 //!
-//! Two sinks, one source:
-//! - `tracing` spans emitted via `#[instrument]` / `debug_span!` in the phase
-//!   functions (always on when `RUST_LOG` allows).
-//! - A [`TraceCollector`] that captures per-phase wall-clock durations and
-//!   per-operator cumulative stats, serialized inline with the query response
-//!   when the caller sets `?trace=true` or config enables it globally.
+//! Two sinks are written in parallel:
+//! - `tracing` spans, always on when `RUST_LOG` allows.
+//! - A [`TraceCollector`] that accumulates a structured trace which is
+//!   returned inline on the query response when `?trace=true` is set.
 //!
-//! Per-operator timing uses a decorator — [`TracingOperator`] wraps every
-//! `Box<dyn Operator>` produced by [`super::plan::build_physical_plan`] so no
-//! operator implementation needs to change.
+//! Per-operator timing goes through [`TracingOperator`], a transparent
+//! wrapper the physical planner inserts around each concrete operator in
+//! [`super::plan::build_physical_plan`]. Operators themselves don't know
+//! they're being traced.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -25,31 +25,22 @@ use super::memory::QueryError;
 use super::operator::{Operator, OperatorSchema};
 
 tokio::task_local! {
-    /// Optional collector available to any code running inside
-    /// [`with_trace`]. Storage-layer helpers use this to record I/O
-    /// sub-phase timings without threading the collector through every
-    /// function signature.
+    /// Installed by [`with_trace`] so I/O call sites can record without
+    /// threading the collector through every signature.
     static TRACE_COLLECTOR: Arc<TraceCollector>;
 }
 
 thread_local! {
-    /// The node id of the currently-polling [`TracingOperator`], or `None`
-    /// if we're outside any operator (e.g. during the planner phases or in
-    /// top-level reshape code). Set on entry to `TracingOperator::next`
-    /// and restored on exit — so nested child polls see the child's id,
-    /// and non-operator call sites see `None`.
-    ///
-    /// Operator polling is synchronous (the `next()` trait returns a Poll,
-    /// it doesn't `.await`), so a plain thread-local with a `Cell` is
-    /// sufficient — no task-local needed.
+    /// Node id of the currently-polling [`TracingOperator`]. Set on entry to
+    /// `next`, restored on exit; nested polls see the child's id, non-operator
+    /// call sites see `None`. Plain thread-local is enough because operator
+    /// polling is synchronous.
     static CURRENT_NODE_ID: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// Toggle bundle describing what tracing should do for a given query.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TraceConfig {
-    /// Record phase / operator data into a [`TraceCollector`] so it can be
-    /// returned to the caller inline. Always emit tracing spans regardless.
+    /// When `true`, also populate a [`TraceCollector`] for inline return.
     pub collect: bool,
 }
 
@@ -59,13 +50,10 @@ impl TraceConfig {
     }
 }
 
-/// Fixed set of phase labels so callers don't stringly-type them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
-    /// Time spent opening bucket readers / materialising the
-    /// `QueryReader` backing the query. Runs *before* `parse` because
-    /// the engine needs the reader in hand to construct the source
-    /// adapter — previously invisible in the trace.
+    /// Opening bucket readers, before `parse`. Must run first because the
+    /// source adapter needs the reader.
     ReaderSetup,
     Parse,
     Lower,
@@ -73,41 +61,26 @@ pub enum Phase {
     BuildPhysical,
     Execute,
     Reshape,
-    /// Time spent turning the collected batches / `QueryValue` into the
-    /// HTTP wire JSON. Covers `serde_json::to_value` + wrapper
-    /// construction in the HTTP handler.
+    /// Final JSON conversion in the HTTP handler.
     Serialize,
 }
 
-/// Storage-layer I/O categories. Each variant maps to one specific call
-/// site in `minitsdb::MiniQueryReader`; splitting at this granularity
-/// lets the reader distinguish e.g. inverted-index traffic from forward-
-/// index traffic when tuning the caches or the object store.
+/// Storage-layer I/O categories. Timing is recorded from
+/// `minitsdb::MiniQueryReader` via `io_trace_*`; per-call payload bytes
+/// are recorded from the inverted / forward index readers in
+/// `storage::mod`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IoKind {
-    /// `snapshot.get(series_sample_key)` — fetch one series's encoded
-    /// sample block for a bucket. Called once per `(bucket, series_id)`
-    /// pair touched by the query; this is the dominant storage call in
-    /// sample-heavy queries.
+    /// Per-`(bucket, series_id)` sample-block fetch — dominant in sample-heavy queries.
     SamplesFetch,
-    /// Time spent decoding a sample block's bytes into `(timestamp,
-    /// value)` pairs via `TimeSeriesIterator`. Pure CPU.
+    /// Sample-block decode (pure CPU).
     Deserialize,
-    /// `forward_index(series_ids)` / `all_forward_index()` — load the
-    /// forward index (series-id → labels) for a bucket. Consulted during
-    /// selector resolution in `build_physical` and, via
-    /// `V2IndexCache`, reused during sample fetching in `execute`.
+    /// Forward index (series-id → labels).
     ForwardIndexFetch,
-    /// `inverted_index(terms)` / `all_inverted_index()` — load the
-    /// inverted index (label → series-ids) for a bucket. Always part of
-    /// selector resolution in `build_physical`.
+    /// Inverted index (label → series-ids).
     InvertedIndexFetch,
-    /// `label_values(label_name)` — enumerate distinct values of a
-    /// label within a bucket. Used by the `/api/v1/label/{name}/values`
-    /// endpoint and by regex candidate search on the PromQL path.
+    /// `label_values` for the labels endpoint / regex candidate search.
     LabelValuesFetch,
-    /// Catch-all for storage-layer calls we haven't categorised yet.
-    Other,
 }
 
 impl IoKind {
@@ -118,7 +91,6 @@ impl IoKind {
             IoKind::ForwardIndexFetch => "forward_index_fetch",
             IoKind::InvertedIndexFetch => "inverted_index_fetch",
             IoKind::LabelValuesFetch => "label_values_fetch",
-            IoKind::Other => "other",
         }
     }
 }
@@ -156,19 +128,11 @@ struct Inner {
     /// Indexed by `Phase as usize`.
     phase_ns: [u64; 8],
     operators: Vec<OperatorStatsInner>,
-    /// Per-kind accumulators. Tracks both cumulative time (sum across
-    /// parallel calls) and wall time (earliest start → latest end), so
-    /// the reader can tell "55 s of storage fetches" ran as one serial
-    /// wait or in ~8-way parallel over a 7 s wall slice.
     io: BTreeMap<IoKind, IoAccum>,
-    /// Sub-phase timings recorded while no operator was on the stack
-    /// (e.g. during a planner phase or inside the reshape path). Keyed by
-    /// `'static` label; rolled up under the top-level `subphases` field in
-    /// the serialized trace.
+    /// Subphase samples taken with no operator on the stack (planner /
+    /// reshape phases). Surface under the top-level `subphases` field.
     orphan_subphases: BTreeMap<&'static str, (u64, u64)>,
-    /// Query start reference — every `Instant` recorded against IO kinds
-    /// is converted to an offset from this baseline so wall spans are
-    /// comparable across parallel tasks.
+    /// All IO `Instant`s are normalised to offsets from here.
     query_start: Instant,
 }
 
@@ -184,27 +148,18 @@ impl Default for Inner {
     }
 }
 
-/// Per-kind IO accumulator — tracks cumulative time (summed across
-/// parallel calls), wall span (min-start → max-end), peak concurrency
-/// (max simultaneous in-flight calls), and cumulative payload bytes.
+/// Per-kind IO accumulator: cumulative time, wall span, peak concurrency,
+/// payload bytes.
 #[derive(Debug, Clone, Copy)]
 struct IoAccum {
     cumulative_ns: u64,
     call_count: u64,
-    /// Offset (ns since query start) of the earliest call's start.
+    /// ns since query start.
     first_start_ns: u64,
-    /// Offset (ns since query start) of the latest call's end. Wall
-    /// span = `last_end_ns - first_start_ns`.
+    /// ns since query start. Wall span = `last_end_ns - first_start_ns`.
     last_end_ns: u64,
-    /// Number of calls currently active. Incremented by
-    /// [`TraceCollector::io_started`] and decremented by
-    /// [`TraceCollector::io_finished`]; `peak_in_flight` is updated on
-    /// each increment.
     in_flight: u64,
     peak_in_flight: u64,
-    /// Sum of payload bytes returned by calls of this kind. Additive.
-    /// Callers report via [`record_bytes`] when they have the size
-    /// handy (e.g. `record.value.len()` after a SlateDB `get`).
     bytes: u64,
 }
 
@@ -222,8 +177,8 @@ impl Default for IoAccum {
     }
 }
 
-/// Internal accumulator — keeps ns precision for repeated additions.
-/// Converted to the public, ms-valued [`OperatorStats`] at snapshot time.
+/// Nanosecond-precision accumulator; converted to ms-valued [`OperatorStats`]
+/// at snapshot time.
 #[derive(Debug, Clone)]
 struct OperatorStatsInner {
     node_id: usize,
@@ -232,19 +187,14 @@ struct OperatorStatsInner {
     call_count: u64,
     batch_count: u64,
     cell_count: u64,
-    /// Operator-scoped sub-phase timings keyed by a `'static` label the
-    /// operator picks (e.g. `"build_batch"`, `"hydrate"`). Populated via
-    /// [`record_subphase`] / [`Scope`] while this operator is the current
-    /// one on the thread-local stack.
-    subphases: BTreeMap<&'static str, (u64, u64)>, // (elapsed_ns, call_count)
-    /// Operator-scoped free-form counters keyed by a `'static` label the
-    /// operator picks (e.g. `"series_selected"`, `"unique_fingerprints"`).
-    /// Additive — successive calls with the same label accumulate.
+    /// `(elapsed_ns, call_count)` keyed by operator-chosen `'static` label.
+    subphases: BTreeMap<&'static str, (u64, u64)>,
+    /// Operator-chosen additive counters.
     counters: BTreeMap<&'static str, u64>,
 }
 
-/// Per-query tracing collector. Thread-safe — operators may run on spawned
-/// tasks (e.g. [`super::operators::ConcurrentOp`]).
+/// Per-query collector. Thread-safe since operators may run on spawned tasks
+/// (e.g. [`super::operators::ConcurrentOp`]).
 #[derive(Debug, Default)]
 pub struct TraceCollector {
     inner: Mutex<Inner>,
@@ -255,8 +205,7 @@ impl TraceCollector {
         Arc::new(Self::default())
     }
 
-    /// Reserve a new operator slot and return its node id. Called once per
-    /// operator at plan time.
+    /// Reserves a slot and returns its node id. Called once per operator.
     pub fn register_operator(&self, op_name: &'static str) -> usize {
         let mut inner = self.inner.lock().expect("trace collector poisoned");
         let node_id = inner.operators.len();
@@ -273,7 +222,6 @@ impl TraceCollector {
         node_id
     }
 
-    /// Accumulate one `next()` call's timing + output into the slot.
     fn record_call(&self, node_id: usize, elapsed_ns: u64, batch: Option<&StepBatch>) {
         let mut inner = self.inner.lock().expect("trace collector poisoned");
         let slot = &mut inner.operators[node_id];
@@ -285,15 +233,12 @@ impl TraceCollector {
         }
     }
 
-    /// Record the wall-clock duration of a phase. Additive — calling twice
-    /// accumulates.
+    /// Additive.
     pub fn record_phase(&self, phase: Phase, elapsed_ns: u64) {
         let mut inner = self.inner.lock().expect("trace collector poisoned");
         inner.phase_ns[phase as usize] = inner.phase_ns[phase as usize].saturating_add(elapsed_ns);
     }
 
-    /// Mark an I/O call of `kind` as starting. Increments `in_flight`
-    /// and widens `peak_in_flight` if the new value sets a record.
     pub fn io_started(&self, kind: IoKind) {
         let mut inner = self.inner.lock().expect("trace collector poisoned");
         let slot = inner.io.entry(kind).or_default();
@@ -303,18 +248,14 @@ impl TraceCollector {
         }
     }
 
-    /// Add `n` payload bytes to the running total for `kind`. Callers
-    /// invoke this after a fetch when they have the returned bytes in
-    /// hand (e.g. `record.value.len()`).
     pub fn record_bytes(&self, kind: IoKind, bytes: u64) {
         let mut inner = self.inner.lock().expect("trace collector poisoned");
         let slot = inner.io.entry(kind).or_default();
         slot.bytes = slot.bytes.saturating_add(bytes);
     }
 
-    /// Mark an I/O call of `kind` as finished, recording its wall
-    /// `[start, start + elapsed_ns)` window. Decrements `in_flight` and
-    /// widens `first_start_ns` / `last_end_ns` to bound observed calls.
+    /// Records the wall `[start, start + elapsed_ns)` window and decrements
+    /// `in_flight`.
     pub fn io_finished(&self, kind: IoKind, start: Instant, elapsed_ns: u64) {
         let mut inner = self.inner.lock().expect("trace collector poisoned");
         let start_ns = start
@@ -333,11 +274,9 @@ impl TraceCollector {
         }
     }
 
-    /// Record a free-form sub-phase duration, attributing it to whatever
-    /// operator is currently on the thread-local stack (via
-    /// [`TracingOperator::next`]). When no operator is on the stack the
-    /// sample lands in an "orphan" bucket surfaced at the top level of
-    /// the trace — useful for attributing time inside planner phases.
+    /// Attributes to the operator on the thread-local stack; with no operator
+    /// on the stack, lands in the top-level "orphan" bucket (useful for
+    /// planner phases).
     pub fn record_subphase(&self, node_id: Option<usize>, label: &'static str, elapsed_ns: u64) {
         let mut inner = self.inner.lock().expect("trace collector poisoned");
         match node_id {
@@ -354,9 +293,7 @@ impl TraceCollector {
         }
     }
 
-    /// Add `value` to the counter named `label`, attributed to the
-    /// operator currently on the thread-local stack. No-op when no
-    /// operator is on the stack (counters are operator-scoped).
+    /// Counters are operator-scoped — no-op when no operator is on the stack.
     pub fn record_counter(&self, node_id: Option<usize>, label: &'static str, value: u64) {
         let Some(id) = node_id else { return };
         let mut inner = self.inner.lock().expect("trace collector poisoned");
@@ -366,7 +303,6 @@ impl TraceCollector {
         }
     }
 
-    /// Snapshot the collector into a serializable trace.
     pub fn finish(&self) -> QueryTrace {
         let inner = self.inner.lock().expect("trace collector poisoned");
         let phases: Vec<PhaseStats> = Phase::all()
@@ -417,8 +353,6 @@ impl TraceCollector {
     }
 }
 
-/// Snapshot helper: convert an internal counter map into a sorted list
-/// of [`CounterStats`] (alphabetical by label, stable across runs).
 fn counter_vec(map: &BTreeMap<&'static str, u64>) -> Vec<CounterStats> {
     map.iter()
         .map(|(label, value)| CounterStats {
@@ -428,8 +362,7 @@ fn counter_vec(map: &BTreeMap<&'static str, u64>) -> Vec<CounterStats> {
         .collect()
 }
 
-/// Snapshot helper: convert an internal subphase map into a slowest-first
-/// list of [`SubphaseStats`].
+/// Slowest-first.
 fn subphase_vec(map: &BTreeMap<&'static str, (u64, u64)>) -> Vec<SubphaseStats> {
     let mut out: Vec<SubphaseStats> = map
         .iter()
@@ -443,48 +376,33 @@ fn subphase_vec(map: &BTreeMap<&'static str, (u64, u64)>) -> Vec<SubphaseStats> 
     out
 }
 
-/// Convert nanoseconds to milliseconds as `f64` with 3 decimal places
-/// so sub-ms timings (e.g. the `lower` phase at 3391 ns) serialize as
-/// `0.003` rather than rounding to zero.
+/// ns → ms as `f64` rounded to 3 decimals so sub-ms timings don't round to zero.
 #[inline]
 fn ns_to_ms(ns: u64) -> f64 {
     ((ns as f64) / 1_000.0).round() / 1_000.0
 }
 
-/// Single operator's accumulated stats. Durations are in **milliseconds**
-/// (three-decimal precision — `0.003` for a 3 μs operator).
+/// One operator's accumulated stats. Durations in ms (three-decimal precision).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperatorStats {
     /// Pre-order index within the physical-plan tree.
     pub node_id: usize,
-    /// Operator type, e.g. "VectorSelector", "Rollup".
     pub op_name: &'static str,
-    /// Cumulative wall-clock time spent inside `next()` in ms.
     pub total_ms: f64,
-    /// Number of `next()` calls (including the terminating `None`).
     pub call_count: u64,
-    /// Number of non-`None` batches yielded.
     pub batch_count: u64,
-    /// Sum of `batch.values.len()` over every yielded batch. Equals
-    /// `series_count × step_count` summed across batches.
+    /// Sum of `batch.values.len()` over yielded batches.
     pub cell_count: u64,
-    /// Operator-internal sub-phase timings — finer-grained than
-    /// [`Self::total_ms`]. Slowest-first. Populated by the operator's own
-    /// [`Scope::enter`] / [`record_subphase_sync`] calls while it is the
-    /// one being polled; other operators' sub-phases land in their own
-    /// slot.
+    /// Sub-phases attributed to this operator, slowest-first.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub subphases: Vec<SubphaseStats>,
-    /// Operator-chosen numeric counters (e.g. `series_selected`,
-    /// `unique_fingerprints` on a `VectorSelector`). Unlike sub-phases
-    /// these are dimensionless — the operator decides what each label
-    /// means. Sorted alphabetically by label.
+    /// Operator-chosen dimensionless counters, alphabetical by label.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub counters: Vec<CounterStats>,
 }
 
-/// One operator-scoped counter. Additive across calls.
+/// Operator-scoped additive counter.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CounterStats {
@@ -492,7 +410,6 @@ pub struct CounterStats {
     pub value: u64,
 }
 
-/// One phase's wall-clock total in milliseconds.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhaseStats {
@@ -500,42 +417,25 @@ pub struct PhaseStats {
     pub elapsed_ms: f64,
 }
 
-/// One I/O kind's stats. Reports both **cumulative** time (sum across
-/// parallel calls — bounded only by the total CPU/wait budget) and
-/// **wall** time (earliest call's start → latest call's end — bounded
-/// by the enclosing phase). `cumulativeMs / wallMs` gives average
-/// concurrency; `peakInFlight` gives the instantaneous max. If peak
-/// matches the configured readahead and avg is much lower, traffic is
-/// bursty; if peak *and* avg are both below the readahead cap, something
-/// upstream (connection pool, object store) is serializing you.
+/// One I/O kind's stats. `cumulativeMs / wallMs` gives average concurrency;
+/// `peakInFlight` gives instantaneous max. Peak matching the readahead ceiling
+/// with low average means bursty; both low means something upstream is
+/// serializing.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IoStats {
-    /// Machine-friendly kind label — `"samples_fetch"`, etc.
     pub kind: &'static str,
-    /// Sum of every call's elapsed wall time. Can exceed the query's
-    /// total wall time when calls run in parallel.
+    /// Sum across parallel calls; may exceed total wall time.
     pub cumulative_ms: f64,
-    /// Wall-clock window from the earliest call's start to the latest
-    /// call's end. Always ≤ the enclosing phase's `elapsedMs`. Divide
-    /// `cumulativeMs / wallMs` to infer average parallelism over the
-    /// span.
+    /// Earliest start → latest end; always ≤ enclosing phase.
     pub wall_ms: f64,
     pub call_count: u64,
-    /// Maximum number of calls of this kind that were simultaneously
-    /// in-flight at any instant. Compare against the readahead ceilings
-    /// (`METADATA_STAGE_READAHEAD`, `SAMPLE_STAGE_READAHEAD`) to see
-    /// whether the planner is saturating them.
     pub peak_in_flight: u64,
-    /// Cumulative payload bytes returned by all calls of this kind.
-    /// Populated by call sites that invoke [`record_bytes`] after a
-    /// fetch (zero when no site reports — indicates we haven't wired
-    /// bytes tracking for that kind yet).
+    /// Zero if no call site has wired [`record_bytes`] for this kind.
     pub bytes: u64,
 }
 
-/// One named sub-phase's cumulative stats. Label is operator-chosen,
-/// typically `"{OpName}.{sub}"` (e.g. `"VectorSelector.build_batch"`).
+/// One sub-phase's stats. Label is operator-chosen, typically `"{OpName}.{sub}"`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubphaseStats {
@@ -544,7 +444,7 @@ pub struct SubphaseStats {
     pub call_count: u64,
 }
 
-/// Serializable snapshot of the collector. All durations in milliseconds.
+/// Serializable collector snapshot. All durations in milliseconds.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryTrace {
@@ -553,17 +453,13 @@ pub struct QueryTrace {
     pub operators: Vec<OperatorStats>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub io: Vec<IoStats>,
-    /// Sub-phases recorded while no operator was on the thread-local
-    /// stack — e.g. inside a planner phase or the reshape path. Rare in
-    /// practice; present for completeness so no timing gets dropped.
+    /// Sub-phases recorded outside any operator (planner / reshape phases).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub subphases: Vec<SubphaseStats>,
 }
 
-/// Decorator that times every `next()` on its inner operator.
-///
-/// Registered once per operator in [`super::plan::build_physical_plan`] when
-/// a collector is in scope; otherwise the inner op is returned bare.
+/// Times every `next()` on its inner operator. Inserted once per operator in
+/// [`super::plan::build_physical_plan`] when a collector is in scope.
 pub struct TracingOperator {
     inner: Box<dyn Operator + Send>,
     node_id: usize,
@@ -619,8 +515,7 @@ impl Operator for TracingOperator {
     }
 }
 
-/// If a collector is supplied, wrap `op` in a [`TracingOperator`]; otherwise
-/// return the op as-is.
+/// Wraps in [`TracingOperator`] iff a collector is supplied.
 pub fn maybe_trace(
     op: Box<dyn Operator + Send>,
     op_name: &'static str,
@@ -632,9 +527,7 @@ pub fn maybe_trace(
     }
 }
 
-/// Run `fut` with `collector` installed as the task-local [`TRACE_COLLECTOR`].
-/// Any call to [`record_io`] inside `fut` (including in spawned tasks that
-/// re-scope the task-local) will be attributed to this collector.
+/// Installs `collector` as the task-local [`TRACE_COLLECTOR`] for `fut`.
 pub async fn with_trace<F, T>(collector: Arc<TraceCollector>, fut: F) -> T
 where
     F: Future<Output = T>,
@@ -642,38 +535,28 @@ where
     TRACE_COLLECTOR.scope(collector, fut).await
 }
 
-/// Return a clone of the current task-local collector, if any. Spawned
-/// tasks that need to forward timings can use this to re-scope themselves
-/// into the same collector.
+/// Used by spawned tasks that need to re-scope themselves into the same collector.
 pub fn current_collector() -> Option<Arc<TraceCollector>> {
     TRACE_COLLECTOR.try_with(|c| c.clone()).ok()
 }
 
-/// Mark an I/O call of `kind` as starting on the task-local collector.
-/// Pair with [`io_finished`] (or use [`IoGuard`] / the `record_sync` /
-/// `record_async` wrappers which bracket automatically).
+/// Pair with [`io_finished`], or use [`record_sync`] / [`record_async`].
 fn io_started(kind: IoKind) {
     let _ = TRACE_COLLECTOR.try_with(|c| c.io_started(kind));
 }
 
-/// Record an I/O call of `kind` as finished, with wall window
-/// `[start, start + elapsed_ns)`. No-op outside a [`with_trace`] scope.
+/// No-op outside a [`with_trace`] scope.
 pub fn io_finished(kind: IoKind, start: Instant, elapsed_ns: u64) {
     let _ = TRACE_COLLECTOR.try_with(|c| c.io_finished(kind, start, elapsed_ns));
 }
 
-/// Attribute `n` payload bytes to the running total for `kind`. Call
-/// this after a fetch once you have the returned bytes handy (e.g.
-/// `record.value.len()` after a SlateDB `get`). No-op outside a
-/// [`with_trace`] scope — safe to call unconditionally.
+/// No-op outside a [`with_trace`] scope — safe to call unconditionally.
 pub fn record_bytes(kind: IoKind, bytes: u64) {
     let _ = TRACE_COLLECTOR.try_with(|c| c.record_bytes(kind, bytes));
 }
 
-/// RAII guard that keeps the `in_flight` counter for `kind` incremented
-/// from `enter` until drop, and records the final cumulative+wall
-/// sample on drop. Used by [`record_sync`] / [`record_async`]; rarely
-/// needed directly.
+/// RAII guard: holds `in_flight` for `kind` from `enter` until drop, then
+/// records the cumulative+wall sample. Used by [`record_sync`] / [`record_async`].
 struct IoGuard {
     kind: IoKind,
     start: Instant,
@@ -699,18 +582,14 @@ impl Drop for IoGuard {
     }
 }
 
-/// Convenience wrapper: time a synchronous block and record it against
-/// `kind`, tracking in-flight concurrency for the duration. Returns the
-/// block's value.
+/// Time a sync block against `kind`, counting in-flight for its duration.
 pub fn record_sync<T>(kind: IoKind, f: impl FnOnce() -> T) -> T {
     let _g = IoGuard::enter(kind);
     f()
 }
 
-/// Convenience wrapper: time an async block and record it against `kind`,
-/// tracking in-flight concurrency for the duration. Includes both work
-/// time and any await-polling latency — the point is exactly this, since
-/// async storage fetches are dominated by I/O wait.
+/// Time an async block against `kind`. Includes await-polling latency — the
+/// point, since storage fetches are I/O-dominated.
 pub async fn record_async<F, T>(kind: IoKind, fut: F) -> T
 where
     F: Future<Output = T>,
@@ -719,28 +598,19 @@ where
     fut.await
 }
 
-/// Attribute `elapsed_ns` to the sub-phase named `label`, scoped to the
-/// operator currently being polled (via the thread-local set by
-/// [`TracingOperator::next`]). If no operator is on the stack, the sample
-/// is recorded against the top-level orphan bucket. No-op outside a
-/// [`with_trace`] scope.
+/// Attributes to the operator currently on the stack, or the orphan bucket.
+/// No-op outside [`with_trace`].
 pub fn record_subphase(label: &'static str, elapsed_ns: u64) {
     let node_id = CURRENT_NODE_ID.with(|c| c.get());
     let _ = TRACE_COLLECTOR.try_with(|c| c.record_subphase(node_id, label, elapsed_ns));
 }
 
-/// Attribute `value` to the counter named `label`, scoped to the
-/// operator currently being polled (via the thread-local set by
-/// [`TracingOperator::next`]). No-op outside a [`with_trace`] scope or
-/// when no operator is on the stack. Additive — call multiple times to
-/// accumulate.
+/// Operator-scoped and additive. No-op when no operator is on the stack.
 pub fn record_counter(label: &'static str, value: u64) {
     let node_id = CURRENT_NODE_ID.with(|c| c.get());
     let _ = TRACE_COLLECTOR.try_with(|c| c.record_counter(node_id, label, value));
 }
 
-/// Time a synchronous block and record its elapsed wall time against the
-/// sub-phase named `label`. Returns the block's value.
 pub fn record_subphase_sync<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
     let start = Instant::now();
     let out = f();
@@ -748,15 +618,8 @@ pub fn record_subphase_sync<T>(label: &'static str, f: impl FnOnce() -> T) -> T 
     out
 }
 
-/// RAII guard for sub-phase timing. `drop` records elapsed wall time
-/// against `label`. Use when a block has early returns / `?`s that make a
-/// wrapping closure awkward.
-///
-/// ```ignore
-/// let _g = trace::Scope::enter("VectorSelector.build_batch");
-/// // ... work ...
-/// // Dropped at scope end; elapsed recorded.
-/// ```
+/// RAII sub-phase timer. Records on drop — use when early returns make a
+/// wrapping closure awkward. Example: `let _g = Scope::enter("...");`
 #[must_use = "dropping the guard is what records the elapsed time; assign it to a `_g` binding"]
 pub struct Scope {
     label: &'static str,
@@ -764,7 +627,6 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// Start a sub-phase timer. Elapsed wall time is recorded on drop.
     pub fn enter(label: &'static str) -> Self {
         Self {
             label,

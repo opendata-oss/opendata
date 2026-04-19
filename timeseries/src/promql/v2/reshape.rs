@@ -1,66 +1,38 @@
-//! `StepBatch` → `QueryValue` reshape (unit 5.3, polished from 5.1).
+//! Reshape stage: the v2 pipeline emits [`StepBatch`]es, but the HTTP layer
+//! speaks [`QueryValue`] (instant samples, range samples, scalars). This
+//! module bridges the two by draining the root operator's batches and
+//! laying them out in the shape the wire boundary expects.
 //!
-//! The v2 executor streams a sequence of [`StepBatch`]es rooted at the
-//! physical plan's root operator. The HTTP / embedded surface consumes
-//! [`QueryValue`] (the wire shape used by v1 — unchanged per RFC
-//! §"Migration Strategy"). This module bridges the two.
+//! Two code paths, one per query kind:
 //!
-//! Shapes produced:
+//! - Instant (`step_count == 1`): one [`InstantSample`] per series with a
+//!   valid cell. Scalar-producing roots (e.g. `scalar(x)`, literal `42`)
+//!   emit [`QueryValue::Scalar`] instead of a single-element vector.
+//! - Range (`step_count > 1`): one [`RangeSample`] per series with at
+//!   least one valid cell, with absent cells elided. Scalar-producing roots
+//!   emit an anonymous single-series matrix (matching v1's
+//!   `evaluate_range`).
 //!
-//! - Instant (`step_count == 1`): one [`InstantSample`] per output series
-//!   with a valid cell; invalid series dropped. Plans rooted at a
-//!   scalar-producing op (single series with empty labels) emit
-//!   [`QueryValue::Scalar`].
-//! - Range (`step_count > 1`): one [`RangeSample`] per output series that
-//!   produced at least one valid cell; absent cells elided inside the
-//!   series. Plans rooted at a scalar-producing op fan out into a single
-//!   anonymous [`RangeSample`] per v1's `evaluate_range` semantics (the
-//!   HTTP adapter from unit 5.2 also handles `Scalar` defensively on a
-//!   range grid; reshape emits a `Matrix` directly).
+//! Labels are cloned from the `Arc<SeriesSchema>` once per output series,
+//! never per step — the range path keys on the global `series_idx`.
 //!
-//! Label-copy strategy: the output samples own `Labels` by value (wire
-//! type, unchanged). The reshape clones each series' `Labels` from
-//! `Arc<SeriesSchema>` exactly once per output series — never per step.
-//! `reshape_instant` reaches each series at most once (one step per
-//! batch); `reshape_range` uses a per-series accumulator keyed by the
-//! global `series_idx`, so the label clone happens the first time a
-//! valid cell for that series is seen, regardless of how many steps or
-//! batches it spans.
+//! Output is ordered by global `series_idx` (deterministic; v1 used
+//! `HashMap<Labels, _>`). Prometheus clients don't rely on order, so this
+//! is a compatibility choice rather than a contract. Exception:
+//! `topk` / `bottomk` roots are re-sorted by value for `promqltest`.
 //!
-//! Ordering: output series are ordered by the global `series_idx` stamped
-//! by the planner. v1's `evaluate_range` uses `HashMap<Labels, _>`
-//! iteration (non-deterministic); v1's `evaluate_instant` preserves the
-//! evaluator's emission order. Prometheus clients don't rely on order
-//! (the wire field is an unordered array), so v2's deterministic
-//! `series_idx`-order is structurally compatible with v1. Root `topk` /
-//! `bottomk` instant queries are the exception: they are re-sorted by
-//! value so `promqltest`'s ordered expectations still match PromQL.
-//!
-//! Deferred schemas: operators like `CountValuesOp` publish
-//! [`SchemaRef::Deferred`] on their `Operator::schema()` but stamp
-//! emitted batches with [`SchemaRef::Static`] once the schema is
-//! finalised. The reshape reads labels off the *batch's* schema handle,
-//! so no special `Deferred` branch is needed here — a `Deferred` batch
-//! (which should never happen in practice) is flagged as a
-//! [`ReshapeError`] rather than a silent panic.
-//!
-//! Streaming vs. collect: 5.1 collects every `StepBatch` into a `Vec` in
-//! `Tsdb::execute_v2` and reshapes in a single pass. A single-pass
-//! streaming reshape is possible (each series' range-sample vector is
-//! bounded by `step_count`, so we could allocate per-series accumulators
-//! up-front and push as batches arrive), and is a future optimisation —
-//! not required for the Phase-5 acceptance criterion. The polished
-//! reshape here keeps the collected input and single BTreeMap-keyed
-//! accumulator for clarity.
+//! `CountValuesOp` publishes [`SchemaRef::Deferred`] from its
+//! `Operator::schema()` but stamps each emitted batch with a concrete
+//! [`SchemaRef::Static`] schema. Reshape reads the schema off the batch, so
+//! a stray `Deferred`-stamped batch surfaces as [`ReshapeError`] rather
+//! than panicking.
 
 use crate::model::{InstantSample, Labels, QueryValue, RangeSample};
 
 use super::batch::{SchemaRef, SeriesSchema, StepBatch};
 use super::plan::{InstantVectorSort, PhysicalPlan};
 
-/// Error surfaced when the executor produces a shape the reshape layer
-/// does not know how to interpret. The wiring layer translates this
-/// into [`crate::error::QueryError::Execution`].
+/// Translated to [`crate::error::QueryError::Execution`] at the wire boundary.
 #[derive(Debug)]
 pub struct ReshapeError(pub String);
 
@@ -72,19 +44,9 @@ impl std::fmt::Display for ReshapeError {
 
 impl std::error::Error for ReshapeError {}
 
-/// Reshape a set of collected [`StepBatch`]es into the instant-query
-/// [`QueryValue`].
-///
-/// Invariants the caller must uphold:
-/// - The plan's step grid has `step_count == 1`.
-/// - Emitted batches have schema `SchemaRef::Static` (the RFC's
-///   `Deferred → Static` transition happens inside the producing
-///   operator before batches reach this function).
-///
-/// Absent cells are elided. An empty input (no batches, or batches with
-/// zero valid cells) produces `QueryValue::Vector(vec![])`. Plans rooted
-/// at a pure scalar node (empty schema with a single valid cell) emit
-/// `QueryValue::Scalar`.
+/// Caller must supply a plan with `step_count == 1` and batches carrying
+/// `SchemaRef::Static`. Absent cells are elided; no valid cells → empty
+/// `Vector`. Scalar-root plans emit [`QueryValue::Scalar`].
 pub fn reshape_instant(
     plan: &PhysicalPlan,
     batches: Vec<StepBatch>,
@@ -175,16 +137,9 @@ fn compare_instant_values(left: f64, right: f64, sort: InstantVectorSort) -> std
     }
 }
 
-/// Reshape a set of collected [`StepBatch`]es into the range-query
-/// [`QueryValue`].
-///
-/// One [`RangeSample`] per series that produced at least one valid cell,
-/// ordered by global `series_idx`. Samples inside each [`RangeSample`]
-/// are ordered by step timestamp; absent cells are elided.
-///
-/// Plans rooted at a scalar-producing operator collapse into a single
-/// anonymous [`RangeSample`] containing every valid cell — mirrors v1's
-/// `evaluate_range` handling of a scalar expression on a range grid.
+/// One [`RangeSample`] per series with at least one valid cell, ordered by
+/// global `series_idx`; samples inside each are ordered by step timestamp.
+/// Scalar-root plans collapse into a single anonymous `RangeSample`.
 pub fn reshape_range(
     plan: &PhysicalPlan,
     batches: Vec<StepBatch>,
@@ -264,10 +219,8 @@ pub fn reshape_range(
     Ok(QueryValue::Matrix(out))
 }
 
-/// Defensive dimension check. `StepBatch::new` enforces these invariants
-/// via `debug_assert` — release builds skip those, so repeat the checks
-/// explicitly here and surface any violation as a `ReshapeError` rather
-/// than letting index-out-of-bounds crash the process.
+/// Repeats `StepBatch::new`'s debug invariants at the wire boundary so
+/// release builds surface violations as [`ReshapeError`] rather than panic.
 fn check_batch_shape(batch: &StepBatch) -> Result<(), ReshapeError> {
     let step_count = batch.step_count();
     let series_count = batch.series_count();
@@ -305,9 +258,8 @@ fn check_batch_shape(batch: &StepBatch) -> Result<(), ReshapeError> {
     Ok(())
 }
 
-/// Extract a static schema from the batch itself — the planner stamps
-/// emitted batches with their (possibly freshly finalised) `Static`
-/// schema, so the reshape can read labels directly off the batch.
+/// Operators stamp emitted batches with their (possibly freshly finalised)
+/// `Static` schema; a `Deferred` batch here is a contract violation.
 fn batch_static_schema(batch: &StepBatch) -> Result<&SeriesSchema, ReshapeError> {
     match &batch.series {
         SchemaRef::Static(schema) => Ok(schema.as_ref()),

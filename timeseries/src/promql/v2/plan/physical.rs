@@ -1,32 +1,23 @@
-//! Physical planner (unit 4.3).
+//! The physical planner — the compilation step that turns a
+//! [`LogicalPlan`] into a ready-to-poll tree of `Box<dyn Operator>`,
+//! alongside all the plan-time artifacts operators need at construction
+//! (resolved series rosters, group maps, match tables).
 //!
-//! Consumes an optimised [`LogicalPlan`] and produces a concrete operator
-//! tree plus everything the executor needs to actually run:
+//! Leaves call [`SeriesSource::resolve`] to materialise the series list
+//! a selector spans. `Subquery` owns a child-factory closure that
+//! re-plans its inner subtree once per outer step (the inner window
+//! slides, so the child has to be rebuilt).
 //!
-//! - Leaves: calls [`SeriesSource::resolve`] to materialise the post-
-//!   resolution series roster (`Arc<SeriesSchema>` + parallel
-//!   `Arc<[ResolvedSeriesRef]>` request slice) and wires them into the leaf
-//!   operator.
-//! - Intermediate nodes: pre-computes the plan-time artifacts operators
-//!   need at construction time — [`GroupMap`] for `Aggregate` /
-//!   `CountValues`, [`MatchTable`] for `Binary`, output `SeriesSchema`s
-//!   where the operator shape requires them.
-//! - Subquery: builds a child-factory closure that re-plans the inner
-//!   subtree for each outer step's time range.
+//! This pass does not mutate the logical plan. Exchange-operator
+//! insertion policy (when to wrap a subtree in `ConcurrentOp`) lives in
+//! [`super::parallelism`].
 //!
-//! # Scope (unit 4.3 strict)
-//!
-//! - Does **not** insert `Concurrent` / `Coalesce` — that is unit 4.5.
-//! - Does **not** modify `LogicalPlan` / operators / `SeriesSource`.
-//!
-//! # CountValues composition
-//!
-//! `CountValues` emits a `SchemaRef::Deferred` handle. v1 operators that
-//! compose a `Deferred` child under a parent that needs a `Static` child
-//! (aggregate, binary, rollup, instant-fn, …) cannot bind at plan time.
-//! The planner rejects these compositions with
-//! [`PlanError::InvalidMatching`]; only root-positioned `CountValues` is
-//! supported in v1. See RFC §"Core Data Model".
+//! [`CountValuesOp`] publishes [`SchemaRef::Deferred`] because its
+//! output labels depend on sample values. The planner rejects
+//! compositions that sink a `Deferred` child under a parent that needs a
+//! `Static` schema at plan time (aggregate, binary, rollup, instant-fn,
+//! ...) with [`PlanError::InvalidMatching`]. Only root-positioned
+//! `CountValues` is supported in v1.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,7 +88,17 @@ fn to_parser_at(a: AtModifier) -> parser::AtModifier {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// The output of [`build_physical_plan`].
+/// The output of the planning phase — a ready-to-poll operator tree
+/// plus the metadata the executor and the reshape pass need to drive it
+/// without re-walking the tree.
+///
+/// Alongside the root `dyn Operator` this carries:
+/// - the output [`SchemaRef`] (what the root will publish);
+/// - the [`StepGrid`] every batch lands on;
+/// - two flags captured at logical-plan time: `root_is_scalar` (so
+///   reshape surfaces a `Scalar` instead of a single-series vector) and
+///   `root_instant_vector_sort` (so `topk` / `bottomk` roots come back
+///   in the order Prometheus clients expect).
 pub struct PhysicalPlan {
     /// Root operator — already wired end-to-end.
     pub root: Box<dyn Operator + Send>,
@@ -125,6 +126,13 @@ impl std::fmt::Debug for PhysicalPlan {
     }
 }
 
+/// Post-reshape sort order for the samples of an instant-vector root.
+///
+/// Set by the physical planner when the logical root is a `topk` /
+/// `bottomk` aggregate — `topk` asks for descending, `bottomk` for
+/// ascending — so the HTTP layer can report values in the order
+/// Prometheus clients and `promqltest` goldens expect. Range queries
+/// never set this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstantVectorSort {
     DescendingValue,
@@ -152,7 +160,7 @@ where
 }
 
 /// Variant of [`build_physical_plan`] that also reports the exchange-operator
-/// insertion statistics accumulated during the walk (see unit 4.5).
+/// insertion statistics accumulated during the walk.
 ///
 /// The stats are used by unit tests to verify `ConcurrentOp` insertion
 /// decisions without downcasting the `dyn Operator` tree. Production
@@ -978,7 +986,7 @@ where
             "bare Subquery without a Rollup parent is not supported in v1".to_string(),
         )),
         LogicalPlan::Rechunk { .. } => Err(PlanError::UnsupportedExpression(
-            "Rechunk is unit 4.5's responsibility; 4.3 does not lower it".to_string(),
+            "Rechunk must be inserted by parallelism planning, not AST lowering".to_string(),
         )),
         LogicalPlan::CountValues {
             label,
@@ -999,7 +1007,8 @@ where
         }
         LogicalPlan::Concurrent { .. } | LogicalPlan::Coalesce { .. } => {
             Err(PlanError::UnsupportedExpression(
-                "Concurrent / Coalesce are unit 4.5's responsibility".to_string(),
+                "Concurrent / Coalesce must be inserted by parallelism planning, not AST lowering"
+                    .to_string(),
             ))
         }
     }
@@ -1380,7 +1389,7 @@ fn inner_grid(effective_t: i64, range_ms: i64, inner_step_ms: i64) -> StepGrid {
 }
 
 // ---------------------------------------------------------------------------
-// Exchange-operator insertion (unit 4.5)
+// Exchange-operator insertion
 // ---------------------------------------------------------------------------
 
 /// Wrap `op` in [`ConcurrentOp`] when the leaf's resolved cardinality

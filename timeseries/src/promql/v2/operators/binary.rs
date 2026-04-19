@@ -1,85 +1,33 @@
-//! `Binary` operator — unit 3b.3.
+//! `BinaryOp` implements every PromQL binary expression — arithmetic
+//! (`+`, `-`, `*`, `/`, `%`, `^`, `atan2`), comparisons (`==`, `<`, ...),
+//! and the set operators (`and`, `or`, `unless`). One operator type drives
+//! all of them cell-by-cell from two child streams.
 //!
-//! Pointwise binary operation between two upstream [`Operator`]s producing
-//! [`StepBatch`]es. Handles the three PromQL shapes: vector/vector (with
-//! pre-computed series matching), vector/scalar (scalar broadcast), and
-//! scalar/scalar (single-series degenerate).
+//! The interesting work is "which LHS series pairs with which RHS series?"
+//! — PromQL's vector-matching rules (`on(...)`, `ignoring(...)`,
+//! `group_left`, `group_right`) decide that from labels alone, so the
+//! planner computes it once as a [`MatchTable`] (input index → paired
+//! index) and hands it to the operator. The operator never recomputes the
+//! match.
 //!
-//! # Series matching is plan-time
+//! Shapes:
 //!
-//! RFC 0007 §"Core Data Model": *"Group maps and series matching are
-//! computed at plan time and reused for every batch — both are invariant
-//! across steps."* This operator therefore does **not** compute matching
-//! at runtime. The planner passes in a [`MatchTable`] indexing the LHS
-//! series set to the RHS series set (or vice versa for `group_right`),
-//! along with the output [`SeriesSchema`]. Unmatched cells emit with
-//! `validity = 0`.
+//! - Vector/vector: output schema follows the "many" side of the match
+//!   ([`MatchTable::OneToOne`] / `GroupLeft` → LHS; `GroupRight` → RHS).
+//!   Unmatched cells emit `validity = 0`.
+//! - Vector/scalar: the scalar side is a single-series degenerate batch
+//!   (one series, empty labels) broadcast across every vector series.
+//!   Output schema = vector side.
+//! - Scalar/scalar: both sides are degenerate; single-series output.
 //!
-//! # Shapes
+//! Comparison ops filter by default: false predicates emit `validity = 0`,
+//! true predicates pass through with the **LHS value**. The `bool`
+//! modifier switches to `1.0` / `0.0` output.
 //!
-//! ## Vector/vector
+//! Set ops (`and`, `or`, `unless`) are label-structural, vector/vector only.
 //!
-//! Both children produce `StepBatch`es over the plan-time-aligned step
-//! grid. For each step in the batch range and each output-series slot,
-//! the operator reads the corresponding LHS and RHS cells (via the
-//! match table), applies [`BinaryOpKind::apply`], and writes one output
-//! cell. The output series schema is:
-//! - LHS's for [`MatchTable::OneToOne`] and [`MatchTable::GroupLeft`]
-//!   ("many on the left").
-//! - RHS's for [`MatchTable::GroupRight`] ("many on the right").
-//!
-//! ## Vector/scalar
-//!
-//! A scalar in v2 is a degenerate [`StepBatch`] with exactly one series.
-//! [`ConstScalarOp`] emits such a batch for every step range. Use
-//! [`BinaryShape::VectorScalar`] or [`BinaryShape::ScalarVector`] — the
-//! operator broadcasts the scalar cell across all vector series.
-//! Output schema = the vector side's schema.
-//!
-//! ## Scalar/scalar
-//!
-//! Both children are degenerate (1-series) batches. The operator produces
-//! a single-series batch per step range. Output schema = a single-series
-//! `SchemaRef::Static`.
-//!
-//! # Comparison ops and the `bool` modifier
-//!
-//! PromQL comparisons (`==`, `!=`, `<`, `>`, `<=`, `>=`) are filters by
-//! default: cells whose predicate evaluates to false are dropped from the
-//! result (emitted with `validity = 0`), and cells whose predicate is true
-//! pass through with the **LHS value** (not `1.0`). With the `bool`
-//! modifier, comparisons produce `1.0`/`0.0` for every matched cell
-//! (validity stays with the input). See [`BinaryOpKind`] for the per-op
-//! `bool` flag.
-//!
-//! This matches the legacy engine at `timeseries/src/promql/evaluator.rs:
-//! 1898-1923, 2082-2094` bit-for-bit.
-//!
-//! # Set operators
-//!
-//! `and`, `or`, `unless` are label-structural — they operate on series
-//! membership, not values. Per step:
-//! - `A and B` — keep LHS cell iff matched RHS cell exists AND is valid.
-//! - `A or B` — keep LHS cell if valid; otherwise fall back to RHS.
-//! - `A unless B` — keep LHS cell iff matched RHS cell is missing or
-//!   invalid.
-//!
-//! The existing engine (`evaluator.rs`) does **not** implement set ops;
-//! this is a strict superset.
-//!
-//! # Division by zero
-//!
-//! The operator uses **IEEE 754 semantics** for `/` and `%`: `x / 0 = ±Inf
-//! (or NaN for 0/0)`. The legacy engine at `evaluator.rs:2159-2165`
-//! forces all division-by-zero to NaN — a bug. The `promqltest` goldens
-//! (`operators.test:108-118`) expect IEEE 754; v2 matches goldens.
-//! Divergence from legacy documented in §5 Decisions Log.
-//!
-//! # Memory accounting
-//!
-//! Only the output values column (`Vec<f64>`) and validity bitset
-//! (`BitSet`) allocations are charged through [`MemoryReservation::try_grow`].
-//! The input batches' reservations belong to the child operators.
+//! `/` and `%` follow IEEE 754 (v1's evaluator incorrectly coerced
+//! division-by-zero to NaN; v2 matches `promqltest` goldens).
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -94,20 +42,7 @@ use super::super::operator::{Operator, OperatorSchema, StepGrid};
 // BinaryOpKind — one operator, function selection as data
 // ---------------------------------------------------------------------------
 
-/// Discriminant for the per-cell binary function plus comparison-op
-/// behaviour flags.
-///
-/// Comparison variants carry a `bool` field reflecting the PromQL
-/// `bool` modifier:
-/// - `bool = false` (the PromQL default for `==`, `!=`, `<`, `>`, `<=`,
-///   `>=`): comparison acts as a filter. Cells with a false predicate are
-///   dropped (`validity = 0`); cells with a true predicate pass through
-///   with the LHS value.
-/// - `bool = true`: comparison produces `1.0` / `0.0` per matched cell;
-///   validity is preserved.
-///
-/// Set operators (`And`, `Or`, `Unless`) operate on series membership and
-/// are only defined for vector/vector.
+/// Per-cell binary function plus the comparison `bool` modifier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinaryOpKind {
     // --- arithmetic ---
@@ -134,8 +69,7 @@ pub enum BinaryOpKind {
 }
 
 impl BinaryOpKind {
-    /// Classify the kind. Callers use this to pick the hot loop (arithmetic
-    /// vs comparison vs set) without re-matching per cell.
+    /// Picks the hot loop (arith / cmp / set) without re-matching per cell.
     #[inline]
     fn class(self) -> OpClass {
         match self {
@@ -152,7 +86,6 @@ impl BinaryOpKind {
         }
     }
 
-    /// `true` if this is a comparison op with the `bool` modifier set.
     #[inline]
     fn bool_modifier(self) -> bool {
         matches!(
@@ -173,9 +106,6 @@ impl BinaryOpKind {
         )
     }
 
-    /// Apply the scalar function. For comparisons, returns
-    /// `CmpResult::True` / `CmpResult::False`; callers consult
-    /// [`Self::bool_modifier`] to decide output-value and validity.
     #[inline]
     fn apply_arith(self, left: f64, right: f64) -> f64 {
         match self {
@@ -221,7 +151,7 @@ enum OpClass {
 
 /// Pre-computed series matching between LHS and RHS vectors.
 ///
-/// Built by the Phase 4 planner from the input series schemas and the
+/// Built by the planner from the input series schemas and the
 /// PromQL `on` / `ignoring` / `group_left` / `group_right` modifiers. The
 /// operator treats this as an opaque mapping — it does not recompute
 /// matching at runtime.
@@ -312,13 +242,11 @@ pub enum BinaryShape {
 // ConstScalarOp — scalar-as-operator helper
 // ---------------------------------------------------------------------------
 
-/// Degenerate [`Operator`] that emits a single 1-series `StepBatch` cover-
-/// ing the full step grid, with the given constant value replicated.
-///
-/// Used by the Phase 4 planner (and by this module's tests) to wrap a
-/// plan-time scalar as a child of [`BinaryOp`]. Keeps the binary operator
-/// uniform across shapes: a scalar is "a child that produces 1-series
-/// batches."
+/// Wraps a plan-time scalar literal (like `42` in `x + 42`) as an
+/// [`Operator`] so [`BinaryOp`] can treat scalar and vector children
+/// uniformly — a scalar is simply "a child that produces 1-series
+/// batches." Emits one [`StepBatch`] covering the full step grid with the
+/// constant replicated, then end-of-stream.
 pub struct ConstScalarOp {
     schema: OperatorSchema,
     step_timestamps: Arc<[i64]>,
@@ -546,7 +474,9 @@ impl Drop for BufferedSide {
 // BinaryOp — the operator
 // ---------------------------------------------------------------------------
 
-/// Pull-based binary operator across two upstream children.
+/// Implements every PromQL binary expression — arithmetic, comparisons,
+/// and set operators — by pulling one batch at a time from two upstream
+/// children and applying a per-cell reducer.
 ///
 /// See module docs for shape semantics, validity policy, and the `bool`
 /// comparison-modifier handling.
@@ -884,11 +814,10 @@ impl<L: Operator, R: Operator> BinaryOp<L, R> {
     /// `match_table` indices are global over the children's full series
     /// rosters — a cross-tile match (lhs in tile A, its paired rhs in
     /// tile B) requires both sides fully resolved before the hot loop.
-    /// See RFC 0007 §4 unit 6.3.9: the prior per-batch path emitted one
-    /// partial output per paired tile with `series_range = 0..out_series`
-    /// and garbage cell values for any row that fell outside the paired
-    /// tile, causing downstream consumers to see duplicate-coverage
-    /// batches for the same step range.
+    /// A prior per-batch path emitted one partial output per paired tile
+    /// with `series_range = 0..out_series` and garbage cell values for any
+    /// row that fell outside the paired tile, causing downstream consumers
+    /// to see duplicate-coverage batches for the same step range.
     fn apply_vv(
         &self,
         lhs: BufferedSide,
@@ -1155,7 +1084,7 @@ impl<L: Operator, R: Operator> Operator for BinaryOp<L, R> {
         // Vector/vector is a pipeline-breaker: drain both children into
         // the full-grid buffers so cross-tile matches (lhs series in tile
         // A paired with rhs series in tile B) can be resolved against
-        // a consistent snapshot (RFC 0007 §4 unit 6.3.9).
+        // a consistent snapshot.
         if matches!(self.shape, BinaryShape::VectorVector { .. }) {
             if self.vv_emitted {
                 self.done = true;
@@ -1813,10 +1742,10 @@ mod tests {
     #[test]
     fn should_stitch_aligned_step_ranges_from_children() {
         // given: two children each emitting a [0..2) then [2..4) batch.
-        // Under the RFC 0007 §4 unit 6.3.9 fix, vector/vector is now a
-        // pipeline-breaker: children are drained into a full-grid buffer
-        // and a single output batch covering 0..4 is emitted on EOS
-        // (correct for cross-tile matches; see module docs).
+        // Vector/vector is a pipeline-breaker: children are drained into
+        // a full-grid buffer and a single output batch covering 0..4 is
+        // emitted on EOS (correct for cross-tile matches; see module
+        // docs).
         let lschema = mk_schema("l", 1);
         let rschema = mk_schema("r", 1);
         let grid = StepGrid {

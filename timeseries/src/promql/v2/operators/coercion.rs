@@ -1,7 +1,15 @@
-//! Scalar/vector coercion helpers for the v2 engine.
+//! Bridges PromQL's scalar world and its instant-vector world. Two
+//! operators:
 //!
-//! - [`TimeScalarOp`]: scalar leaf for `time()`.
-//! - [`ScalarizeOp`]: `scalar(v)` coercion from instant-vector to scalar.
+//! - [`TimeScalarOp`]: implements PromQL `time()` — a scalar leaf that
+//!   emits each step's timestamp, in seconds, as its value.
+//! - [`ScalarizeOp`]: implements PromQL `scalar(v)` — drains an
+//!   instant-vector child and, per step, emits the lone valid input
+//!   sample's value; zero or multiple valid samples collapse to `NaN`.
+//!
+//! The opposite direction (`vector(s)` — scalar to instant-vector) is
+//! handled directly by the physical planner, which lowers it to its
+//! scalar child without a dedicated operator.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -39,7 +47,9 @@ fn out_bytes(cells: usize) -> usize {
     values.saturating_add(validity)
 }
 
-/// Scalar leaf for `time()`.
+/// Implements PromQL `time()`. A scalar leaf: emits one batch holding the
+/// step timestamp (in seconds) for each step in the grid, then
+/// end-of-stream.
 pub struct TimeScalarOp {
     schema: OperatorSchema,
     step_timestamps: Arc<[i64]>,
@@ -97,11 +107,13 @@ impl Operator for TimeScalarOp {
     }
 }
 
-/// `scalar(v)` coercion.
+/// Implements PromQL's `scalar(v)` coercion — collapses an instant-vector
+/// child into a single scalar per step.
 ///
-/// Drains the full child and emits one scalar-valued batch over the child's
-/// full step grid. For each step: exactly one valid input sample yields that
-/// value; zero or more-than-one valid samples yield `NaN`.
+/// Pipeline breaker: drains the full child, then emits one scalar-valued
+/// batch covering the full step grid. For each step: exactly one valid
+/// input sample yields that value; zero or more-than-one valid samples
+/// yield `NaN`.
 pub struct ScalarizeOp<C: Operator> {
     child: C,
     schema: OperatorSchema,

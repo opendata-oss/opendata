@@ -1,94 +1,29 @@
-//! `CountValues` (deferred-schema) operator — unit 3c.4.
+//! `CountValuesOp` implements PromQL `count_values` — the one aggregation
+//! whose output labelset depends on the sample values it sees, not just
+//! the query's matchers. It buckets input series by their per-step value
+//! and emits one output series per distinct observed value, labelled
+//! `{<label>="<value>"}` plus any `by` / `without` grouping labels.
 //!
-//! `count_values("label", expr)` is the **one** PromQL construct whose
-//! output label set is derived from runtime sample values: for each step,
-//! it buckets input series by their value, emitting one output series per
-//! distinct value observed, carrying `{label="<value>"}` plus any
-//! `by`/`without` grouping labels. Because the roster cannot be built at
-//! plan time, this operator is a pipeline breaker that drains its child,
-//! discovers the output label set, and only then emits its `StepBatch`es.
+//! Because the output roster isn't known until the samples have been
+//! read, this is a pipeline breaker (buffers its child fully before
+//! emitting): it drains the child, discovers the distinct values,
+//! finalises an output [`SeriesSchema`], and only then emits batches.
+//! [`Operator::schema`] publishes [`SchemaRef::Deferred`] for the
+//! operator's whole life; downstream consumers read the concrete schema
+//! off each emitted batch (internally memoised and exposed via
+//! [`CountValuesOp::finalized_schema`]).
 //!
-//! See RFC 0007 §"Core Data Model" for the [`SchemaRef::Deferred`]
-//! contract and `promqltest/testdata/aggregators.test:480` for goldens
-//! (currently ignored — this operator is their first runtime host).
+//! Value-to-label formatting matches Prometheus' Go
+//! `FormatFloat(v, 'f', -1, 64)`: NaN → `"NaN"`, ±Inf → `"±Inf"`, `-0.0`
+//! → `"-0"`, finite values use the shortest round-trip decimal. Buckets
+//! key on `f64::to_bits()` internally so `+0.0` / `-0.0` and individual
+//! NaN bit patterns don't collide during hashing; label formatting then
+//! collapses all NaN patterns to `"NaN"` so the user-facing roster stays
+//! consistent.
 //!
-//! # Schema-finalisation strategy (§5 Decisions Log 3c.4)
-//!
-//! [`Operator::schema`] returns [`SchemaRef::Deferred`] for the whole life
-//! of the operator. Downstream consumers that need the concrete roster
-//! call [`CountValuesOp::finalized_schema`] after draining the first
-//! batch; the operator memoises the built `SeriesSchema` and returns
-//! `Some(&schema)` on every subsequent call. The alternative (option 1 in
-//! the task prompt — `Cell<SchemaRef>` inside `OperatorSchema`) would let
-//! `schema()` flip to `Static` mid-life, but it complicates the `&`-
-//! returning trait shape and the RFC explicitly treats `Deferred` as
-//! "schema known after my child's first batch" — a channel separate from
-//! `schema()`.
-//!
-//! # Value-to-label formatting (§5 Decisions Log 3c.4)
-//!
-//! Prometheus formats bucket label values with Go's
-//! `strconv.FormatFloat(v, 'f', -1, 64)` (shortest round-trip
-//! representation). See
-//! <https://pkg.go.dev/strconv#FormatFloat>. The existing Rust engine does
-//! not implement `count_values` (the goldens at
-//! `promqltest/testdata/aggregators.test:480` are ignored), so there is
-//! no in-crate citation to match; the implementation here is written to
-//! mirror Prometheus' documented behaviour:
-//!
-//! | value                 | rendered           |
-//! |-----------------------|--------------------|
-//! | `6.0`                 | `"6"`              |
-//! | `6.5`                 | `"6.5"`            |
-//! | `-0.0`                | `"-0"`             |
-//! | `NaN`                 | `"NaN"`            |
-//! | `+Inf` / `-Inf`       | `"+Inf"` / `"-Inf"`|
-//!
-//! Rust's `f64::to_string` agrees on all finite cases except that it
-//! prints integer-valued floats without a trailing zero already, prints
-//! `NaN`/`inf`/`-inf` lowercase, and does not preserve the sign of zero.
-//! [`format_value_label`] normalises those three cases.
-//!
-//! # NaN / +0 / -0 bucketing (§5 Decisions Log 3c.4)
-//!
-//! Values are keyed by `f64::to_bits()` so the hash map distinguishes
-//! `+0.0` / `-0.0` and every NaN bit pattern as separate buckets. Label
-//! formatting then collapses all NaNs to the literal `"NaN"`, so the
-//! user-facing roster is consistent; the bit-distinction only matters for
-//! correctness of the hashing (Rust's `f64` does not implement `Hash` /
-//! `Eq` directly). This follows Prometheus' "float map keyed by value
-//! bits" pattern.
-//!
-//! # Grouping
-//!
-//! The optional [`GroupMap`] assigns input-series indices to intermediate
-//! groups (`by`/`without`). When present, output series are
-//! `(group, value)` pairs; when absent, all inputs fall into one
-//! synthetic group so the output is purely `(value)` indexed (PromQL
-//! `count_values("label", expr)` with no modifier). The planner supplies
-//! the grouping labels — one `Labels` per group — so this operator can
-//! compose the group's labels with the new `{label=<value>}` entry to
-//! build each output row's `Labels`. See [`CountValuesOp::new`].
-//!
-//! # Memory accounting
-//!
-//! Three reservations are routed through [`MemoryReservation::try_grow`]:
-//!
-//! 1. An intermediate counts map charged incrementally as new
-//!    `(group, value)` buckets appear. Bytes per bucket are a conservative
-//!    approximation of `HashMap` entry + `Vec<u64>` per-step counts.
-//! 2. The finalised output [`SeriesSchema`] (labels + fingerprints),
-//!    charged when the roster is built.
-//! 3. The emitted [`StepBatch`]'s `values` + `validity` columns, charged
-//!    per batch and released on the same `finish`/`Drop` path used by
-//!    sibling operators.
-//!
-//! # Schema contract
-//!
-//! [`SchemaRef::Deferred`] — the output schema cannot be built until the
-//! child has been fully drained. Downstream operators that read
-//! `Deferred` must wait for the first batch and query
-//! [`CountValuesOp::finalized_schema`] to bind their own roster.
+//! The optional [`GroupMap`] partitions inputs into `(group, value)`
+//! buckets; absent a group map, all inputs feed one synthetic group. The
+//! planner passes one `Labels` per group for composing output rows.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,17 +40,8 @@ use super::aggregate::GroupMap;
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-/// Format a sample value for the `{label="<value>"}` output label.
-///
-/// Matches Prometheus' `strconv.FormatFloat(v, 'f', -1, 64)` in the cases
-/// that matter for `count_values`:
-/// - NaN ⇒ `"NaN"` (not `"nan"`).
-/// - +Inf ⇒ `"+Inf"`, -Inf ⇒ `"-Inf"` (not `"inf"` / `"-inf"`).
-/// - `-0.0` ⇒ `"-0"` (Rust's default drops the sign).
-/// - Finite values: Rust's `f64::to_string` (shortest round-trip) agrees
-///   with Go's `FormatFloat(-1, 64)` — integer values render without a
-///   trailing decimal (`6`, not `6.0`), fractional values use the
-///   shortest decimal (`0.5`, not `.5`).
+/// Matches Prometheus' `FormatFloat(v, 'f', -1, 64)` for the cases Rust's
+/// `to_string` diverges on: NaN, ±Inf, and `-0.0`.
 pub fn format_value_label(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -244,7 +170,10 @@ impl Drop for OutBuffers {
 // CountValuesOp — the operator
 // ---------------------------------------------------------------------------
 
-/// Deferred-schema pipeline-breaker implementing PromQL's `count_values`.
+/// Implements PromQL's `count_values`. The one operator in v2 whose output
+/// series roster depends on sample values — so it publishes
+/// [`SchemaRef::Deferred`] from [`Self::schema`] and only binds a concrete
+/// [`SeriesSchema`] after it has drained its child.
 ///
 /// Life cycle:
 /// 1. Constructor stores the child and grouping configuration.
@@ -325,9 +254,9 @@ impl<C: Operator> CountValuesOp<C> {
     /// Returns the finalised output schema once the child has been drained
     /// and the first emit has happened. Before that, returns `None`.
     ///
-    /// Downstream operators that need the concrete roster (a Phase 4
-    /// planner concern) should call this after polling their deferred
-    /// child to completion of its first batch.
+    /// Downstream operators that need the concrete roster (a planner
+    /// concern) should call this after polling their deferred child to
+    /// completion of its first batch.
     pub fn finalized_schema(&self) -> Option<&Arc<SeriesSchema>> {
         self.finalized.as_ref()
     }

@@ -1,67 +1,53 @@
-//! Per-query memory accounting for the v2 execution engine.
+//! Per-query memory accounting for the v2 engine.
 //!
-//! Defines:
-//! - [`MemoryReservation`]: atomic reserved-bytes counter enforced against a
-//!   configurable per-query cap. All allocating calls in the v2 engine must
-//!   route through [`MemoryReservation::try_grow`] before allocating and call
-//!   [`MemoryReservation::release`] when the buffer is dropped.
-//! - [`QueryError`]: v2-local error type carrying structured diagnostics for
-//!   memory-limit rejections. Kept isolated from the crate-level
-//!   [`crate::error::QueryError`] for phase 1; integration with the outer
-//!   error surface happens in the phase-5 wiring unit.
+//! A query allocates across many operators on many tasks; [`MemoryReservation`]
+//! is the shared ledger that keeps their combined footprint under the
+//! per-query cap. Every allocating call site in v2 (batch buffers,
+//! accumulator grids, rechunk scratch, ...) pairs
+//! [`MemoryReservation::try_grow`] with [`MemoryReservation::release`] on
+//! drop — operators that forget either side are memory-leak bugs.
 //!
-//! See RFC 0007 §"Execution Model" (subsection "Memory accounting") and
-//! §"Error Handling & Observability".
+//! [`QueryError`] is deliberately isolated from the crate-wide
+//! [`crate::error::QueryError`]: v2 errors are a small closed set (memory
+//! limit plus a catch-all `Internal` for storage plumbing), and the wire
+//! boundary maps them to `crate::error::QueryError::Execution`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Structured error type for the v2 engine.
-///
-/// Isolated from [`crate::error::QueryError`] so phase 1 doesn't perturb the
-/// crate-wide error surface. The phase-5 wiring unit decides how to bridge
-/// the two (likely an `impl From<v2::QueryError> for crate::error::QueryError`).
+/// The v2 engine's error type. Kept separate from
+/// [`crate::error::QueryError`] so the engine's error surface stays small and
+/// closed; the wire boundary maps these onto
+/// `crate::error::QueryError::Execution`.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum QueryError {
-    /// The query exceeded its per-query memory cap while attempting to grow
-    /// a reservation. Carries enough context for operator tracing and user
-    /// diagnostics.
     #[error(
         "memory limit exceeded: requested {requested} bytes, already reserved \
          {already_reserved} bytes, cap {cap} bytes"
     )]
     MemoryLimit {
-        /// Bytes the caller asked to reserve on the `try_grow` call that
-        /// failed.
         requested: usize,
-        /// Configured per-query cap (bytes).
         cap: usize,
-        /// Bytes already reserved at the moment of the failing call
-        /// (does not include `requested`).
+        /// Bytes reserved at the moment of the failing call (excluding `requested`).
         already_reserved: usize,
     },
 
-    /// Generic internal / storage-surface error. Used by the Phase 2
-    /// storage adapter to carry crate-level `Error` messages without
-    /// extending the public v2 surface with a storage-specific variant.
-    /// The Phase 5 wiring unit can retire this in favour of a more
-    /// structured shape (e.g. distinct `Storage` / `InvalidInput`
-    /// variants) once the bridging into `crate::error::QueryError` is
-    /// defined.
+    /// Storage-surface error, used by the storage adapter to carry crate-level
+    /// `Error` messages without leaking a storage-specific variant.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
-/// Per-query memory reservation.
+/// The shared ledger of bytes reserved by a single query. One reservation
+/// serves the whole operator tree; clones hand copies to individual
+/// operators and tasks, and every clone mutates the same `Arc`ed atomic
+/// counter under the hood.
 ///
-/// Tracks bytes reserved against a configurable per-query `cap`. All counters
-/// are `AtomicUsize` so the reservation can be cloned into tokio tasks behind
-/// a `Concurrent`/`Coalesce` wrapper without locks. Clones share state via
-/// an internal `Arc` — dropping one clone does *not* release its reservation;
-/// callers must pair [`try_grow`](Self::try_grow) with
-/// [`release`](Self::release).
-///
-/// See RFC 0007 §"Execution Model" (memory accounting).
+/// Reservation is explicit on both sides: [`try_grow`](Self::try_grow) to
+/// acquire bytes, [`release`](Self::release) to give them back. Dropping a
+/// clone does **not** release its outstanding reservation — the operator
+/// that grew the counter is responsible for releasing it, typically from a
+/// `Drop` impl on the buffer that held the memory.
 #[derive(Debug, Clone)]
 pub struct MemoryReservation {
     inner: Arc<Inner>,
@@ -75,10 +61,7 @@ struct Inner {
 }
 
 impl MemoryReservation {
-    /// Create a reservation with the given per-query cap in bytes.
-    ///
-    /// A `cap` of zero is legal and causes every non-zero `try_grow` to
-    /// fail; zero-byte reservations always succeed (they never allocate).
+    /// `cap` of zero is legal; every non-zero `try_grow` then fails.
     pub fn new(cap: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -89,39 +72,24 @@ impl MemoryReservation {
         }
     }
 
-    /// Configured per-query cap, in bytes.
     #[inline]
     pub fn cap(&self) -> usize {
         self.inner.cap
     }
 
-    /// Currently reserved bytes. Snapshot; concurrent `try_grow`/`release`
-    /// calls may observe a different value on the next load.
     #[inline]
     pub fn reserved(&self) -> usize {
         self.inner.reserved.load(Ordering::Acquire)
     }
 
-    /// High-water mark: the largest value [`reserved`](Self::reserved) has
-    /// ever reached for this reservation. Monotonically non-decreasing — in
-    /// particular, [`release`](Self::release) does not shrink the high-water
-    /// mark. Used for the per-query tracing event (RFC §"Error Handling &
-    /// Observability").
+    /// Largest value [`reserved`](Self::reserved) has reached. Never shrinks;
+    /// [`release`](Self::release) does not affect it.
     #[inline]
     pub fn high_water(&self) -> usize {
         self.inner.high_water.load(Ordering::Acquire)
     }
 
-    /// Attempt to reserve `bytes`. On success, returns `Ok(())` and the
-    /// reserved counter is incremented atomically; on failure, returns
-    /// [`QueryError::MemoryLimit`] carrying the requested amount, the cap,
-    /// and the reservation observed at the moment of rejection.
-    ///
     /// Zero-byte requests always succeed without touching state.
-    ///
-    /// Concurrency: implemented as a CAS loop on the reserved counter so
-    /// multiple tokio tasks may call `try_grow` simultaneously; at most one
-    /// over-cap request is accepted for a given state transition.
     pub fn try_grow(&self, bytes: usize) -> Result<(), QueryError> {
         if bytes == 0 {
             return Ok(());
@@ -155,12 +123,8 @@ impl MemoryReservation {
         }
     }
 
-    /// Release `bytes` previously reserved via [`try_grow`](Self::try_grow).
-    ///
-    /// In debug builds, underflow (releasing more than is currently
-    /// reserved) panics; in release builds it saturates at zero so a
-    /// miscounted operator cannot take down the process. The high-water
-    /// mark is not affected.
+    /// Debug-asserts against underflow; release builds saturate at zero so a
+    /// miscounted operator cannot take down the process.
     pub fn release(&self, bytes: usize) {
         if bytes == 0 {
             return;
@@ -186,7 +150,6 @@ impl MemoryReservation {
         }
     }
 
-    /// Raise the high-water mark if `candidate` exceeds the current value.
     fn bump_high_water(&self, candidate: usize) {
         let mut current = self.inner.high_water.load(Ordering::Relaxed);
         while candidate > current {

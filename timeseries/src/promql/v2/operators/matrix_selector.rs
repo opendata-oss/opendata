@@ -1,94 +1,35 @@
-//! `MatrixSelector` operator — unit 3a.2.
+//! `MatrixSelectorOp` — the storage leaf for PromQL range vectors
+//! (`metric[5m]`). It fetches raw samples and repackages them into
+//! per-step windows for [`RollupOp`] (`rate`, `*_over_time`, ...) and for
+//! [`SubqueryOp`](super::subquery::SubqueryOp) to consume.
 //!
-//! Range-vector leaf. A PromQL matrix selector (`metric[range]`) yields a
-//! *vector* of samples per step: all samples whose timestamps fall in
-//! `(t - range - offset, t - offset]`, not a single scalar like
-//! [`VectorSelectorOp`](super::vector_selector::VectorSelectorOp). This is
-//! inherently incompatible with [`StepBatch`]'s single-float-per-cell shape
-//! — so the operator satisfies the [`Operator`] trait with a degenerate
-//! `next()` that reports end-of-stream immediately, and exposes the useful
-//! API via [`MatrixSelectorOp::windows`]:
+//! `metric[range]` produces a *vector of samples* per step, which doesn't
+//! fit [`StepBatch`]'s one-float-per-cell shape. So this operator doesn't
+//! emit `StepBatch`es on its main `Operator::next` loop (that path is a
+//! degenerate "immediate EOS"); the real output is
+//! [`MatrixSelectorOp::windows`], which emits [`MatrixWindowBatch`]es.
+//! [`RollupOp`] drives this via the [`super::rollup::WindowStream`]
+//! trait, which [`super::rollup::MatrixWindowSource`] implements over a
+//! `MatrixSelectorOp`.
 //!
-//! ```ignore
-//! fn windows(&mut self, cx: &mut Context<'_>)
-//!     -> Poll<Option<Result<MatrixWindowBatch, QueryError>>>;
-//! ```
-//!
-//! Consumers are the fused [`Rollup`] (unit 3b.1 — `rate`, `increase`,
-//! `*_over_time`, …) and [`Subquery`] (unit 3c.2) operators. The
-//! `Operator` impl exists so the type is pluggable into generic pipeline
-//! code that indexes operators by trait; in practice rollup/subquery
-//! downcast to `MatrixSelectorOp<S>` and call `windows()` directly.
-//!
-//! See §5 Decisions Log (unit 3a.2) for the option chosen (fuller API +
-//! window-batch type) and why.
-//!
-//! # Semantics
-//!
-//! For each step `t = start_ms + k * step_ms` (k in `0..step_count`):
-//!
+//! Per-step semantics (no `lookback_delta` — the bracketed `[range]`
+//! replaces it):
 //! ```text
-//!   pin         = @ value when @ is set, else t
-//!   effective   = pin - offset                 (Offset::Pos subtracts; Neg adds)
+//!   pin         = @ value when set, else t
+//!   effective   = pin - offset
 //!   window      = (effective - range, effective]
-//!   samples     = all source samples with timestamp in window,
-//!                 in ascending timestamp order, excluding STALE_NAN
+//!   samples     = source samples in window, ascending, STALE_NAN dropped
 //! ```
 //!
-//! Window convention cross-checked against
-//! `timeseries/src/promql/evaluator.rs:595-611` (`slice_samples_binary_search`
-//! — "timestamp_ms > start_ms && timestamp_ms <= end_ms") and
-//! `timeseries/src/promql/pipeline.rs:184` (`for_matrix`:
-//! `start_ms = end_ms - range_ms`). `STALE_NAN` treated as absence,
-//! matching 3a.1's stricter policy.
+//! Tiling: one [`MatrixWindowBatch`] per `(series_chunk × step_chunk)` —
+//! the same two-level tiling scheme as
+//! [`VectorSelectorOp`](super::vector_selector::VectorSelectorOp).
 //!
-//! `MatrixSelector` does **not** apply Prometheus `lookback_delta` — the
-//! explicit bracketed `[range]` replaces it. Composition order
-//! (`@` → offset → range) mirrors
-//! `timeseries/src/promql/evaluator.rs:1487-1513` (`evaluate_matrix_selector`,
-//! which calls `apply_time_modifiers` to fold `@`/offset into
-//! `adjusted_eval_ts`, then `QueryPlan::for_matrix` carves the window as
-//! `[adjusted_eval_ts - range, adjusted_eval_ts]`).
-//!
-//! # Batching
-//!
-//! Emits one [`MatrixWindowBatch`] per `(series_chunk × step_chunk)` tile.
-//! Default tile dimensions reuse 3a.1's `N ≈ 64 × K ≈ 512` (RFC
-//! §"Core Data Model"); tunable via [`BatchShape`]. The same two-level
-//! chunking strategy drains the source stream once per series chunk into
-//! pre-materialised per-series sample columns, then iterates step chunks
-//! emitting one window batch per poll.
-//!
-//! # Window batch layout
-//!
-//! [`MatrixWindowBatch`] keeps a flat sample buffer plus a per-cell
-//! `(offset, len)` index:
-//!
-//! ```text
-//!   timestamps: Vec<i64>              (sample timestamps, flat, packed
-//!                                      per-cell in row-major step × series
-//!                                      order)
-//!   values:     Vec<f64>              (parallel to timestamps)
-//!   cells:      Vec<CellIndex>        (length = step_count × series_count;
-//!                                      row-major by step matching
-//!                                      StepBatch)
-//! ```
-//!
-//! `cells[t * series_count + s] = { offset, len }` yields the `[offset,
-//! offset + len)` slice of `timestamps` / `values` covering the window for
-//! step `t`, series `s`. This layout is friendly to `Rollup`'s two-pointer
-//! driver: cells for adjacent steps of the same series advance the
-//! pointers monotonically, so the consumer can reuse state across steps
-//! by tracking per-series indices rather than re-slicing each time.
-//!
-//! # Memory accounting
-//!
-//! Three RAII guards route through [`MemoryReservation::try_grow`]:
-//! - [`ChunkSamples`] (shared with 3a.1's shape) — per-series sample
-//!   columns pre-materialised from the source stream.
-//! - [`WindowBuffers`] — the flat `timestamps`/`values`/`cells` arrays of
-//!   an emitted [`MatrixWindowBatch`].
-//! - Internal working state is small-O(step_chunk × series_chunk).
+//! [`MatrixWindowBatch`] layout: flat `timestamps` / `values` buffers plus
+//! a row-major-by-step `cells: Vec<CellIndex>` where
+//! `cells[t * series_count + s] = { offset, len }` indexes into the flat
+//! buffers. Adjacent-step cells for the same series advance monotonically,
+//! so `RollupOp`'s two-pointer driver reuses state across steps.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -113,12 +54,9 @@ use super::super::source::{
 // Defaults & tile shape (mirrors 3a.1)
 // ---------------------------------------------------------------------------
 
-/// Default step chunk — roughly `N ≈ 64` per RFC §"Core Data Model".
 pub(crate) const DEFAULT_STEP_CHUNK: usize = 64;
-/// Default series chunk — roughly `K ≈ 512` per RFC §"Core Data Model".
 pub(crate) const DEFAULT_SERIES_CHUNK: usize = 512;
 
-/// Tile dimensions emitted by the operator.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BatchShape {
     pub(crate) step_chunk: usize,
@@ -151,7 +89,7 @@ impl Default for BatchShape {
 ///
 /// `offset` and `len` are `u32` because a single window cell is bounded
 /// by the range's sample count at scrape resolution; billions of samples
-/// in one cell would not fit the operator's memory budget anyway.
+/// in one cell would not fit the operator's memory reservation anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellIndex {
     /// Start index into [`MatrixWindowBatch::timestamps`] / [`MatrixWindowBatch::values`].
@@ -173,17 +111,22 @@ impl CellIndex {
     }
 }
 
-/// Window-batch output of [`MatrixSelectorOp::windows`].
+/// The window-batch counterpart to [`StepBatch`]: a rectangle of *sample
+/// lists* (one list of `(ts, val)` pairs per `(step, series)` cell)
+/// instead of single values. This is what flows between range-vector
+/// producers ([`MatrixSelectorOp`], [`SubqueryOp`]) and
+/// [`RollupOp`](super::rollup::RollupOp).
 ///
 /// Covers a contiguous `(series_range × step_range)` tile. Samples for
 /// each cell are packed into the flat `timestamps` / `values` columns and
 /// indexed per cell via [`Self::cells`] (row-major by step, matching
-/// [`StepBatch`]'s `values` layout).
+/// [`StepBatch`]'s layout).
 ///
-/// Consumers (`Rollup`, `Subquery`) read per-cell slices via
-/// [`Self::cell_samples`]. `STALE_NAN` values are already filtered by the
-/// operator — consumers see only valid numeric samples in ascending
-/// timestamp order.
+/// Consumers read per-cell slices via [`Self::cell_samples`]. `STALE_NAN`
+/// values are already filtered out by the producer — consumers see only
+/// valid numeric samples in ascending timestamp order.
+///
+/// [`SubqueryOp`]: super::subquery::SubqueryOp
 #[derive(Debug, Clone)]
 pub struct MatrixWindowBatch {
     /// Absolute step timestamps (ms), shared with the rest of the query
@@ -192,7 +135,7 @@ pub struct MatrixWindowBatch {
     /// Slice of [`Self::step_timestamps`] covered by this batch.
     pub step_range: std::ops::Range<usize>,
 
-    /// Series roster the planner built (same `Arc` 3a.1 would publish).
+    /// Series roster the planner built.
     pub series: SchemaRef,
     /// Slice of the series roster covered by this batch.
     pub series_range: std::ops::Range<usize>,
@@ -219,7 +162,7 @@ pub struct MatrixWindowBatch {
     /// it, `rate(metric[100s] @ 100)` at outer step `t=25s` would compute
     /// rate over the window `(-75s, 25s]` while the packed samples
     /// actually cover `(0, 100s]`, producing a negative rate disjoint
-    /// from the data (at_modifier #21 / RFC 0007 §6.3.8).
+    /// from the data.
     ///
     /// [`RollupOp`]: super::rollup::RollupOp
     pub effective_times: Option<Arc<[i64]>>,
@@ -277,7 +220,7 @@ fn window_bytes(cells: usize, samples: usize) -> usize {
         .saturating_add(val_bytes)
 }
 
-/// Per-series sample column byte estimate (shared with 3a.1's shape).
+/// Per-series sample column byte estimate.
 #[inline]
 fn samples_bytes(n: usize) -> usize {
     n.saturating_mul(std::mem::size_of::<i64>() + std::mem::size_of::<f64>())
@@ -286,10 +229,10 @@ fn samples_bytes(n: usize) -> usize {
 /// RAII reservation wrapper around an in-flight window batch's buffers.
 ///
 /// Reserves on construction (cells-only, up front), grows as samples are
-/// pushed, and releases the entire allotment on [`Drop`]. Callers move
+/// pushed, and releases the entire reservation on [`Drop`]. Callers move
 /// the inner vectors out via [`Self::finish`], which transfers ownership
-/// of the bytes and releases the reservation slice (convention from
-/// 3a.1: downstream re-reserves if it holds the batch).
+/// of the bytes and releases the reservation slice (downstream
+/// re-reserves if it holds the batch).
 struct WindowBuffers {
     reservation: MemoryReservation,
     bytes: usize,
@@ -590,11 +533,13 @@ enum State<'a> {
 // Operator struct
 // ---------------------------------------------------------------------------
 
-/// PromQL matrix-selector operator.
+/// Storage leaf for PromQL range vectors (`metric[range]`). Fetches raw
+/// samples from a [`SeriesSource`] and packs them into per-step windows
+/// for a downstream [`RollupOp`](super::rollup::RollupOp) to reduce.
 ///
-/// See module docs for the two-API arrangement (degenerate `Operator::next`,
-/// useful [`Self::windows`] secondary API) and for the sliding-window
-/// semantics.
+/// See module docs for the two-API arrangement (degenerate
+/// `Operator::next`, plus the useful [`Self::windows`] secondary API) and
+/// for the sliding-window semantics.
 pub(crate) struct MatrixSelectorOp<'a, S: SeriesSource + 'a> {
     // Plan-time inputs ------------------------------------------------------
     source: Arc<S>,
@@ -606,7 +551,7 @@ pub(crate) struct MatrixSelectorOp<'a, S: SeriesSource + 'a> {
     /// from `step_timestamps`. When set, [`MatrixWindowBatch`] carries the
     /// `effective_times` array so the enclosing `RollupOp` can compute
     /// rate-family extrapolation over the window the samples actually
-    /// live in (RFC 0007 §6.3.8).
+    /// live in.
     has_effective_shift: bool,
     range_ms: i64,
     shape: BatchShape,
@@ -1102,7 +1047,7 @@ mod tests {
     }
 
     // ====================================================================
-    // required tests (task spec)
+    // required tests
     // ====================================================================
 
     #[test]

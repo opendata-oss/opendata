@@ -1,19 +1,29 @@
-//! PromQL v2 execution engine.
+//! PromQL v2 execution engine. Replaces the row-oriented AST interpreter in
+//! [`crate::promql::evaluator`] and [`crate::promql::pipeline`] with a
+//! columnar, step-major, pull-based pipeline: each operator yields
+//! [`StepBatch`]es (rectangles of `series × step` values) when polled, and
+//! the query result is the root operator's final batch reshaped onto the HTTP
+//! wire format. Gated behind the `promql-v2` Cargo feature. See
+//! `timeseries/rfcs/0007-promql-execution.md` for the full design.
 //!
-//! Columnar, step-major, pull-based operator pipeline. Replaces the row-oriented AST
-//! interpreter in [`crate::promql::evaluator`] and [`crate::promql::pipeline`]. Gated
-//! behind the `promql-v2` Cargo feature so the baseline build is untouched while the
-//! new engine is under construction.
+//! How the code is laid out:
 //!
-//! See `timeseries/rfcs/0007-promql-execution.md` for the full design and
-//! `timeseries/rfcs/0007-impl-plan.md` for how the module is being built out.
-//!
-//! Module layout:
-//! - [`batch`]: `StepBatch`, `SeriesSchema`, `SchemaRef` (unit 1.3).
-//! - [`memory`]: `MemoryReservation` and memory-limit error variants (unit 1.4).
-//! - [`operator`]: the `Operator` trait (unit 1.5).
-//! - [`source`]: the `SeriesSource` storage contract (unit 2.1).
-//! - [`source_adapter`]: adapter over the existing `QueryReader` (unit 2.2).
+//! - [`batch`], [`operator`]: the wire shape ([`StepBatch`]) and the
+//!   pull-based operator trait every node in the tree implements.
+//! - [`memory`]: per-query [`MemoryReservation`] — every allocating operator
+//!   routes through `try_grow` so memory limits are enforced centrally.
+//! - [`source`], [`source_adapter`]: the storage-facing trait
+//!   ([`SeriesSource`]) and the in-repo adapter over the per-bucket
+//!   `QueryReader`.
+//! - [`operators`]: concrete operator implementations (selectors, functions,
+//!   aggregations, binary ops, subqueries, plumbing).
+//! - [`plan`]: PromQL `Expr` → [`LogicalPlan`] lowering, rule-based
+//!   optimisation, and physical-plan construction (series resolution, group
+//!   maps, match tables).
+//! - [`reshape`]: converts the stream of collected [`StepBatch`]es back to
+//!   the [`QueryValue`](crate::model::QueryValue) shape the HTTP layer emits.
+//! - [`trace`], [`index_cache`]: per-query tracing collector and
+//!   inverted/forward-index dedup cache (shared across selectors).
 
 pub(crate) mod batch;
 pub(crate) mod index_cache;

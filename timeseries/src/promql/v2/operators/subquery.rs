@@ -1,75 +1,25 @@
-//! `Subquery` operator — unit 3c.2.
+//! `SubqueryOp` implements PromQL's subquery syntax (`expr[range:step]`)
+//! — the "compute an inner range vector at a finer step, then feed it to
+//! a range function" construct.
 //!
-//! Pipeline-breaker that re-grids an arbitrary child [`Operator`] onto the
-//! subquery's inner step, one *outer* step at a time, and packs the inner
-//! instant-vector samples into a [`MatrixWindowBatch`] compatible with the
-//! [`WindowStream`] contract 3b.1 defined. In PromQL surface terms:
-//! `expr[range:inner_step]` evaluates `expr` at `t0, t0+inner_step, …, tN`
-//! covering `(outer_t - range, outer_t]`, producing one matrix cell per
-//! outer step that an enclosing [`RollupOp`] (or chained subquery) consumes
-//! exactly as it would the output of a [`MatrixSelectorOp`].
+//! A subquery is logically an inner range-vector producer and feeds
+//! into a downstream [`RollupOp`], so `SubqueryOp` implements the same
+//! [`WindowStream`] contract `MatrixSelectorOp` does — it emits
+//! [`MatrixWindowBatch`]es, one per outer step. `Operator::next` is a
+//! degenerate "immediate EOS", same arrangement as [`MatrixSelectorOp`].
 //!
-//! See RFC 0007 §"Operator Taxonomy" ("`Subquery`: Re-grids child onto
-//! inner step; feeds outer MatrixSelector semantics.") and §5 Decisions
-//! Log (unit 3c.2).
+//! The hard part is that the inner child has to be re-evaluated for each
+//! outer step (the inner window slides). The operator owns a
+//! [`ChildFactory`] closure the planner supplies; it calls the factory
+//! once per outer step to build a freshly-planned child covering
+//! `(outer_t - range, outer_t]` at the inner step, drains the child, and
+//! packs the resulting instant-vector samples into a
+//! [`MatrixWindowBatch`].
 //!
-//! # Architecture
-//!
-//! The child is a **re-plannable sub-tree**: the operator owns a factory
-//! closure the planner supplies at construction time, and builds a fresh
-//! child [`Operator`] per outer step with that step's inner
-//! `(TimeRange, step_ms)` plugged in. This matches the "build a child
-//! plan for each outer step" model outlined in the task spec; a single
-//! child bound to one inner grid cannot express the required per-step
-//! window shift.
-//!
-//! Because `SubqueryOp`'s output is a matrix (one vector-per-inner-step
-//! per outer step), the [`Operator::next`] surface is *degenerate* —
-//! identical to [`MatrixSelectorOp`]'s: it returns `Ready(None)`
-//! immediately. The useful API is [`SubqueryOp::windows`] /
-//! [`WindowStream::poll_windows`], which emits **one [`MatrixWindowBatch`]
-//! per outer step** in v1. Batch-packing into larger outer-step tiles is
-//! a later optimisation (§5 Decisions Log).
-//!
-//! # Memory accounting
-//!
-//! The subquery **shares the parent's [`MemoryReservation`]** in v1 (RFC
-//! Open Question #2 resolved in §5 Decisions Log — nested-budget scoping
-//! is a post-MVP concern). Every allocation flows through the same
-//! reservation: the factory clones it into the freshly-built child, the
-//! per-outer-step scratch buffers reserve before packing, and each
-//! emitted [`MatrixWindowBatch`] releases its byte slice when the
-//! consumer takes ownership (same convention as 3a.2).
-//!
-//! # Factory shape
-//!
-//! ```ignore
-//! Box<dyn FnMut(TimeRange, i64) -> Result<Box<dyn Operator + Send>, QueryError> + Send>
-//! ```
-//!
-//! - `TimeRange` is the inner `(outer_t - range, outer_t]` window
-//!   (inclusive-exclusive per [`TimeRange`] convention: start is the first
-//!   inner step strictly greater than `outer_t - range`, end is
-//!   `outer_t + 1`). The factory is responsible for aligning the inner
-//!   step grid to the requested range — this operator does not reshape
-//!   the grid the child publishes.
-//! - `i64` is the inner `step_ms` — the spacing between inner evaluation
-//!   points.
-//! - The factory may fail (e.g. allocation-gate) by returning a
-//!   [`QueryError`]; the subquery propagates that error verbatim.
-//!
-//! `FnMut` rather than `Fn` so the planner can carry mutable plan-time
-//! state (e.g. a cached child-schema handle) through the factory; `Send`
-//! so the operator composes with `Concurrent` wrappers.
-//!
-//! # Verified invariants (debug_assert)
-//!
-//! - The child's published schema must match the sub-tree's output
-//!   series roster (static; stamped at construction). A `Deferred` child
-//!   schema is a planner bug — `count_values` inside a subquery is out
-//!   of scope for v1.
-//! - The child's step grid must advance monotonically within the inner
-//!   window; samples outside `(outer_t - range, outer_t]` are dropped.
+//! The subquery shares its parent's [`MemoryReservation`]; nested
+//! per-subquery reservations are deferred. A [`SchemaRef::Deferred`] child
+//! schema is a planner bug — `count_values` inside a subquery is out of
+//! scope.
 
 use std::task::{Context, Poll};
 
@@ -117,10 +67,9 @@ fn window_bytes(cells: usize, samples: usize) -> usize {
 /// buffers for a single emitted [`MatrixWindowBatch`].
 ///
 /// Reserves the cell-index array up front, grows the flat sample buffer
-/// as samples arrive, releases the entire allotment on [`Drop`], and
+/// as samples arrive, releases the entire reservation on [`Drop`], and
 /// transfers ownership of the inner vectors via [`Self::finish`]
-/// (matching 3a.2 / 3b.1's convention: downstream re-reserves if it
-/// retains the batch).
+/// (downstream re-reserves if it retains the batch).
 struct WindowBuffers {
     reservation: MemoryReservation,
     bytes: usize,
@@ -174,16 +123,19 @@ impl Drop for WindowBuffers {
 // Subquery operator
 // ---------------------------------------------------------------------------
 
-/// PromQL subquery re-grid operator.
+/// Implements PromQL's subquery syntax `expr[range:step]`.
 ///
-/// Constructs a fresh child operator per outer step via the supplied
-/// [`ChildFactory`], drains the child's [`StepBatch`] stream, and packs
-/// the inner-step instant-vector samples into a [`MatrixWindowBatch`]
-/// covering the outer step's `(outer_t - range, outer_t]` window.
+/// For each outer step, builds a fresh child operator via the
+/// planner-supplied [`ChildFactory`] covering the inner window
+/// `(outer_t - range, outer_t]` at the inner step, drains the child's
+/// [`StepBatch`] stream, and packs the resulting instant-vector samples
+/// into a [`MatrixWindowBatch`] for a downstream [`RollupOp`] to reduce.
 ///
-/// See module docs for the architectural invariants; see §5 Decisions
-/// Log (unit 3c.2) for the factory shape, shared-reservation choice,
-/// and one-batch-per-outer-step emission policy.
+/// See module docs for the architectural invariants, factory shape,
+/// shared-reservation choice, and one-batch-per-outer-step emission
+/// policy.
+///
+/// [`RollupOp`]: super::rollup::RollupOp
 pub struct SubqueryOp {
     // Plan-time inputs ------------------------------------------------------
     factory: ChildFactory,
@@ -198,8 +150,7 @@ pub struct SubqueryOp {
     /// `true` when the subquery has a non-trivial `@` or `offset`
     /// modifier and `effective_times` differs from `outer_step_timestamps`.
     /// Propagated to the emitted [`MatrixWindowBatch`] so the enclosing
-    /// `RollupOp` computes window math over the actual sample window
-    /// (RFC 0007 §6.3.8).
+    /// `RollupOp` computes window math over the actual sample window.
     has_effective_shift: bool,
     series: Arc<SeriesSchema>,
     range_ms: i64,
@@ -230,8 +181,8 @@ impl SubqueryOp {
     ///   Must be `> 0`; the planner resolves the PromQL default when
     ///   omitted.
     /// * `reservation` — per-query reservation; **shared** with the
-    ///   parent (no nested scope — see §5 Decisions Log 3c.2 for RFC
-    ///   Open Question #2 resolution).
+    ///   parent (no nested scope — nested-reservation scoping is a post-MVP
+    ///   concern).
     /// * `effective_times` — per-outer-step effective evaluation times
     ///   with the subquery's `@` / `offset` already folded in. Must be the
     ///   same length as `outer_grid.step_count`. Use [`Self::new`] when
@@ -355,15 +306,13 @@ impl SubqueryOp {
         loop {
             match child.next(cx) {
                 Poll::Pending => {
-                    // v1 `SubqueryOp` does not persist partial child
-                    // state across polls — the whole child sweep happens
-                    // within a single `windows()` invocation. If the
-                    // underlying storage is async-ready under back
-                    // pressure, the *caller*'s task will re-poll us and
-                    // we rebuild from scratch. This is the "keep it
-                    // simple" v1 policy (§5 Decisions Log 3c.2);
-                    // revisit once a `Concurrent` wrapper exercises the
-                    // real async path.
+                    // `SubqueryOp` does not persist partial child state
+                    // across polls — the whole child sweep happens within
+                    // a single `windows()` invocation. If the underlying
+                    // storage is async-ready under back pressure, the
+                    // *caller*'s task will re-poll us and we rebuild from
+                    // scratch. Revisit once a `Concurrent` wrapper
+                    // exercises the real async path.
                     return Poll::Pending;
                 }
                 Poll::Ready(None) => break,
@@ -422,8 +371,7 @@ impl SubqueryOp {
 
     /// Absorb one inner-step [`StepBatch`] into the per-series scratch
     /// columns. Drops invalid cells (validity=0) and `STALE_NAN` values
-    /// up front — consumers (`Rollup`) expect pre-filtered windows per
-    /// 3a.2's policy.
+    /// up front — consumers (`Rollup`) expect pre-filtered windows.
     fn absorb_batch(
         batch: &StepBatch,
         inner_window: TimeRange,
@@ -468,7 +416,7 @@ impl SubqueryOp {
     /// Secondary API — the useful one.
     ///
     /// Polls for the next outer-step [`MatrixWindowBatch`]. v1 emits one
-    /// batch per outer step (see §5 Decisions Log 3c.2).
+    /// batch per outer step.
     pub fn windows(
         &mut self,
         cx: &mut Context<'_>,

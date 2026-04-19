@@ -1,58 +1,21 @@
-//! `Rechunk` breaker — unit 3c.3.
+//! `RechunkOp` — the reshaping helper the planner inserts when two
+//! adjacent operators disagree on the preferred `(step_chunk, series_chunk)`
+//! tile shape. Same roster, same step grid, same values — only the
+//! rectangle boundaries of the emitted [`StepBatch`]es change.
 //!
-//! Repackages an upstream stream of [`StepBatch`]es to a different
-//! `(step_chunk × series_chunk)` tile shape. Logically a pipeline breaker:
-//! the operator buffers upstream batches until the current target tile is
-//! fully covered, then emits the tile. Upstream and downstream see the
-//! same series roster and the same step grid — only the rectangle
-//! boundaries change.
+//! Strategy: full materialisation. Buffer the entire
+//! `step_count × series_count` grid into a dense scratch, then emit tiles
+//! in the target shape. Worst-case memory is bounded at plan time because
+//! both axes are plan-time constants; the scratch is charged once via
+//! [`MemoryReservation::try_grow`] and released on drop / EOS.
 //!
-//! # Strategy
+//! Passthrough short-circuit: if the first upstream batch already matches
+//! the target shape, re-emit upstream batches verbatim with no copy and
+//! no reservation. This is what makes it safe to leave a `RechunkOp` in
+//! the plan even when upstream already produces the right rectangle.
 //!
-//! RFC §"Operator Taxonomy": *"Transposes series-major ↔ step-major when
-//! ops need the other axis."* In the v2 data model [`StepBatch`] already
-//! carries both axes (row-major-by-step values for a `K × N` rectangle)
-//! so the transpose is trivial; what callers really need is a different
-//! *batch boundary*. `RechunkOp` materialises the full grid into a dense
-//! `(step_count × series_count)` scratch buffer, then re-emits it as
-//! `(target_step_chunk × target_series_chunk)` tiles.
-//!
-//! Two mode choices, picked up front:
-//!
-//! 1. **Full materialisation** (chosen). Simplest correct thing: buffer
-//!    everything, then emit tiles. Worst-case memory is
-//!    `step_count × series_count × (8 B + 1 bit)` — plan-time bounded
-//!    because both axes are plan-time constants. Fully routed through
-//!    [`MemoryReservation::try_grow`].
-//! 2. **Partial / sliding materialisation** — buffer only enough rows/
-//!    columns to form the next target tile. More complex, requires
-//!    upstream emission order to be predictable. Deferred.
-//!
-//! Plus a **passthrough short-circuit**: when the first upstream batch's
-//! shape already matches the target, re-emit upstream batches verbatim
-//! (without copying / without reserving scratch memory). Planners that
-//! insert `RechunkOp` in mixed-shape plans benefit from this — the op is
-//! safe to leave in the plan even when the upstream happens to already be
-//! producing the right rectangle.
-//!
-//! Upstream emission order is assumed to be a natural scan — some
-//! interleaving of step and series ranges — but no particular ordering is
-//! required. The operator places each upstream batch into the scratch by
-//! (step, series) offset, so out-of-order upstream emission is handled
-//! correctly.
-//!
-//! # Memory accounting
-//!
-//! A single [`MemoryReservation::try_grow`] call charges
-//! `scratch_bytes = step_count × series_count × (8 + 1/8)` bytes before
-//! any `values` / validity allocation. The corresponding `release` happens
-//! on drop (end-of-stream, operator dropped, or error short-circuit).
-//!
-//! Per-tile output batches are *not* re-reserved: the operator drains its
-//! scratch buffer into the output `Vec<f64>` / `BitSet` (transferring
-//! ownership of slices, not re-allocating). The scratch reservation is
-//! released only after every tile has been emitted — this matches the
-//! "pipeline-breaker" framing (memory is held until the breaker drains).
+//! Upstream batches may arrive in any interleaving of step / series
+//! ranges — the operator tolerates reordering.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -124,11 +87,9 @@ fn scratch_bytes(cells: usize) -> usize {
 // RechunkOp — the operator
 // ---------------------------------------------------------------------------
 
-/// Pipeline-breaker that repackages its child's output batches to a
-/// different `(step_chunk, series_chunk)` rectangle.
-///
-/// See module docs for the strategy, memory accounting, and ordering
-/// contract.
+/// Reshaping operator that repackages its child's [`StepBatch`]es to a
+/// different `(step_chunk, series_chunk)` tile shape, leaving the roster,
+/// grid, and values unchanged.
 pub struct RechunkOp<C: Operator> {
     child: C,
     target_step_chunk: usize,
@@ -138,54 +99,32 @@ pub struct RechunkOp<C: Operator> {
     state: State,
 }
 
-/// Internal state machine. Held as a discrete enum so `next()` can
-/// transition cleanly (draining the child → emitting tiles → done).
 enum State {
-    /// Haven't polled the child yet.
     Init,
-    /// Short-circuiting upstream batches unchanged. Reached when the first
-    /// upstream batch's shape matches the target exactly.
+    /// First upstream batch matches the target exactly; pass through.
     Passthrough,
-    /// Full-materialisation path: drain all upstream batches into
-    /// [`Scratch`], then emit tiles.
+    /// Draining all upstream batches into [`Scratch`].
     Draining {
         scratch: Scratch,
         step_timestamps: Arc<[i64]>,
         series: SchemaRef,
     },
-    /// Tiles are ready to emit from [`Scratch`]. `next_step` / `next_series`
-    /// are the top-left cell (in global step / global series offsets within
-    /// the scratch rectangle) of the next tile to emit.
+    /// Emitting tiles from [`Scratch`]. `next_step` / `next_series` are the
+    /// top-left cell (global offsets) of the next tile.
     Emitting {
         scratch: Scratch,
         step_timestamps: Arc<[i64]>,
         series: SchemaRef,
-        /// Step offset (into `scratch`, which starts at global step 0) of
-        /// the next tile's first step.
         next_step: usize,
-        /// Series offset (into `scratch`, which starts at global series 0)
-        /// of the next tile's first series.
         next_series: usize,
-        /// Total step count — plan-time known, cached so we don't re-read
-        /// `schema` on every poll.
         step_count: usize,
-        /// Total series count — plan-time known.
         series_count: usize,
     },
-    /// End-of-stream or terminal error.
     Done,
 }
 
 impl<C: Operator> RechunkOp<C> {
-    /// Construct a rechunker wrapping `child`.
-    ///
-    /// - `target_step_chunk`: emitted batches cover at most this many
-    ///   consecutive steps. Zero is rejected (it is degenerate; the
-    ///   planner must not build a rechunker with a zero-sized target).
-    /// - `target_series_chunk`: emitted batches cover at most this many
-    ///   consecutive series.
-    /// - `reservation`: the scratch buffer's memory is routed through
-    ///   this.
+    /// `target_*_chunk` values must be `> 0`.
     pub fn new(
         child: C,
         target_step_chunk: usize,
@@ -213,8 +152,6 @@ impl<C: Operator> RechunkOp<C> {
         }
     }
 
-    /// Total step count and total series count for the full grid — read
-    /// from the schema.
     fn grid_shape(&self) -> (usize, usize) {
         let step_count = self.schema.step_grid.step_count;
         let series_count = match &self.schema.series {
@@ -229,9 +166,6 @@ impl<C: Operator> RechunkOp<C> {
         (step_count, series_count)
     }
 
-    /// Copy one upstream batch's cells into the scratch buffer at their
-    /// global `(step_range, series_range)` offsets. Validity bits come
-    /// through bit-for-bit.
     fn ingest(scratch: &mut Scratch, batch: &StepBatch) {
         let step_count_in = batch.step_count();
         let series_count_in = batch.series_count();

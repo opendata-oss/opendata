@@ -1,137 +1,71 @@
-//! `Aggregate` operator — units 3b.4 (streaming) and 3c.1 (breakers).
+//! `AggregateOp` implements PromQL's aggregation operators: `sum by (…)`,
+//! `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `group`, `topk`,
+//! `bottomk`, and `quantile`. One operator type handles all of them; the
+//! specific reduction is selected by an [`AggregateKind`] enum.
+//! (`count_values` has its own operator because its output labels depend on
+//! sample values, not just label matchers.)
 //!
-//! Reduces an upstream [`Operator`]'s step batches by collapsing input
-//! series into output groups. The group map — the input-series-index →
-//! output-group-index lookup — is a **plan-time artifact** (RFC 0007
-//! §"Core Data Model" / §"Execution Model"): the planner builds it from
-//! the query's `by (labels)` / `without (labels)` modifiers and the
-//! input series schema, and hands it to the operator as a constructor
-//! argument. This operator performs no grouping at runtime.
+//! PromQL's `by (…)` / `without (…)` decides which input series end up in
+//! the same output group. That mapping is fixed by the query's labels and
+//! doesn't depend on sample data, so the planner computes it once up
+//! front — the operator just receives a [`GroupMap`]
+//! (input series index → output group index) and reads from it. For
+//! `sum by (pod) (http_requests_total)`, the planner maps each input
+//! series to a group index keyed on its `pod` label value before any
+//! samples are fetched. No grouping logic at runtime.
 //!
-//! # Aggregations covered
+//! # Streaming kinds
 //!
-//! ## Streaming (3b.4)
+//! `Sum`, `Avg`, `Min`, `Max`, `Count`, `Stddev`, `Stdvar`, `Group` apply a
+//! per-cell single-pass reducer. The child may tile its output arbitrarily
+//! (any `(step_range, series_range)` slice), so the operator buffers a
+//! `(step × group)` accumulator grid and only emits once the child signals
+//! end-of-stream. Grid footprint is
+//! `O(step_count × output_groups × sizeof(Accumulator))`.
 //!
-//! Named "streaming" for the per-cell single-pass reducer. Correctness
-//! under arbitrary child tiling (`step_tile × series_tile` emission from
-//! `VectorSelectorOp`, plus `Concurrent` / `Coalesce` interleaving)
-//! requires buffering every input cell into a `(step × group)`
-//! accumulator grid and emitting a single output batch on child-EOS.
-//! The per-cell reducer stays cheap; the grid's footprint is
-//! `O(step_count × output_groups × sizeof(Accumulator))`. See §5
-//! Decisions Log for why an earlier per-batch emit path was incorrect.
+//! # Breaker kinds — `Topk`, `Bottomk`, `Quantile`
 //!
-//! | kind     | reducer                                     | min-valid |
-//! |----------|---------------------------------------------|-----------|
-//! | `Sum`    | Kahan–Neumaier compensated sum              | 1         |
-//! | `Avg`    | compensated incremental mean (overflow-safe)| 1         |
-//! | `Min`    | NaN-safe min (first real initialises)       | 1         |
-//! | `Max`    | NaN-safe max (first real initialises)       | 1         |
-//! | `Count`  | integer count of valid input cells          | 1         |
-//! | `Stddev` | Welford single-pass, Kahan-compensated      | 1         |
-//! | `Stdvar` | Welford single-pass, Kahan-compensated      | 1         |
-//! | `Group`  | `1.0` iff any input contributed             | 1         |
+//! These buffer the whole step before emitting (K-selection and quantile
+//! interpolation need every input for the step, so they can't stream
+//! cell-by-cell like the reducer kinds — hence "breaker").
 //!
-//! ## Breakers (3c.1) — `topk`, `bottomk`, `quantile`
+//! | kind         | output schema  | per-step scratch        |
+//! |--------------|----------------|-------------------------|
+//! | `Topk(k)`    | input series   | `k × group_count` heap  |
+//! | `Bottomk(k)` | input series   | `k × group_count` heap  |
+//! | `Quantile(q)`| group series   | per-group sort buffer   |
 //!
-//! These buffer a whole step before emitting: you cannot decide whether
-//! a given `(step, series)` cell belongs in the top K until every input
-//! for that step has been seen. The breaker paths run inside the same
-//! [`AggregateOp`] — the variant on [`AggregateKind`] selects the code
-//! path — and share the same [`GroupMap`] shape as the streaming ops.
+//! `topk` / `bottomk` filter (preserve input series, flip validity on
+//! unselected cells); `quantile` reduces (one cell per group). The planner
+//! picks the output schema; the operator debug-asserts its size matches the
+//! variant.
 //!
-//! | kind         | output schema     | per-step memory         |
-//! |--------------|-------------------|-------------------------|
-//! | `Topk(k)`    | **input** series  | `k × group_count` heap  |
-//! | `Bottomk(k)` | **input** series  | `k × group_count` heap  |
-//! | `Quantile(q)`| group series      | per-group sort buffer   |
+//! Tie-break for `topk` / `bottomk`: equal values go to the lower
+//! input-series index (deterministic). NaN inputs rank worst. `k < 1`
+//! selects nothing; `k` past input width selects every valid cell.
 //!
-//! ### Output schema asymmetry (planner contract)
+//! `quantile`: `q < 0` ⇒ `-inf`, `q > 1` ⇒ `+inf`, `q == NaN` ⇒ `NaN`.
 //!
-//! `topk` / `bottomk` act as **filters**: they pick the K largest /
-//! smallest values per group per step and preserve the **input** series
-//! as output, flipping validity=0 for cells that didn't make the cut.
-//! `quantile` is a **reducer**: it emits one output cell per group per
-//! step, same shape as the streaming kinds.
+//! # Group map
 //!
-//! The planner decides the output schema and hands the correct one in
-//! to [`AggregateOp::new`] (see §5 Decisions Log 3c.1). The operator
-//! debug-asserts the schema size matches the variant's expectation:
+//! `input_to_group: Vec<Option<u32>>` — `None` drops an input from all
+//! aggregations. `by ()` ⇒ all inputs map to group 0. `without ()` ⇒ one
+//! group per input.
 //!
-//! - streaming / `Quantile`: `output_schema.len() == group_count`
-//! - `Topk` / `Bottomk`: `output_schema.len() == input_series_count`
+//! # Validity
 //!
-//! ### Tie-break rule (topk / bottomk)
+//! Every kind emits a valid output cell iff at least one valid input
+//! contributed to its group. `Group` always emits `1.0`; `Count` emits the
+//! count (always ≥ 1 when valid).
 //!
-//! Matches the existing engine (`evaluator.rs:649-693`
-//! `compare_k_values` + `KHeapEntry::cmp`): equal-valued cells are
-//! ordered by **lower input-series index wins** (deterministic,
-//! first-seen preference). NaN inputs rank "worst" — they are
-//! selected only when K ≥ (valid non-NaN count in group) and some
-//! NaN-bearing cells remain; matches legacy behavior.
+//! # Memory
 //!
-//! ### K semantics (topk / bottomk)
+//! Streaming-kind accumulator grid is allocated once at construction and
+//! fails with [`QueryError::MemoryLimit`] if it doesn't fit. Breaker
+//! scratch is per-step, drained between steps. Output batches allocate
+//! per-poll.
 //!
-//! K is an `i64`. Per `evaluator.rs:2249-2253` `coerce_k_size`:
-//! K < 1 ⇒ no cells selected. K ≥ input width ⇒ every valid input cell
-//! is eligible for selection. Literal `k` values are coerced at plan
-//! time; scalar expression params (e.g. `topk(scalar(foo), bar)`) are
-//! drained once onto the query step grid and coerced per step.
-//!
-//! ### q semantics (quantile)
-//!
-//! Matches `rollup::rollup_fns::quantile` linear-interpolation rule
-//! (cited Prometheus `quantile_over_time`): `q < 0` ⇒ `-inf`, `q > 1`
-//! ⇒ `+inf`, `q == NaN` ⇒ `NaN`. Validity=1 for the group whenever
-//! at least one valid input contributed.
-//!
-//! # Group map semantics
-//!
-//! The constructor takes a [`GroupMap`] with an `input_to_group:
-//! Vec<Option<u32>>` of length equal to the input series count. Entry `i`
-//! is the output group index for input series `i`, or `None` to drop
-//! that input from all aggregations (edge case; the planner only emits
-//! `None` if it ever needs to exclude a series without trimming the
-//! input schema — see §5 Decisions Log for discussion).
-//!
-//! - `by ()` ⇒ all input series map to group 0, `group_count == 1`.
-//! - `without ()` ⇒ each input series gets its own group, `group_count
-//!   == input_series_count`.
-//! - The output [`SeriesSchema`] (`group_count` entries) is built by the
-//!   planner from the selected grouping labels and passed in via
-//!   [`AggregateOp::new`].
-//!
-//! # Validity rules
-//!
-//! - `Sum` / `Avg` / `Min` / `Max` / `Stddev` / `Stdvar` — output cell is
-//!   valid iff at least one valid input contributed to its group.
-//! - `Count` — output cell is valid iff at least one valid input
-//!   contributed (value is the count, always ≥ 1 in that case). A group
-//!   with zero valid inputs emits `validity = 0` (matches the existing
-//!   engine — `count()` over no samples drops the group, and within an
-//!   existing group with no valid cells the result is absent).
-//! - `Group` — output cell is valid iff at least one input contributed;
-//!   value is always `1.0`.
-//!
-//! # Memory accounting
-//!
-//! - **Scratch accumulators** — `step_count × group_count` accumulators
-//!   for streaming kinds, allocated once at operator construction; bytes
-//!   are charged to the reservation and released on `Drop`. Construction
-//!   fails with [`QueryError::MemoryLimit`] if the grid does not fit
-//!   the query reservation.
-//! - **Breaker scratch** — `Topk` / `Bottomk` reserve a per-group heap;
-//!   `Quantile` reserves a per-group sort buffer. Both are per-step
-//!   (drained between steps) because breaker paths still emit per-batch.
-//! - **Per-batch output** — `Vec<f64>` + `BitSet` for the output batch,
-//!   charged on each poll and transferred to the consumer via
-//!   [`StepBatch::new`]. The input batch's reservation belongs to the
-//!   child operator.
-//!
-//! # Schema contract
-//!
-//! [`SchemaRef::Static`] — the output schema is pre-computed by the
-//! planner.
+//! Output schema is always [`SchemaRef::Static`].
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -147,37 +81,26 @@ use super::super::operator::{Operator, OperatorSchema};
 // ---------------------------------------------------------------------------
 
 /// Discriminant selecting the per-group reducer.
-///
-/// A `Copy` enum so dispatch is a single match per step. Streaming
-/// variants (3b.4) are single-pass per cell; breaker variants (3c.1:
-/// `Topk` / `Bottomk` / `Quantile`) buffer a whole step before emitting
-/// and dispatch to a separate code path inside [`AggregateOp`]. Keeping
-/// them all in one enum (vs. one-enum-per-operator) lets the planner
-/// lower every aggregation to a single `AggregateKind`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregateKind {
-    /// Kahan-compensated sum over valid input cells.
+    /// Kahan-compensated.
     Sum,
     /// Overflow-resistant running mean.
     Avg,
-    /// NaN-safe minimum — NaN is ignored when a real value is available.
+    /// NaN-safe (NaN ignored when a real value exists).
     Min,
-    /// NaN-safe maximum — NaN is ignored when a real value is available.
+    /// NaN-safe (NaN ignored when a real value exists).
     Max,
-    /// Integer count of valid input cells, emitted as `f64`.
+    /// Integer count emitted as `f64`.
     Count,
-    /// Population standard deviation (Welford single-pass).
+    /// Welford single-pass.
     Stddev,
-    /// Population variance (Welford single-pass).
+    /// Welford single-pass.
     Stdvar,
-    /// Always emits `1.0` when at least one input contributed.
+    /// Always `1.0` when any input contributed.
     Group,
-    /// `topk(k, v)` — select the K largest values per group per step.
-    ///
-    /// Output schema is the **input series** (see §"Breakers" in the
-    /// module docs). Cells not selected get `validity = 0`. `k < 1`
-    /// selects nothing. Matches the existing engine's
-    /// `select_k_from_group` with `KAggregationOrder::Top`.
+    /// `topk(k, v)`. Output schema is the **input series**; unselected cells
+    /// get `validity = 0`. See module docs for tie-break / k semantics.
     Topk(i64),
     /// `bottomk(k, v)` — smallest-K counterpart to [`Self::Topk`].
     Bottomk(i64),
@@ -210,41 +133,26 @@ impl AggregateKind {
 // GroupMap — the planner-built series-index → group-index mapping
 // ---------------------------------------------------------------------------
 
-/// Plan-time mapping from input series index to output group index.
+/// Input-series index → output-group index, precomputed by the planner
+/// from the query's `by` / `without` clause. The operator reads this array
+/// to decide which accumulator absorbs each cell; it never recomputes
+/// grouping itself.
 ///
-/// Built by the planner from the input series' labels and the query's
-/// `by` / `without` modifier. The operator treats this as an opaque
-/// lookup — it does not interpret labels or recompute grouping at
-/// runtime (RFC §"Execution Model").
+/// Example: for `sum by (pod) (http_requests_total)`, the planner walks the
+/// resolved series list, bucketises by `pod` label value, and records a
+/// group index (or `None` to drop the input) for each input series here.
 ///
-/// # Encoding choice
-///
-/// `input_to_group` uses `Vec<Option<u32>>` rather than a sentinel value
-/// (e.g. `u32::MAX`). Rationale: the `None` case is rare (the planner
-/// almost always emits `Some(_)` for every input; a `None` happens only
-/// when the planner explicitly wants to drop an input from the
-/// aggregation). `Option<u32>` makes the intent explicit at the cost of
-/// 4 bytes of padding per entry — negligible compared to the per-batch
-/// values/validity column this operator already pays for. See §5
-/// Decisions Log.
-///
-/// # Invariants (planner-guaranteed)
-///
+/// Invariants (planner-guaranteed):
 /// - `input_to_group.len()` equals the input operator's series count.
-/// - Every `Some(g)` value satisfies `g < group_count`.
+/// - Every `Some(g)` satisfies `g < group_count`.
 #[derive(Debug, Clone)]
 pub struct GroupMap {
-    /// For each input-series index, the output group index (or `None`
-    /// to drop from aggregation).
+    /// `None` drops an input from aggregation.
     pub input_to_group: Vec<Option<u32>>,
-    /// Number of output groups. The output [`SeriesSchema`] has exactly
-    /// this many rows.
     pub group_count: usize,
 }
 
 impl GroupMap {
-    /// Build a group map. Panics in debug if any `Some(g)` exceeds
-    /// `group_count` (planner contract).
     pub fn new(input_to_group: Vec<Option<u32>>, group_count: usize) -> Self {
         debug_assert!(input_to_group.iter().all(|slot| match slot {
             Some(g) => (*g as usize) < group_count,
@@ -256,7 +164,6 @@ impl GroupMap {
         }
     }
 
-    /// Number of input series this map covers.
     #[inline]
     pub fn input_series_count(&self) -> usize {
         self.input_to_group.len()
@@ -267,18 +174,8 @@ impl GroupMap {
 // Per-group accumulator
 // ---------------------------------------------------------------------------
 
-/// Single-pass accumulator for one group, used by every kind above.
-///
-/// Fields fall into three orthogonal lanes:
-/// - Sum/Avg: Kahan-compensated `sum` / `c`.
-/// - Min/Max: `extremum` tracks the running value; the `any_valid` flag
-///   distinguishes "no valid input yet" from "first valid was NaN".
-/// - Welford (Stddev/Stdvar): `mean` / `c_mean` / `m2` / `c_m2` /
-///   `count` evolve together on every update.
-///
-/// All fields are always updated regardless of kind (the update cost is
-/// trivially overlapped with the per-cell work). The reducer reads only
-/// the lane it needs.
+/// Single-pass per-group accumulator. Three overlapping lanes (Kahan sum,
+/// NaN-safe min/max, Welford) are all maintained; the reducer reads its own.
 #[derive(Debug, Clone, Copy)]
 struct Accumulator {
     /// Count of valid inputs that contributed. Also the Welford `n`.
@@ -590,7 +487,9 @@ impl Drop for OutBuffers {
 // AggregateOp — the operator
 // ---------------------------------------------------------------------------
 
-/// Streaming aggregation operator.
+/// Implements PromQL's aggregation operators (`sum by (…)`, `topk`,
+/// `quantile`, ...). One operator type, with the specific reduction
+/// selected by an [`AggregateKind`] enum.
 ///
 /// See module docs for supported kinds, group-map semantics, validity
 /// rules, and memory accounting.
@@ -618,13 +517,13 @@ pub struct AggregateOp<C: Operator> {
     /// of how the child tiles its emission (step tiles × series tiles).
     /// Empty for breaker kinds.
     ///
-    /// See §5 Decisions Log: streaming aggregate is a step-bounded breaker
-    /// — it must see every series tile for a given step before it can
-    /// emit, because aggregations are associative across input rows but
-    /// not decomposable into "partial tile sums" without a downstream
-    /// merge. Buffering the whole grid keeps the operator correct under
-    /// arbitrary batch ordering (step/series tiles interleaved, or split
-    /// by `Concurrent`/`Coalesce`).
+    /// Streaming aggregate is a step-bounded breaker — it must see every
+    /// series tile for a given step before it can emit, because
+    /// aggregations are associative across input rows but not decomposable
+    /// into "partial tile sums" without a downstream merge. Buffering the
+    /// whole grid keeps the operator correct under arbitrary batch
+    /// ordering (step/series tiles interleaved, or split by
+    /// `Concurrent`/`Coalesce`).
     accums: Vec<Accumulator>,
     /// Step timestamps captured from the first child batch. Reused for the
     /// single output batch this operator emits on EOS. Streaming kinds
@@ -647,8 +546,8 @@ pub struct AggregateOp<C: Operator> {
     /// selection / quantile per step. `values` is row-major
     /// (`values[step * input_series + series]`); `validity` runs
     /// parallel. Allocated alongside the per-kind heap/sort buffers so
-    /// breakers remain correct under arbitrary input tiling (RFC 0007
-    /// §4 unit 6.3.9). Empty for streaming kinds.
+    /// breakers remain correct under arbitrary input tiling. Empty for
+    /// streaming kinds.
     breaker_values: Vec<f64>,
     breaker_validity: BitSet,
     /// Bytes reserved for [`Self::breaker_values`] / `breaker_validity`;
@@ -755,9 +654,9 @@ impl<C: Operator> AggregateOp<C> {
 
         // Breaker kinds need a full-grid (step × input_series) buffer
         // so `topk` / `bottomk` / `quantile` select globally against the
-        // full input at each step rather than per-tile (see RFC 0007 §4
-        // unit 6.3.9). Allocated alongside the per-kind scratch so
-        // construction fails fast on undersize reservations.
+        // full input at each step rather than per-tile. Allocated
+        // alongside the per-kind scratch so construction fails fast on
+        // undersize reservations.
         let (breaker_values, breaker_validity, breaker_grid_bytes) = if kind.is_breaker() {
             let cells = grid
                 .step_count
@@ -808,7 +707,7 @@ impl<C: Operator> AggregateOp<C> {
             _ => {
                 // Streaming kinds buffer a (step × group) accumulator grid
                 // so they remain correct under arbitrary input tiling
-                // (series tiles × step tiles). See §5 Decisions Log.
+                // (series tiles × step tiles).
                 let bytes = accum_bytes(grid.step_count, group_map.group_count);
                 reservation.try_grow(bytes)?;
                 let cells = grid.step_count.saturating_mul(group_map.group_count);
@@ -1015,7 +914,7 @@ impl<C: Operator> AggregateOp<C> {
     /// Row-major by step: `breaker_values[global_step * input_series +
     /// global_series]`. Idempotent across arbitrary batch ordering —
     /// step tiles × series tiles × Concurrent/Coalesce interleaving all
-    /// funnel into the same grid (RFC 0007 §4 unit 6.3.9).
+    /// funnel into the same grid.
     fn absorb_batch_breaker(&mut self, input: &StepBatch) {
         debug_assert!(self.kind.is_breaker());
         self.debug_assert_batch_within_input_roster(input);
@@ -1420,7 +1319,7 @@ impl<C: Operator> Operator for AggregateOp<C> {
             // `(step × input_series)` grid, then on EOS run the per-step
             // selection / quantile globally. Correct under arbitrary
             // child tile ordering (step tiles × series tiles, Concurrent
-            // / Coalesce reordering). See RFC 0007 §4 unit 6.3.9.
+            // / Coalesce reordering).
             if self.breaker_emitted {
                 self.done = true;
                 return Poll::Ready(None);
@@ -2781,10 +2680,10 @@ mod tests {
         // given: a filter-shaped topk over the tail slice of a 6-series roster.
         // The global lower-index tie-break and output `series_range` must both
         // be based on the child's absolute roster position, not batch-local 0..n.
-        // Under the RFC 0007 §4 unit 6.3.9 fix the breaker kinds emit a single
-        // filter-shape output covering the full input roster, so the
-        // selected cells land at their global indices (series 3 and 4)
-        // and the leading 0..3 cells are all invalid.
+        // The breaker kinds emit a single filter-shape output covering
+        // the full input roster, so the selected cells land at their
+        // global indices (series 3 and 4) and the leading 0..3 cells
+        // are all invalid.
         let in_schema = mk_schema("in", 6);
         let out_schema = in_schema.clone();
         let grid = mk_grid(1);

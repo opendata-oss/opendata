@@ -1,21 +1,17 @@
-//! EXPLAIN support for the v2 PromQL engine.
+//! The `/explain` endpoint: renders a plan as a JSON-serialisable
+//! [`PlanNode`] tree, at three stages — unoptimised logical, optimised
+//! logical, and physical.
 //!
-//! Walks a [`LogicalPlan`] and produces a JSON-serialisable
-//! [`PlanNode`] tree for each of three stages: unoptimised logical,
-//! optimised logical, and physical. [`describe_physical`] mirrors the
-//! dispatch in [`super::physical::build_node`] but instantiates no
-//! operators and performs no I/O, so it is safe to call as part of a
-//! dry-run HTTP handler.
+//! [`describe_physical`] mirrors
+//! [`super::physical::build_node`]'s per-variant dispatch but
+//! instantiates no operators and performs no I/O, so HTTP handlers can
+//! render it as a dry run. The physical describer duplicates
+//! `build_node`'s dispatch;
+//! `should_describe_physical_agrees_with_build_node` guards against
+//! drift.
 //!
-//! [`pretty_print`] renders a single [`PlanNode`] into a
-//! DataFusion-style indented tree for text/plain responses and tests.
-//!
-//! # Drift
-//!
-//! The physical describer duplicates `build_node`'s per-variant
-//! dispatch. When new variants land or dispatch shape changes, the
-//! paired drift test (`should_describe_physical_agrees_with_build_node`)
-//! flags the divergence — see the test module.
+//! [`pretty_print`] renders the same tree in a DataFusion-style indented
+//! text format.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,14 +21,11 @@ use super::plan_types::{
     AggregateGrouping, AtModifier, BinaryMatching, Cardinality, LogicalPlan, MatchingAxis, Offset,
 };
 
-/// Current wire-format version for [`ExplainResult`]. Bump only on a
-/// breaking change to node names or arg shapes; additive changes keep
-/// the same version.
+/// Bump on a breaking change to node names or arg shapes.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// One node in the serialisable plan tree. `op` names the operator;
-/// `args` carries variant-specific scalar fields; `children` holds
-/// sub-plans in execution order.
+/// `op` names the operator; `args` holds variant-specific fields; `children`
+/// are sub-plans in execution order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanNode {

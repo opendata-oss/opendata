@@ -1,92 +1,30 @@
-//! `InstantFn` operator — unit 3b.2.
+//! `InstantFnOp` implements PromQL's pointwise scalar functions (`abs`,
+//! `ln`, `round`, `clamp`, ...) — every function that takes one sample
+//! and produces one sample at the same `(step, series)` position. One
+//! operator type, with the specific function selected by an
+//! [`InstantFnKind`] enum; dispatch is a single `match` per cell.
 //!
-//! Pointwise scalar function over an upstream [`Operator`] producing
-//! [`StepBatch`]es. Applies one PromQL scalar function cell-by-cell,
-//! preserving the child's series schema and step grid (RFC 0007
-//! §"Operator Taxonomy": "Pointwise scalar functions").
+//! Because the transformation is cell-for-cell, the child's series schema
+//! and step grid pass through unchanged. The operator never rearranges
+//! series and never buffers across steps.
 //!
-//! Rather than one operator per PromQL function, the reducer is selected
-//! by an [`InstantFnKind`] discriminant — the same "dispatch-as-data"
-//! pattern used by [`RollupKind`](super::rollup::RollupKind). Each variant
-//! has a tiny, no-alloc [`InstantFnKind::compute`] body; dispatch is a
-//! single `match` per cell, no trait object, no vtable.
+//! Scope: every pointwise float→float function the legacy engine ships,
+//! plus `sgn`. Excluded: `absent` / `absent_over_time` (derive their own
+//! schema), `histogram_quantile` (native histograms, out of scope),
+//! `scalar` / `vector` / `pi` / `time` (planner-level coercions),
+//! `label_replace` / `label_join` (label mutation — see [`super::label_manip`]).
 //!
-//! # Supported kinds (MVP)
+//! `timestamp()` returns the value of
+//! [`StepBatch::source_timestamps`](super::super::batch::StepBatch::source_timestamps)
+//! for the cell when present, else falls back to the step timestamp (in
+//! seconds). [`VectorSelectorOp`](super::vector_selector::VectorSelectorOp)
+//! is the only operator that populates `source_timestamps`; any operator
+//! that derives a new value drops the column.
 //!
-//! | variant | PromQL function | notes |
-//! |---|---|---|
-//! | `Abs` / `Ceil` / `Floor` / `Exp` / `Ln` / `Log2` / `Log10` / `Sqrt` | `abs/ceil/floor/exp/ln/log2/log10/sqrt` | unary math |
-//! | `Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan` | trig | |
-//! | `Sinh`/`Cosh`/`Tanh`/`Asinh`/`Acosh`/`Atanh` | hyperbolic | |
-//! | `Deg` / `Rad` | radians ↔ degrees | `f64::to_degrees` / `to_radians` |
-//! | `Sgn` | `sgn(v)` | -1 / 0 / +1, NaN passthrough (Prometheus semantics) |
-//! | `Round { to_nearest }` | `round(v[, to_nearest])` | plan-time `to_nearest`; default 1.0 |
-//! | `Clamp { min, max }` | `clamp(v, min, max)` | plan-time scalar bounds |
-//! | `ClampMin { min }` | `clamp_min(v, min)` | plan-time scalar bound |
-//! | `ClampMax { max }` | `clamp_max(v, max)` | plan-time scalar bound |
-//! | `Timestamp` | `timestamp(v)` | see §"Timestamp semantics" below |
-//!
-//! **Parity with the existing engine** (`timeseries/src/promql/functions.rs`):
-//! every pointwise float→float function the legacy engine ships is covered
-//! here: `abs`, `acos`, `acosh`, `asin`, `asinh`, `atan`, `atanh`, `ceil`,
-//! `cos`, `cosh`, `deg`, `exp`, `floor`, `ln`, `log10`, `log2`, `rad`,
-//! `round`, `sin`, `sinh`, `sqrt`, `tan`, `tanh`, `clamp`, `clamp_min`,
-//! `clamp_max`, `timestamp`. Additions: `sgn` (not in the legacy engine;
-//! Prometheus ships it). Deliberate exclusions per plan §3.4 scope:
-//! `absent`/`absent_over_time` (schema-derivation; separate unit),
-//! `histogram_quantile` (out of scope per RFC non-goals: native
-//! histograms), `scalar`/`vector` (planner-level type coercions),
-//! `pi`/`time` (planner-level scalar leaves / coercions). `label_replace` /
-//! `label_join` mutate labels and are handled by a separate operator (not
-//! pointwise in the "cell → cell" sense).
-//!
-//! # Timestamp semantics
-//!
-//! `timestamp()` in this operator returns **the output step timestamp in
-//! seconds** (`step_timestamps[step_off] as f64 / 1000.0`). The legacy
-//! engine (`timeseries/src/promql/functions.rs:870-881`,
-//! `TimestampFunction`) returns the *source sample's* timestamp in seconds
-//! — it reads `sample.timestamp_ms`, the original scrape time of the
-//! lookback-selected sample. In v2's columnar model, `StepBatch` does not
-//! carry per-cell source timestamps (RFC §"Core Data Model": `values:
-//! Vec<f64>` only); the step timestamp is the closest available proxy and
-//! matches the task spec's "`t/1000` (seconds)" definition. This is a
-//! deliberate divergence, recorded in §5 Decisions Log. For instant
-//! queries (step_count == 1, step == eval_timestamp) the two definitions
-//! coincide; for range queries with lookback, v2's `timestamp()` reports
-//! the evaluation step rather than the underlying sample's scrape time.
-//! Phase 6 goldens involving `timestamp()` across range queries may flag
-//! this — that would be an operator re-open, not a fixture change.
-//!
-//! # Validity policy
-//!
-//! - If the input cell's validity bit is clear, the output cell's
-//!   validity bit is also clear (value is left as the NaN-filled default;
-//!   callers must consult validity before reading).
-//! - If the input cell is valid, the output cell is valid — even when the
-//!   computed value is `NaN` or `±inf` (e.g. `ln(-1)` → `NaN`, `ln(0)` →
-//!   `-inf`). This matches the legacy `UnaryFunction` path
-//!   (`timeseries/src/promql/functions.rs:203-211`) which writes
-//!   `sample.value = (self.op)(sample.value)` and preserves the sample
-//!   regardless of the result. Downstream operators (e.g. `Binary`) read
-//!   the NaN like any other value.
-//! - The operator never flips validity from clear to set.
-//!
-//! Since validity is never modified relative to the input, the output
-//! validity is a pointer-clone of the input's — no rebuild needed.
-//!
-//! # Memory accounting
-//!
-//! Output `StepBatch` `values` is a fresh `Vec<f64>`; validity is
-//! pointer-cloned from the input (so only the values column is charged
-//! to this operator's reservation). The [`OutValues`] RAII guard routes
-//! allocation through [`MemoryReservation::try_grow`] and releases on
-//! `Drop`. The input batch's reservation is the child operator's
-//! concern, matching the 3a.1 / 3a.2 / 3b.1 convention: each operator
-//! reserves only the bytes it allocates itself.
-//!
-//! Output `step_timestamps` is an `Arc` pointer-clone of the input's;
-//! `SchemaRef` / `SeriesSchema` flows through unchanged.
+//! Validity: `InstantFnOp` never flips bits — a clear input cell stays
+//! clear, a valid input cell stays valid even when the result is `NaN` /
+//! `±Inf`. The output batch's `validity` is pointer-cloned from the input;
+//! only `values` is charged through [`MemoryReservation::try_grow`].
 
 use std::task::{Context, Poll};
 
@@ -100,12 +38,8 @@ use super::super::operator::{Operator, OperatorSchema};
 // InstantFnKind — one operator, function selection as data
 // ---------------------------------------------------------------------------
 
-/// Discriminant selecting the per-cell pointwise reducer.
-///
-/// Designed as a small `Copy` enum (no allocations) so the reducer
-/// dispatch is a single `match` per cell. Variants that take plan-time
-/// scalar arguments (`Round`, `Clamp*`) carry them inline — the arguments
-/// are constant across every step and series per PromQL semantics.
+/// Per-cell reducer. `Round` / `Clamp*` carry their plan-time scalar args
+/// inline (constant across steps and series per PromQL).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InstantFnKind {
     // --- unary math / transcendentals ---
@@ -348,11 +282,9 @@ fn values_bytes(cells: usize) -> usize {
 }
 
 /// RAII wrapper around a fresh `Vec<f64>` output column. Reserves on
-/// construction; releases on `Drop`. `finish()` transfers ownership of
-/// the `Vec` to the caller and releases the reservation immediately
-/// (matches 3a.1 / 3b.1 convention: operator-owned bytes leave the
-/// operator at batch-emission time; downstream re-reserves if it needs
-/// to retain the batch).
+/// construction; releases on `Drop`. `finish()` transfers the `Vec` to
+/// the caller and releases the reservation. Downstream re-reserves if
+/// it retains the batch.
 struct OutValues {
     reservation: MemoryReservation,
     bytes: usize,
@@ -392,8 +324,10 @@ impl Drop for OutValues {
 // InstantFnOp — the operator
 // ---------------------------------------------------------------------------
 
-/// Pointwise scalar function operator. Applies [`InstantFnKind`]'s reducer
-/// to each cell in every [`StepBatch`] pulled from `child`.
+/// Implements PromQL's pointwise functions (`abs`, `ln`, `round`, ...).
+/// Applies the reducer named by [`InstantFnKind`] to each cell in every
+/// [`StepBatch`] pulled from `child`, preserving the child's series
+/// schema and step grid.
 ///
 /// See module docs for function taxonomy, timestamp semantics, and the
 /// validity / memory-accounting policy.
@@ -1262,9 +1196,9 @@ mod tests {
         use promql_parser::parser::VectorSelector;
         use std::future::ready;
 
-        /// Sync-on-poll mock copied from the 3a.1 tests — single-batch,
-        /// honours `(start, end]` via TimeRange's `[start, end)`
-        /// convention. Samples are in ascending timestamp order.
+        /// Sync-on-poll mock — single-batch, honours `(start, end]` via
+        /// TimeRange's `[start, end)` convention. Samples are in
+        /// ascending timestamp order.
         struct MockSource {
             data: Vec<(Vec<i64>, Vec<f64>)>,
         }

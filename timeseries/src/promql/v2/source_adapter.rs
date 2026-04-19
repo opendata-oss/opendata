@@ -1,24 +1,12 @@
-//! Adapter from the existing per-bucket [`QueryReader`] surface to the v2
-//! [`SeriesSource`] contract.
+//! Adapter from the per-bucket [`QueryReader`] surface to [`SeriesSource`].
 //!
-//! Wraps an `Arc<R: QueryReader>` and fans out per-bucket selector
-//! resolution / sample streaming. Cross-bucket stitching happens inside
-//! this source — callers see a single stream of metadata chunks and a
-//! single stream of sample batches, not per-bucket state.
+//! Fans out per-bucket selector resolution / sample streaming. Callers see
+//! single streams; cross-bucket stitching lives inside this source.
 //!
-//! Decisions (see §5 Decisions Log entries for 2.2):
-//! - Batch emission strategy: **per-bucket batches**. A series that lives
-//!   in several buckets yields one [`SampleBatch`] per bucket (in bucket
-//!   timestamp order). Operators perform the cross-bucket merge — same
-//!   split as the existing `BucketSampleData → shape_matrix_results`
-//!   pipeline.
-//! - Selector matcher logic is re-implemented in [`selector_util`] rather
-//!   than pulled from `promql::selector` (which ties to the evaluator's
-//!   `CachedQueryReader`). Matches the source file's positive/OR/negative
-//!   handling 1:1; the RFC mandates leaving `selector.rs` untouched.
-//!
-//! The adapter is gated behind the `promql-v2` feature through its parent
-//! module.
+//! A series spanning multiple buckets yields one [`SampleBatch`] per bucket
+//! in bucket-timestamp order; operators merge across buckets. Selector
+//! matcher logic is re-implemented in [`selector_util`] rather than pulled
+//! from `promql::selector` (which ties to v1's `CachedQueryReader`).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -54,47 +42,34 @@ use super::source::{
 //     (64 per-series futures in flight). V2 does not — RFC 0007
 //     §"Execution Model" (line 256) prohibits implicit spawn-per-series.
 //     A future "range-coalesced samples" API can close this gap without
-//     breaking the rule (see §5 discussion on selective-scan trade-offs).
+//     breaking the rule.
 //   - V1 has a separate global permit layer (`QueryReaderEvalCache`
 //     metadata/sample semaphores) that throttles real I/O independent of
 //     scheduler readahead. V2 has no such layer; the constants below act
 //     as both scheduler and I/O ceiling.
 
-/// Cross-bucket readahead for [`async_stream_resolve`] — mirrors v1
-/// `METADATA_STAGE_READAHEAD` (pipeline.rs).
+/// Cross-bucket readahead for resolve. Mirrors v1's `METADATA_STAGE_READAHEAD`.
 const METADATA_STAGE_READAHEAD: usize = 32;
 
-/// Cross-bucket readahead for [`build_sample_batches`] (both forward-index
-/// preload and per-run batch construction) — mirrors v1
-/// `SAMPLE_STAGE_READAHEAD` (pipeline.rs).
+/// Cross-bucket readahead for sample batching. Mirrors v1's `SAMPLE_STAGE_READAHEAD`.
 const SAMPLE_STAGE_READAHEAD: usize = 32;
 
-/// Fan-out cap for per-key index fetches inside a single bucket's resolve
-/// path (forward-index entries for each candidate, inverted-index terms
-/// for each `and_term`). Chosen to match the sample-stage cap so the
-/// overall query never exceeds `METADATA_STAGE_READAHEAD * INDEX_PER_KEY`
-/// gets in flight during build_physical.
+/// Per-key index-fetch fan-out inside one bucket's resolve path. Worst-case
+/// in-flight gets during build_physical = `METADATA_STAGE_READAHEAD * INDEX_PER_KEY`.
 const INDEX_PER_KEY_CONCURRENCY: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Bucket-id encoding
 // ---------------------------------------------------------------------------
 
-/// Encode a [`TimeBucket`] into the opaque `u64` carried by
+/// Pack `(start, size)` into the opaque `u64` carried by
 /// [`ResolvedSeriesRef::bucket_id`].
-///
-/// Shape: `(start as u64) << 8 | size as u64`. `size` is a `u8`
-/// (exponent, 1..=15), `start` is a `u32` (minutes-since-epoch). A `u64`
-/// is enough for both pieces with 24 spare high bits.
 #[inline]
 fn encode_bucket(bucket: TimeBucket) -> u64 {
     ((bucket.start as u64) << 8) | (bucket.size as u64)
 }
 
-/// Decode a bucket id back into a [`TimeBucket`]. Inverse of
-/// [`encode_bucket`]. Returns `None` when the encoded `size` is out of
-/// range — defensive; the adapter only mints ids via `encode_bucket`, so
-/// this is a cheap sanity guard rather than a real fallible conversion.
+/// Inverse of [`encode_bucket`]. `None` only on defensive size=0 guard.
 #[inline]
 fn decode_bucket(bucket_id: u64) -> Option<TimeBucket> {
     let size_bits = (bucket_id & 0xFF) as u8;
@@ -108,7 +83,7 @@ fn decode_bucket(bucket_id: u64) -> Option<TimeBucket> {
     })
 }
 
-/// Absolute millisecond window covered by a bucket: `[start_ms, end_ms)`.
+/// `[start_ms, end_ms)` covered by a bucket.
 #[inline]
 fn bucket_ms_window(bucket: TimeBucket) -> (i64, i64) {
     let start_ms = (bucket.start as i64) * 60 * 1000;
@@ -116,9 +91,7 @@ fn bucket_ms_window(bucket: TimeBucket) -> (i64, i64) {
     (start_ms, end_ms)
 }
 
-/// True iff `bucket`'s window overlaps the caller-supplied
-/// `[time_range)` window. Equivalent to the retain clause in
-/// `QueryPlan::for_matrix` (pipeline.rs:186-190).
+/// Matches the retain clause in `QueryPlan::for_matrix`.
 #[inline]
 fn bucket_overlaps(bucket: TimeBucket, time_range: TimeRange) -> bool {
     if time_range.is_empty() {
@@ -132,30 +105,17 @@ fn bucket_overlaps(bucket: TimeBucket, time_range: TimeRange) -> bool {
 // Adapter
 // ---------------------------------------------------------------------------
 
-/// [`SeriesSource`] implementation over the crate-internal
-/// [`QueryReader`].
-///
-/// The adapter is parameterised by a generic `R: QueryReader` and holds
-/// it behind an [`Arc`] so its streams can own a handle independent of
-/// the caller's lifetime. A single [`QueryReaderSource`] instance
-/// services one query; nothing in the adapter maintains per-query scratch
-/// state between calls (the planner owns scratch).
-///
-/// The adapter is **stateless**: `resolve` emits all metadata needed by
-/// the caller, and `samples` re-consults the forward index on-demand to
-/// map `(bucket, series_id)` back to a metric name (the existing
-/// `QueryReader::samples` method needs it as an argument). The cost is
-/// one extra forward-index lookup per bucket touched by `samples`, which
-/// is cached by the reader itself; the benefit is no interior mutability.
+/// [`SeriesSource`] over the crate-internal [`QueryReader`]. One instance per
+/// query. Stateless between calls — `samples` re-consults the forward index
+/// on-demand for `(bucket, series_id) → metric_name`; the index cache absorbs
+/// the cost.
 pub(crate) struct QueryReaderSource<R: QueryReader> {
     reader: Arc<R>,
     index_cache: Arc<V2IndexCache>,
 }
 
 impl<R: QueryReader> QueryReaderSource<R> {
-    /// Build an adapter around an `Arc<R>`. A fresh query-scoped index
-    /// cache is created alongside the adapter; it lives as long as the
-    /// adapter itself and is not shared across queries.
+    /// Creates a fresh query-scoped index cache alongside the adapter.
     pub(crate) fn new(reader: Arc<R>) -> Self {
         Self {
             reader,
@@ -190,10 +150,8 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
 // resolve()
 // ---------------------------------------------------------------------------
 
-/// Fan out selector resolution across overlapping buckets and emit one
-/// [`ResolvedSeriesChunk`] per non-empty bucket. Up to
-/// [`METADATA_STAGE_READAHEAD`] buckets resolve in parallel; see
-/// [`async_stream_resolve`] for details.
+/// Fan out selector resolution across overlapping buckets and emit one chunk
+/// per non-empty bucket.
 fn resolve_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
     index_cache: Arc<V2IndexCache>,
@@ -203,17 +161,9 @@ fn resolve_stream<R: QueryReader + 'static>(
     async_stream_resolve(reader, index_cache, selector, time_range)
 }
 
-/// `async fn`-returning-`impl Stream` via `stream::unfold`. One yielded
-/// item per *non-empty* bucket. Empty buckets are silently skipped so
-/// the caller does not need to look at empty chunks (callers of the
-/// 2.1 trait treat `series: Arc<[]>` as "no match" already, but
-/// skipping keeps the stream tidy).
-///
-/// Up to [`METADATA_STAGE_READAHEAD`] buckets are resolved in parallel —
-/// each bucket is an independent keyspace in RFC 0001, so concurrent
-/// fetches cannot interfere. Emission order stays chronological via
-/// [`StreamExt::buffered`]: later buckets' results wait for earlier ones
-/// to yield, but the I/O overlaps.
+/// Up to [`METADATA_STAGE_READAHEAD`] buckets resolve in parallel; emission
+/// order is chronological (oldest first) via [`StreamExt::buffered`]. Empty
+/// buckets are skipped.
 fn async_stream_resolve<R: QueryReader + 'static>(
     reader: Arc<R>,
     index_cache: Arc<V2IndexCache>,
@@ -267,14 +217,8 @@ fn async_stream_resolve<R: QueryReader + 'static>(
     .flat_map(stream::iter)
 }
 
-/// Resolve the selector in a single bucket. Returns `Ok(None)` when no
-/// series match (the caller suppresses the empty chunk).
-///
-/// Forward-index entries for each candidate are fetched per-series and
-/// fanned out through [`V2IndexCache::forward_index_one`] up to
-/// [`INDEX_PER_KEY_CONCURRENCY`]. Caching is per-`(bucket, series_id)`
-/// so the downstream sample path re-uses the same entries without a
-/// second storage round trip.
+/// `Ok(None)` when no series match. Forward-index entries populate the
+/// per-`(bucket, series_id)` cache, which the samples path later reuses.
 async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     reader: &R,
     index_cache: &V2IndexCache,
@@ -345,13 +289,8 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
 // samples()
 // ---------------------------------------------------------------------------
 
-/// Stream [`SampleBatch`]es for the post-resolution series set.
-///
-/// Batch emission strategy: **per-bucket**. The request's `series` slice is
-/// grouped by bucket (preserving the caller's series ordering), and one
-/// batch is emitted per contiguous same-bucket run. Series that span
-/// multiple buckets therefore produce one batch per bucket — operators
-/// own cross-bucket merging (same split as `shape_matrix_results`).
+/// One [`SampleBatch`] per contiguous same-bucket run of the caller's series
+/// slice; series spanning buckets yield one batch per bucket. Operators merge.
 fn samples_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
     index_cache: Arc<V2IndexCache>,
@@ -366,23 +305,9 @@ fn samples_stream<R: QueryReader + 'static>(
     .flat_map(stream::iter)
 }
 
-/// Build the full list of per-bucket [`SampleBatch`]es for a request.
-///
-/// Broken out as an async fn (not a generator) so it's straightforward to
-/// unit-test future extensions. The function:
-/// 1. Walks the request's series slice to identify contiguous same-bucket
-///    runs — each run becomes one batch covering a
-///    `series_range` into `request.series`.
-/// 2. For each bucket that appears in a run, loads the forward index
-///    once to resolve `series_id → metric_name`. Distinct buckets are
-///    loaded concurrently (up to [`SAMPLE_STAGE_READAHEAD`]) via
-///    [`StreamExt::buffer_unordered`] — order doesn't matter since we
-///    just fill a `HashMap`.
-/// 3. Builds one batch per run concurrently (up to
-///    [`SAMPLE_STAGE_READAHEAD`]). Order is preserved with
-///    [`StreamExt::buffered`] because tests and the
-///    `SampleBatch::series_range` contract index into the caller's
-///    `request.series` slice.
+/// Order-preserving: runs are dispatched concurrently up to
+/// [`SAMPLE_STAGE_READAHEAD`] but yielded via `buffered` so each batch's
+/// `series_range` indexes into the caller's `request.series`.
 async fn build_sample_batches<R: QueryReader + ?Sized>(
     reader: &R,
     index_cache: &V2IndexCache,
@@ -408,15 +333,9 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     Ok(out)
 }
 
-/// Build a single [`SampleBatch`] for one bucket-run.
-///
-/// The per-series inner loop stays sequential by design — RFC 0007
-/// §"Execution Model" (line 256) prohibits implicit spawn-per-series.
-/// Concurrency at this layer is the per-run dispatch above.
-///
-/// Per-series forward-index lookups go through [`V2IndexCache::forward_index_one`],
-/// which is a pure in-memory hit here because `resolve_one_bucket`
-/// populated the same `(bucket, series_id)` keys during build_physical.
+/// Per-series loop stays sequential — implicit spawn-per-series is prohibited.
+/// Concurrency is the per-run dispatch one layer up. Forward-index lookups
+/// here are pure in-memory hits (populated by `resolve_one_bucket`).
 async fn build_batch_for_run<R: QueryReader + ?Sized>(
     reader: &R,
     index_cache: &V2IndexCache,
@@ -435,8 +354,7 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
     // `timestamp > start_ms && timestamp <= end_ms`
     // (see mock + MiniQueryReader). Translate by passing
     // `start_ms = time_range.start_ms - 1` and
-    // `end_ms = time_range.end_ms_exclusive - 1`. See §5 Decisions
-    // Log 2.2 for this quirk.
+    // `end_ms = time_range.end_ms_exclusive - 1`.
     let start_ms = time_range.start_ms.saturating_sub(1);
     let end_ms = time_range.end_ms_exclusive.saturating_sub(1);
 
@@ -483,20 +401,15 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
     })
 }
 
-/// A contiguous sub-slice of `request.series` whose entries all share a
-/// single bucket. Produced by [`contiguous_bucket_runs`] so that
-/// `series_range` in each emitted batch is a single `Range<usize>` that
-/// indexes directly into the caller's request.
+/// A same-bucket contiguous sub-slice of `request.series`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BucketRun {
     bucket_id: u64,
     range: Range<usize>,
 }
 
-/// Partition `series` into contiguous runs with the same `bucket_id`.
-///
-/// Preserves the caller's ordering — crucial for the `SampleBatch`
-/// contract that `series_range` indexes into the caller-supplied request.
+/// Preserves caller ordering so each run's `series_range` indexes directly
+/// into the caller's request.
 fn contiguous_bucket_runs(series: &[ResolvedSeriesRef]) -> Vec<BucketRun> {
     if series.is_empty() {
         return Vec::new();
@@ -525,9 +438,8 @@ fn contiguous_bucket_runs(series: &[ResolvedSeriesRef]) -> Vec<BucketRun> {
 // QueryError bridging
 // ---------------------------------------------------------------------------
 
-/// Wrap a crate-level error message into the v2 [`QueryError::Internal`]
-/// variant. Kept as a free helper (not an `impl From`) so the adapter can
-/// feed both `String` and `Error::to_string()` through the same path.
+/// Free helper (not `impl From`) so both `String` and `Error::to_string()`
+/// flow through one path.
 #[inline]
 fn internal_err(msg: impl Into<String>) -> QueryError {
     QueryError::Internal(msg.into())
@@ -551,10 +463,8 @@ mod selector_util {
     use regex_syntax::hir::{Hir, HirKind};
     use std::collections::HashSet;
 
-    /// Parse a limited regex of the shape `value1|value2|…` into its
-    /// literal alternatives. Matches the behaviour of the equivalent
-    /// helper in `promql::selector` (RFC mandates we leave that module
-    /// untouched, so we re-implement here).
+    /// Parses `value1|value2|…` into literal alternatives. Mirrors the helper
+    /// in `promql::selector`, which can't be reused here (ties to v1).
     pub(super) fn parse_limited_regex(pattern: &str) -> Result<Vec<String>, String> {
         let hir = Parser::new()
             .parse(pattern)
@@ -611,10 +521,8 @@ mod selector_util {
             .any(|m| matches!(m.op, MatchOp::Equal) && m.value.is_empty())
     }
 
-    /// Resolve candidate series IDs using just a [`QueryReader`] and the
-    /// inverted index. Mirrors `promql::selector::find_candidates_with_reader`
-    /// except that it consults the reader directly (no
-    /// `CachedQueryReader`).
+    /// Mirrors `promql::selector::find_candidates_with_reader` but consults
+    /// the reader directly (no `CachedQueryReader`).
     pub(super) async fn find_candidates<R: QueryReader + ?Sized>(
         reader: &R,
         index_cache: &V2IndexCache,
@@ -710,9 +618,7 @@ mod selector_util {
         Ok(v)
     }
 
-    /// Apply negative and empty-string matchers using a loaded
-    /// `ForwardIndexLookup`. Equivalent to the post-filter block in
-    /// `promql::selector::evaluate_selector_with_reader`.
+    /// Matches the post-filter block in `promql::selector::evaluate_selector_with_reader`.
     pub(super) fn apply_post_filters(
         forward: &dyn ForwardIndexLookup,
         candidates: Vec<SeriesId>,
@@ -728,8 +634,7 @@ mod selector_util {
         Ok(out)
     }
 
-    /// HashMap-backed variant of [`apply_post_filters`] used by the v2
-    /// resolve path after fetching per-series forward-index entries.
+    /// HashMap-backed variant of [`apply_post_filters`] for the resolve path.
     pub(super) fn apply_post_filters_map(
         specs: &std::collections::HashMap<SeriesId, crate::index::SeriesSpec>,
         candidates: Vec<SeriesId>,
@@ -987,7 +892,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Integration tests (unit 2.3)
+// Integration tests
 //
 // These exercise the [`SeriesSource`] contract end-to-end against the
 // existing in-memory [`MockQueryReader`] fixture (the same one that backs
@@ -995,17 +900,13 @@ mod tests {
 //
 //   - RFC §"Storage Contract" caller → source and source → caller
 //     guarantees (series set, time window, ordering, stale markers).
-//   - The boundary quirks called out in §5 Decisions Log 2.2 (inclusive
-//     start / exclusive end translation over `QueryReader`'s `(start, end]`
-//     contract).
+//   - The inclusive-start / exclusive-end translation over `QueryReader`'s
+//     `(start, end]` contract.
 //   - Cross-bucket stitching (per-bucket batches in chronological order).
 //   - `selector_util` matcher parity with the shapes covered in
 //     `promql/selector.rs`: metric-only, equality, negation, regex OR,
 //     empty-string, AND-combination.
 //
-// Adapter bugs surfaced during authoring: none. If a future test exposes
-// one, file it in §5 with a failing case, mark 2.3 `blocked`, and hand
-// back — per 2.3 scope we do not patch the adapter here.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1281,7 +1182,7 @@ mod integration_tests {
         assert_eq!(ts, &vec![1_500]);
     }
 
-    // ---------- Boundary / edge cases (§5 2.2 decisions) ---------------
+    // ---------- Boundary / edge cases ---------------
 
     #[tokio::test]
     async fn should_include_sample_at_start_ms_boundary() {
@@ -1431,8 +1332,8 @@ mod integration_tests {
 
     // ---------- Selector-matcher parity --------------------------------
     //
-    // Per §5 Decisions Log 2.2 we validate `selector_util` behaviourally
-    // against hand-built fixtures (not by calling into `promql::selector`,
+    // `selector_util` is validated behaviourally against hand-built
+    // fixtures rather than by calling into `promql::selector`,
     // whose `CachedQueryReader`-coupled API is private to the
     // evaluator). The existing selector.rs tests already cover
     // `evaluate_selector_with_reader` over the same matcher shapes, so a

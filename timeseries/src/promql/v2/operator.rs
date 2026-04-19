@@ -1,95 +1,73 @@
-//! The pull-based [`Operator`] trait and its plan-time [`OperatorSchema`].
+//! The [`Operator`] trait that every node in the v2 query plan implements,
+//! plus the two pieces of plan-time metadata every operator carries:
+//! [`StepGrid`] (the `(start, end, step)` timeline batches land on) and
+//! [`OperatorSchema`] (series roster + step grid — everything a consumer
+//! needs before the first batch arrives).
 //!
-//! Every node in a v2 physical plan implements [`Operator`]. The executor
-//! drives the root with [`Operator::next`], which returns a [`StepBatch`]
-//! per poll; inner nodes pull from their children the same way. The trait
-//! mirrors the shape of [`futures::Stream`] — `Poll<Option<Result<_>>>` —
-//! so operators compose cleanly under tokio without requiring the trait
-//! itself to pin to a specific runtime.
+//! The trait is pull-based: consumers call `next` and drive work forward one
+//! batch at a time. Its `Poll<Option<Result<_>>>` shape mirrors
+//! [`futures::Stream`] but the trait stays runtime-agnostic — no `async fn`,
+//! no pinning requirement — so planners can compose heterogeneous operators
+//! as `Box<dyn Operator>`.
 //!
-//! Two invariants operators must hold:
-//! - [`Operator::schema`] is callable before any [`Operator::next`]. It
-//!   returns the operator's view of its outputs: the (possibly
-//!   [`SchemaRef::Deferred`]) series roster and the step grid the batches
-//!   will land on.
-//! - [`Operator::next`] returns [`Poll::Ready(None)`] for end-of-stream
-//!   and [`Poll::Pending`] for back-pressure / I/O waits. Once `None` has
-//!   been returned the operator is exhausted; callers must not poll again.
-//!
-//! See RFC 0007 §"Execution Model" and §"Core Data Model".
+//! Operator invariants:
+//! - [`Operator::schema`] is callable before any [`Operator::next`], so
+//!   downstream operators can size buffers and precompute maps up front.
+//! - [`Operator::next`] returning [`Poll::Ready(None)`] is terminal; callers
+//!   must not poll again.
 
 use std::task::{Context, Poll};
 
 use super::batch::{SchemaRef, StepBatch};
 use super::memory::QueryError;
 
-/// Step grid an operator's output batches will land on.
-///
-/// Shared by every batch the operator produces — the grid is resolved at
-/// plan time from the query's `(start, end, step)` parameters (RFC
-/// §"Core Data Model"). `start_ms` and `end_ms` are inclusive timestamp
-/// bounds in milliseconds; `step_ms` is the spacing; `step_count` is
-/// `((end_ms - start_ms) / step_ms) + 1` for range queries and `1` for
-/// instant queries (RFC: "Instant queries are a range of one step").
+/// The timeline of evaluation points a query runs over, resolved at plan
+/// time from the request's `(start, end, step)`. Every batch an operator
+/// produces lands on this same grid (batches carry a `step_range` slice of
+/// it). Instant queries collapse to `step_count == 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepGrid {
-    /// First step timestamp (ms, inclusive).
+    /// Inclusive, milliseconds.
     pub start_ms: i64,
-    /// Last step timestamp (ms, inclusive).
+    /// Inclusive, milliseconds.
     pub end_ms: i64,
     /// Spacing between consecutive steps (ms). Must be `> 0`.
     pub step_ms: i64,
-    /// Total number of steps in the grid. Equals `1` for instant queries.
     pub step_count: usize,
 }
 
-/// The operator's view of its outputs before [`Operator::next`] is called.
-///
-/// Carries the (possibly deferred) series schema and the step grid every
-/// downstream operator needs to size buffers and precompute group maps.
-/// Deliberately minimal for phase 1 — planner units (4.x) extend with
-/// group maps, binary-match tables, and bucket membership as those
-/// contracts solidify. Storage-specific fields live on the phase-2
-/// `SeriesSource` contract, not here.
+/// What an operator publishes about its output before producing any
+/// batches. Carries the (possibly deferred) series schema and the step
+/// grid, so downstream operators can size buffers, build group maps, and
+/// pre-allocate accumulator grids without first pulling a sample.
 #[derive(Debug, Clone)]
 pub struct OperatorSchema {
-    /// Series roster the operator will emit. [`SchemaRef::Static`] for
-    /// every operator except `count_values`.
     pub series: SchemaRef,
-    /// Step grid the batches will land on. Plan-time constant.
     pub step_grid: StepGrid,
 }
 
 impl OperatorSchema {
-    /// Build a schema from a series handle and a step grid.
     pub fn new(series: SchemaRef, step_grid: StepGrid) -> Self {
         Self { series, step_grid }
     }
 }
 
-/// Pull-based, step-batched streaming operator.
+/// The one trait every v2 query-plan node implements. Consumers call
+/// [`Self::next`] to pull the next [`StepBatch`], or [`Self::schema`] to
+/// learn the output shape before polling.
 ///
-/// Object-safe: planners build heterogeneous trees as
-/// `Box<dyn Operator>`. Operators are `Send` so a `Concurrent` wrapper
-/// can move a subplan onto a spawned tokio task; `Sync` is deliberately
-/// not required, matching DataFusion / thanos-io promql-engine.
-///
-/// The trait mirrors [`futures::Stream`]'s polling shape but stays
-/// runtime-agnostic — the executor crate chooses tokio, the operator
-/// trait does not.
+/// Object-safe on purpose — the planner builds heterogeneous operator
+/// trees as `Box<dyn Operator>` without monomorphising over every
+/// combination. `Send` is required so
+/// [`ConcurrentOp`](super::operators::concurrent::ConcurrentOp) can move a
+/// subplan onto a spawned task; `Sync` is deliberately not required,
+/// because operators hold per-poll mutable state.
 pub trait Operator: Send {
-    /// Operator's outputs, known before any call to [`Self::next`].
     fn schema(&self) -> &OperatorSchema;
 
-    /// Pull the next [`StepBatch`].
-    ///
-    /// - `Poll::Ready(Some(Ok(batch)))` — one batch of output.
-    /// - `Poll::Ready(Some(Err(err)))` — terminal error; downstream must
-    ///   not poll again.
-    /// - `Poll::Ready(None)` — end of stream; downstream must not poll
-    ///   again.
-    /// - `Poll::Pending` — back-pressure or I/O wait; the runtime will
-    ///   wake via the waker stored on `cx`.
+    /// - `Ready(Some(Ok))` — one batch.
+    /// - `Ready(Some(Err))` / `Ready(None)` — terminal; must not poll again.
+    /// - `Pending` — back-pressure or I/O wait; runtime wakes via `cx`.
     fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>>;
 }
 

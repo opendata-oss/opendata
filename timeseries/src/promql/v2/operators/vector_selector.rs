@@ -1,58 +1,33 @@
-//! `VectorSelector` operator — unit 3a.1.
+//! `VectorSelectorOp` — the storage leaf for PromQL instant vectors (the
+//! plain `metric{labels=...}` selector, no brackets). It turns raw
+//! samples from a [`SeriesSource`] into [`StepBatch`]es ready for
+//! downstream operators to consume.
 //!
-//! Instant-vector leaf. Emits one sample per series per step of the query's
-//! step grid, where each sample is the latest raw sample in the operator's
-//! lookback window. Owns PromQL semantics for `lookback_delta`,
-//! `@ timestamp`/`@ start()`/`@ end()`, and `offset`. The upstream
-//! [`SeriesSource`](crate::promql::v2::source::SeriesSource) is PromQL-unaware
-//! — it returns raw samples in an absolute time range; this operator applies
-//! lookback, `@`, `offset`, and stale-marker handling (RFC 0007
-//! §"Operator Taxonomy", §"Storage Contract").
+//! This is where all the PromQL semantics for picking "the sample at
+//! step `t`" live: `lookback_delta`, the `@` modifier, `offset`, and
+//! `STALE_NAN` handling. The underlying [`SeriesSource`] is deliberately
+//! PromQL-unaware and just returns raw samples in an absolute time
+//! window; everything else happens here.
 //!
-//! # Semantics
-//!
-//! For each step `t = start_ms + k * step_ms` (k in `0..step_count`):
-//!
+//! Per-step semantics:
 //! ```text
 //!   pin         = @ value when @ is set, else t
 //!   effective   = pin - offset               (Offset::Pos subtracts; Neg adds)
 //!   window      = (effective - lookback, effective]
-//!   sample      = latest non-STALE_NAN sample with timestamp in window
-//!   validity    = 1 when sample exists, 0 otherwise
-//!   value[cell] = sample.value              (undefined when validity = 0)
+//!   sample      = latest non-STALE_NAN sample in window
 //! ```
 //!
-//! Composition order verified against the existing evaluator at
-//! `timeseries/src/promql/evaluator.rs:1126-1160`. Lookback window uses the
-//! same `(start, end]` convention as `timeseries/src/promql/pipeline.rs:673-688`.
+//! `STALE_NAN` is treated as absence — stricter than v1's pipeline.rs
+//! but matches Prometheus' "stale marker terminates a series" rule.
 //!
-//! `STALE_NAN` samples are treated as absence here (task spec for 3a.1) —
-//! stricter than the current `pipeline.rs` path, which does not filter them.
-//! Matches Prometheus lookback semantics where an explicit staleness marker
-//! terminates a series.
+//! Output is tiled: one [`StepBatch`] per `(series_chunk, step_chunk)`
+//! rectangle (default ~64 steps × 512 series) so a single batch's
+//! allocation stays bounded regardless of query width. Samples are
+//! drained from the source stream on demand; everything
+//! `series_count × step_count`-scaled routes through
+//! [`MemoryReservation::try_grow`].
 //!
-//! # Batching
-//!
-//! Emits one [`StepBatch`] per `(series_chunk, step_chunk)` tile. Default
-//! tile dimensions are `N ≈ 64 steps × K ≈ 512 series` per RFC
-//! §"Core Data Model"; callers may override via [`BatchShape::new`]. Samples
-//! for a given series chunk are drained from the source stream on-demand:
-//! the first poll produces the batch `(0, 0)`, subsequent polls advance
-//! steps within the current series chunk, then move to the next series
-//! chunk once step chunks are exhausted.
-//!
-//! # Memory accounting
-//!
-//! Every allocation that scales with `series_count × step_count` routes
-//! through [`MemoryReservation::try_grow`]. The [`BatchBuffers`] guard
-//! releases the reservation in its `Drop` impl once a batch has been
-//! emitted — the values/validity vectors are moved into the batch, and
-//! the reservation is only released when the operator is ready to build
-//! the next buffer (`BatchBuffers` therefore re-reserves per batch).
-//!
-//! The per-series sample columns materialised from the source also route
-//! through the reservation, proportional to the number of samples in the
-//! series-chunk window.
+//! [`SeriesSource`]: crate::promql::v2::source::SeriesSource
 
 use std::future::Future;
 use std::pin::Pin;
@@ -78,21 +53,16 @@ use super::super::trace;
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Default step chunk — roughly `N ≈ 64` per RFC §"Core Data Model".
 pub(crate) const DEFAULT_STEP_CHUNK: usize = 64;
-/// Default series chunk — roughly `K ≈ 512` per RFC §"Core Data Model".
 pub(crate) const DEFAULT_SERIES_CHUNK: usize = 512;
-/// Default Prometheus lookback delta (5 minutes) — matches
-/// `crate::model::QueryOptions` default and `promqltest` expectations.
+/// Prometheus default.
 pub(crate) const DEFAULT_LOOKBACK_MS: i64 = 5 * 60 * 1_000;
 
 // ---------------------------------------------------------------------------
 // Batch shape
 // ---------------------------------------------------------------------------
 
-/// Tile dimensions emitted by the operator. Chosen to fit an `N × K` tile
-/// into the L2-sized rectangle the RFC targets; callers may override the
-/// defaults for tests / tuning.
+/// Tile dimensions; defaults target an L2-sized rectangle.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BatchShape {
     pub(crate) step_chunk: usize,
@@ -120,21 +90,9 @@ impl Default for BatchShape {
 // Memory-guarded per-batch buffers
 // ---------------------------------------------------------------------------
 
-/// RAII wrapper around a `StepBatch`'s value + validity allocations.
-///
-/// Reserves bytes against a [`MemoryReservation`] on [`Self::allocate`] and
-/// releases them on [`Drop`]. Callers move the inner `values` / `validity`
-/// into a freshly-built [`StepBatch`] via [`Self::finish`] — the move
-/// transfers ownership of the bytes to the caller, so the `Drop` release
-/// must happen *before* the batch is emitted. In practice we release the
-/// reservation the moment `finish()` is called; the caller accounts for
-/// the batch's memory separately (i.e. in an outer reservation scope, the
-/// operator is not the sole owner of the emitted batch).
-///
-/// v1 simplification: operator releases its reservation slice as soon as
-/// the batch leaves the operator. Downstream operators re-reserve if they
-/// need to hold onto the batch. Matches the per-batch accounting model in
-/// RFC §"Execution Model".
+/// RAII wrapper around a batch's value / validity allocations. Reserves on
+/// [`Self::allocate`] and releases on drop or [`Self::finish`]. Downstream
+/// operators re-reserve if they need to hold onto the emitted batch.
 struct BatchBuffers {
     reservation: MemoryReservation,
     bytes: usize,
@@ -143,10 +101,8 @@ struct BatchBuffers {
 }
 
 impl BatchBuffers {
-    /// Attempt to allocate `len` cells of `(f64, validity bit)` storage,
-    /// reserving `len * (8 + 1)` bytes plus a rounded-up `Vec<u64>` for the
-    /// bitset. Returns `QueryError::MemoryLimit` without allocating if the
-    /// reservation rejects the grow.
+    /// Returns `QueryError::MemoryLimit` without allocating if the reservation
+    /// rejects the grow.
     fn allocate(reservation: &MemoryReservation, len: usize) -> Result<Self, QueryError> {
         let bytes = cell_bytes(len);
         reservation.try_grow(bytes)?;
@@ -167,8 +123,6 @@ impl BatchBuffers {
         })
     }
 
-    /// Consume the buffer, returning `(values, validity)` and releasing
-    /// the reservation.
     fn finish(mut self) -> (Vec<f64>, BitSet) {
         let values = std::mem::take(&mut self.values);
         let validity = std::mem::take(&mut self.validity);
@@ -187,8 +141,6 @@ impl Drop for BatchBuffers {
     }
 }
 
-/// Conservative byte estimate for a `len`-cell buffer: `f64` column +
-/// bit-per-cell validity (rounded up to whole `u64` words).
 #[inline]
 fn cell_bytes(len: usize) -> usize {
     let values = len.saturating_mul(std::mem::size_of::<f64>());
@@ -197,8 +149,6 @@ fn cell_bytes(len: usize) -> usize {
     values.saturating_add(validity)
 }
 
-/// Conservative byte estimate for a pre-materialised per-series sample
-/// column holding `n` samples (timestamps + values).
 #[inline]
 fn samples_bytes(n: usize) -> usize {
     n.saturating_mul(std::mem::size_of::<i64>() + std::mem::size_of::<f64>())
@@ -208,14 +158,9 @@ fn samples_bytes(n: usize) -> usize {
 // Lookback / @ / offset resolution
 // ---------------------------------------------------------------------------
 
-/// Pre-computed per-step lookup times. `times[k]` is the pinned evaluation
-/// time for step `k` **before** subtracting the lookback window (i.e.
-/// `pin - offset`); the operator then looks for the latest sample in
-/// `(times[k] - lookback, times[k]]`.
-///
-/// When `@` is set, all entries are identical (all steps pin to the same
-/// evaluation time). When `@ start()`/`@ end()` is used, all entries pin
-/// to the grid's `start_ms`/`end_ms` respectively.
+/// Per-step `pin - offset` times. The operator looks up
+/// `(times[k] - lookback, times[k]]`. `@` / `@ start()` / `@ end()` collapse
+/// all entries to the pinned value.
 #[derive(Debug, Clone)]
 struct EffectiveTimes {
     times: Arc<[i64]>,
@@ -291,9 +236,7 @@ impl EffectiveTimes {
 // Per-chunk sample state
 // ---------------------------------------------------------------------------
 
-/// Samples for every series in the current series chunk, pre-materialised
-/// as two parallel columns. Uses the operator's reservation for all
-/// per-chunk allocations; released in `Drop`.
+/// Pre-materialised per-series-chunk sample columns.
 struct ChunkSamples {
     reservation: MemoryReservation,
     bytes: usize,
@@ -312,9 +255,8 @@ impl ChunkSamples {
         }
     }
 
-    /// Absorb a `SampleBatch` whose `series_range` indexes into the flattened
-    /// chunk-local `SamplesRequest::series`. `request_to_series[request_idx]` resolves
-    /// each sample column back onto the logical output series it belongs to.
+    /// `request_to_series[request_idx]` maps each sample column back to its
+    /// logical output series (a logical series may span several request refs).
     fn absorb(
         &mut self,
         batch: SampleBatch,
@@ -361,30 +303,23 @@ impl Drop for ChunkSamples {
 type SampleStream<'a> = Pin<Box<dyn Stream<Item = Result<SampleBatch, QueryError>> + Send + 'a>>;
 
 enum State<'a> {
-    /// Pending first poll — need to build effective times and start the
-    /// first series chunk.
     Init,
-    /// A series chunk is being hydrated from the source stream. The
-    /// future drives the stream to completion and collects all batches
-    /// into `chunk`.
+    /// Series chunk being hydrated from the source stream.
     LoadingChunk {
         chunk_start: usize,
         chunk_len: usize,
         #[allow(clippy::type_complexity)]
         future: Pin<Box<dyn Future<Output = Result<ChunkSamples, QueryError>> + Send + 'a>>,
     },
-    /// Chunk is loaded; iterate step chunks emitting one batch per poll.
+    /// Chunk loaded; step chunks emit one batch per poll.
     Emitting {
         chunk_start: usize,
         chunk_len: usize,
         samples: Box<ChunkSamples>,
-        /// Next step chunk index within the full grid (absolute, 0-based).
         next_step_chunk_start: usize,
     },
-    /// All chunks / steps exhausted.
     Done,
-    /// Terminal error already reported — subsequent polls return
-    /// `Ready(None)`.
+    /// Terminal error; subsequent polls return `Ready(None)`.
     Errored,
     /// Transient placeholder used while swapping state inside `next()`.
     Transitioning,
@@ -396,9 +331,9 @@ enum State<'a> {
 // Operator struct
 // ---------------------------------------------------------------------------
 
-/// PromQL instant-vector selector operator.
-///
-/// See module docs for semantics and batching strategy.
+/// Storage leaf for PromQL instant vectors (`metric{labels=...}`). Pulls
+/// raw samples from a [`SeriesSource`] and applies lookback / `@` /
+/// `offset` / stale-marker semantics to emit tiled [`StepBatch`]es.
 pub(crate) struct VectorSelectorOp<'a, S: SeriesSource + 'a> {
     // Plan-time inputs ------------------------------------------------------
     source: Arc<S>,
@@ -415,24 +350,8 @@ pub(crate) struct VectorSelectorOp<'a, S: SeriesSource + 'a> {
 }
 
 impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
-    /// Build an operator from resolved inputs.
-    ///
-    /// * `source` — storage handle. The operator clones `Arc<S>` into the
-    ///   sample-load future so the stream can outlive the operator's
-    ///   call stack inside `next()`.
-    /// * `series` — post-resolve series roster in the order the planner
-    ///   wants samples to land. `schema.series` is a
-    ///   [`SchemaRef::Static`] handle over the same roster.
-    /// * `request_series` — parallel slice of per-logical-series opaque source
-    ///   handle groups aligned with `schema.series`. A single logical series
-    ///   may carry several bucket-local refs when the planner deduplicates the
-    ///   resolved roster by fingerprint.
-    /// * `grid` — step grid the query runs on.
-    /// * `at` / `offset` — selector modifiers; may both be `None`.
-    /// * `lookback_ms` — Prometheus lookback delta in ms. Use
-    ///   [`DEFAULT_LOOKBACK_MS`] for the 5-minute default.
-    /// * `reservation` — per-query reservation. Cloned for internal use.
-    /// * `shape` — tile dimensions; use [`BatchShape::default`] outside tests.
+    /// `request_series[i]` is the group of bucket-local source handles for
+    /// logical series `i` (deduplicated by fingerprint).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         source: Arc<S>,
@@ -932,7 +851,7 @@ mod tests {
     }
 
     // ====================================================================
-    // required tests (task spec)
+    // required tests
     // ====================================================================
 
     #[test]

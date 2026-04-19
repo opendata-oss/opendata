@@ -1,83 +1,35 @@
-//! Rule-based logical-plan optimizer (unit 4.2).
+//! The logical-plan optimiser that runs between
+//! [`lower`](super::lowering::lower) and
+//! [`build_physical_plan`](super::physical::build_physical_plan). Pure
+//! rewrite passes on [`LogicalPlan`], no cost model.
 //!
-//! Sits between AST→IR lowering (unit 4.1) and physical planning (unit 4.3)
-//! — see RFC 0007 §"Architecture Overview". Rewrites a [`LogicalPlan`] tree
-//! in-place (by owned-value transformation) using a small, fixed set of
-//! correctness-preserving rules. No cost model — the RFC's §"Non-Goals"
-//! rules out cost-based optimization for v1.
+//! Rules:
+//! 1. **Constant folding** of `Binary { Scalar, op, Scalar }` for
+//!    arithmetic and comparison ops. Comparison folding is safe
+//!    regardless of the `bool` modifier because PromQL's scalar/scalar
+//!    comparison returns a scalar either way.
+//! 2. **Unary-minus fold** — `-x` lowers to `Mul { -1, x }`, and rule 1
+//!    folds it when `x` is a literal.
+//! 3. **Matcher dedup** — `{job="a", job="a"}` from the parser collapses
+//!    to one matcher. Not a general label pushdown.
 //!
-//! # Rule set
+//! Rules we considered and dropped: algebraic identities (`x * 1 → x`
+//! etc.) aren't safe on vector branches where `Binary` materialises for
+//! validity / matching. Deferred: CSE (the physical plan is a tree, not
+//! a DAG; we need the cache-key question answered first).
 //!
-//! 1. **Constant folding** — `Binary { Scalar(a), op, Scalar(b) }` is
-//!    rewritten to `Scalar(op.apply(a, b))`. Applies to both arithmetic
-//!    ops (`+`, `-`, `*`, `/`, `%`, `^`, `atan2`) and comparison ops
-//!    (`==`, `!=`, `<`, `>`, `<=`, `>=`). Comparison folding is safe
-//!    regardless of the `bool` modifier because PromQL returns a scalar
-//!    (not a filter) for scalar-vs-scalar comparisons — cited against
-//!    [`crate::promql::evaluator::Evaluator::evaluate_binary_expr`]
-//!    (`timeseries/src/promql/evaluator.rs:2109-2112`) where
-//!    `(Scalar, Scalar)` drops straight through
-//!    `apply_binary_op` to `ExprResult::Scalar`.
-//!
-//! 2. **Unary-minus fold** — the lowering represents `-x` as
-//!    `Binary { Mul, Scalar(-1.0), x }` (see `lowering.rs` and §5
-//!    Decisions Log 4.1). Rule 1 already folds this when `x` is a
-//!    `Scalar(n)` — no dedicated rule needed.
-//!
-//! 3. **Redundant vector-selector matcher dedup** — a
-//!    [`LogicalPlan::VectorSelector`] whose `Matchers` contains two
-//!    structurally-equal `(name, op, value)` entries collapses to one.
-//!    The parser does not normalise these (verified against
-//!    `promql-parser-0.8.0/src/parser/production.rs`), so a user-written
-//!    `{job="a", job="a"}` reaches us with two matchers. This rule is
-//!    *not* a general label pushdown — it does not invent matchers from
-//!    surrounding context.
-//!
-//! 4. **CSE** — **deferred to unit 4.3 / v2**. See §5 Decisions Log entry
-//!    for 4.2. The physical plan builds unique operator objects rather
-//!    than a DAG, so structural dedup on the logical tree would not yet
-//!    yield a shared computation. Open Question #4 (cache-key
-//!    canonicalization) is unresolved; implementing CSE prematurely
-//!    risks picking the wrong equivalence relation.
-//!
-//! 5. **Algebraic identities** (`x * 1 → x`, `x + 0 → x`, `x - 0 → x`,
-//!    `x * 0 → 0`) — **dropped**. `0 * NaN` must preserve `NaN` per
-//!    IEEE 754 and the v2 `Binary` operator already does (`apply_arith`
-//!    at `binary.rs:180-193`). Dropping the multiply for `x * 1` is
-//!    correct only if we can guarantee `x` has no side effects and no
-//!    NaN-observability changes — safe for pure pointwise scalars but
-//!    not for vector branches that the Binary operator might materialise
-//!    for validity/matching purposes. Correctness > micro-optimization.
-//!
-//! 6. **Parens** — already stripped by lowering; no rule needed.
-//!
-//! # Fixpoint strategy
-//!
-//! Iterate all rules until the plan stops changing, bounded by
-//! [`MAX_PASSES`]. Each pass is top-level: the entire tree is rewritten
-//! once, and the result is compared (structural `PartialEq`) to the
-//! input. Rule bodies are themselves recursive bottom-up traversals so a
-//! single pass already reaches a local fixpoint for the rule — the outer
-//! loop exists only to re-run *other* rules after a rewrite exposes new
-//! opportunities (e.g. `fold_constants` exposing a `Scalar` that the
-//! dedup rule may not care about but a future rule might). In practice
-//! the optimizer converges in one or two passes; the bound is a safety
-//! net.
+//! Rules run in a fixpoint loop bounded by [`MAX_PASSES`]; each rule is
+//! bottom-up, so a single pass reaches that rule's local fixpoint.
 
 use promql_parser::label::{Matcher, Matchers};
 
 use super::plan_types::LogicalPlan;
 use crate::promql::v2::operators::binary::BinaryOpKind;
 
-/// Upper bound on rule-set passes before the optimizer gives up. Hit is
-/// logged via `tracing::warn!` at runtime (not here — optimizer is a pure
-/// function today; phase-5 wiring may wrap it). Small because rule
-/// interactions are shallow.
+/// Upper bound before the optimizer gives up. Small because rule interactions
+/// are shallow.
 const MAX_PASSES: usize = 4;
 
-/// Run the rule-based optimizer over a logical plan.
-///
-/// See the module docs for the rule set and fixpoint strategy.
 pub fn optimize(plan: LogicalPlan) -> LogicalPlan {
     let mut current = plan;
     for _ in 0..MAX_PASSES {
@@ -90,9 +42,6 @@ pub fn optimize(plan: LogicalPlan) -> LogicalPlan {
     current
 }
 
-/// Apply every rule once, bottom-up. Each rule consumes and returns a
-/// [`LogicalPlan`]; composing them by pipelining is the simplest way to
-/// keep rule ordering explicit.
 fn apply_rules(plan: LogicalPlan) -> LogicalPlan {
     let plan = dedupe_vector_selector_matchers(plan);
     fold_constants(plan)
@@ -102,9 +51,7 @@ fn apply_rules(plan: LogicalPlan) -> LogicalPlan {
 // Rule 1/2: constant folding (arith + comparison + unary-minus-of-literal)
 // ---------------------------------------------------------------------------
 
-/// Fold `Binary { Scalar(a), op, Scalar(b) }` into `Scalar(op.apply(a, b))`.
-/// Recursive bottom-up: children are folded before the parent, so
-/// `(1 + 2) * (3 + 4)` collapses to `Scalar(21)` in one pass.
+/// Bottom-up: `(1 + 2) * (3 + 4)` collapses to `Scalar(21)` in one pass.
 fn fold_constants(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Binary {
@@ -490,8 +437,7 @@ mod tests {
     #[test]
     fn should_fold_unary_minus_of_literal() {
         // given: `-3` — the lowering rewrites this to `Binary { Mul,
-        // Scalar(-1), Scalar(3) }` (lowering.rs:126-137, §5 Decisions
-        // Log 4.1).
+        // Scalar(-1), Scalar(3) }` (lowering.rs:126-137).
         // when: optimized
         // then: collapses to Scalar(-3).
         let plan = lower_and_optimize("-3");

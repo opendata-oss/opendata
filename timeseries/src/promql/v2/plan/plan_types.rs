@@ -1,21 +1,13 @@
-//! Logical-plan IR (unit 4.1).
+//! The logical-plan IR — pure data, one enum variant per PromQL operator
+//! family, and the single rewrite surface the optimiser walks.
 //!
-//! The logical plan is a tree that mirrors the PromQL AST but is (a) easier
-//! to rewrite in the rule-based optimizer (unit 4.2) and (b) easier to
-//! translate into a physical operator tree (unit 4.3).
-//!
-//! # Contract
-//!
-//! - The logical plan is **pure data** — no `Arc<SeriesSchema>`, no
-//!   references to a `SeriesSource`, no compiled `GroupMap` / `MatchTable`.
-//!   Those are physical-plan artifacts (unit 4.3) computed after series
-//!   resolution.
-//! - Each variant carries exactly the information the physical planner
-//!   needs to pick the right operator and its constructor args.
-//! - Operator-kind enums ([`InstantFnKind`], [`RollupKind`],
-//!   [`AggregateKind`], [`BinaryOpKind`]) are re-used from
-//!   [`crate::promql::v2::operators`] so the logical plan does not
-//!   re-define them.
+//! Kept deliberately free of physical-planner artifacts: no
+//! `Arc<SeriesSchema>`, no source handles, no compiled group maps or
+//! match tables. Each variant carries only the data the physical planner
+//! will need to *pick* an operator; resolution and compilation happen
+//! later. Operator-kind enums ([`InstantFnKind`], [`RollupKind`],
+//! [`AggregateKind`], [`BinaryOpKind`]) are re-used from
+//! [`crate::promql::v2::operators`].
 
 use std::sync::Arc;
 
@@ -30,24 +22,15 @@ use promql_parser::parser;
 // Supporting types
 // ---------------------------------------------------------------------------
 
-/// Millisecond-precision PromQL `offset` modifier.
-///
-/// Mirrors `promql_parser::parser::Offset`'s `Pos(Duration)` / `Neg(Duration)`
-/// shape but stores a plain `i64` so the logical plan is cheaply `Copy`-able
-/// and independent of `std::time::Duration` units. Evaluator semantics
-/// (`Offset::Pos` subtracts from the step timestamp; `Offset::Neg` adds)
-/// match the operator conventions established in units 3a.1 / 3a.2.
+/// PromQL `offset` in ms. `Pos` shifts the eval point backward, `Neg` forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offset {
-    /// `offset 5m` — shifts the evaluation point backward by the duration.
     Pos(i64),
-    /// `offset -5m` — shifts the evaluation point forward by the duration.
     Neg(i64),
 }
 
 impl Offset {
-    /// Millisecond magnitude of the offset, signed: positive values pull
-    /// earlier, negative values pull later (mirrors the evaluator's use).
+    /// Signed magnitude in ms: positive pulls earlier, negative pulls later.
     #[inline]
     pub fn signed_ms(self) -> i64 {
         match self {
@@ -66,15 +49,12 @@ impl From<&parser::Offset> for Offset {
     }
 }
 
-/// Plan-time `@` modifier. Mirrors `promql_parser::parser::AtModifier` but
-/// materialises `@ <float>` into an absolute millisecond timestamp up front.
+/// Plan-time `@` modifier. `@ <float>` is materialised to absolute ms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtModifier {
-    /// `@ start()` — pins to the query range's start.
     Start,
-    /// `@ end()` — pins to the query range's end.
     End,
-    /// `@ <float>` — absolute pin in UTC milliseconds.
+    /// Absolute UTC ms.
     Value(i64),
 }
 
@@ -93,58 +73,56 @@ impl TryFrom<&parser::AtModifier> for AtModifier {
     }
 }
 
-/// Plan-time representation of PromQL vector-matching. Carries the raw
-/// label lists from the parser; the physical planner (unit 4.3) compiles
-/// this into a runtime `MatchTable` once input schemas are known.
+/// How the two sides of a vector/vector binary op match — the plan-time
+/// encoding of PromQL's `on(...)` / `ignoring(...)` / `group_left(...)`
+/// / `group_right(...)` clauses. The physical planner compiles this into
+/// a runtime
+/// [`MatchTable`](crate::promql::v2::operators::binary::MatchTable) once
+/// both input schemas are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryMatching {
-    /// Matching axis: `on` or `ignoring`.
     pub axis: MatchingAxis,
-    /// Labels that form the matching key (on `axis`).
     pub labels: Arc<[String]>,
-    /// Cardinality of the match (`OneToOne`, `group_left`, `group_right`,
-    /// or `ManyToMany` for set operators).
     pub cardinality: Cardinality,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchingAxis {
-    /// `on(l1, l2, ...)` — match only on the listed labels.
     On,
-    /// `ignoring(l1, l2, ...)` — match on every label except the listed ones.
     Ignoring,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cardinality {
-    /// `a op b` — default. No side is the "many" side.
     OneToOne,
-    /// `a op group_left(labels) b` — LHS is "many", RHS is "one". The
-    /// `include` labels are carried through from the "one" side.
-    GroupLeft { include: Arc<[String]> },
-    /// `a op group_right(labels) b` — RHS is "many", LHS is "one".
-    GroupRight { include: Arc<[String]> },
+    GroupLeft {
+        include: Arc<[String]>,
+    },
+    GroupRight {
+        include: Arc<[String]>,
+    },
     /// Set-operator cardinality (`and` / `or` / `unless`).
     ManyToMany,
 }
 
-/// Lowered `by` / `without` modifier for aggregations.
+/// The `by (...)` / `without (...)` clause on a PromQL aggregation,
+/// preserved verbatim from the AST. The physical planner consumes this
+/// to build the
+/// [`GroupMap`](crate::promql::v2::operators::aggregate::GroupMap) once
+/// the child's series schema is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateGrouping {
-    /// `by (l1, l2, ...)` — output groups on the listed labels.
     By(Arc<[String]>),
-    /// `without (l1, l2, ...)` — output groups on every label except the
-    /// listed ones. Empty list ⇒ each input series gets its own group.
+    /// Empty list ⇒ each input series gets its own group.
     Without(Arc<[String]>),
 }
 
 impl AggregateGrouping {
-    /// The empty grouping: `by ()` — one global group.
+    /// `by ()` — one global group.
     pub fn by_empty() -> Self {
         Self::By(Arc::from(Vec::<String>::new()))
     }
 
-    /// Construct from the parser's optional `LabelModifier`.
     pub fn from_label_modifier(modifier: Option<&parser::LabelModifier>) -> Self {
         match modifier {
             None => Self::by_empty(),
@@ -166,27 +144,30 @@ fn labels_to_arc(labels: &promql_parser::label::Labels) -> Arc<[String]> {
 // LogicalPlan
 // ---------------------------------------------------------------------------
 
-/// One node per operator group produced by Phase 3, plus `Scalar` for
-/// compile-time constants. The tree mirrors the PromQL AST one-to-one after
-/// lowering (no optimizer rewrites applied yet — that is unit 4.2).
+/// The v2 engine's logical-plan IR — a tree of PromQL operators as plain
+/// data, the single rewrite surface the optimiser walks, and the
+/// post-lowering mirror of the PromQL AST (one variant per operator
+/// family, plus `Scalar` / `Time` for scalar leaves).
+///
+/// The exchange-shaped variants (`Rechunk`, `Concurrent`, `Coalesce`) are
+/// physical concerns in spirit, but they live here because
+/// [`PhysicalPlan`](super::physical::PhysicalPlan) is a `dyn Operator`
+/// tree with no rewrite surface of its own. Optimizer rules must treat
+/// them as structurally transparent. Revisit when adding scatter-gather:
+/// the natural fix is a second enum IR between `LogicalPlan` and the
+/// operator tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     // --- leaves -----------------------------------------------------------
-    /// `foo{label="value"}` — consumed by `VectorSelector` operator.
-    /// `lookback_ms` is threaded through from the `LoweringContext` so the
-    /// physical planner can parameterise the operator without re-reading
-    /// query state.
+    /// `foo{...}`. `lookback_ms = None` means "use engine default".
     VectorSelector {
         selector: parser::VectorSelector,
         offset: Offset,
         at: Option<AtModifier>,
-        /// Per-plan lookback; `None` means "use the engine default".
         lookback_ms: Option<i64>,
     },
 
-    /// `foo[5m]` — consumed by `MatrixSelector` operator inside a `Rollup`
-    /// (or a subquery). Never a valid logical-plan root; the `Rollup` /
-    /// `Subquery` parent wraps it.
+    /// `foo[5m]` — never a valid logical-plan root; `Rollup` / `Subquery` wraps it.
     MatrixSelector {
         selector: parser::VectorSelector,
         range_ms: i64,
@@ -194,49 +175,42 @@ pub enum LogicalPlan {
         at: Option<AtModifier>,
     },
 
-    /// Literal scalar constant (`42`, `1.5e-3`). `NumberLiteral` and `Scalar`
-    /// are collapsed into a single variant per RFC — there is no semantic
-    /// distinction at plan time.
+    /// Literal scalar (`42`, `1.5e-3`). Subsumes parser's `NumberLiteral`.
     Scalar(f64),
 
-    /// Scalar leaf whose value is the current evaluation step timestamp in
-    /// seconds. Used for `time()` and as the default argument carrier for the
-    /// zero-arg calendar functions.
+    /// `time()` — current step timestamp in seconds. Also the default
+    /// argument for zero-arg calendar functions.
     Time,
 
-    /// Scalar coercion: `scalar(v)` collapses an instant-vector child to one
-    /// scalar value per step (`exactly one sample => that value`, otherwise
-    /// `NaN`).
+    /// `scalar(v)`: collapses an instant-vector child to one scalar per step
+    /// (`exactly one sample => that value`, else `NaN`).
     Scalarize { child: Box<LogicalPlan> },
 
-    /// Vector coercion: `vector(s)` re-interprets a scalar-producing child as
-    /// a single anonymous instant-vector series. This is a logical typing
-    /// wrapper; the physical planner may lower it to the child op unchanged.
+    /// `vector(s)`: scalar-producing child → single anonymous series. The
+    /// physical planner may lower this to the child unchanged.
     Vectorize { child: Box<LogicalPlan> },
 
     // --- stateless middle -------------------------------------------------
-    /// Pointwise instant-vector function (`abs`, `ln`, `clamp`, ...).
+    /// Pointwise (`abs`, `ln`, `clamp`, ...).
     InstantFn {
         kind: InstantFnKind,
         child: Box<LogicalPlan>,
     },
 
-    /// Label-rewriting instant-vector functions (`label_replace`,
-    /// `label_join`).
+    /// `label_replace`, `label_join`.
     LabelManip {
         kind: LabelManipKind,
         child: Box<LogicalPlan>,
     },
 
-    /// Unified range-function driver (`rate`, `increase`, `*_over_time`).
-    /// `child` must be a `MatrixSelector` or `Subquery` — lowering enforces.
+    /// `rate`, `increase`, `*_over_time`. Lowering enforces that `child` is
+    /// `MatrixSelector` or `Subquery`.
     Rollup {
         kind: RollupKind,
         child: Box<LogicalPlan>,
     },
 
-    /// Vector/vector or vector/scalar or scalar/scalar binop. Matching is
-    /// present for vector/vector; `None` for scalar-involving shapes.
+    /// `matching` is present for vector/vector; `None` for scalar-involving shapes.
     Binary {
         op: BinaryOpKind,
         lhs: Box<LogicalPlan>,
@@ -244,13 +218,11 @@ pub enum LogicalPlan {
         matching: Option<BinaryMatching>,
     },
 
-    /// Streaming or breaker aggregate (`sum`, `avg`, `topk`, `quantile`,
-    /// ...). `count_values` is a separate variant ([`Self::CountValues`]).
+    /// `sum`, `avg`, `topk`, `quantile`, .... `count_values` is separate.
     Aggregate {
         kind: AggregateKind,
         child: Box<LogicalPlan>,
-        /// Optional scalar parameter expression for `topk` / `bottomk`
-        /// when the argument is not a foldable numeric literal.
+        /// Scalar parameter for `topk` / `bottomk` when not a foldable literal.
         param: Option<Box<LogicalPlan>>,
         grouping: AggregateGrouping,
     },
@@ -265,48 +237,8 @@ pub enum LogicalPlan {
         at: Option<AtModifier>,
     },
 
-    /// Breaker that reshapes upstream batches to different tile dimensions.
-    /// Inserted by the physical planner (unit 4.5) when operators disagree
-    /// on the preferred axis; present here so the IR is complete across
-    /// rewrites.
-    ///
-    /// # Design note: exchange-shaped variants in the logical plan
-    ///
-    /// `Rechunk`, `Concurrent`, and `Coalesce` are physical concerns —
-    /// tile shape, parallelism, fan-in. Most query engines (DataFusion,
-    /// Spark Catalyst, DuckDB, thanos-io/promql-engine) keep variants
-    /// like these out of the logical plan and introduce them only in
-    /// the physical plan, so the logical plan stays an executor-agnostic
-    /// semantic description.
-    ///
-    /// We deliberately keep them in `LogicalPlan` for now because it is
-    /// the only enum IR in the system. `PhysicalPlan` (unit 4.3) is not
-    /// a parallel IR — its `root` is `Box<dyn Operator>`, a compiled,
-    /// type-erased operator tree you can only `.next()` against. There
-    /// is no physical-side `match` target, no `PartialEq`, no rewrite
-    /// surface. Physical-shaped variants therefore have nowhere else to
-    /// live and end up here by default.
-    ///
-    /// The cost: fields like `target_step_chunk` are specific to this
-    /// engine's tile model, the `LogicalPlan` is no longer an
-    /// executor-agnostic semantic description, and optimizer rules must
-    /// treat these variants as structurally transparent (the way an
-    /// AST-level pass would look past `Paren`).
-    ///
-    /// **Revisit when adding scatter-gather across timeseries nodes.**
-    /// Distributed execution wants a `RemoteExec`-shaped variant at
-    /// shard boundaries, and at that point the natural fix is to
-    /// introduce a second enum IR — `PhysicalPlanNode` or similar —
-    /// sitting between `LogicalPlan` and the dyn-`Operator` tree. It
-    /// would hold `Rechunk` / `Concurrent` / `Coalesce` / `RemoteExec`
-    /// and whatever runtime artifacts (compiled group maps, match
-    /// tables, resolved schemas) the operators need, giving us a
-    /// rewrite surface for physical decisions (coalesce placement,
-    /// remote pushdown) that does not exist today. `LogicalPlan` stays
-    /// semantic-only; the dyn-`Operator` tree stays the final compiled
-    /// form. Three phases instead of two — the shape Catalyst,
-    /// DataFusion, and DuckDB all settle on once physical rewrites
-    /// become load-bearing.
+    /// Tile-shape breaker, inserted by the physical planner when operators
+    /// disagree on the preferred axis. See enum-level docs for why it lives here.
     Rechunk {
         child: Box<LogicalPlan>,
         target_step_chunk: usize,
@@ -321,8 +253,7 @@ pub enum LogicalPlan {
     },
 
     // --- exchange ---------------------------------------------------------
-    /// Producer/consumer decoupling via a bounded mpsc. Inserted by the
-    /// planner (unit 4.5); represented here so the IR is complete.
+    /// Producer/consumer decoupling via a bounded mpsc.
     Concurrent {
         child: Box<LogicalPlan>,
         channel_bound: usize,
@@ -333,7 +264,6 @@ pub enum LogicalPlan {
 }
 
 impl LogicalPlan {
-    /// `true` iff this node is a leaf (no logical children).
     pub fn is_leaf(&self) -> bool {
         matches!(
             self,
@@ -344,14 +274,11 @@ impl LogicalPlan {
         )
     }
 
-    /// `true` iff this node produces a range (matrix) value. Useful for the
-    /// physical planner's type-checking pass.
     pub fn produces_matrix(&self) -> bool {
         matches!(self, Self::MatrixSelector { .. } | Self::Subquery { .. })
     }
 
-    /// `true` iff this node produces a scalar shape (one anonymous value per
-    /// step rather than a vector/matrix).
+    /// One anonymous value per step (vs. a vector/matrix).
     pub fn produces_scalar(&self) -> bool {
         match self {
             Self::Scalar(_) | Self::Time => true,

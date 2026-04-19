@@ -1,91 +1,73 @@
-//! Core columnar data types for the v2 execution engine.
+//! The columnar data types that flow between v2 operators.
 //!
-//! Defines:
-//! - [`StepBatch`]: the universal on-the-wire shape between operators (a
-//!   contiguous chunk of series × a contiguous range of output steps,
-//!   columnar, float-only).
-//! - [`SeriesSchema`]: the per-query series roster referenced by every
-//!   batch via `Arc`. Labels and fingerprints are dense-indexed by
-//!   `series_idx: u32`.
-//! - [`SchemaRef`]: the handle operators publish via `Operator::schema`.
-//!   `Static` covers every operator; `Deferred` is the RFC's one named
-//!   escape hatch for `count_values`, whose output labelset is derived
-//!   from runtime sample values.
-//! - [`BitSet`]: hand-rolled `Vec<u64>` bitset used for sample validity
-//!   (no new workspace dependency).
+//! A query plan is a tree of operators; [`StepBatch`] is the one shape that
+//! moves along every edge. Every supporting type here exists so batches can
+//! carry just enough metadata to be produced, consumed, and re-assembled
+//! without per-cell lookups.
 //!
-//! See RFC 0007 §"Core Data Model".
-//!
-//! Subsequent units extend these types — notably unit 1.4
-//! ([`super::memory::MemoryReservation`]) will add `try_grow`-routed
-//! allocation helpers, and the planner units will populate `SeriesSchema`
-//! with group maps and fingerprint indexes.
+//! - [`StepBatch`]: the wire shape. A rectangle of `f64` values over
+//!   `series × step` with a parallel validity bitset.
+//! - [`SeriesSchema`]: the per-query series roster (the full list of series
+//!   a query will touch), dense-indexed by `series_idx: u32` so operator
+//!   state can use arrays instead of label hashmaps.
+//! - [`SchemaRef`]: a handle to an operator's output schema, callable before
+//!   the operator has produced any batches. [`SchemaRef::Deferred`] is the
+//!   one escape hatch for `count_values`, whose output labels depend on
+//!   sample values.
+//! - [`BitSet`]: the `Vec<u64>` bitset behind every batch's validity column.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::model::Labels;
 
-/// A contiguous rectangle of values for `series_range × step_range`,
-/// streamed between operators.
+/// The wire shape of the v2 engine — operators produce and consume
+/// `StepBatch`es, and nothing else flows between them.
 ///
-/// Invariants (checked in debug by [`StepBatch::new`]):
-/// - `step_range` is a sub-range of `0..step_timestamps.len()`.
-/// - `series_range` is a sub-range of `0..series.len()` when `series` is
-///   [`SchemaRef::Static`]. For [`SchemaRef::Deferred`] the range is only
-///   valid after the deferred child has produced its first batch.
-/// - `values.len() == validity.len() == step_count * series_count`.
+/// Each batch covers a rectangle of the query's output: a contiguous slice of
+/// the series roster (`series_range`) across a contiguous slice of output
+/// steps (`step_range`). `values` holds the numbers in a flat `Vec<f64>`,
+/// laid out step-by-step — all series for step 0, then all series for step 1,
+/// and so on (row-major by step). `validity` tracks which cells actually
+/// carry a sample; a cleared bit means "no sample in the lookback window,"
+/// which is distinct from `NaN` (a real value) and from `STALE_NAN` (an
+/// explicit staleness marker preserved from the source).
 ///
-/// See RFC 0007 §"Core Data Model".
+/// A query usually emits many batches: leaf operators tile the
+/// `series × step` grid into sub-rectangles so a single batch's allocation
+/// stays bounded, and downstream operators either pass the tiling through
+/// or repackage it (see [`RechunkOp`](super::operators::rechunk::RechunkOp)).
+///
+/// For [`SchemaRef::Deferred`] outputs, `series_range` is only meaningful
+/// after the deferred child has produced its first batch. Shape invariants
+/// are checked in debug builds by [`StepBatch::new`].
 #[derive(Debug, Clone)]
 pub struct StepBatch {
-    /// Absolute evaluation timestamps (ms). Shared by every batch in a
-    /// query via `Arc`. One allocation per query, pointer-copied here.
+    /// Absolute evaluation timestamps (ms). `Arc`-shared across every batch in a query.
     pub step_timestamps: Arc<[i64]>,
-    /// Slice of [`Self::step_timestamps`] covered by this batch.
     pub step_range: Range<usize>,
 
-    /// Series roster. `Arc`-shared across every batch emitted from a
-    /// single operator (and usually across the whole plan).
     pub series: SchemaRef,
-    /// Slice of the series roster covered by this batch.
     pub series_range: Range<usize>,
 
-    /// Sample values, SoA, float-only in v1.
-    ///
-    /// Layout: **row-major by step**. The sample for the `s`th series in
-    /// this batch (0-indexed within `series_range`) at the `t`th step in
-    /// this batch (0-indexed within `step_range`) lives at
-    /// `values[t * series_count + s]`, where `series_count = series_range.len()`.
-    ///
-    /// Length is always `step_count * series_count`.
+    /// Row-major by step: cell `(t, s)` lives at `values[t * series_count + s]`.
     pub values: Vec<f64>,
-    /// Per-cell validity. Bit `i` of [`Self::validity`] is set iff
-    /// `values[i]` is a sample; cleared means "no sample in lookback
-    /// window" (distinct from `NaN`, which is a real value, and from
-    /// `STALE_NAN`, which is a real explicit marker preserved by the
-    /// source).
+    /// Bit `i` set iff `values[i]` is a real sample. Cleared means "no sample in
+    /// lookback window" — distinct from `NaN` (real value) and `STALE_NAN` (explicit
+    /// marker preserved by the source).
     pub validity: BitSet,
 
-    /// Optional per-cell source-sample timestamps (ms). Populated only by
-    /// [`super::operators::VectorSelectorOp`] — the sole operator that
-    /// reads raw samples from storage — and dropped by every operator
-    /// that derives a new value (arithmetic, aggregation, rollup, etc.),
-    /// which matches Prometheus' `timestamp()` semantics: the function
-    /// returns the time of the underlying sample for a bare vector
-    /// selector and the evaluation time otherwise (at_modifier.test:193).
+    /// Per-cell source-sample timestamps. Populated only by [`VectorSelectorOp`],
+    /// dropped by any operator that derives a new value, matching Prometheus'
+    /// `timestamp()` semantics. [`InstantFnKind::Timestamp`] consults this column
+    /// before falling back to the step timestamp.
     ///
-    /// When `Some`, has the same layout and length as [`Self::values`] /
-    /// [`Self::validity`]; only cells with validity bit set carry a
-    /// meaningful timestamp. [`InstantFnKind::Timestamp`] consults this
-    /// column before falling back to the step timestamp.
-    ///
+    /// [`VectorSelectorOp`]: super::operators::VectorSelectorOp
     /// [`InstantFnKind::Timestamp`]: super::operators::instant_fn::InstantFnKind::Timestamp
     pub source_timestamps: Option<Arc<[i64]>>,
 }
 
 impl StepBatch {
-    /// Construct a new batch. In debug builds, verifies shape invariants.
     pub fn new(
         step_timestamps: Arc<[i64]>,
         step_range: Range<usize>,
@@ -143,10 +125,8 @@ impl StepBatch {
         }
     }
 
-    /// Attach per-cell source-sample timestamps (`ms`). Builder-style;
-    /// only [`super::operators::VectorSelectorOp`] should call this, so
-    /// the rest of the pipeline pays nothing for the column when it
-    /// isn't in use. Length must equal `self.values.len()`.
+    /// Attach per-cell source-sample timestamps. Only
+    /// [`super::operators::VectorSelectorOp`] should call this.
     pub fn with_source_timestamps(mut self, source_timestamps: Arc<[i64]>) -> Self {
         debug_assert_eq!(
             source_timestamps.len(),
@@ -159,42 +139,34 @@ impl StepBatch {
         self
     }
 
-    /// Number of steps covered by this batch.
     #[inline]
     pub fn step_count(&self) -> usize {
         self.step_range.len()
     }
 
-    /// Number of series covered by this batch.
     #[inline]
     pub fn series_count(&self) -> usize {
         self.series_range.len()
     }
 
-    /// Total number of `(step, series)` cells = `step_count * series_count`.
+    /// Total number of `(step, series)` cells.
     #[inline]
     pub fn len(&self) -> usize {
         self.step_count() * self.series_count()
     }
 
-    /// `true` when the batch has zero cells (either zero steps or zero
-    /// series).
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.step_count() == 0 || self.series_count() == 0
     }
 
-    /// Timestamps for the steps covered by this batch.
     #[inline]
     pub fn step_timestamps_slice(&self) -> &[i64] {
         &self.step_timestamps[self.step_range.clone()]
     }
 
-    /// Linear index into [`Self::values`] / [`Self::validity`] for the
-    /// cell at `(step_offset, series_offset)`, where offsets are
-    /// 0-indexed within this batch's ranges (not the global schema).
-    ///
-    /// Row-major by step: `step_offset * series_count + series_offset`.
+    /// Linear index into `values` / `validity` for the cell at
+    /// `(step_offset, series_offset)`, 0-indexed within this batch's ranges.
     #[inline]
     pub fn cell_index(&self, step_offset: usize, series_offset: usize) -> usize {
         debug_assert!(step_offset < self.step_count());
@@ -202,8 +174,7 @@ impl StepBatch {
         step_offset * self.series_count() + series_offset
     }
 
-    /// Read the value at `(step_offset, series_offset)`. Returns `None`
-    /// when the cell is absent (validity bit clear).
+    /// `None` when the cell's validity bit is clear.
     #[inline]
     pub fn get(&self, step_offset: usize, series_offset: usize) -> Option<f64> {
         let idx = self.cell_index(step_offset, series_offset);
@@ -215,28 +186,23 @@ impl StepBatch {
     }
 }
 
-/// Per-query series roster. Plan-time constructed, read-only during
-/// execution. Indexed by dense `series_idx: u32` so operator state can
-/// be dense-array-keyed rather than `HashMap<Labels, …>`.
+/// The full list of series a query will touch, built once by the physical
+/// planner and shared (via `Arc`) across every batch for that query.
 ///
-/// Subsequent units will extend this struct with group maps, binary
-/// matching tables, and bucket-membership metadata; the minimum shape
-/// here is what unit 1.3 needs.
+/// Because the roster is fixed at plan time, a series can be identified by
+/// a dense `series_idx: u32` — an index into this schema — so operator state
+/// (group maps, match tables, per-series accumulators) uses arrays rather
+/// than `HashMap<Labels, _>`. Fingerprints are kept alongside labels so
+/// comparisons across buckets don't have to re-hash labelsets.
 #[derive(Debug, Clone)]
 pub struct SeriesSchema {
-    /// Label set for each series. `labels[i]` corresponds to
-    /// `series_idx = i as u32`.
     labels: Arc<[Labels]>,
-    /// Stable cross-bucket fingerprint for each series. Same dense
-    /// indexing as [`Self::labels`].
+    /// Stable cross-bucket fingerprint for each series.
     fingerprints: Arc<[u128]>,
 }
 
 impl SeriesSchema {
-    /// Build a schema from parallel label / fingerprint vectors.
-    ///
-    /// Panics if the two slices have mismatched lengths — this is a
-    /// plan-time programmer error, not a runtime condition.
+    /// Panics on mismatched lengths — a plan-time programmer error.
     pub fn new(labels: Arc<[Labels]>, fingerprints: Arc<[u128]>) -> Self {
         assert_eq!(
             labels.len(),
@@ -249,7 +215,6 @@ impl SeriesSchema {
         }
     }
 
-    /// Empty schema — used as a placeholder and by tests.
     pub fn empty() -> Self {
         Self {
             labels: Arc::from(Vec::<Labels>::new()),
@@ -257,71 +222,61 @@ impl SeriesSchema {
         }
     }
 
-    /// Number of series in the roster. Also the exclusive upper bound
-    /// for any legal `series_idx` / `series_range.end`.
+    /// Exclusive upper bound for any legal `series_idx`.
     #[inline]
     pub fn len(&self) -> usize {
         self.labels.len()
     }
 
-    /// `true` when the roster has zero series.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.labels.is_empty()
     }
 
-    /// Labels for a given `series_idx`.
     #[inline]
     pub fn labels(&self, series_idx: u32) -> &Labels {
         &self.labels[series_idx as usize]
     }
 
-    /// All labels, dense-indexed.
     #[inline]
     pub fn labels_slice(&self) -> &[Labels] {
         &self.labels
     }
 
-    /// Cross-bucket fingerprint for a given `series_idx`.
     #[inline]
     pub fn fingerprint(&self, series_idx: u32) -> u128 {
         self.fingerprints[series_idx as usize]
     }
 
-    /// All fingerprints, dense-indexed.
     #[inline]
     pub fn fingerprints_slice(&self) -> &[u128] {
         &self.fingerprints
     }
 }
 
-/// Handle to an operator's output series schema.
+/// Handle to an operator's output series schema, callable before the
+/// operator has produced any batches.
 ///
-/// Every operator exposes a schema before `next()` is called. In v1 this
-/// is [`SchemaRef::Static`] for every operator except `count_values`,
-/// whose output labelset is derived from runtime sample values; it
-/// publishes [`SchemaRef::Deferred`] and only binds to a `Static` schema
-/// after draining its child. Downstream operators treat `Deferred` as
-/// "schema known after my child's first batch."
-///
-/// See RFC 0007 §"Core Data Model".
+/// Almost every operator can name its output series at plan time — it either
+/// forwards the child's schema or derives a new one from plan-time data —
+/// and so returns [`SchemaRef::Static`]. The one exception is `count_values`,
+/// whose output labels include each distinct observed sample value and so
+/// cannot be known until the child has been drained. It publishes
+/// [`SchemaRef::Deferred`] from [`super::operator::Operator::schema`] and
+/// stamps a concrete `Static` schema onto each emitted batch. Downstream
+/// operators read `Deferred` as "this schema is known once my child has
+/// produced its first batch."
 #[derive(Debug, Clone)]
 pub enum SchemaRef {
-    /// Statically-known schema, available at plan time.
     Static(Arc<SeriesSchema>),
-    /// Schema is value-dependent and will be resolved at runtime by the
-    /// producing operator (i.e., `count_values`).
     Deferred,
 }
 
 impl SchemaRef {
-    /// Static helper for tests and callers that want an empty schema.
     pub fn empty_static() -> Self {
         SchemaRef::Static(Arc::new(SeriesSchema::empty()))
     }
 
-    /// `Some(&schema)` when the schema is statically known, `None` when
-    /// [`SchemaRef::Deferred`].
     pub fn as_static(&self) -> Option<&Arc<SeriesSchema>> {
         match self {
             SchemaRef::Static(schema) => Some(schema),
@@ -329,19 +284,13 @@ impl SchemaRef {
         }
     }
 
-    /// `true` if this is a [`SchemaRef::Deferred`] handle.
     pub fn is_deferred(&self) -> bool {
         matches!(self, SchemaRef::Deferred)
     }
 }
 
-/// Fixed-length bitset backed by `Vec<u64>`.
-///
-/// Hand-rolled deliberately: the RFC forbids adding workspace
-/// dependencies for this unit, and the required surface area
-/// (`with_len`, `get`, `set`, `clear`, `len`) is trivial. All-zero
-/// default means "all cells absent," matching the intended use for
-/// `StepBatch::validity`.
+/// Fixed-length bitset backed by `Vec<u64>`, used as the validity column of
+/// every [`StepBatch`]. Default (all zero) means "all cells absent."
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BitSet {
     bits: Vec<u64>,
@@ -349,8 +298,7 @@ pub struct BitSet {
 }
 
 impl BitSet {
-    /// Create a bitset of the given length with all bits cleared
-    /// (i.e., all cells marked absent).
+    /// All bits cleared.
     pub fn with_len(len: usize) -> Self {
         let word_count = len.div_ceil(64);
         Self {
@@ -359,8 +307,7 @@ impl BitSet {
         }
     }
 
-    /// Create a bitset of the given length with all bits set
-    /// (i.e., all cells marked present).
+    /// All bits set.
     pub fn all_set(len: usize) -> Self {
         let word_count = len.div_ceil(64);
         let mut bits = vec![u64::MAX; word_count];
@@ -372,20 +319,17 @@ impl BitSet {
         Self { bits, len }
     }
 
-    /// Number of tracked bits (equal to `step_count * series_count` for
-    /// a `StepBatch`).
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// `true` when zero bits are tracked.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Read the bit at `idx`. Panics if `idx >= len`.
+    /// Panics if `idx >= len`.
     #[inline]
     pub fn get(&self, idx: usize) -> bool {
         assert!(
@@ -398,7 +342,7 @@ impl BitSet {
         (self.bits[word] >> bit) & 1 == 1
     }
 
-    /// Set the bit at `idx`. Panics if `idx >= len`.
+    /// Panics if `idx >= len`.
     #[inline]
     pub fn set(&mut self, idx: usize) {
         assert!(
@@ -411,7 +355,7 @@ impl BitSet {
         self.bits[word] |= 1u64 << bit;
     }
 
-    /// Clear the bit at `idx`. Panics if `idx >= len`.
+    /// Panics if `idx >= len`.
     #[inline]
     pub fn clear(&mut self, idx: usize) {
         assert!(
@@ -424,8 +368,7 @@ impl BitSet {
         self.bits[word] &= !(1u64 << bit);
     }
 
-    /// Count of set bits. Linear in `len / 64`; callers relying on this
-    /// repeatedly should cache it.
+    /// Linear in `len / 64`.
     pub fn count_ones(&self) -> usize {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }

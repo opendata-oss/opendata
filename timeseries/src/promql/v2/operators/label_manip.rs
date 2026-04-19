@@ -1,12 +1,19 @@
-//! Label-manipulation breaker for `label_replace` / `label_join`.
+//! Implements PromQL's `label_replace` and `label_join` — the two
+//! functions that rewrite output labelsets without touching sample values.
 //!
-//! These functions rewrite output labelsets rather than sample values. The
-//! planner precomputes the deduplicated output roster plus an
-//! `input_series -> output_series` map from the child schema and the call's
-//! string arguments. Runtime still must reject overlapping rewrites that
-//! collapse distinct input series onto the same output labels at the same
-//! step, so this operator drains its child and merges cells onto the output
-//! roster, erroring on same-step collisions.
+//! Because the rewrites depend only on input labels and plan-time
+//! constants (the destination label, the regex / separator, the source
+//! labels), the planner can precompute the deduplicated output roster
+//! plus an `input_series → output_series` map from the child schema
+//! alone. The runtime work is then just "merge input cells onto the
+//! output roster."
+//!
+//! But there's a runtime check the planner can't do: two input series
+//! whose rewritten labels collide are legal (if their samples are
+//! disjoint in time) but produce an error if both are valid at the same
+//! step. So this operator is a pipeline breaker — it drains the child
+//! fully, merges cells onto the output roster, and errors on any same-step
+//! collision.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -18,14 +25,20 @@ use crate::promql::v2::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
 use crate::promql::v2::memory::{MemoryReservation, QueryError};
 use crate::promql::v2::operator::{Operator, OperatorSchema};
 
+/// Which label-rewrite function the operator applies to each input
+/// labelset. `regex` / `replacement` / `separator` are plan-time constants
+/// passed through from the PromQL call; `src_labels` preserves the caller's
+/// argument order for `label_join`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LabelManipKind {
+    /// `label_replace(v, dst, replacement, src, regex)`.
     Replace {
         dst_label: String,
         replacement: String,
         src_label: String,
         regex: String,
     },
+    /// `label_join(v, dst, separator, src_labels...)`.
     Join {
         dst_label: String,
         separator: String,
@@ -151,6 +164,11 @@ impl Drop for OutBuffers {
     }
 }
 
+/// Implements PromQL's `label_replace` / `label_join`. A pipeline breaker:
+/// drains its child, merges each input cell onto the planner-built output
+/// roster via an `input_series → output_series` map, and errors on
+/// same-step collisions between distinct input series that rewrite to the
+/// same output labels.
 pub struct LabelManipOp<C: Operator> {
     child: Option<C>,
     input_to_output: Arc<[u32]>,

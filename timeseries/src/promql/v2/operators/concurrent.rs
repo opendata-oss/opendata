@@ -1,41 +1,16 @@
-//! `Concurrent` exchange operator — unit 3c.5.
+//! `ConcurrentOp` — the one operator that introduces parallelism into the
+//! v2 pipeline. Decouples an I/O-heavy child (typically a selector) from
+//! the downstream CPU-bound chain by running the child on a spawned tokio
+//! task that pushes batches through a bounded mpsc channel.
 //!
-//! Producer/consumer decoupling with a bounded mpsc channel. The wrapped
-//! child is moved onto a freshly-spawned tokio task; the task drives the
-//! child with an ambient [`tokio::spawn`] and pushes each batch (or error)
-//! into a bounded [`tokio::sync::mpsc`] channel. The outer operator's
-//! [`Operator::next`] polls the channel receiver.
+//! The channel's bounded capacity provides back-pressure: when the
+//! consumer stops polling, the producer's `send` awaits and the child
+//! task blocks, so the child can never run arbitrarily far ahead of the
+//! consumer. The operator itself holds no memory reservation — batches in
+//! flight are already accounted for by their producers.
 //!
-//! # Why
-//!
-//! RFC 0007 §"Execution Model" — `Concurrent` operators decouple async
-//! I/O from CPU-bound evaluation downstream. Without this wrapper, every
-//! `Pending` the child emits (e.g. waiting on a `SeriesSource` stream)
-//! ripples all the way to the query root. Wrapping an I/O-heavy subplan
-//! in `Concurrent` lets the tokio runtime schedule it alongside the
-//! evaluator, so CPU work proceeds while the child awaits bytes.
-//!
-//! # Back-pressure
-//!
-//! The mpsc channel's capacity is the back-pressure. When the consumer
-//! (downstream operator) stops polling, the channel fills, the producer's
-//! `send` awaits, and the child task blocks. When the consumer resumes,
-//! the producer wakes up and keeps going. No additional state; no
-//! explicit flow-control signals.
-//!
-//! # Memory accounting
-//!
-//! No reservation is taken by this operator itself. Each batch traversing
-//! the channel is already accounted-for by its producer (child operator's
-//! `OutBuffers` / scratch / etc.); the channel just holds at most `bound`
-//! already-counted batches. When this operator forwards a batch downstream
-//! the batch's memory belongs to whoever last allocated it.
-//!
-//! # Tokio dependency
-//!
-//! `tokio` is already a workspace dependency (`timeseries/Cargo.toml:56`).
-//! No new deps. The ambient runtime is used — callers must be inside a
-//! tokio runtime when constructing a [`ConcurrentOp`].
+//! Callers must construct from inside a tokio runtime (the constructor
+//! spawns the task eagerly).
 
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -48,34 +23,23 @@ use super::super::memory::QueryError;
 use super::super::operator::{Operator, OperatorSchema};
 use super::super::trace;
 
-/// Default channel bound. Small enough that pathological producers can't
-/// buffer unbounded batches, large enough to keep a typical CPU-bound
-/// consumer fed through one async `.await` round-trip.
 pub const DEFAULT_CHANNEL_BOUND: usize = 4;
 
-/// Producer/consumer decoupling wrapper.
-///
-/// See module docs for back-pressure, memory, and tokio semantics.
+/// Runs its child on a spawned tokio task, decoupling it from the downstream
+/// polling loop via a bounded mpsc channel. The bound is the back-pressure
+/// budget — how many batches the child may run ahead of the consumer.
 pub struct ConcurrentOp {
-    /// Cached child schema — captured at construction so [`Operator::schema`]
+    /// Captured before the child is moved onto the task so [`Operator::schema`]
     /// stays callable before the first `next()`.
     cached_schema: Arc<OperatorSchema>,
-    /// Receiver side of the bounded mpsc channel fed by the spawned task.
     rx: mpsc::Receiver<Result<StepBatch, QueryError>>,
-    /// Retained so the task doesn't outlive the operator (cancellation on
-    /// drop). Not polled — the channel signals end-of-stream via `rx`
-    /// returning `None` when the task drops `tx`.
+    /// Held so the task is cancelled on drop. End-of-stream is signalled by
+    /// the task dropping its `tx`.
     _task: tokio::task::JoinHandle<()>,
 }
 
 impl ConcurrentOp {
-    /// Wrap `child`, spawning a tokio task that drives it and forwards
-    /// batches to the returned operator over a bounded mpsc channel.
-    ///
-    /// - `bound`: channel capacity. Must be `> 0`. Use
-    ///   [`DEFAULT_CHANNEL_BOUND`] unless profiling suggests otherwise.
-    ///
-    /// Must be called from inside a tokio runtime (ambient `tokio::spawn`).
+    /// `bound` must be `> 0`. Must be called from inside a tokio runtime.
     pub fn new<C>(mut child: C, bound: usize) -> Self
     where
         C: Operator + Send + 'static,

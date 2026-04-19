@@ -1,83 +1,30 @@
-//! `Rollup` operator — unit 3b.1.
+//! `RollupOp` implements every PromQL range function — `rate`,
+//! `increase`, `delta`, `*_over_time`, `quantile_over_time`, `resets`,
+//! `changes`, and the rest. One operator type, with the specific
+//! reduction selected by a [`RollupKind`] enum.
 //!
-//! Unified range-function driver. Consumes [`MatrixWindowBatch`]es from an
-//! upstream [`WindowStream`] (in production: [`MatrixSelectorOp`]) and
-//! reduces each `(step, series)` window cell to a single scalar, producing
-//! a [`StepBatch`] with identical series schema and step grid.
+//! The division of labour with the upstream selector is deliberate:
+//! [`MatrixSelectorOp`] does the "per-step window" work (fetch samples,
+//! slice them per cell, emit [`MatrixWindowBatch`]es); `RollupOp` does
+//! the "window → scalar" work (pick a reducer, apply it per cell, emit
+//! [`StepBatch`]es). They talk through the [`WindowStream`] trait so
+//! [`SubqueryOp`](super::subquery::SubqueryOp) can plug in as an
+//! alternative producer without subclassing the selector.
 //!
-//! Rather than one operator per PromQL range function, this type takes a
-//! [`RollupKind`] discriminant at plan time and dispatches via enum-match
-//! in the per-cell reducer (RFC 0007 §"Operator Taxonomy" / §"Prior Art":
-//! VictoriaMetrics-style unified rollup abstraction). The per-cell
-//! computation is a no-alloc function of `(window_start_ms,
-//! window_end_ms, &[i64], &[f64])` returning `Option<f64>` (`None` ⇒ set
-//! validity bit to 0). This keeps every range function on the same
-//! two-pointer driver and memory-accounting path.
+//! Dispatch is a [`RollupKind`] enum-match on a no-alloc
+//! `(window_start, window_end, &[ts], &[val]) → Option<f64>` reducer —
+//! `None` flips the output cell's validity to 0.
 //!
-//! # Supported rollup kinds (MVP)
+//! Scope: the legacy engine's range functions plus `increase`, `delta`,
+//! `irate`, `idelta`, `resets`, `changes`, `last_over_time`,
+//! `quantile_over_time`, `present_over_time`.
 //!
-//! | kind | requires ≥N samples | semantics |
-//! |---|---|---|
-//! | `Rate` | 2 | extrapolated per-second rate, counter-reset aware |
-//! | `Increase` | 2 | extrapolated total increase (rate × range_seconds) |
-//! | `Delta` | 2 | extrapolated `last - first`, no reset handling |
-//! | `Irate` | 2 | `(last.v - prev.v) / (last.t - prev.t)` per-second, reset-aware |
-//! | `Idelta` | 2 | `last.v - prev.v`, no reset handling |
-//! | `Resets` | 1 | count of counter resets in window |
-//! | `Changes` | 1 | count of value changes in window |
-//! | `SumOverTime` | 1 | Kahan/Neumaier compensated sum |
-//! | `AvgOverTime` | 1 | compensated mean, overflow-switching to incremental |
-//! | `MinOverTime` | 1 | min, NaN-replaces-by-real |
-//! | `MaxOverTime` | 1 | max, NaN-replaces-by-real |
-//! | `CountOverTime` | 1 | count of samples |
-//! | `LastOverTime` | 1 | last sample value |
-//! | `StddevOverTime` | 1 | population stddev (Welford) |
-//! | `StdvarOverTime` | 1 | population variance (Welford) |
-//! | `QuantileOverTime(q)` | 1 | Prometheus-style linear interpolation |
-//! | `PresentOverTime` | 1 | 1 if any sample, else absent |
+//! Extrapolation for `rate` / `increase` / `delta` is ported verbatim
+//! from v1's `counter_increase_correction` + `extrapolated_rate`.
 //!
-//! **MVP gaps vs the existing engine** (see `timeseries/src/promql/functions.rs`):
-//! the current engine only ships `rate`, `sum_over_time`, `avg_over_time`,
-//! `min_over_time`, `max_over_time`, `count_over_time`, `stddev_over_time`,
-//! `stdvar_over_time`. This Rollup implements a **strict superset** —
-//! `increase`, `delta`, `irate`, `idelta`, `resets`, `changes`,
-//! `last_over_time`, `quantile_over_time`, `present_over_time` are new
-//! here. Phase 6 golden tests only exercise functions the existing engine
-//! supports, so no downgrade risk; the extras will come online when the
-//! Phase 4 planner wires them.
-//!
-//! # Extrapolation (`rate` / `increase` / `delta`)
-//!
-//! Ported verbatim from `timeseries/src/promql/functions.rs:1008-1077`
-//! (`counter_increase_correction` + `extrapolated_rate`). The formula:
-//!
-//! - `result = last.v - first.v`
-//! - For counters (`rate` / `increase`), add [`counter_increase_correction`]
-//!   — the sum of values before each reset (Prometheus logic).
-//! - Compute `avg_interval = (last.t - first.t) / (n - 1)` and
-//!   `extrapolation_threshold = 1.1 × avg_interval`.
-//! - `duration_to_start = first.t - range_start`, clipped to `avg_interval
-//!   / 2` when ≥ threshold. For non-negative counters with positive result,
-//!   further clip so extrapolation does not cross zero.
-//! - `duration_to_end = range_end - last.t`, clipped identically.
-//! - `factor = (time_diff + duration_to_start + duration_to_end) /
-//!   time_diff / range_seconds`.
-//! - `rate = result * factor`; `increase = result * factor * range_seconds`;
-//!   `delta = result * factor * range_seconds` (but without counter
-//!   correction — matches Prometheus `delta`).
-//!
-//! This is the sole implementation of PromQL's extrapolation in v2; no
-//! re-derivation or reinterpretation.
-//!
-//! # Memory accounting
-//!
-//! - Input `MatrixWindowBatch` is already reservation-accounted by 3a.2 —
-//!   Rollup does not double-count it.
-//! - Output `StepBatch` (`values: Vec<f64>` + `validity: BitSet`)
-//!   allocates through [`MemoryReservation::try_grow`]. The [`OutBuffers`]
-//!   RAII guard releases on `Drop`; `finish()` transfers ownership and
-//!   releases the slice (the consumer re-reserves if it retains the
-//!   batch — same convention as 3a.1 / 3a.2).
+//! Only the output `StepBatch` buffers route through
+//! [`MemoryReservation::try_grow`]; the input window batch is already
+//! accounted for by `MatrixSelectorOp`.
 
 use std::task::{Context, Poll};
 
@@ -91,12 +38,8 @@ use super::matrix_selector::{MatrixSelectorOp, MatrixWindowBatch};
 // RollupKind — one operator, function selection as data
 // ---------------------------------------------------------------------------
 
-/// Discriminant selecting the per-window scalar reducer.
-///
-/// Designed as a small `Copy` enum (no allocations) so the reducer
-/// dispatch is a single `match` per cell. Adding a new rollup is a new
-/// variant + a new arm in [`RollupKind::min_samples`] and
-/// [`RollupKind::compute`]; no trait object, no `Box<dyn …>`.
+/// Per-window scalar reducer. Adding a rollup is a new variant + arms in
+/// [`RollupKind::min_samples`] and [`RollupKind::compute`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RollupKind {
     Rate,
@@ -188,13 +131,20 @@ impl RollupKind {
 // WindowStream trait — the injection point for production vs test
 // ---------------------------------------------------------------------------
 
-/// Abstraction over any source of [`MatrixWindowBatch`]es. Production
-/// callers pass a [`MatrixSelectorOp`]; tests pass a hand-built mock.
+/// The "producer of [`MatrixWindowBatch`]es" abstraction that
+/// [`RollupOp`] pulls from — narrower than [`Operator`] (only `schema` +
+/// window-poll), so any producer of windowed samples can slot in.
 ///
-/// Intentionally narrower than the full [`Operator`] trait — it only
-/// needs `schema()` and the window-poll shape. [`MatrixSelectorOp`]
-/// implements this via a blanket below; test mocks implement it directly
-/// without spinning up a real `SeriesSource`.
+/// Production: [`MatrixWindowSource`] wraps a [`MatrixSelectorOp`].
+/// Subqueries: [`SubqueryOp`] implements it directly. Tests: hand-built
+/// mocks.
+///
+/// There's no blanket impl for [`MatrixSelectorOp`] because its
+/// `Operator::schema` is only exposed for `'static`, but `Rollup::schema`
+/// must work for any `'a` before any poll; the wrapper snapshots the
+/// schema at construction time to bridge the gap.
+///
+/// [`SubqueryOp`]: super::subquery::SubqueryOp
 pub trait WindowStream: Send {
     fn schema(&self) -> &OperatorSchema;
 
@@ -265,8 +215,10 @@ impl Drop for OutBuffers {
 // RollupOp — the operator
 // ---------------------------------------------------------------------------
 
-/// Per-window range-function operator. Reduces each window cell in a
-/// [`MatrixWindowBatch`] to a scalar, emitting a [`StepBatch`].
+/// Implements every PromQL range function (`rate`, `*_over_time`, ...).
+/// Pulls [`MatrixWindowBatch`]es from a [`WindowStream`] and reduces each
+/// `(step, series)` window to one scalar via the reducer named by
+/// [`RollupKind`], emitting a [`StepBatch`].
 ///
 /// See module docs for the function taxonomy and extrapolation citation.
 pub struct RollupOp<W: WindowStream> {
@@ -380,15 +332,15 @@ impl<W: WindowStream> Operator for RollupOp<W> {
 // Integration helper: wrap a MatrixSelectorOp without the schema trait gap
 // ---------------------------------------------------------------------------
 
-/// Production wrapper around [`MatrixSelectorOp`] that implements
-/// [`WindowStream`] cleanly for any lifetime `'a`. This exists because
-/// `MatrixSelectorOp::schema()` is only exposed via `Operator::schema` for
-/// the `'static` impl in 3a.2, and we need schema access before any poll
-/// happens regardless of the child's lifetime.
+/// The production implementation of [`WindowStream`] — wraps a
+/// [`MatrixSelectorOp`] so [`RollupOp`] can drive it for any lifetime
+/// `'a`.
 ///
-/// `schema_snapshot` is captured at construction time (the matrix
-/// schema is plan-time-stable per RFC §"Core Data Model"), so this
-/// wrapper owns the schema independently of the child's trait surface.
+/// This wrapper exists because `MatrixSelectorOp::schema` is only
+/// exposed through `Operator::schema` for the `'static` impl, but
+/// `WindowStream::schema` has to be callable for any `'a` before any
+/// poll. We resolve the gap by snapshotting the schema at construction
+/// and owning it here.
 pub struct MatrixWindowSource<'a, S: SeriesSource + Send + Sync + 'a> {
     inner: MatrixSelectorOp<'a, S>,
     schema_snapshot: OperatorSchema,
@@ -428,8 +380,8 @@ mod rollup_fns {
     // - avg_kahan (lines 77-113)
     // - variance_kahan (lines 1245-1265)
     //
-    // Kept here (rather than re-using the old module) per plan §3.4:
-    // operator units must not depend on `evaluator.rs` / `pipeline.rs` /
+    // Kept here (rather than re-using the old module) because v2
+    // operators must not depend on `evaluator.rs` / `pipeline.rs` /
     // `functions.rs`. v2 is an independent engine.
 
     /// Kahan-Neumaier compensated summation step. `#[inline(never)]`
@@ -909,7 +861,7 @@ mod tests {
     fn should_compute_rate_over_simple_counter() {
         // given: single step t=40, range=40 → window (0, 40]; samples
         // 10, 20, 30, 40 at timestamps 10, 20, 30, 40. Result should be
-        // extrapolated_rate against evaluator.rs:1026-1077 reference.
+        // extrapolated_rate, matching the v1 reference in functions.rs.
         let step_ts = vec![40];
         let series = 1;
         let cells = vec![vec![(10, 10.0), (20, 20.0), (30, 30.0), (40, 40.0)]];

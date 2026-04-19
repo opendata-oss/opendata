@@ -1,22 +1,28 @@
-//! Concrete [`Operator`](super::operator::Operator) implementations for the
-//! v2 execution engine.
+//! Every concrete [`Operator`](super::operator::Operator) implementation
+//! that can appear in a v2 query plan. The planner composes these into a
+//! tree; at runtime, the root operator is polled and each node pulls from
+//! its children.
 //!
-//! The submodule layout mirrors RFC 0007 §"Operator Taxonomy" — each phase
-//! 3 unit drops one or more files in here:
+//! Grouped by role:
 //!
-//! - [`vector_selector`] (unit 3a.1): leaf. Lookback, `@`, `offset`.
-//! - `matrix_selector` (unit 3a.2): leaf. Sliding window.
-//! - `rollup` (unit 3b.1): unified range-function driver.
-//! - `instant_fn` (unit 3b.2): pointwise scalar functions.
-//! - `binary` (unit 3b.3): vector/vector and vector/scalar binops.
-//! - `aggregate` (units 3b.4 / 3c.1): streaming and pipeline-breaker aggregates.
-//! - `subquery` (unit 3c.2): re-grids child onto inner step.
-//! - `rechunk` (unit 3c.3): transposes series-major ↔ step-major.
-//! - `count_values` (unit 3c.4): deferred-schema operator.
-//! - `concurrent` / `coalesce` (unit 3c.5): exchange operators.
+//! - Storage leaves (pull samples from a [`SeriesSource`]):
+//!   [`vector_selector`] for instant-vector leaves, [`matrix_selector`]
+//!   for bracketed range windows.
+//! - Per-cell transforms (one output value per input cell, schema
+//!   preserved): [`instant_fn`] (math functions like `abs`, `ln`),
+//!   [`coercion`] (`scalar()`, `time()`), [`label_manip`]
+//!   (`label_replace`, `label_join`).
+//! - Range-function driver: [`rollup`] — reduces each bracketed window to
+//!   one scalar for `rate`, `*_over_time`, and friends.
+//! - Binary ops and match-time broadcasting: [`binary`] — pointwise
+//!   arithmetic, comparisons, and set operations.
+//! - Grouping aggregates: [`aggregate`] (`sum by (…)`, `topk`, …),
+//!   [`count_values`] (deferred-schema — the one operator whose output
+//!   series depend on sample values).
+//! - Shape and plumbing (no semantic change, just data movement):
+//!   [`subquery`], [`rechunk`], [`concurrent`], [`coalesce`].
 //!
-//! Operator structs are re-exported from [`super`] via the prelude below so
-//! callers can write `use crate::promql::v2::operators::prelude::*;`.
+//! [`SeriesSource`]: super::source::SeriesSource
 
 pub(crate) mod aggregate;
 pub(crate) mod binary;
@@ -32,9 +38,6 @@ pub(crate) mod rollup;
 pub(crate) mod subquery;
 pub(crate) mod vector_selector;
 
-/// Public operator surface. Re-exports every concrete operator struct
-/// implemented so far, so downstream (planner, wiring) can pull them in
-/// with one `use`.
 #[allow(unused_imports)]
 pub(crate) mod prelude {
     pub(crate) use super::aggregate::{AggregateKind, AggregateOp, GroupMap};

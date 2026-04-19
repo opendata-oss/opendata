@@ -1,27 +1,18 @@
-//! AST → [`LogicalPlan`] lowering (unit 4.1).
+//! Lowering step: turns a `promql_parser::Expr` (the parse tree) into a
+//! [`LogicalPlan`] (the engine's rewrite surface). Pure function of
+//! `(Expr, LoweringContext)` — no series resolution, no group maps, no
+//! [`SeriesSource`](super::super::source::SeriesSource) binding. That's
+//! all the physical planner's job.
 //!
-//! The lowering pass walks a `promql_parser::parser::Expr` and produces the
-//! plan IR defined in [`super::plan_types`]. It does **not** resolve series,
-//! build group maps, or bind a `SeriesSource` — those are the physical
-//! planner's job (unit 4.3).
+//! The lowering does fold plan-time constants that are passed as
+//! function arguments in PromQL but logically belong in the operator-kind
+//! enum (`clamp` bounds, `quantile_over_time` q, `topk` k). Non-literal
+//! values in those argument positions error with
+//! [`PlanError::InvalidArgument`].
 //!
-//! # Contract
-//!
-//! - Pure function of `(Expr, LoweringContext)`. No I/O, no allocation beyond
-//!   what the plan IR itself requires.
-//! - Every recognised PromQL construct maps to exactly one [`LogicalPlan`]
-//!   variant; unknown shapes error with the appropriate [`PlanError`].
-//! - Function arguments that must be plan-time constants (e.g. `clamp`'s
-//!   bounds, `quantile_over_time`'s `q`, `topk`'s `k`) are folded into the
-//!   operator-kind enum at lowering time. Non-literal arguments in those
-//!   positions error with [`PlanError::InvalidArgument`].
-//!
-//! # Non-goals
-//!
-//! - Constant folding, CSE, selector label pushdown — those are unit 4.2.
-//! - Type-checking beyond what the operator enums enforce (e.g. ensuring a
-//!   `rate(_)` argument produces a matrix) — that is a best-effort
-//!   narrow check here; the physical planner (4.3) performs full typing.
+//! Constant folding, CSE, and type-checking beyond operator-enum
+//! coverage happen elsewhere ([`super::optimize`] and the physical
+//! planner).
 
 use std::sync::Arc;
 
@@ -50,33 +41,24 @@ use super::plan_types::{
 // LoweringContext
 // ---------------------------------------------------------------------------
 
-/// Plan-time query parameters that affect lowering.
-///
-/// Supplied by the caller (unit 4.3 / 5 wiring) before `lower` is invoked.
-/// The `start_ms` / `end_ms` / `step_ms` triple defines the output step grid;
-/// `lookback_delta_ms` is threaded into [`LogicalPlan::VectorSelector`] so
-/// the physical planner can parameterise the operator without re-reading
-/// query state.
+/// The query's plan-time parameters — evaluation range, step, lookback,
+/// and parallelism policy — that the caller supplies to [`lower`] and
+/// later to
+/// [`build_physical_plan`](super::physical::build_physical_plan). One
+/// context travels with the plan through every pass.
 #[derive(Debug, Clone)]
 pub struct LoweringContext {
-    /// Inclusive query range start, absolute UTC milliseconds.
     pub start_ms: i64,
-    /// Inclusive query range end, absolute UTC milliseconds. For instant
-    /// queries this equals `start_ms`.
+    /// Equals `start_ms` for instant queries.
     pub end_ms: i64,
-    /// Output step in milliseconds. For instant queries this is a sentinel
-    /// (`1`); downstream code must not divide by this value without first
-    /// consulting [`Self::is_instant`].
+    /// `1` sentinel for instant queries — consult [`Self::is_instant`] before
+    /// dividing.
     pub step_ms: i64,
-    /// PromQL lookback window in milliseconds.
     pub lookback_delta_ms: i64,
-    /// Exchange-operator insertion knobs (unit 4.5). Consulted by the
-    /// physical planner when wrapping I/O-bound leaves in `ConcurrentOp`.
-    /// Lowering ignores this field.
+    /// Consulted by the physical planner; lowering ignores this field.
     pub parallelism: super::parallelism::Parallelism,
-    /// Optional per-query trace collector. When `Some`, the physical planner
-    /// wraps every operator in a [`crate::promql::v2::trace::TracingOperator`]
-    /// that records cumulative timing. `None` is a zero-cost no-op path.
+    /// `Some` → physical planner wraps every operator in a
+    /// [`TracingOperator`](crate::promql::v2::trace::TracingOperator).
     pub trace: Option<Arc<TraceCollector>>,
 }
 
@@ -95,7 +77,6 @@ impl PartialEq for LoweringContext {
 impl Eq for LoweringContext {}
 
 impl LoweringContext {
-    /// Construct a range-query context.
     pub fn new(start_ms: i64, end_ms: i64, step_ms: i64, lookback_delta_ms: i64) -> Self {
         Self {
             start_ms,
@@ -107,9 +88,8 @@ impl LoweringContext {
         }
     }
 
-    /// Construct a context for an instant query at time `t_ms`. Step is set
-    /// to `1` (non-zero sentinel — downstream must not divide by it; the
-    /// physical planner treats `start == end` as an instant query).
+    /// Physical planner treats `start == end` as instant; `step_ms` is a
+    /// non-zero sentinel.
     pub fn for_instant(t_ms: i64, lookback_delta_ms: i64) -> Self {
         Self {
             start_ms: t_ms,
@@ -121,8 +101,6 @@ impl LoweringContext {
         }
     }
 
-    /// Return a new context with the given exchange-operator insertion
-    /// knobs. Chainable.
     pub fn with_parallelism(mut self, parallelism: super::parallelism::Parallelism) -> Self {
         self.parallelism = parallelism;
         self

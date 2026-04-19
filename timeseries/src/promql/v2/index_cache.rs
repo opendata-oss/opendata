@@ -1,20 +1,12 @@
-//! Query-scoped inverted/forward index cache for the v2 PromQL engine.
+//! Query-scoped inverted/forward index cache.
 //!
-//! One instance per query, held by `QueryReaderSource`. Deduplicates repeat
-//! index fetches against the same `(bucket, terms)` / `(bucket, series_ids)`
-//! key within the query's lifetime. Keys normalise by sorting the term /
-//! series-id slice so callers don't have to.
+//! One instance per query, held by `QueryReaderSource`. Dedupes index fetches
+//! against `(bucket, terms)` / `(bucket, series_ids)` keys (term/id slices are
+//! sorted before keying). Concurrent misses on the same key may both fetch;
+//! last write wins. Errors are never cached.
 //!
-//! Kept deliberately minimal: plain `DashMap`s, no semaphores, no
-//! "singleflight", no stats, no TTL. Concurrent misses on the same key may
-//! both fetch; whichever write lands last wins. The duplicated work is
-//! bounded by the query's fan-out factor and is cheap relative to the
-//! round trips the cache saves.
-//!
-//! This cache is intentionally separate from the v1 `CachedQueryReader` /
-//! `QueryReaderEvalCache` in `crate::promql::evaluator` — v1 couples the
-//! cache to semaphores, bucket-list memoisation, and read-path stats the
-//! v2 engine doesn't need.
+//! Deliberately separate from v1's `CachedQueryReader` / `QueryReaderEvalCache`,
+//! which couple to semaphores, bucket-list memoisation, and stats v2 doesn't need.
 
 use std::sync::Arc;
 
@@ -32,26 +24,17 @@ type ForwardKey = (TimeBucket, Vec<SeriesId>);
 type InvertedValue = Arc<dyn InvertedIndexLookup + Send + Sync + 'static>;
 type ForwardValue = Arc<dyn ForwardIndexLookup + Send + Sync + 'static>;
 
-/// Per-term posting slot. `Arc<Option<_>>` so the "not present in bucket"
-/// case is cacheable too (don't re-fetch absent keys).
+/// `Arc<Option<_>>` so "not present in bucket" is also cacheable.
 type InvertedTermValue = Arc<Option<RoaringBitmap>>;
-/// Per-series forward-index slot. Same cacheable-absent shape.
 type ForwardSeriesValue = Arc<Option<SeriesSpec>>;
 
-/// Per-query cache of inverted and forward index lookups.
+/// Per-query cache of inverted and forward index lookups. All methods take
+/// `&self`; interior concurrency via [`DashMap`].
 ///
-/// All methods take `&self`; interior concurrency is provided by
-/// [`DashMap`]. Cheap to clone the containing `Arc<V2IndexCache>` across
-/// per-bucket tasks.
-///
-/// Offers two granularities:
-/// - [`Self::inverted_index`] / [`Self::forward_index`] — batch, keyed
-///   on a sorted slice. Used by callers that don't own their own
-///   fan-out (legacy / labels endpoint).
-/// - [`Self::inverted_index_term`] / [`Self::forward_index_one`] —
-///   per-key. Used by the v2 source adapter to parallelise at its own
-///   layer and keep traces per-call. Finer-grained cache keys also
-///   enable cross-query sharing when selectors overlap partially.
+/// Two granularities: batch (`inverted_index` / `forward_index`, used where
+/// callers don't own fan-out) and per-key (`inverted_index_term` /
+/// `forward_index_one`, used by the source adapter to parallelise at its
+/// own layer and keep per-call traces).
 pub(crate) struct V2IndexCache {
     inverted: DashMap<InvertedKey, InvertedValue>,
     forward: DashMap<ForwardKey, ForwardValue>,
@@ -69,11 +52,8 @@ impl V2IndexCache {
         }
     }
 
-    /// Fetch the inverted index for `(bucket, terms)`, consulting the
-    /// cache first. On miss, calls `reader.inverted_index(..)` and stores
-    /// the result. `terms` is cloned and sorted internally before keying,
-    /// so callers may pass any order. Errors are propagated verbatim and
-    /// **not** cached — a transient failure does not poison the key.
+    /// `terms` is sorted internally before keying. Errors propagate verbatim
+    /// and are **not** cached.
     pub(crate) async fn inverted_index<R: QueryReader + ?Sized>(
         &self,
         reader: &R,
@@ -94,9 +74,8 @@ impl V2IndexCache {
         Ok(value)
     }
 
-    /// Fetch the forward index for `(bucket, series_ids)`, consulting the
-    /// cache first. Mirrors [`Self::inverted_index`]: `series_ids` is
-    /// cloned + sorted internally; errors are not cached.
+    /// Mirrors [`Self::inverted_index`]: `series_ids` is sorted internally;
+    /// errors are not cached.
     pub(crate) async fn forward_index<R: QueryReader + ?Sized>(
         &self,
         reader: &R,
@@ -117,10 +96,8 @@ impl V2IndexCache {
         Ok(value)
     }
 
-    /// Fetch a single inverted-index posting for `(bucket, term)`. On
-    /// miss, calls `reader.inverted_index_term(..)` and stores the
-    /// result — including the `None` case so repeated queries for a
-    /// missing term don't re-hit storage. Errors are not cached.
+    /// Cacheable `None` so repeated lookups of a missing term don't re-hit
+    /// storage. Errors are not cached.
     pub(crate) async fn inverted_index_term<R: QueryReader + ?Sized>(
         &self,
         reader: &R,
@@ -137,8 +114,7 @@ impl V2IndexCache {
         Ok(value)
     }
 
-    /// Fetch a single forward-index entry for `(bucket, series_id)`. See
-    /// [`Self::inverted_index_term`] for the cached-`None` semantics.
+    /// See [`Self::inverted_index_term`] for cached-`None` semantics.
     pub(crate) async fn forward_index_one<R: QueryReader + ?Sized>(
         &self,
         reader: &R,

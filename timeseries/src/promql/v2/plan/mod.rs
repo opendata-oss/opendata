@@ -1,16 +1,38 @@
-//! Plan phase of the v2 PromQL engine (units 4.1–4.5).
+//! Everything between *Parse* and a runnable operator tree. The plan
+//! phase turns `promql_parser::Expr` into a tree of `Box<dyn Operator>`
+//! ready to poll.
 //!
-//! This module owns the **logical plan IR** and the AST→IR lowering path. See
-//! `timeseries/rfcs/0007-promql-execution.md` §"Architecture Overview" for the
-//! stage diagram; this crate slice is everything between *Parse* and *Physical
-//! Plan*.
+//! The pipeline has two stages with a clear boundary:
 //!
-//! Submodules:
-//! - [`plan_types`]: the [`LogicalPlan`] enum and supporting plan-time types
-//!   ([`Offset`], [`AtModifier`], [`BinaryMatching`], [`AggregateGrouping`]).
-//! - [`error`]: [`PlanError`], the structured plan-time error.
-//! - [`lowering`]: the `promql_parser::Expr` → [`LogicalPlan`] translation plus
-//!   its plan-time [`LoweringContext`].
+//! ```text
+//!   promql_parser::Expr
+//!       │  lower(..) — pure AST → LogicalPlan lowering, literal folding
+//!       ▼
+//!   LogicalPlan                   ←─ single rewrite surface
+//!       │  optimize(..) — rule-based rewrites
+//!       ▼
+//!   LogicalPlan (optimised)
+//!       │  build_physical_plan(..) — resolves series, compiles group
+//!       │                            maps / match tables, wires operators
+//!       ▼
+//!   PhysicalPlan (dyn Operator tree, opaque)
+//! ```
+//!
+//! [`LogicalPlan`] is the only rewrite surface the optimiser and EXPLAIN
+//! touch; the physical tree is compiled and opaque.
+//!
+//! - [`plan_types`], [`error`]: [`LogicalPlan`] and plan-time errors.
+//! - [`lowering`]: `Expr` → [`LogicalPlan`] under a caller-supplied
+//!   [`LoweringContext`] (query grid, lookback, etc.).
+//! - [`optimize`]: rule-based rewrites (constant folding, matcher dedup).
+//! - [`parallelism`]: policy for where to insert exchange operators
+//!   (`ConcurrentOp`).
+//! - [`physical`]: resolves series via [`SeriesSource`], builds group
+//!   maps and match tables from resolved schemas, and wires concrete
+//!   operators.
+//! - [`explain`]: JSON-serialisable plan tree for `/explain` endpoints.
+//!
+//! [`SeriesSource`]: super::source::SeriesSource
 
 pub mod error;
 pub mod explain;
