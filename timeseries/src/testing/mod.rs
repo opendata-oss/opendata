@@ -4,7 +4,10 @@
 //! SlateDB-backed TSDB. HTTP-specific helpers live in the [`http`]
 //! submodule, which is only available when the `http-server` feature
 //! is enabled.
+#![allow(unused_imports)]
 
+#[cfg(feature = "promql-v2")]
+pub mod columnar_stress;
 #[cfg(feature = "http-server")]
 pub mod http;
 

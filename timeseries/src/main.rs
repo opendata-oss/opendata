@@ -17,6 +17,8 @@ mod server;
 mod storage;
 #[cfg(test)]
 mod test_utils;
+#[cfg(any(test, feature = "testing"))]
+mod testing;
 mod timeseries;
 mod tsdb;
 mod tsdb_metrics;

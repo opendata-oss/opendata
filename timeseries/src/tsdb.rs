@@ -2642,6 +2642,13 @@ mod tests {
     #[cfg(feature = "promql-v2")]
     mod v2_wiring_tests {
         use super::*;
+        use crate::testing::columnar_stress::{
+            Oracle, Scenario, ScenarioConfig, assert_grouped_count_matrix,
+            assert_grouped_count_vector, assert_grouped_rate_matrix, assert_grouped_sum_matrix,
+            assert_grouped_sum_vector, assert_raw_selector_cardinality, build_oracle,
+            build_scenario, concurrency_profiles, create_tsdb_for_scenario, query_end_time,
+            query_start_time, query_step,
+        };
 
         async fn create_tsdb_with_counter() -> Tsdb {
             let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
@@ -3090,6 +3097,196 @@ mod tests {
                     s.labels.get("g"),
                 );
             }
+        }
+
+        async fn create_columnar_stress_fixture(
+            config: ScenarioConfig,
+        ) -> (Scenario, Oracle, Tsdb) {
+            let scenario = build_scenario(config);
+            let oracle = build_oracle(&scenario);
+            let tsdb = create_tsdb_for_scenario(&scenario).await;
+            (scenario, oracle, tsdb)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn should_eval_v2_long_window_stress_regression_instant_probes() {
+            // given
+            let (scenario, oracle, tsdb) =
+                create_columnar_stress_fixture(ScenarioConfig::regression()).await;
+
+            for (profile_name, opts) in concurrency_profiles() {
+                for &timestamp_ms in &scenario.probe_timestamps {
+                    let query_time = UNIX_EPOCH + Duration::from_millis(timestamp_ms as u64);
+
+                    // when
+                    let raw_result = tsdb
+                        .eval_query_v2("stress_gauge", Some(query_time), &opts)
+                        .await
+                        .unwrap();
+                    let count_result = tsdb
+                        .eval_query_v2(
+                            "count by (applicationid) (stress_gauge)",
+                            Some(query_time),
+                            &opts,
+                        )
+                        .await
+                        .unwrap();
+                    let sum_result = tsdb
+                        .eval_query_v2(
+                            "sum by (applicationid) (stress_gauge)",
+                            Some(query_time),
+                            &opts,
+                        )
+                        .await
+                        .unwrap();
+
+                    // then
+                    let raw_samples = match raw_result {
+                        QueryValue::Vector(samples) => samples,
+                        other => panic!("expected Vector for raw selector, got {:?}", other),
+                    };
+                    assert_raw_selector_cardinality(&raw_samples, &scenario, timestamp_ms);
+
+                    let count_samples = match count_result {
+                        QueryValue::Vector(samples) => samples,
+                        other => panic!("expected Vector for count query, got {:?}", other),
+                    };
+                    assert_grouped_count_vector(&count_samples, &scenario, &oracle, timestamp_ms);
+
+                    let sum_samples = match sum_result {
+                        QueryValue::Vector(samples) => samples,
+                        other => panic!("expected Vector for sum query, got {:?}", other),
+                    };
+                    assert_grouped_sum_vector(&sum_samples, &scenario, &oracle, timestamp_ms);
+                }
+
+                assert!(
+                    !scenario.probe_timestamps.is_empty(),
+                    "expected probe timestamps for profile {profile_name}"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn should_eval_v2_long_window_stress_regression_range_queries() {
+            // given
+            let (scenario, oracle, tsdb) =
+                create_columnar_stress_fixture(ScenarioConfig::regression()).await;
+            let start = query_start_time(&scenario);
+            let end = query_end_time(&scenario);
+            let step = query_step(&scenario);
+
+            for (_profile_name, opts) in concurrency_profiles() {
+                // when
+                let count_result = tsdb
+                    .eval_query_range_v2(
+                        "count by (applicationid) (stress_gauge)",
+                        start..=end,
+                        step,
+                        &opts,
+                    )
+                    .await
+                    .unwrap();
+                let sum_result = tsdb
+                    .eval_query_range_v2(
+                        "sum by (applicationid) (stress_gauge)",
+                        start..=end,
+                        step,
+                        &opts,
+                    )
+                    .await
+                    .unwrap();
+                let rate_result = tsdb
+                    .eval_query_range_v2(
+                        "sum by (applicationid) (rate(stress_counter_total[15m]))",
+                        start..=end,
+                        step,
+                        &opts,
+                    )
+                    .await
+                    .unwrap();
+
+                // then
+                let count_matrix = match count_result {
+                    QueryValue::Matrix(matrix) => matrix,
+                    other => panic!("expected Matrix for count range, got {:?}", other),
+                };
+                assert_grouped_count_matrix(&count_matrix, &scenario, &oracle);
+
+                let sum_matrix = match sum_result {
+                    QueryValue::Matrix(matrix) => matrix,
+                    other => panic!("expected Matrix for sum range, got {:?}", other),
+                };
+                assert_grouped_sum_matrix(&sum_matrix, &scenario, &oracle);
+
+                let rate_matrix = match rate_result {
+                    QueryValue::Matrix(matrix) => matrix,
+                    other => panic!("expected Matrix for rate range, got {:?}", other),
+                };
+                assert_grouped_rate_matrix(&rate_matrix, &scenario, &oracle);
+            }
+        }
+
+        /// Larger ignored soak for RFC 0008. Invoke with:
+        /// `cargo test -p timeseries --features promql-v2 should_eval_v2_long_window_stress_soak -- --ignored --nocapture`
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore]
+        async fn should_eval_v2_long_window_stress_soak() {
+            // given
+            let (scenario, oracle, tsdb) =
+                create_columnar_stress_fixture(ScenarioConfig::soak()).await;
+            let start = query_start_time(&scenario);
+            let end = query_end_time(&scenario);
+            let step = query_step(&scenario);
+            let opts = QueryOptions::default();
+
+            // when
+            let count_result = tsdb
+                .eval_query_range_v2(
+                    "count by (applicationid) (stress_gauge)",
+                    start..=end,
+                    step,
+                    &opts,
+                )
+                .await
+                .unwrap();
+            let sum_result = tsdb
+                .eval_query_range_v2(
+                    "sum by (applicationid) (stress_gauge)",
+                    start..=end,
+                    step,
+                    &opts,
+                )
+                .await
+                .unwrap();
+            let rate_result = tsdb
+                .eval_query_range_v2(
+                    "sum by (applicationid) (rate(stress_counter_total[15m]))",
+                    start..=end,
+                    step,
+                    &opts,
+                )
+                .await
+                .unwrap();
+
+            // then
+            let count_matrix = match count_result {
+                QueryValue::Matrix(matrix) => matrix,
+                other => panic!("expected Matrix for count soak, got {:?}", other),
+            };
+            assert_grouped_count_matrix(&count_matrix, &scenario, &oracle);
+
+            let sum_matrix = match sum_result {
+                QueryValue::Matrix(matrix) => matrix,
+                other => panic!("expected Matrix for sum soak, got {:?}", other),
+            };
+            assert_grouped_sum_matrix(&sum_matrix, &scenario, &oracle);
+
+            let rate_matrix = match rate_result {
+                QueryValue::Matrix(matrix) => matrix,
+                other => panic!("expected Matrix for rate soak, got {:?}", other),
+            };
+            assert_grouped_rate_matrix(&rate_matrix, &scenario, &oracle);
         }
 
         // ── Read-only reader v2 tests (RFC 0007 unit 7.0) ────────────
