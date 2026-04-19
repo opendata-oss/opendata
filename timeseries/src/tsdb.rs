@@ -491,15 +491,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         }
         let collector = plan_ctx.trace.clone();
 
+        let ranges = preload_ranges_for_v2(query, at_ms, at_ms, opts.lookback_delta)?;
         let t0 = Instant::now();
-        let reader = self
-            .make_query_reader_for_ranges(&preload_ranges_for_v2(
-                query,
-                at_ms,
-                at_ms,
-                opts.lookback_delta,
-            )?)
-            .await?;
+        let build_reader = self.make_query_reader_for_ranges(&ranges);
+        let reader = match collector.clone() {
+            Some(c) => crate::promql::v2::trace::with_trace(c, build_reader).await?,
+            None => build_reader.await?,
+        };
         if let Some(c) = collector.as_ref() {
             c.record_phase(
                 crate::promql::v2::trace::Phase::ReaderSetup,
@@ -565,15 +563,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         }
         let collector = plan_ctx.trace.clone();
 
+        let ranges = preload_ranges_for_v2(query, start_ms, end_ms, opts.lookback_delta)?;
         let t0 = Instant::now();
-        let reader = self
-            .make_query_reader_for_ranges(&preload_ranges_for_v2(
-                query,
-                start_ms,
-                end_ms,
-                opts.lookback_delta,
-            )?)
-            .await?;
+        let build_reader = self.make_query_reader_for_ranges(&ranges);
+        let reader = match collector.clone() {
+            Some(c) => crate::promql::v2::trace::with_trace(c, build_reader).await?,
+            None => build_reader.await?,
+        };
         if let Some(c) = collector.as_ref() {
             c.record_phase(
                 crate::promql::v2::trace::Phase::ReaderSetup,
@@ -967,10 +963,22 @@ impl Tsdb {
         &self,
         ranges: &[(i64, i64)],
     ) -> Result<TsdbQueryReader> {
-        let snapshot = self.storage.snapshot().await?;
-        let buckets = snapshot.get_buckets_for_ranges(ranges).await?;
+        let snapshot = {
+            #[cfg(feature = "promql-v2")]
+            let _g = crate::promql::v2::trace::Scope::enter("snapshot");
+            self.storage.snapshot().await?
+        };
+        let buckets = {
+            #[cfg(feature = "promql-v2")]
+            let _g = crate::promql::v2::trace::Scope::enter("list_buckets");
+            snapshot.get_buckets_for_ranges(ranges).await?
+        };
 
-        let readers = self.build_readers(&snapshot, buckets).await;
+        let readers = {
+            #[cfg(feature = "promql-v2")]
+            let _g = crate::promql::v2::trace::Scope::enter("build_readers");
+            self.build_readers(&snapshot, buckets).await
+        };
         Ok(TsdbQueryReader::new(readers))
     }
 
