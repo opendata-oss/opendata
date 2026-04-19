@@ -15,10 +15,11 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::StorageConfig;
+use common::{tracing, StorageConfig};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
 use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
@@ -926,7 +927,10 @@ impl Benchmark for RecallBenchmark {
         let object_store = match &reader_config.storage {
             StorageConfig::SlateDb(slate_config) => {
                 println!("CREATE STATIC OBJECT STORE");
-                Some(create_object_store(&slate_config.object_store)?)
+                let store = create_object_store(&slate_config.object_store)?;
+                let tracing = Arc::new(
+                    tracing::object_store::TracedObjectStore::new(store));
+                Some(tracing)
             }
             _ => None,
         };

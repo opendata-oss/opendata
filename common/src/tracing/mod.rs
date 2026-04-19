@@ -51,6 +51,9 @@ use tracing_subscriber::registry::{LookupSpan, Registry};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+pub mod object_store;
+
+pub use object_store::TracedObjectStore;
 pub use opendata_macros::trace_instrument;
 
 /// Environment variable that controls which spans land in the Chrome trace
