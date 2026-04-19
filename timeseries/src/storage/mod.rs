@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use common::storage::RecordOp;
+use common::storage::{PutRecordOp, RecordOp};
 use common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
@@ -364,6 +364,26 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
 // Implement the trait for all types that implement Storage
 impl<T: ?Sized + Storage> OpenTsdbStorageExt for T {}
 
+/// Read the current `BucketList` value and rewrite it as a single `Put`,
+/// collapsing the merge chain that accrues across ingestion batches into
+/// one flat record. Intended to run once at startup before ingestion
+/// begins, so later reads don't have to replay operands scattered across
+/// SSTs. Safe only when there are no concurrent writers.
+#[tracing::instrument(level = "info", skip_all)]
+pub(crate) async fn coalesce_bucket_list(storage: &dyn Storage) -> Result<()> {
+    let key = BucketListKey.encode();
+    let Some(record) = storage.get(key.clone()).await? else {
+        return Ok(());
+    };
+    storage
+        .put(vec![PutRecordOp::new(Record {
+            key,
+            value: record.value,
+        })])
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +538,52 @@ mod tests {
         // then
         assert!(size_one);
         assert!(!size_two);
+    }
+
+    // ── coalesce_bucket_list tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_coalesce_bucket_list_preserving_merged_value() {
+        // given: several merge operands have accrued on the BucketList key
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let ops = vec![
+            storage
+                .merge_bucket_list(TimeBucket { size: 1, start: 0 })
+                .unwrap(),
+            storage
+                .merge_bucket_list(TimeBucket { size: 1, start: 60 })
+                .unwrap(),
+            storage
+                .merge_bucket_list(TimeBucket {
+                    size: 1,
+                    start: 120,
+                })
+                .unwrap(),
+        ];
+        storage.apply(ops).await.unwrap();
+
+        // when
+        coalesce_bucket_list(storage.as_ref()).await.unwrap();
+
+        // then: readable value still reflects the full merged list
+        let buckets = storage.get_buckets_in_range(None, None).await.unwrap();
+        assert_eq!(starts(&buckets), vec![0, 60, 120]);
+    }
+
+    #[tokio::test]
+    async fn should_be_noop_when_bucket_list_absent() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+
+        // when
+        coalesce_bucket_list(storage.as_ref()).await.unwrap();
+
+        // then: key is still absent
+        let record = storage.get(BucketListKey.encode()).await.unwrap();
+        assert!(record.is_none());
     }
 }

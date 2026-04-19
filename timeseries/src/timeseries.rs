@@ -13,6 +13,7 @@ use common::{StorageBuilder, StorageSemantics};
 use crate::config::Config;
 use crate::error::{QueryError, Result};
 use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
+use crate::storage::coalesce_bucket_list;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
     Tsdb, TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range,
@@ -84,6 +85,10 @@ impl TimeSeriesDb {
             )
             .build()
             .await?;
+        // Flatten accumulated BucketList merge operands into a single Put so
+        // later reads don't have to replay them across SSTs. Runs before any
+        // writer is started, so no concurrent merges can race the Put.
+        coalesce_bucket_list(storage.as_ref()).await?;
         let tsdb = Tsdb::new(storage);
         Ok(Self { tsdb })
     }
