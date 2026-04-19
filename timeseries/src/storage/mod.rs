@@ -228,6 +228,23 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(max_series_id)
     }
 
+    /// Check whether `bucket` is already present in the stored `BucketList`.
+    ///
+    /// Used by the flush path to suppress redundant single-element merges
+    /// on a bucket that has already been announced. The `BucketListKey` is
+    /// a global singleton that stays hot in SlateDB's block cache (read on
+    /// every query and warmed at startup), so this is a cache hit in the
+    /// common case.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn bucket_list_contains(&self, bucket: TimeBucket) -> Result<bool> {
+        let key = BucketListKey.encode();
+        let Some(record) = self.get(key).await? else {
+            return Ok(false);
+        };
+        let list = BucketListValue::decode(record.value.as_ref())?;
+        Ok(list.buckets.contains(&(bucket.size, bucket.start)))
+    }
+
     /// Get all unique values for a specific label name within a bucket.
     /// This method scans only the inverted index keys for the specified label,
     /// which is more efficient than loading all inverted index entries.
@@ -429,5 +446,77 @@ mod tests {
         let s = storage_with_buckets(&[0, 60]).await;
         let buckets = s.get_buckets_for_ranges(&[(3600, 7200)]).await.unwrap();
         assert_eq!(starts(&buckets), vec![60]);
+    }
+
+    // ── bucket_list_contains tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_return_true_when_bucket_in_list() {
+        // given
+        let storage = storage_with_buckets(&[0, 60, 120]).await;
+
+        // when
+        let present = storage
+            .bucket_list_contains(TimeBucket { size: 1, start: 60 })
+            .await
+            .unwrap();
+
+        // then
+        assert!(present);
+    }
+
+    #[tokio::test]
+    async fn should_return_false_when_bucket_absent() {
+        // given
+        let storage = storage_with_buckets(&[0, 60]).await;
+
+        // when
+        let present = storage
+            .bucket_list_contains(TimeBucket {
+                size: 1,
+                start: 180,
+            })
+            .await
+            .unwrap();
+
+        // then
+        assert!(!present);
+    }
+
+    #[tokio::test]
+    async fn should_return_false_when_bucket_list_key_missing() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+
+        // when
+        let present = storage
+            .bucket_list_contains(TimeBucket { size: 1, start: 0 })
+            .await
+            .unwrap();
+
+        // then
+        assert!(!present);
+    }
+
+    #[tokio::test]
+    async fn should_distinguish_buckets_with_same_start_but_different_size() {
+        // given: only a size=1 bucket at start=60 is present
+        let storage = storage_with_buckets(&[60]).await;
+
+        // when
+        let size_one = storage
+            .bucket_list_contains(TimeBucket { size: 1, start: 60 })
+            .await
+            .unwrap();
+        let size_two = storage
+            .bucket_list_contains(TimeBucket { size: 2, start: 60 })
+            .await
+            .unwrap();
+
+        // then
+        assert!(size_one);
+        assert!(!size_two);
     }
 }
