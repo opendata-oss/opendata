@@ -1,7 +1,7 @@
 //! Per-query tracing for the v2 PromQL engine.
 //!
 //! Two sinks, one source:
-//! - `tracing` spans emitted via `#[instrument]` / `info_span!` in the phase
+//! - `tracing` spans emitted via `#[instrument]` / `debug_span!` in the phase
 //!   functions (always on when `RUST_LOG` allows).
 //! - A [`TraceCollector`] that captures per-phase wall-clock durations and
 //!   per-operator cumulative stats, serialized inline with the query response
@@ -237,6 +237,10 @@ struct OperatorStatsInner {
     /// [`record_subphase`] / [`Scope`] while this operator is the current
     /// one on the thread-local stack.
     subphases: BTreeMap<&'static str, (u64, u64)>, // (elapsed_ns, call_count)
+    /// Operator-scoped free-form counters keyed by a `'static` label the
+    /// operator picks (e.g. `"series_selected"`, `"unique_fingerprints"`).
+    /// Additive — successive calls with the same label accumulate.
+    counters: BTreeMap<&'static str, u64>,
 }
 
 /// Per-query tracing collector. Thread-safe — operators may run on spawned
@@ -264,6 +268,7 @@ impl TraceCollector {
             batch_count: 0,
             cell_count: 0,
             subphases: BTreeMap::new(),
+            counters: BTreeMap::new(),
         });
         node_id
     }
@@ -349,6 +354,18 @@ impl TraceCollector {
         }
     }
 
+    /// Add `value` to the counter named `label`, attributed to the
+    /// operator currently on the thread-local stack. No-op when no
+    /// operator is on the stack (counters are operator-scoped).
+    pub fn record_counter(&self, node_id: Option<usize>, label: &'static str, value: u64) {
+        let Some(id) = node_id else { return };
+        let mut inner = self.inner.lock().expect("trace collector poisoned");
+        if id < inner.operators.len() {
+            let entry = inner.operators[id].counters.entry(label).or_default();
+            *entry = entry.saturating_add(value);
+        }
+    }
+
     /// Snapshot the collector into a serializable trace.
     pub fn finish(&self) -> QueryTrace {
         let inner = self.inner.lock().expect("trace collector poisoned");
@@ -371,6 +388,7 @@ impl TraceCollector {
                 batch_count: raw.batch_count,
                 cell_count: raw.cell_count,
                 subphases: subphase_vec(&raw.subphases),
+                counters: counter_vec(&raw.counters),
             })
             .collect();
         let io: Vec<IoStats> = inner
@@ -397,6 +415,17 @@ impl TraceCollector {
             subphases: orphan_subphases,
         }
     }
+}
+
+/// Snapshot helper: convert an internal counter map into a sorted list
+/// of [`CounterStats`] (alphabetical by label, stable across runs).
+fn counter_vec(map: &BTreeMap<&'static str, u64>) -> Vec<CounterStats> {
+    map.iter()
+        .map(|(label, value)| CounterStats {
+            label,
+            value: *value,
+        })
+        .collect()
 }
 
 /// Snapshot helper: convert an internal subphase map into a slowest-first
@@ -447,6 +476,20 @@ pub struct OperatorStats {
     /// slot.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub subphases: Vec<SubphaseStats>,
+    /// Operator-chosen numeric counters (e.g. `series_selected`,
+    /// `unique_fingerprints` on a `VectorSelector`). Unlike sub-phases
+    /// these are dimensionless — the operator decides what each label
+    /// means. Sorted alphabetically by label.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub counters: Vec<CounterStats>,
+}
+
+/// One operator-scoped counter. Additive across calls.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CounterStats {
+    pub label: &'static str,
+    pub value: u64,
 }
 
 /// One phase's wall-clock total in milliseconds.
@@ -686,6 +729,16 @@ pub fn record_subphase(label: &'static str, elapsed_ns: u64) {
     let _ = TRACE_COLLECTOR.try_with(|c| c.record_subphase(node_id, label, elapsed_ns));
 }
 
+/// Attribute `value` to the counter named `label`, scoped to the
+/// operator currently being polled (via the thread-local set by
+/// [`TracingOperator::next`]). No-op outside a [`with_trace`] scope or
+/// when no operator is on the stack. Additive — call multiple times to
+/// accumulate.
+pub fn record_counter(label: &'static str, value: u64) {
+    let node_id = CURRENT_NODE_ID.with(|c| c.get());
+    let _ = TRACE_COLLECTOR.try_with(|c| c.record_counter(node_id, label, value));
+}
+
 /// Time a synchronous block and record its elapsed wall time against the
 /// sub-phase named `label`. Returns the block's value.
 pub fn record_subphase_sync<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
@@ -910,6 +963,86 @@ mod tests {
         assert_eq!(t.subphases.len(), 1);
         assert_eq!(t.subphases[0].label, "loose");
         assert_eq!(t.subphases[0].call_count, 1);
+    }
+
+    /// Operator records a counter from inside `next()`; it must land in
+    /// that operator's `counters` slot and be additive across calls.
+    #[test]
+    fn should_attribute_counter_to_current_operator_and_sum() {
+        // given
+        struct CounterOp {
+            schema: OperatorSchema,
+            remaining: usize,
+        }
+        impl Operator for CounterOp {
+            fn schema(&self) -> &OperatorSchema {
+                &self.schema
+            }
+            fn next(
+                &mut self,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<StepBatch, QueryError>>> {
+                if self.remaining == 0 {
+                    return Poll::Ready(None);
+                }
+                record_counter("rows", 10);
+                self.remaining -= 1;
+                Poll::Ready(None)
+            }
+        }
+        let grid = StepGrid {
+            start_ms: 0,
+            end_ms: 0,
+            step_ms: 1,
+            step_count: 1,
+        };
+        let c = TraceCollector::new();
+        let inner = Box::new(CounterOp {
+            schema: OperatorSchema::new(SchemaRef::empty_static(), grid),
+            remaining: 3,
+        });
+        let mut wrapped = TracingOperator::new(inner, "Fake", c.clone());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // when
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(with_trace(c.clone(), async move {
+            for _ in 0..3 {
+                let _ = wrapped.next(&mut cx);
+            }
+        }));
+
+        // then
+        let t = c.finish();
+        let op = &t.operators[0];
+        assert_eq!(op.counters.len(), 1);
+        assert_eq!(op.counters[0].label, "rows");
+        assert_eq!(op.counters[0].value, 30);
+    }
+
+    /// Counters recorded outside a `TracingOperator::next` scope have no
+    /// operator to attribute to and must be silently dropped (they aren't
+    /// timings, so they can't share the orphan sub-phase bucket).
+    #[test]
+    fn should_drop_counter_when_no_operator_on_stack() {
+        // given
+        let c = TraceCollector::new();
+
+        // when
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(with_trace(c.clone(), async {
+            record_counter("loose", 42);
+        }));
+
+        // then
+        let t = c.finish();
+        assert!(t.subphases.is_empty());
+        assert!(t.operators.is_empty());
     }
 
     #[test]

@@ -144,7 +144,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
     let run = async move {
         let trace_collector = trace_for_run;
         // Parse --------------------------------------------------------
-        let span = tracing::info_span!("phase", name = "parse");
+        let span = tracing::debug_span!("phase", name = "parse");
         let t0 = Instant::now();
         let parse_res = span.in_scope(|| promql_parser::parser::parse(query));
         let expr = parse_res.map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
@@ -153,7 +153,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         }
 
         // Lower --------------------------------------------------------
-        let span = tracing::info_span!("phase", name = "lower");
+        let span = tracing::debug_span!("phase", name = "lower");
         let t0 = Instant::now();
         let logical = span
             .in_scope(|| crate::promql::v2::plan::lower(&expr, &ctx))
@@ -163,7 +163,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         }
 
         // Optimize -----------------------------------------------------
-        let span = tracing::info_span!("phase", name = "optimize");
+        let span = tracing::debug_span!("phase", name = "optimize");
         let t0 = Instant::now();
         let logical = span.in_scope(|| crate::promql::v2::plan::optimize(logical));
         if let Some(c) = trace_collector.as_ref() {
@@ -180,7 +180,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         let t0 = Instant::now();
         let mut plan = tracing::Instrument::instrument(
             crate::promql::v2::plan::build_physical_plan(logical, &source, reservation, &ctx),
-            tracing::info_span!("phase", name = "build_physical"),
+            tracing::debug_span!("phase", name = "build_physical"),
         )
         .await
         .map_err(plan_error_to_query_error)?;
@@ -191,7 +191,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         // Execute ------------------------------------------------------
         let t0 = Instant::now();
         let mut batches = Vec::new();
-        let exec_span = tracing::info_span!("phase", name = "execute");
+        let exec_span = tracing::debug_span!("phase", name = "execute");
         let _exec_guard = exec_span.enter();
         loop {
             match poll_fn(|cx| plan.root.next(cx)).await {
@@ -206,7 +206,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         }
 
         // Reshape ------------------------------------------------------
-        let span = tracing::info_span!("phase", name = "reshape");
+        let span = tracing::debug_span!("phase", name = "reshape");
         let t0 = Instant::now();
         let reshaped = span.in_scope(|| {
             if is_instant {

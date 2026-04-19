@@ -630,6 +630,19 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                         self.state = State::Done;
                         return Poll::Ready(None);
                     }
+                    // `request_series` is indexed by logical (fingerprint-
+                    // deduped) series; each entry holds one ref per bucket
+                    // the series lives in. The outer length is the distinct
+                    // fingerprint count; the sum of inner lengths is the
+                    // total number of bucket-local series handles fetched.
+                    let unique_fingerprints = self.request_series.len() as u64;
+                    let series_selected: u64 = self
+                        .request_series
+                        .iter()
+                        .map(|refs| refs.len() as u64)
+                        .sum();
+                    trace::record_counter("series_selected", series_selected);
+                    trace::record_counter("unique_fingerprints", unique_fingerprints);
                     let _g = trace::Scope::enter("start_chunk_load");
                     self.state = self.start_chunk_load(0);
                 }
