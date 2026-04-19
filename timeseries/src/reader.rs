@@ -110,6 +110,28 @@ impl QueryReader for ReaderQueryReader {
         })?;
         mini.samples(series_id, metric_name, start_ms, end_ms).await
     }
+
+    async fn forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<crate::index::SeriesSpec>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index_one(series_id).await
+    }
+
+    async fn inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<roaring::RoaringBitmap>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.inverted_index_term(term).await
+    }
 }
 
 // ── TimeSeriesDbReader ───────────────────────────────────────────────

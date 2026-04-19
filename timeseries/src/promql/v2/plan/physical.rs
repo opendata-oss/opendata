@@ -54,12 +54,24 @@ use super::super::operators::subquery::{ChildFactory, SubqueryOp};
 use super::super::operators::vector_selector::VectorSelectorOp;
 use super::super::source::{ResolvedSeriesChunk, ResolvedSeriesRef, SeriesSource, TimeRange};
 
+use super::super::trace;
 use super::error::PlanError;
 use super::lowering::LoweringContext;
 use super::parallelism::ExchangeStats;
 use super::plan_types::{
     AggregateGrouping, AtModifier, BinaryMatching, Cardinality, LogicalPlan, MatchingAxis, Offset,
 };
+
+/// Wrap `op` in a [`trace::TracingOperator`] tagged with `name` when the
+/// context carries a trace collector; otherwise return it unchanged.
+#[inline]
+fn wrap_op(
+    op: Box<dyn Operator + Send>,
+    name: &'static str,
+    ctx: &LoweringContext,
+) -> Box<dyn Operator + Send> {
+    trace::maybe_trace(op, name, ctx.trace.as_ref())
+}
 
 /// Convert our plan-time [`Offset`] into the parser's
 /// `promql_parser::parser::Offset` the leaf operators consume.
@@ -776,17 +788,17 @@ where
     match plan {
         LogicalPlan::Scalar(v) => {
             let op = ConstScalarOp::new(v, grid, reservation.clone());
-            Ok(Box::new(op))
+            Ok(wrap_op(Box::new(op), "ConstScalar", ctx))
         }
         LogicalPlan::Time => {
             let op = TimeScalarOp::new(grid, reservation.clone());
-            Ok(Box::new(op))
+            Ok(wrap_op(Box::new(op), "TimeScalar", ctx))
         }
         LogicalPlan::Scalarize { child } => {
             let child_op = build_node(*child, source, reservation, ctx, grid, false, stats).await?;
             let _ = static_schema(&child_op.schema().series)?;
             let op = ScalarizeOp::new(BoxedOp(child_op), reservation.clone());
-            Ok(Box::new(op))
+            Ok(wrap_op(Box::new(op), "Scalarize", ctx))
         }
         LogicalPlan::Vectorize { child } => {
             build_node(*child, source, reservation, ctx, grid, false, stats).await
@@ -819,6 +831,7 @@ where
             // async `samples()` pull from downstream evaluation.
             Ok(maybe_wrap_concurrent(
                 Box::new(op),
+                "VectorSelector",
                 series_count,
                 ctx,
                 stats,
@@ -839,7 +852,7 @@ where
             let child_op = build_node(*child, source, reservation, ctx, grid, false, stats).await?;
             let _ = static_schema(&child_op.schema().series)?;
             let op = InstantFnOp::new(BoxedOp(child_op), kind, reservation.clone());
-            Ok(Box::new(op))
+            Ok(wrap_op(Box::new(op), "InstantFn", ctx))
         }
         LogicalPlan::LabelManip { kind, child } => {
             let child_op = build_node(*child, source, reservation, ctx, grid, false, stats).await?;
@@ -851,7 +864,7 @@ where
                 built.output_schema,
                 reservation.clone(),
             );
-            Ok(Box::new(op))
+            Ok(wrap_op(Box::new(op), "LabelManip", ctx))
         }
         LogicalPlan::Rollup { kind, child } => {
             // Rollup wraps either a MatrixSelector (directly) or a Subquery.
@@ -889,6 +902,7 @@ where
                     // evaluation" contract at the right boundary.
                     Ok(maybe_wrap_concurrent(
                         Box::new(op),
+                        "Rollup",
                         series_count,
                         ctx,
                         stats,
@@ -915,7 +929,7 @@ where
                     )
                     .await?;
                     let op = RollupOp::new(sub, kind, range_ms, reservation.clone());
-                    Ok(Box::new(op))
+                    Ok(wrap_op(Box::new(op), "Rollup", ctx))
                 }
                 other => Err(PlanError::UnsupportedExpression(format!(
                     "Rollup child must be MatrixSelector or Subquery, got {other:?}"
@@ -1024,7 +1038,7 @@ where
                 op,
                 reservation.clone(),
             );
-            Ok(Box::new(op_box))
+            Ok(wrap_op(Box::new(op_box), "Binary", ctx))
         }
         (true, false) => {
             let op_box = BinaryOp::<BoxedOp, BoxedOp>::new_scalar_vector(
@@ -1033,7 +1047,7 @@ where
                 op,
                 reservation.clone(),
             );
-            Ok(Box::new(op_box))
+            Ok(wrap_op(Box::new(op_box), "Binary", ctx))
         }
         (false, true) => {
             let op_box = BinaryOp::<BoxedOp, BoxedOp>::new_vector_scalar(
@@ -1042,7 +1056,7 @@ where
                 op,
                 reservation.clone(),
             );
-            Ok(Box::new(op_box))
+            Ok(wrap_op(Box::new(op_box), "Binary", ctx))
         }
         (false, false) => {
             let lhs_schema = static_schema(&lhs_op.schema().series)?.clone();
@@ -1058,7 +1072,7 @@ where
                 built.output_schema,
                 reservation.clone(),
             );
-            Ok(Box::new(op_box))
+            Ok(wrap_op(Box::new(op_box), "Binary", ctx))
         }
     }
 }
@@ -1110,7 +1124,7 @@ where
         reservation.clone(),
     )
     .map_err(map_construct_err)?;
-    Ok(Box::new(op))
+    Ok(wrap_op(Box::new(op), "Aggregate", ctx))
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,7 +1166,7 @@ where
         group_labels_arc,
         reservation.clone(),
     );
-    Ok(Box::new(op))
+    Ok(wrap_op(Box::new(op), "CountValues", ctx))
 }
 
 fn is_trivial_grouping(grouping: &AggregateGrouping) -> bool {
@@ -1233,7 +1247,7 @@ where
 
     // Clone captures for the factory closure.
     let source_arc = source.clone();
-    let ctx_copy = *ctx;
+    let ctx_copy = ctx.clone();
     let reservation_inner = reservation.clone();
     let inner_plan = inner;
     let sub_range_ms = range_ms;
@@ -1253,7 +1267,7 @@ where
         let grid = inner_grid(effective_t, sub_range_ms, inner_step_ms);
         let src = source_arc.clone();
         let res = reservation_inner.clone();
-        let ctx_cp = ctx_copy;
+        let ctx_cp = ctx_copy.clone();
         let plan = inner_plan.clone();
         // Drive the async recursive planner to completion using a
         // single-threaded runtime. This is a plan-time path, called once
@@ -1381,21 +1395,25 @@ fn inner_grid(effective_t: i64, range_ms: i64, inner_step_ms: i64) -> StepGrid {
 /// without downcasting the resulting `dyn Operator`.
 fn maybe_wrap_concurrent(
     op: Box<dyn Operator + Send>,
+    inner_name: &'static str,
     series_count: u64,
     ctx: &LoweringContext,
     stats: &mut ExchangeStats,
 ) -> Box<dyn Operator + Send> {
+    // Always tag the inner op so its own `next()` timing is recorded even
+    // when it's adopted by a ConcurrentOp's spawned task.
+    let traced_inner = wrap_op(op, inner_name, ctx);
     if ctx.parallelism.should_wrap_concurrent(series_count) {
         stats.record_wrap();
         // `ConcurrentOp::new` takes `C: Operator + Send + 'static` by
         // value. `Box<dyn Operator + Send>` doesn't itself implement
         // `Operator` (no blanket impl), so we route through the existing
         // `BoxedOp` shim that forwards `schema()` / `next()`.
-        let wrapped = ConcurrentOp::new(BoxedOp(op), ctx.parallelism.channel_bound);
-        Box::new(wrapped)
+        let wrapped = ConcurrentOp::new(BoxedOp(traced_inner), ctx.parallelism.channel_bound);
+        wrap_op(Box::new(wrapped), "Concurrent", ctx)
     } else {
         stats.record_skip();
-        op
+        traced_inner
     }
 }
 

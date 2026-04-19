@@ -2056,6 +2056,34 @@ mod tests {
                 .samples(bucket, series_id, metric_name, start_ms, end_ms)
                 .await
         }
+
+        async fn forward_index_one(
+            &self,
+            bucket: &TimeBucket,
+            series_id: crate::model::SeriesId,
+        ) -> crate::util::Result<Option<crate::index::SeriesSpec>> {
+            self.forward_index_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _guard = track_in_flight(&self.in_flight_metadata, &self.max_in_flight_metadata);
+            if let Some(&delay) = self.metadata_delays.get(bucket) {
+                tokio::time::sleep(delay).await;
+            }
+            self.inner.forward_index_one(bucket, series_id).await
+        }
+
+        async fn inverted_index_term(
+            &self,
+            bucket: &TimeBucket,
+            term: &crate::model::Label,
+        ) -> crate::util::Result<Option<roaring::RoaringBitmap>> {
+            self.inverted_index_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _guard = track_in_flight(&self.in_flight_metadata, &self.max_in_flight_metadata);
+            if let Some(&delay) = self.metadata_delays.get(bucket) {
+                tokio::time::sleep(delay).await;
+            }
+            self.inner.inverted_index_term(bucket, term).await
+        }
     }
 
     #[tokio::test(start_paused = true)]

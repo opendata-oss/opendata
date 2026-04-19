@@ -19,9 +19,10 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use roaring::RoaringBitmap;
 
 use crate::error::Result;
-use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
+use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{Label, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 
@@ -31,14 +32,31 @@ type ForwardKey = (TimeBucket, Vec<SeriesId>);
 type InvertedValue = Arc<dyn InvertedIndexLookup + Send + Sync + 'static>;
 type ForwardValue = Arc<dyn ForwardIndexLookup + Send + Sync + 'static>;
 
+/// Per-term posting slot. `Arc<Option<_>>` so the "not present in bucket"
+/// case is cacheable too (don't re-fetch absent keys).
+type InvertedTermValue = Arc<Option<RoaringBitmap>>;
+/// Per-series forward-index slot. Same cacheable-absent shape.
+type ForwardSeriesValue = Arc<Option<SeriesSpec>>;
+
 /// Per-query cache of inverted and forward index lookups.
 ///
 /// All methods take `&self`; interior concurrency is provided by
 /// [`DashMap`]. Cheap to clone the containing `Arc<V2IndexCache>` across
 /// per-bucket tasks.
+///
+/// Offers two granularities:
+/// - [`Self::inverted_index`] / [`Self::forward_index`] — batch, keyed
+///   on a sorted slice. Used by callers that don't own their own
+///   fan-out (legacy / labels endpoint).
+/// - [`Self::inverted_index_term`] / [`Self::forward_index_one`] —
+///   per-key. Used by the v2 source adapter to parallelise at its own
+///   layer and keep traces per-call. Finer-grained cache keys also
+///   enable cross-query sharing when selectors overlap partially.
 pub(crate) struct V2IndexCache {
     inverted: DashMap<InvertedKey, InvertedValue>,
     forward: DashMap<ForwardKey, ForwardValue>,
+    inverted_terms: DashMap<(TimeBucket, Label), InvertedTermValue>,
+    forward_series: DashMap<(TimeBucket, SeriesId), ForwardSeriesValue>,
 }
 
 impl V2IndexCache {
@@ -46,6 +64,8 @@ impl V2IndexCache {
         Self {
             inverted: DashMap::new(),
             forward: DashMap::new(),
+            inverted_terms: DashMap::new(),
+            forward_series: DashMap::new(),
         }
     }
 
@@ -94,6 +114,44 @@ impl V2IndexCache {
         let fetched = reader.forward_index(bucket, &key.1).await?;
         let value: ForwardValue = Arc::from(fetched);
         self.forward.insert(key, value.clone());
+        Ok(value)
+    }
+
+    /// Fetch a single inverted-index posting for `(bucket, term)`. On
+    /// miss, calls `reader.inverted_index_term(..)` and stores the
+    /// result — including the `None` case so repeated queries for a
+    /// missing term don't re-hit storage. Errors are not cached.
+    pub(crate) async fn inverted_index_term<R: QueryReader + ?Sized>(
+        &self,
+        reader: &R,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<InvertedTermValue> {
+        let key = (*bucket, term.clone());
+        if let Some(hit) = self.inverted_terms.get(&key) {
+            return Ok(hit.clone());
+        }
+        let fetched = reader.inverted_index_term(bucket, term).await?;
+        let value: InvertedTermValue = Arc::new(fetched);
+        self.inverted_terms.insert(key, value.clone());
+        Ok(value)
+    }
+
+    /// Fetch a single forward-index entry for `(bucket, series_id)`. See
+    /// [`Self::inverted_index_term`] for the cached-`None` semantics.
+    pub(crate) async fn forward_index_one<R: QueryReader + ?Sized>(
+        &self,
+        reader: &R,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<ForwardSeriesValue> {
+        let key = (*bucket, series_id);
+        if let Some(hit) = self.forward_series.get(&key) {
+            return Ok(hit.clone());
+        }
+        let fetched = reader.forward_index_one(bucket, series_id).await?;
+        let value: ForwardSeriesValue = Arc::new(fetched);
+        self.forward_series.insert(key, value.clone());
         Ok(value)
     }
 }
@@ -186,6 +244,28 @@ mod tests {
         ) -> Result<Vec<Sample>> {
             Ok(vec![])
         }
+
+        async fn forward_index_one(
+            &self,
+            _bucket: &TimeBucket,
+            _series_id: SeriesId,
+        ) -> Result<Option<crate::index::SeriesSpec>> {
+            self.forward_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(SeriesSpec {
+                unit: None,
+                metric_type: Some(MetricType::Gauge),
+                labels: vec![],
+            }))
+        }
+
+        async fn inverted_index_term(
+            &self,
+            _bucket: &TimeBucket,
+            _term: &Label,
+        ) -> Result<Option<roaring::RoaringBitmap>> {
+            self.inverted_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(roaring::RoaringBitmap::new()))
+        }
     }
 
     /// A reader that fails the first N inverted_index calls, then succeeds.
@@ -258,6 +338,27 @@ mod tests {
             _end_ms: i64,
         ) -> Result<Vec<Sample>> {
             Ok(vec![])
+        }
+
+        async fn forward_index_one(
+            &self,
+            _bucket: &TimeBucket,
+            _series_id: SeriesId,
+        ) -> Result<Option<crate::index::SeriesSpec>> {
+            Ok(None)
+        }
+
+        async fn inverted_index_term(
+            &self,
+            _bucket: &TimeBucket,
+            _term: &Label,
+        ) -> Result<Option<roaring::RoaringBitmap>> {
+            let n = self.inverted_calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first_n {
+                Err(crate::error::Error::Internal("transient".to_string()))
+            } else {
+                Ok(Some(roaring::RoaringBitmap::new()))
+            }
         }
     }
 

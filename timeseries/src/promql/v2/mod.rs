@@ -24,6 +24,7 @@ pub(crate) mod plan;
 pub(crate) mod reshape;
 pub(crate) mod source;
 pub(crate) mod source_adapter;
+pub(crate) mod trace;
 
 #[allow(unused_imports)]
 pub(crate) use batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};

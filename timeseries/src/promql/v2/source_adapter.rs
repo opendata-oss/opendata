@@ -69,6 +69,13 @@ const METADATA_STAGE_READAHEAD: usize = 32;
 /// `SAMPLE_STAGE_READAHEAD` (pipeline.rs).
 const SAMPLE_STAGE_READAHEAD: usize = 32;
 
+/// Fan-out cap for per-key index fetches inside a single bucket's resolve
+/// path (forward-index entries for each candidate, inverted-index terms
+/// for each `and_term`). Chosen to match the sample-stage cap so the
+/// overall query never exceeds `METADATA_STAGE_READAHEAD * INDEX_PER_KEY`
+/// gets in flight during build_physical.
+const INDEX_PER_KEY_CONCURRENCY: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Bucket-id encoding
 // ---------------------------------------------------------------------------
@@ -174,7 +181,8 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
         request: SamplesRequest,
     ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
         let reader = self.reader.clone();
-        samples_stream(reader, request)
+        let index_cache = self.index_cache.clone();
+        samples_stream(reader, index_cache, request)
     }
 }
 
@@ -261,6 +269,12 @@ fn async_stream_resolve<R: QueryReader + 'static>(
 
 /// Resolve the selector in a single bucket. Returns `Ok(None)` when no
 /// series match (the caller suppresses the empty chunk).
+///
+/// Forward-index entries for each candidate are fetched per-series and
+/// fanned out through [`V2IndexCache::forward_index_one`] up to
+/// [`INDEX_PER_KEY_CONCURRENCY`]. Caching is per-`(bucket, series_id)`
+/// so the downstream sample path re-uses the same entries without a
+/// second storage round trip.
 async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     reader: &R,
     index_cache: &V2IndexCache,
@@ -272,17 +286,30 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
         return Ok(None);
     }
 
-    // Apply negative / empty-string matchers (require forward index).
+    // Fan out: one forward-index get per candidate, parallel through the
+    // index cache. Duplicate ids are filtered with a sort+dedup first so
+    // we don't waste concurrency slots.
+    let mut unique_ids = candidates.clone();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    let specs: HashMap<SeriesId, crate::index::SeriesSpec> =
+        stream::iter(unique_ids.into_iter().map(|sid| async move {
+            let slot = index_cache
+                .forward_index_one(reader, &bucket, sid)
+                .await
+                .map_err(|e| internal_err(e.to_string()))?;
+            Ok::<_, QueryError>(slot.as_ref().as_ref().map(|spec| (sid, spec.clone())))
+        }))
+        .buffer_unordered(INDEX_PER_KEY_CONCURRENCY)
+        .try_filter_map(|x| async move { Ok(x) })
+        .try_collect()
+        .await?;
+
+    // Apply negative / empty-string matchers using the materialised specs.
     let needs_filter = selector_util::has_negative_matchers(selector)
         || selector_util::has_empty_string_matchers(selector);
-
-    let forward = index_cache
-        .forward_index(reader, &bucket, &candidates)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-
     let filtered_ids: Vec<SeriesId> = if needs_filter {
-        selector_util::apply_post_filters(forward.as_ref(), candidates, selector)?
+        selector_util::apply_post_filters_map(&specs, candidates, selector)?
     } else {
         candidates
     };
@@ -291,12 +318,11 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
         return Ok(None);
     }
 
-    // Now translate each series_id → Labels via the forward index.
     let bucket_id = encode_bucket(bucket);
     let mut labels_vec: Vec<Labels> = Vec::with_capacity(filtered_ids.len());
     let mut handles: Vec<ResolvedSeriesRef> = Vec::with_capacity(filtered_ids.len());
     for sid in &filtered_ids {
-        let spec = forward.get_spec(sid).ok_or_else(|| {
+        let spec = specs.get(sid).ok_or_else(|| {
             internal_err(format!(
                 "series {} missing from forward index in bucket {:?}",
                 sid, bucket
@@ -328,10 +354,11 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
 /// own cross-bucket merging (same split as `shape_matrix_results`).
 fn samples_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
+    index_cache: Arc<V2IndexCache>,
     request: SamplesRequest,
 ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
     stream::once(async move {
-        match build_sample_batches(reader.as_ref(), &request).await {
+        match build_sample_batches(reader.as_ref(), &index_cache, &request).await {
             Ok(batches) => batches.into_iter().map(Ok).collect::<Vec<_>>(),
             Err(e) => vec![Err(e)],
         }
@@ -358,6 +385,7 @@ fn samples_stream<R: QueryReader + 'static>(
 ///    `request.series` slice.
 async fn build_sample_batches<R: QueryReader + ?Sized>(
     reader: &R,
+    index_cache: &V2IndexCache,
     request: &SamplesRequest,
 ) -> Result<Vec<SampleBatch>, QueryError> {
     if request.series.is_empty() || request.time_range.is_empty() {
@@ -368,16 +396,10 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     // caller's order inside each run.
     let runs = contiguous_bucket_runs(&request.series);
 
-    let per_bucket_forward = preload_forward_indices(reader, &runs, &request.series).await?;
-
     let time_range = request.time_range;
     let out: Vec<SampleBatch> = stream::iter(runs.into_iter().map(|run| {
-        let forward = per_bucket_forward
-            .get(&run.bucket_id)
-            .expect("forward index pre-loaded above")
-            .clone();
         let series = request.series.clone();
-        async move { build_batch_for_run(reader, run, forward, series, time_range).await }
+        async move { build_batch_for_run(reader, index_cache, run, series, time_range).await }
     }))
     .buffered(SAMPLE_STAGE_READAHEAD)
     .try_collect()
@@ -386,59 +408,19 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     Ok(out)
 }
 
-/// Load the forward index for every distinct bucket referenced by `runs`,
-/// fanning out up to [`SAMPLE_STAGE_READAHEAD`] fetches in parallel.
-///
-/// Buckets are independent keyspaces (RFC 0001), so concurrent
-/// `QueryReader::forward_index` calls share nothing. The returned map is
-/// keyed by the opaque `bucket_id` used throughout the adapter.
-async fn preload_forward_indices<R: QueryReader + ?Sized>(
-    reader: &R,
-    runs: &[BucketRun],
-    series: &[ResolvedSeriesRef],
-) -> Result<HashMap<u64, Arc<dyn crate::index::ForwardIndexLookup + Send + Sync>>, QueryError> {
-    // Dedupe buckets and gather the distinct series IDs touched inside each.
-    let mut distinct: HashMap<u64, (TimeBucket, Vec<SeriesId>)> = HashMap::new();
-    for run in runs {
-        if distinct.contains_key(&run.bucket_id) {
-            continue;
-        }
-        let bucket = decode_bucket(run.bucket_id)
-            .ok_or_else(|| internal_err(format!("invalid bucket id: {}", run.bucket_id)))?;
-        let mut ids: Vec<SeriesId> = series
-            .iter()
-            .filter(|r| r.bucket_id == run.bucket_id)
-            .map(|r| r.series_id as SeriesId)
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        distinct.insert(run.bucket_id, (bucket, ids));
-    }
-
-    // Fan out. `forward_index` returns `Box<dyn ... + 'static>`; upgrade
-    // to `Arc<dyn ...>` so multiple runs for the same bucket can share one
-    // lookup. Box → Arc conversion is free.
-    stream::iter(distinct.into_iter().map(|(bid, (bucket, ids))| async move {
-        let forward = reader
-            .forward_index(&bucket, &ids)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?;
-        Ok::<_, QueryError>((bid, Arc::from(forward)))
-    }))
-    .buffer_unordered(SAMPLE_STAGE_READAHEAD)
-    .try_collect()
-    .await
-}
-
 /// Build a single [`SampleBatch`] for one bucket-run.
 ///
 /// The per-series inner loop stays sequential by design — RFC 0007
 /// §"Execution Model" (line 256) prohibits implicit spawn-per-series.
 /// Concurrency at this layer is the per-run dispatch above.
+///
+/// Per-series forward-index lookups go through [`V2IndexCache::forward_index_one`],
+/// which is a pure in-memory hit here because `resolve_one_bucket`
+/// populated the same `(bucket, series_id)` keys during build_physical.
 async fn build_batch_for_run<R: QueryReader + ?Sized>(
     reader: &R,
+    index_cache: &V2IndexCache,
     run: BucketRun,
-    forward: Arc<dyn crate::index::ForwardIndexLookup + Send + Sync>,
     series: Arc<[ResolvedSeriesRef]>,
     time_range: TimeRange,
 ) -> Result<SampleBatch, QueryError> {
@@ -460,7 +442,11 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
 
     for (col_idx, series_ref) in series[run.range.clone()].iter().enumerate() {
         let sid = series_ref.series_id as SeriesId;
-        let spec = forward.get_spec(&sid).ok_or_else(|| {
+        let spec_slot = index_cache
+            .forward_index_one(reader, &bucket, sid)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        let spec = spec_slot.as_ref().as_ref().ok_or_else(|| {
             internal_err(format!(
                 "series {} missing from forward index in bucket {:?}",
                 sid, bucket
@@ -740,6 +726,73 @@ mod selector_util {
             out = apply_empty_string(forward, out, selector);
         }
         Ok(out)
+    }
+
+    /// HashMap-backed variant of [`apply_post_filters`] used by the v2
+    /// resolve path after fetching per-series forward-index entries.
+    pub(super) fn apply_post_filters_map(
+        specs: &std::collections::HashMap<SeriesId, crate::index::SeriesSpec>,
+        candidates: Vec<SeriesId>,
+        selector: &VectorSelector,
+    ) -> Result<Vec<SeriesId>, QueryError> {
+        let mut out = candidates;
+        if has_negative_matchers(selector) {
+            out = apply_negative_map(specs, out, selector)?;
+        }
+        if has_empty_string_matchers(selector) {
+            out = apply_empty_string_map(specs, out, selector);
+        }
+        Ok(out)
+    }
+
+    fn apply_negative_map(
+        specs: &std::collections::HashMap<SeriesId, crate::index::SeriesSpec>,
+        candidates: Vec<SeriesId>,
+        selector: &VectorSelector,
+    ) -> Result<Vec<SeriesId>, QueryError> {
+        let mut out = candidates;
+        for m in &selector.matchers.matchers {
+            match &m.op {
+                MatchOp::NotEqual => {
+                    out.retain(|id| {
+                        specs
+                            .get(id)
+                            .map(|spec| !has_label(&spec.labels, &m.name, &m.value))
+                            .unwrap_or(false)
+                    });
+                }
+                MatchOp::NotRe(_) => {
+                    let values = parse_limited_regex(&m.value).map_err(internal_err)?;
+                    out.retain(|id| {
+                        specs
+                            .get(id)
+                            .map(|spec| !values.iter().any(|v| has_label(&spec.labels, &m.name, v)))
+                            .unwrap_or(false)
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn apply_empty_string_map(
+        specs: &std::collections::HashMap<SeriesId, crate::index::SeriesSpec>,
+        candidates: Vec<SeriesId>,
+        selector: &VectorSelector,
+    ) -> Vec<SeriesId> {
+        let mut out = candidates;
+        for m in &selector.matchers.matchers {
+            if matches!(m.op, MatchOp::Equal) && m.value.is_empty() {
+                out.retain(|id| {
+                    specs
+                        .get(id)
+                        .map(|spec| !has_label_with_non_empty_value(&spec.labels, &m.name))
+                        .unwrap_or(false)
+                });
+            }
+        }
+        out
     }
 
     fn apply_negative(

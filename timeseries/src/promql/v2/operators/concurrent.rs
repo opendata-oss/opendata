@@ -46,6 +46,7 @@ use tokio::sync::mpsc;
 use super::super::batch::StepBatch;
 use super::super::memory::QueryError;
 use super::super::operator::{Operator, OperatorSchema};
+use super::super::trace;
 
 /// Default channel bound. Small enough that pathological producers can't
 /// buffer unbounded batches, large enough to keep a typical CPU-bound
@@ -87,7 +88,13 @@ impl ConcurrentOp {
 
         let (tx, rx) = mpsc::channel::<Result<StepBatch, QueryError>>(bound);
 
-        let task = tokio::spawn(async move {
+        // Snapshot the current task-local trace collector (if any) and
+        // re-scope the spawned task into it so downstream storage I/O and
+        // `TracingOperator` wrappers inside `child` attribute their work
+        // to the same collector as the outer query.
+        let trace_collector = trace::current_collector();
+
+        let drive = async move {
             // Drive the child pull-by-pull. Each `poll_fn` call hands the
             // task's waker to the child; the child re-wakes when it's ready.
             loop {
@@ -112,7 +119,11 @@ impl ConcurrentOp {
                     }
                 }
             }
-        });
+        };
+        let task = match trace_collector {
+            Some(c) => tokio::spawn(trace::with_trace(c, drive)),
+            None => tokio::spawn(drive),
+        };
 
         Self {
             cached_schema,

@@ -41,6 +41,9 @@ pub(crate) struct AppState {
     pub(crate) metrics: Arc<Metrics>,
     #[cfg(feature = "otel")]
     pub(crate) otel_converter: Arc<OtelConverter>,
+    /// Server-level tracing config. A request with `?trace=true` always
+    /// traces regardless; this flag forces tracing on for *every* query.
+    pub(crate) tracing_config: crate::promql::config::TracingConfig,
 }
 
 /// Server configuration
@@ -65,6 +68,7 @@ pub(crate) fn build_router(
     tsdb: Arc<TsdbEngine>,
     metrics: Arc<Metrics>,
     _otel_config: OtelServerConfig,
+    tracing_config: crate::promql::config::TracingConfig,
 ) -> Router {
     let state = AppState {
         tsdb,
@@ -74,6 +78,7 @@ pub(crate) fn build_router(
             include_resource_attrs: _otel_config.include_resource_attrs,
             include_scope_attrs: _otel_config.include_scope_attrs,
         })),
+        tracing_config,
     };
 
     let app = Router::new()
@@ -207,6 +212,7 @@ impl TimeSeriesHttpServer {
             self.tsdb.clone(),
             metrics,
             self.config.prometheus_config.otel.clone(),
+            self.config.prometheus_config.tracing.clone(),
         );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
@@ -345,10 +351,34 @@ async fn handle_query(
         .eval_query(&params.query, time, &QueryOptions::default())
         .await;
     #[cfg(feature = "promql-v2")]
-    let result = state
-        .tsdb
-        .eval_query_v2(&params.query, time, &QueryOptions::default())
-        .await;
+    {
+        let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
+        if tracing_on {
+            let collector = crate::promql::v2::trace::TraceCollector::new();
+            let outcome = state
+                .tsdb
+                .eval_query_v2_traced(
+                    &params.query,
+                    time,
+                    &QueryOptions::default(),
+                    Some(collector),
+                )
+                .await;
+            let (value_res, trace) = match outcome {
+                Ok(o) => (Ok(o.value), o.trace),
+                Err(e) => (Err(e), None),
+            };
+            let mut resp = response::query_value_to_response(value_res);
+            resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
+            return Ok(Json(resp).into_response());
+        }
+        let result = state
+            .tsdb
+            .eval_query_v2(&params.query, time, &QueryOptions::default())
+            .await;
+        Ok(Json(response::query_value_to_response(result)).into_response())
+    }
+    #[cfg(not(feature = "promql-v2"))]
     Ok(Json(response::query_value_to_response(result)).into_response())
 }
 
@@ -391,11 +421,36 @@ async fn handle_query_range(
         .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
         .await;
     #[cfg(feature = "promql-v2")]
-    let result = state
-        .tsdb
-        .eval_query_range_v2(&params.query, start..=end, step, &QueryOptions::default())
-        .await
-        .and_then(query_value_to_range_samples);
+    {
+        let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
+        if tracing_on {
+            let collector = crate::promql::v2::trace::TraceCollector::new();
+            let outcome = state
+                .tsdb
+                .eval_query_range_v2_traced(
+                    &params.query,
+                    start..=end,
+                    step,
+                    &QueryOptions::default(),
+                    Some(collector),
+                )
+                .await;
+            let (range_res, trace) = match outcome {
+                Ok(o) => (query_value_to_range_samples(o.value), o.trace),
+                Err(e) => (Err(e), None),
+            };
+            let mut resp = response::range_result_to_response(range_res);
+            resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
+            return Ok(Json(resp).into_response());
+        }
+        let result = state
+            .tsdb
+            .eval_query_range_v2(&params.query, start..=end, step, &QueryOptions::default())
+            .await
+            .and_then(query_value_to_range_samples);
+        Ok(Json(response::range_result_to_response(result)).into_response())
+    }
+    #[cfg(not(feature = "promql-v2"))]
     Ok(Json(response::range_result_to_response(result)).into_response())
 }
 

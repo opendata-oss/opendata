@@ -72,6 +72,7 @@ use super::super::operator::{Operator, OperatorSchema, StepGrid};
 use super::super::source::{
     ResolvedSeriesRef, SampleBatch, SamplesRequest, SeriesSource, TimeRange,
 };
+use super::super::trace;
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -515,7 +516,13 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
             let mut stream: SampleStream<'_> = Box::pin(stream);
             while let Some(item) = stream.next().await {
                 let batch = item?;
-                samples.absorb(batch, &request_to_series)?;
+                // `absorb` copies per-series (ts, value) pairs into this
+                // chunk's columnar staging vectors. Pure CPU, measured
+                // separately from the source's I/O wait (which is already
+                // attributed to `object_storage_fetch` / `deserialize`).
+                trace::record_subphase_sync("absorb", || {
+                    samples.absorb(batch, &request_to_series)
+                })?;
             }
             // Silence "unused variable" when chunk_start isn't read
             // by absorb — it's threaded into the state machine as an
@@ -623,34 +630,42 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                         self.state = State::Done;
                         return Poll::Ready(None);
                     }
+                    let _g = trace::Scope::enter("start_chunk_load");
                     self.state = self.start_chunk_load(0);
                 }
                 State::LoadingChunk {
                     chunk_start,
                     chunk_len,
                     mut future,
-                } => match future.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.state = State::LoadingChunk {
-                            chunk_start,
-                            chunk_len,
-                            future,
-                        };
-                        return Poll::Pending;
+                } => {
+                    // Time each poll of the hydration future — covers the
+                    // `samples_stream.next().await` + `absorb` loop. Only
+                    // Ready polls record (Pending polls don't contribute
+                    // CPU, just the wake-up cost).
+                    let _g = trace::Scope::enter("hydrate");
+                    match future.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.state = State::LoadingChunk {
+                                chunk_start,
+                                chunk_len,
+                                future,
+                            };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(samples)) => {
+                            self.state = State::Emitting {
+                                chunk_start,
+                                chunk_len,
+                                samples: Box::new(samples),
+                                next_step_chunk_start: 0,
+                            };
+                        }
+                        Poll::Ready(Err(err)) => {
+                            self.state = State::Errored;
+                            return Poll::Ready(Some(Err(err)));
+                        }
                     }
-                    Poll::Ready(Ok(samples)) => {
-                        self.state = State::Emitting {
-                            chunk_start,
-                            chunk_len,
-                            samples: Box::new(samples),
-                            next_step_chunk_start: 0,
-                        };
-                    }
-                    Poll::Ready(Err(err)) => {
-                        self.state = State::Errored;
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                },
+                }
                 State::Emitting {
                     chunk_start,
                     chunk_len,
@@ -668,11 +683,15 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                             self.state = State::Done;
                             return Poll::Ready(None);
                         }
+                        let _g = trace::Scope::enter("start_chunk_load");
                         self.state = self.start_chunk_load(next_chunk_start);
                         continue;
                     }
-                    match self.build_batch(chunk_start, chunk_len, &samples, next_step_chunk_start)
-                    {
+                    let build_result = {
+                        let _g = trace::Scope::enter("build_batch");
+                        self.build_batch(chunk_start, chunk_len, &samples, next_step_chunk_start)
+                    };
+                    match build_result {
                         Ok(batch) => {
                             let step_advance = batch.step_count();
                             self.state = State::Emitting {

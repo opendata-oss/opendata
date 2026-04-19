@@ -53,6 +53,8 @@ fn make_range_response(num_series: usize, num_samples: usize) -> QueryRangeRespo
         }),
         error: None,
         error_type: None,
+        #[cfg(feature = "promql-v2")]
+        trace: None,
     }
 }
 
@@ -76,6 +78,8 @@ fn make_vector_response(num_series: usize) -> QueryResponse {
         }),
         error: None,
         error_type: None,
+        #[cfg(feature = "promql-v2")]
+        trace: None,
     }
 }
 
@@ -89,6 +93,8 @@ fn make_scalar_response() -> QueryResponse {
         }),
         error: None,
         error_type: None,
+        #[cfg(feature = "promql-v2")]
+        trace: None,
     }
 }
 

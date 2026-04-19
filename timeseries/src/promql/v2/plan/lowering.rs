@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use crate::promql::v2::trace::TraceCollector;
 use promql_parser::parser;
 use promql_parser::parser::LabelModifier;
 use promql_parser::parser::token::{
@@ -56,7 +57,7 @@ use super::plan_types::{
 /// `lookback_delta_ms` is threaded into [`LogicalPlan::VectorSelector`] so
 /// the physical planner can parameterise the operator without re-reading
 /// query state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LoweringContext {
     /// Inclusive query range start, absolute UTC milliseconds.
     pub start_ms: i64,
@@ -73,7 +74,25 @@ pub struct LoweringContext {
     /// physical planner when wrapping I/O-bound leaves in `ConcurrentOp`.
     /// Lowering ignores this field.
     pub parallelism: super::parallelism::Parallelism,
+    /// Optional per-query trace collector. When `Some`, the physical planner
+    /// wraps every operator in a [`crate::promql::v2::trace::TracingOperator`]
+    /// that records cumulative timing. `None` is a zero-cost no-op path.
+    pub trace: Option<Arc<TraceCollector>>,
 }
+
+impl PartialEq for LoweringContext {
+    fn eq(&self, other: &Self) -> bool {
+        // Trace collector is intentionally excluded — it is observability
+        // state, not part of the plan's identity.
+        self.start_ms == other.start_ms
+            && self.end_ms == other.end_ms
+            && self.step_ms == other.step_ms
+            && self.lookback_delta_ms == other.lookback_delta_ms
+            && self.parallelism == other.parallelism
+    }
+}
+
+impl Eq for LoweringContext {}
 
 impl LoweringContext {
     /// Construct a range-query context.
@@ -84,6 +103,7 @@ impl LoweringContext {
             step_ms,
             lookback_delta_ms,
             parallelism: super::parallelism::Parallelism::default(),
+            trace: None,
         }
     }
 
@@ -97,6 +117,7 @@ impl LoweringContext {
             step_ms: 1,
             lookback_delta_ms,
             parallelism: super::parallelism::Parallelism::default(),
+            trace: None,
         }
     }
 
@@ -104,6 +125,12 @@ impl LoweringContext {
     /// knobs. Chainable.
     pub fn with_parallelism(mut self, parallelism: super::parallelism::Parallelism) -> Self {
         self.parallelism = parallelism;
+        self
+    }
+
+    /// Attach a trace collector. Chainable.
+    pub fn with_trace(mut self, trace: Arc<TraceCollector>) -> Self {
+        self.trace = Some(trace);
         self
     }
 

@@ -40,17 +40,23 @@ impl BucketQueryReader for MiniQueryReader {
         &self,
         series_ids: &[SeriesId],
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-        let forward_index = self
-            .snapshot
-            .get_forward_index_series(&self.bucket, series_ids)
-            .await?;
+        let forward_index = io_trace_async(IoKindLocal::ForwardIndexFetch, async {
+            self.snapshot
+                .get_forward_index_series(&self.bucket, series_ids)
+                .await
+        })
+        .await?;
         Ok(Box::new(forward_index))
     }
 
     async fn all_forward_index(
         &self,
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
-        let forward_index = self.snapshot.get_forward_index(self.bucket).await?;
+        let forward_index = io_trace_async(
+            IoKindLocal::ForwardIndexFetch,
+            self.snapshot.get_forward_index(self.bucket),
+        )
+        .await?;
         Ok(Box::new(forward_index))
     }
 
@@ -58,24 +64,51 @@ impl BucketQueryReader for MiniQueryReader {
         &self,
         terms: &[Label],
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-        let inverted_index = self
-            .snapshot
-            .get_inverted_index_terms(&self.bucket, terms)
-            .await?;
+        let inverted_index = io_trace_async(IoKindLocal::InvertedIndexFetch, async {
+            self.snapshot
+                .get_inverted_index_terms(&self.bucket, terms)
+                .await
+        })
+        .await?;
         Ok(Box::new(inverted_index))
     }
 
     async fn all_inverted_index(
         &self,
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
-        let inverted_index = self.snapshot.get_inverted_index(self.bucket).await?;
+        let inverted_index = io_trace_async(
+            IoKindLocal::InvertedIndexFetch,
+            self.snapshot.get_inverted_index(self.bucket),
+        )
+        .await?;
         Ok(Box::new(inverted_index))
     }
 
     async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
-        self.snapshot
-            .get_label_values(&self.bucket, label_name)
-            .await
+        io_trace_async(
+            IoKindLocal::LabelValuesFetch,
+            self.snapshot.get_label_values(&self.bucket, label_name),
+        )
+        .await
+    }
+
+    async fn forward_index_one(
+        &self,
+        series_id: SeriesId,
+    ) -> Result<Option<crate::index::SeriesSpec>> {
+        io_trace_async(
+            IoKindLocal::ForwardIndexFetch,
+            self.snapshot.get_forward_index_one(&self.bucket, series_id),
+        )
+        .await
+    }
+
+    async fn inverted_index_term(&self, term: &Label) -> Result<Option<roaring::RoaringBitmap>> {
+        io_trace_async(
+            IoKindLocal::InvertedIndexFetch,
+            self.snapshot.get_inverted_index_term(&self.bucket, term),
+        )
+        .await
     }
 
     async fn samples(
@@ -91,25 +124,88 @@ impl BucketQueryReader for MiniQueryReader {
             metric_name: metric_name.to_string(),
             series_id,
         };
-        let record = self.snapshot.get(storage_key.encode()).await?;
+        let record = io_trace_async(
+            IoKindLocal::SamplesFetch,
+            self.snapshot.get(storage_key.encode()),
+        )
+        .await?;
 
         match record {
             Some(record) => {
-                let iter = TimeSeriesIterator::new(record.value.as_ref())
-                    .ok_or_else(|| Error::Internal("Invalid timeseries data in storage".into()))?;
-
-                let samples: Vec<Sample> = iter
-                    .filter_map(|r| r.ok())
-                    // Filter by time range: timestamp > start_ms && timestamp <= end_ms
-                    // Following PromQL lookback window semantics with exclusive start
-                    .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
-                    .collect();
-
+                #[cfg(feature = "promql-v2")]
+                crate::promql::v2::trace::record_bytes(
+                    crate::promql::v2::trace::IoKind::SamplesFetch,
+                    record.value.len() as u64,
+                );
+                let raw_len = record.value.len() as u64;
+                let samples = io_trace_sync(IoKindLocal::Deserialize, || {
+                    let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
+                        Error::Internal("Invalid timeseries data in storage".into())
+                    })?;
+                    let samples: Vec<Sample> = iter
+                        .filter_map(|r| r.ok())
+                        // Filter by time range: timestamp > start_ms && timestamp <= end_ms
+                        // Following PromQL lookback window semantics with exclusive start
+                        .filter(|s| s.timestamp_ms > start_ms && s.timestamp_ms <= end_ms)
+                        .collect();
+                    Ok::<Vec<Sample>, Error>(samples)
+                })?;
+                // Deserialize's bytes are the same bytes the fetch returned —
+                // it's decoding that payload. Attribute here so both kinds
+                // report throughput.
+                #[cfg(feature = "promql-v2")]
+                crate::promql::v2::trace::record_bytes(
+                    crate::promql::v2::trace::IoKind::Deserialize,
+                    raw_len,
+                );
+                #[cfg(not(feature = "promql-v2"))]
+                let _ = raw_len;
                 Ok(samples)
             }
             None => Ok(Vec::new()),
         }
     }
+}
+
+// ─── trace helpers ──────────────────────────────────────────────────
+//
+// Expose a thin I/O-kind facade that maps to the v2 tracing module when
+// the `promql-v2` feature is on, and compiles to a no-op otherwise so the
+// storage layer stays feature-agnostic.
+
+#[cfg(feature = "promql-v2")]
+use crate::promql::v2::trace::IoKind as IoKindLocal;
+
+#[cfg(not(feature = "promql-v2"))]
+#[allow(dead_code)]
+enum IoKindLocal {
+    SamplesFetch,
+    Deserialize,
+    ForwardIndexFetch,
+    InvertedIndexFetch,
+    LabelValuesFetch,
+}
+
+#[cfg(feature = "promql-v2")]
+async fn io_trace_async<F: std::future::Future<Output = T>, T>(kind: IoKindLocal, fut: F) -> T {
+    crate::promql::v2::trace::record_async(kind, fut).await
+}
+
+#[cfg(not(feature = "promql-v2"))]
+#[inline]
+async fn io_trace_async<F: std::future::Future<Output = T>, T>(_kind: IoKindLocal, fut: F) -> T {
+    fut.await
+}
+
+#[cfg(feature = "promql-v2")]
+fn io_trace_sync<T>(kind: IoKindLocal, f: impl FnOnce() -> T) -> T {
+    crate::promql::v2::trace::record_sync(kind, f)
+}
+
+#[cfg(not(feature = "promql-v2"))]
+#[inline]
+fn io_trace_sync<T>(_kind: IoKindLocal, f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 pub(crate) struct MiniTsdb {

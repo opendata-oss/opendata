@@ -823,6 +823,87 @@ mod v2_dispatch {
     }
 
     #[tokio::test]
+    async fn should_omit_trace_field_when_tracing_not_requested() {
+        // given — default server config disables tracing; no ?trace param.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query?query=http_requests_total&time={}",
+            SAMPLE_TS_SECS
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json.get("trace").is_none(),
+            "trace should be omitted when not requested: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_populate_trace_field_when_trace_param_set() {
+        // given — ?trace=true on an instant query.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query?query=http_requests_total&time={}&trace=true",
+            SAMPLE_TS_SECS
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let trace = json
+            .get("trace")
+            .unwrap_or_else(|| panic!("trace missing: {body}"));
+        let phases = trace
+            .get("phases")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("phases missing: {body}"));
+        // Expect every phase name we emit from execute_v2.
+        let names: Vec<&str> = phases
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
+            .collect();
+        for expected in [
+            "parse",
+            "lower",
+            "optimize",
+            "build_physical",
+            "execute",
+            "reshape",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing phase {expected} in {names:?}"
+            );
+        }
+        let operators = trace
+            .get("operators")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("operators missing: {body}"));
+        assert!(
+            operators
+                .iter()
+                .any(|o| o.get("opName")
+                    == Some(&serde_json::Value::String("VectorSelector".into()))),
+            "expected a VectorSelector operator entry: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn should_map_v2_invalid_query_to_error_response() {
         // given — unknown PromQL functions are rejected by the v2 planner
         // as `PlanError::UnknownFunction`, mapping to

@@ -16,6 +16,10 @@ pub struct QueryParams {
     /// With `explain=true`, set `pretty=true` to receive a text/plain
     /// indented tree instead of the structured JSON response.
     pub pretty: Option<String>,
+    /// Set `trace=true` to collect per-phase / per-operator timings and
+    /// return them under a `trace` field in the response. Combines with
+    /// the server's `tracing.enabled` config (logical OR).
+    pub trace: Option<String>,
 }
 
 /// Query parameters for /api/v1/query_range
@@ -30,6 +34,8 @@ pub struct QueryRangeParams {
     pub explain: Option<String>,
     /// See [`QueryParams::pretty`].
     pub pretty: Option<String>,
+    /// See [`QueryParams::trace`].
+    pub trace: Option<String>,
 }
 
 /// `true` when a query-string flag like `explain` or `pretty` should be

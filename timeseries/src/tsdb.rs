@@ -116,48 +116,120 @@ fn preload_ranges_for_v2(
 /// one place. Generic over the [`QueryReader`] type so both the writer's
 /// `TsdbQueryReader` and the reader's `ReaderQueryReader` flow through
 /// the same pipeline without duplication.
+/// Execution outcome bundling the reshaped query value with an optional
+/// tracing snapshot. The snapshot is populated when the [`LoweringContext`]
+/// carried a trace collector.
+#[cfg(feature = "promql-v2")]
+pub(crate) struct ExecuteOutcome {
+    pub value: QueryValue,
+    pub trace: Option<crate::promql::v2::trace::QueryTrace>,
+}
+
 #[cfg(feature = "promql-v2")]
 async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
     query: &str,
     reader: R,
     ctx: crate::promql::v2::plan::LoweringContext,
     is_instant: bool,
-) -> std::result::Result<QueryValue, QueryError> {
+) -> std::result::Result<ExecuteOutcome, QueryError> {
+    use crate::promql::v2::trace::{self, Phase};
     use std::future::poll_fn;
 
-    let expr =
-        promql_parser::parser::parse(query).map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
-    let logical = crate::promql::v2::plan::lower(&expr, &ctx).map_err(plan_error_to_query_error)?;
-    let logical = crate::promql::v2::plan::optimize(logical);
+    let trace_collector = ctx.trace.clone();
+    let trace_for_run = trace_collector.clone();
 
-    let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
-        Arc::new(reader),
-    ));
-    let reservation =
-        crate::promql::v2::memory::MemoryReservation::new(DEFAULT_V2_MEMORY_CAP_BYTES);
-
-    let mut plan =
-        crate::promql::v2::plan::build_physical_plan(logical, &source, reservation, &ctx)
-            .await
-            .map_err(plan_error_to_query_error)?;
-
-    // Drive the root operator — collect every emitted batch.
-    let mut batches = Vec::new();
-    loop {
-        match poll_fn(|cx| plan.root.next(cx)).await {
-            Some(Ok(batch)) => batches.push(batch),
-            Some(Err(e)) => return Err(v2_query_error_to_query_error(e)),
-            None => break,
+    // Hoist the whole pipeline into a task-local scope so storage-layer
+    // code can record I/O timings without the planner having to thread the
+    // collector through every function signature.
+    let run = async move {
+        let trace_collector = trace_for_run;
+        // Parse --------------------------------------------------------
+        let span = tracing::info_span!("phase", name = "parse");
+        let t0 = Instant::now();
+        let parse_res = span.in_scope(|| promql_parser::parser::parse(query));
+        let expr = parse_res.map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        if let Some(c) = trace_collector.as_ref() {
+            c.record_phase(Phase::Parse, t0.elapsed().as_nanos() as u64);
         }
-    }
 
-    // Reshape according to the requested shape.
-    let reshaped = if is_instant {
-        crate::promql::v2::reshape::reshape_instant(&plan, batches)
-    } else {
-        crate::promql::v2::reshape::reshape_range(&plan, batches)
+        // Lower --------------------------------------------------------
+        let span = tracing::info_span!("phase", name = "lower");
+        let t0 = Instant::now();
+        let logical = span
+            .in_scope(|| crate::promql::v2::plan::lower(&expr, &ctx))
+            .map_err(plan_error_to_query_error)?;
+        if let Some(c) = trace_collector.as_ref() {
+            c.record_phase(Phase::Lower, t0.elapsed().as_nanos() as u64);
+        }
+
+        // Optimize -----------------------------------------------------
+        let span = tracing::info_span!("phase", name = "optimize");
+        let t0 = Instant::now();
+        let logical = span.in_scope(|| crate::promql::v2::plan::optimize(logical));
+        if let Some(c) = trace_collector.as_ref() {
+            c.record_phase(Phase::Optimize, t0.elapsed().as_nanos() as u64);
+        }
+
+        let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
+            Arc::new(reader),
+        ));
+        let reservation =
+            crate::promql::v2::memory::MemoryReservation::new(DEFAULT_V2_MEMORY_CAP_BYTES);
+
+        // Build physical ----------------------------------------------
+        let t0 = Instant::now();
+        let mut plan = tracing::Instrument::instrument(
+            crate::promql::v2::plan::build_physical_plan(logical, &source, reservation, &ctx),
+            tracing::info_span!("phase", name = "build_physical"),
+        )
+        .await
+        .map_err(plan_error_to_query_error)?;
+        if let Some(c) = trace_collector.as_ref() {
+            c.record_phase(Phase::BuildPhysical, t0.elapsed().as_nanos() as u64);
+        }
+
+        // Execute ------------------------------------------------------
+        let t0 = Instant::now();
+        let mut batches = Vec::new();
+        let exec_span = tracing::info_span!("phase", name = "execute");
+        let _exec_guard = exec_span.enter();
+        loop {
+            match poll_fn(|cx| plan.root.next(cx)).await {
+                Some(Ok(batch)) => batches.push(batch),
+                Some(Err(e)) => return Err(v2_query_error_to_query_error(e)),
+                None => break,
+            }
+        }
+        drop(_exec_guard);
+        if let Some(c) = trace_collector.as_ref() {
+            c.record_phase(Phase::Execute, t0.elapsed().as_nanos() as u64);
+        }
+
+        // Reshape ------------------------------------------------------
+        let span = tracing::info_span!("phase", name = "reshape");
+        let t0 = Instant::now();
+        let reshaped = span.in_scope(|| {
+            if is_instant {
+                crate::promql::v2::reshape::reshape_instant(&plan, batches)
+            } else {
+                crate::promql::v2::reshape::reshape_range(&plan, batches)
+            }
+        });
+        if let Some(c) = trace_collector.as_ref() {
+            c.record_phase(Phase::Reshape, t0.elapsed().as_nanos() as u64);
+        }
+        reshaped.map_err(|e| QueryError::Execution(e.to_string()))
     };
-    reshaped.map_err(|e| QueryError::Execution(e.to_string()))
+
+    let value = match trace_collector.clone() {
+        Some(c) => trace::with_trace(c, run).await?,
+        None => run.await?,
+    };
+
+    Ok(ExecuteOutcome {
+        value,
+        trace: trace_collector.as_ref().map(|c| c.finish()),
+    })
 }
 
 /// Dry-run: parse, lower, optimize, and describe the physical plan
@@ -390,13 +462,36 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     where
         Self::QR: 'static,
     {
+        self.eval_query_v2_traced(query, time, opts, None)
+            .await
+            .map(|o| o.value)
+    }
+
+    /// Tracing-aware variant of [`Self::eval_query_v2`]. Pass `trace`
+    /// `Some(...)` to populate [`ExecuteOutcome::trace`] on the result.
+    #[cfg(feature = "promql-v2")]
+    async fn eval_query_v2_traced(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+    ) -> std::result::Result<ExecuteOutcome, QueryError>
+    where
+        Self::QR: 'static,
+    {
         let query_time = time.unwrap_or_else(SystemTime::now);
         let at_ms = system_time_to_ms(query_time);
-        let plan_ctx = crate::promql::v2::plan::LoweringContext::for_instant(
+        let mut plan_ctx = crate::promql::v2::plan::LoweringContext::for_instant(
             at_ms,
             duration_to_ms(opts.lookback_delta),
         );
+        if let Some(c) = trace {
+            plan_ctx = plan_ctx.with_trace(c);
+        }
+        let collector = plan_ctx.trace.clone();
 
+        let t0 = Instant::now();
         let reader = self
             .make_query_reader_for_ranges(&preload_ranges_for_v2(
                 query,
@@ -405,6 +500,12 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
                 opts.lookback_delta,
             )?)
             .await?;
+        if let Some(c) = collector.as_ref() {
+            c.record_phase(
+                crate::promql::v2::trace::Phase::ReaderSetup,
+                t0.elapsed().as_nanos() as u64,
+            );
+        }
         execute_v2(query, reader, plan_ctx, /*is_instant=*/ true).await
     }
 
@@ -425,6 +526,24 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     where
         Self::QR: 'static,
     {
+        self.eval_query_range_v2_traced(query, range, step, opts, None)
+            .await
+            .map(|o| o.value)
+    }
+
+    /// Tracing-aware variant of [`Self::eval_query_range_v2`].
+    #[cfg(feature = "promql-v2")]
+    async fn eval_query_range_v2_traced(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime> + Send,
+        step: Duration,
+        opts: &QueryOptions,
+        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+    ) -> std::result::Result<ExecuteOutcome, QueryError>
+    where
+        Self::QR: 'static,
+    {
         let (start, end) = crate::util::range_bounds_to_system_time(range);
         let start_ms = system_time_to_ms(start);
         let end_ms = system_time_to_ms(end);
@@ -435,13 +554,18 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
             ));
         }
 
-        let plan_ctx = crate::promql::v2::plan::LoweringContext::new(
+        let mut plan_ctx = crate::promql::v2::plan::LoweringContext::new(
             start_ms,
             end_ms,
             step_ms,
             duration_to_ms(opts.lookback_delta),
         );
+        if let Some(c) = trace {
+            plan_ctx = plan_ctx.with_trace(c);
+        }
+        let collector = plan_ctx.trace.clone();
 
+        let t0 = Instant::now();
         let reader = self
             .make_query_reader_for_ranges(&preload_ranges_for_v2(
                 query,
@@ -450,6 +574,12 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
                 opts.lookback_delta,
             )?)
             .await?;
+        if let Some(c) = collector.as_ref() {
+            c.record_phase(
+                crate::promql::v2::trace::Phase::ReaderSetup,
+                t0.elapsed().as_nanos() as u64,
+            );
+        }
         execute_v2(query, reader, plan_ctx, /*is_instant=*/ false).await
     }
 }
@@ -1129,6 +1259,23 @@ impl TsdbEngine {
         }
     }
 
+    /// Tracing-aware instant query. Populates [`ExecuteOutcome::trace`]
+    /// when `trace` is `Some`. Otherwise behaves like [`Self::eval_query_v2`]
+    /// wrapped in an [`ExecuteOutcome`].
+    #[cfg(feature = "promql-v2")]
+    pub(crate) async fn eval_query_v2_traced(
+        &self,
+        query: &str,
+        time: Option<SystemTime>,
+        opts: &QueryOptions,
+        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+    ) -> std::result::Result<ExecuteOutcome, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.eval_query_v2_traced(query, time, opts, trace).await,
+            Self::ReadOnly(reader) => reader.eval_query_v2_traced(query, time, opts, trace).await,
+        }
+    }
+
     /// A/B v2 entry point for range queries. Unlike v1 (`Vec<RangeSample>`),
     /// v2 returns a full [`QueryValue`] because the plan root may emit a
     /// [`QueryValue::Scalar`] over a range grid (e.g. `1+1`). The HTTP
@@ -1146,6 +1293,29 @@ impl TsdbEngine {
         match self {
             Self::ReadWrite(tsdb) => tsdb.eval_query_range_v2(query, range, step, opts).await,
             Self::ReadOnly(reader) => reader.eval_query_range_v2(query, range, step, opts).await,
+        }
+    }
+
+    /// Tracing-aware range query. See [`Self::eval_query_v2_traced`].
+    #[cfg(feature = "promql-v2")]
+    pub(crate) async fn eval_query_range_v2_traced(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime> + Send,
+        step: Duration,
+        opts: &QueryOptions,
+        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+    ) -> std::result::Result<ExecuteOutcome, QueryError> {
+        match self {
+            Self::ReadWrite(tsdb) => {
+                tsdb.eval_query_range_v2_traced(query, range, step, opts, trace)
+                    .await
+            }
+            Self::ReadOnly(reader) => {
+                reader
+                    .eval_query_range_v2_traced(query, range, step, opts, trace)
+                    .await
+            }
         }
     }
 
@@ -1367,6 +1537,28 @@ impl QueryReader for TsdbQueryReader {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
         mini.samples(series_id, metric_name, start_ms, end_ms).await
+    }
+
+    async fn forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<crate::index::SeriesSpec>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index_one(series_id).await
+    }
+
+    async fn inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<roaring::RoaringBitmap>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.inverted_index_term(term).await
     }
 }
 

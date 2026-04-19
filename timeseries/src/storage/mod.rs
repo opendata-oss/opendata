@@ -159,7 +159,11 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(inverted_index)
     }
 
-    /// Load only the specified terms from the inverted index.
+    /// Load only the specified terms from the inverted index. Legacy
+    /// batch path — kept for the v1 evaluator / pipeline which still
+    /// calls it. New callers should use [`Self::get_inverted_index_term`]
+    /// and fan out in parallel themselves so each per-term latency is
+    /// independently traceable.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_inverted_index_terms(
         &self,
@@ -168,22 +172,16 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     ) -> Result<InvertedIndex> {
         let result = InvertedIndex::default();
         for term in terms {
-            let key = InvertedIndexKey {
-                time_bucket: bucket.start,
-                bucket_size: bucket.size,
-                attribute: term.name.clone(),
-                value: term.value.clone(),
-            }
-            .encode();
-            if let Some(record) = self.get(key).await? {
-                let value = InvertedIndexValue::decode(record.value.as_ref())?;
-                result.postings.insert(term.clone(), value.postings);
+            if let Some(postings) = self.get_inverted_index_term(bucket, term).await? {
+                result.postings.insert(term.clone(), postings);
             }
         }
         Ok(result)
     }
 
-    /// Load only the specified series from the forward index.
+    /// Load only the specified series from the forward index. Legacy
+    /// batch path — see [`Self::get_inverted_index_terms`] for context.
+    /// New callers should use [`Self::get_forward_index_one`].
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_forward_index_series(
         &self,
@@ -192,18 +190,76 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     ) -> Result<ForwardIndex> {
         let result = ForwardIndex::default();
         for &series_id in series_ids {
-            let key = ForwardIndexKey {
-                time_bucket: bucket.start,
-                bucket_size: bucket.size,
-                series_id,
-            }
-            .encode();
-            if let Some(record) = self.get(key).await? {
-                let value = ForwardIndexValue::decode(record.value.as_ref())?;
-                result.series.insert(series_id, value.into());
+            if let Some(spec) = self.get_forward_index_one(bucket, series_id).await? {
+                result.series.insert(series_id, spec);
             }
         }
         Ok(result)
+    }
+
+    /// Fetch a single inverted-index posting for `(bucket, term)`.
+    /// Returns `None` when the term isn't present in the bucket.
+    ///
+    /// Per-term granularity by design: callers (e.g. the v2 query
+    /// adapter) parallelise at *their* layer so concurrency budget and
+    /// caching can be managed end-to-end. The previous batched variant
+    /// looped sequentially and was a silent bottleneck.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<RoaringBitmap>> {
+        let key = InvertedIndexKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            attribute: term.name.clone(),
+            value: term.value.clone(),
+        }
+        .encode();
+        let rec = self.get(key).await?;
+        match rec {
+            Some(r) => {
+                #[cfg(feature = "promql-v2")]
+                crate::promql::v2::trace::record_bytes(
+                    crate::promql::v2::trace::IoKind::InvertedIndexFetch,
+                    r.value.len() as u64,
+                );
+                let value = InvertedIndexValue::decode(r.value.as_ref())?;
+                Ok(Some(value.postings))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a single forward-index entry for `(bucket, series_id)`.
+    /// Returns `None` when the series isn't present in the bucket.
+    /// See [`Self::get_inverted_index_term`] for why this is per-key.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<SeriesSpec>> {
+        let key = ForwardIndexKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            series_id,
+        }
+        .encode();
+        let rec = self.get(key).await?;
+        match rec {
+            Some(r) => {
+                #[cfg(feature = "promql-v2")]
+                crate::promql::v2::trace::record_bytes(
+                    crate::promql::v2::trace::IoKind::ForwardIndexFetch,
+                    r.value.len() as u64,
+                );
+                let value = ForwardIndexValue::decode(r.value.as_ref())?;
+                Ok(Some(value.into()))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Load the series dictionary using the provided insert function and
