@@ -30,7 +30,6 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
             }),
             error: None,
             error_type: None,
-            #[cfg(feature = "promql-v2")]
             trace: None,
         },
         Ok(QueryValue::Vector(samples)) => {
@@ -44,7 +43,6 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
                 }),
                 error: None,
                 error_type: None,
-                #[cfg(feature = "promql-v2")]
                 trace: None,
             }
         }
@@ -59,7 +57,6 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
                 }),
                 error: None,
                 error_type: None,
-                #[cfg(feature = "promql-v2")]
                 trace: None,
             }
         }
@@ -70,7 +67,6 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
                 data: None,
                 error: Some(err.error),
                 error_type: Some(err.error_type),
-                #[cfg(feature = "promql-v2")]
                 trace: None,
             }
         }
@@ -93,7 +89,6 @@ pub fn range_result_to_response(
                 }),
                 error: None,
                 error_type: None,
-                #[cfg(feature = "promql-v2")]
                 trace: None,
             }
         }
@@ -104,7 +99,6 @@ pub fn range_result_to_response(
                 data: None,
                 error: Some(err.error),
                 error_type: Some(err.error_type),
-                #[cfg(feature = "promql-v2")]
                 trace: None,
             }
         }
@@ -323,7 +317,6 @@ impl ErrorResponse {
 /// Dry-run EXPLAIN response for `/api/v1/query[?explain=true]` and
 /// `/api/v1/query_range[?explain=true]`. Mirrors the shape of
 /// [`QueryResponse`] so the HTTP handler can unify error rendering.
-#[cfg(feature = "promql-v2")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplainResponse {
     pub status: String,
@@ -337,7 +330,6 @@ pub struct ExplainResponse {
 
 /// Wrap an [`ExplainResult`](crate::promql::v2::plan::ExplainResult)
 /// (or error) into an [`ExplainResponse`].
-#[cfg(feature = "promql-v2")]
 pub fn explain_result_to_response(
     result: Result<crate::promql::v2::plan::ExplainResult, QueryError>,
 ) -> ExplainResponse {
@@ -376,7 +368,6 @@ pub struct QueryResponse {
     /// Populated when the request enabled per-query tracing (either via
     /// `?trace=true` or `tracing.enabled` in the server config). Absent
     /// otherwise so the wire shape stays unchanged for normal callers.
-    #[cfg(feature = "promql-v2")]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trace: Option<serde_json::Value>,
 }
@@ -460,7 +451,6 @@ pub struct QueryRangeResponse {
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     /// See [`QueryResponse::trace`].
-    #[cfg(feature = "promql-v2")]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trace: Option<serde_json::Value>,
 }
@@ -897,7 +887,6 @@ mod tests {
             }),
             error: None,
             error_type: None,
-            #[cfg(feature = "promql-v2")]
             trace: None,
         };
         let json = serde_json::to_string(&qr).unwrap();
@@ -924,7 +913,6 @@ mod tests {
             }),
             error: None,
             error_type: None,
-            #[cfg(feature = "promql-v2")]
             trace: None,
         };
         let json = serde_json::to_string(&qr).unwrap();
@@ -1244,7 +1232,6 @@ mod tests {
             data: None,
             error: Some("bad".into()),
             error_type: Some("bad_data".into()),
-            #[cfg(feature = "promql-v2")]
             trace: None,
         };
         let json = serde_json::to_value(&query).unwrap();
@@ -1255,7 +1242,6 @@ mod tests {
             data: None,
             error: Some("bad".into()),
             error_type: Some("bad_data".into()),
-            #[cfg(feature = "promql-v2")]
             trace: None,
         };
         let json = serde_json::to_value(&query_range).unwrap();

@@ -719,24 +719,19 @@ async fn test_slatedb_metrics_reflect_writes() {
 }
 
 // ---------------------------------------------------------------------------
-// Unit 5.2 — HTTP handler dispatch on the `promql-v2` feature flag.
-//
-// These tests only compile-run with `--features promql-v2`. They exercise
-// the compile-time A/B boundary in `server/http.rs`: the handler calls
-// `eval_query_v2` / `eval_query_range_v2` when the flag is on, and the
-// range adapter reshapes `QueryValue` back to the `Vec<RangeSample>` wire
-// shape consumed by `range_result_to_response`.
+// HTTP handler dispatch tests. Exercise `server/http.rs`: the handler
+// calls `eval_query` / `eval_query_range[_traced]`, and the range adapter
+// reshapes `QueryValue` back to the `Vec<RangeSample>` wire shape consumed
+// by `range_result_to_response`.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "promql-v2")]
 mod v2_dispatch {
     use super::*;
 
     #[tokio::test]
-    async fn should_dispatch_query_endpoint_to_v2_when_feature_enabled() {
-        // given — v2 is a compile-time A/B; with the flag on `handle_query`
-        // should invoke the columnar engine and still return the v1 wire
-        // shape.
+    async fn should_dispatch_query_endpoint_to_v2() {
+        // given — `handle_query` invokes the columnar engine and returns
+        // the standard wire shape.
         let (app, _) = setup_with_data().await;
 
         // when
@@ -770,9 +765,9 @@ mod v2_dispatch {
     }
 
     #[tokio::test]
-    async fn should_dispatch_query_range_endpoint_to_v2_when_feature_enabled() {
-        // given — the range handler wraps `eval_query_range_v2` in an
-        // adapter that projects `QueryValue` back to `Vec<RangeSample>`.
+    async fn should_dispatch_query_range_endpoint_to_v2() {
+        // given — the range handler projects `QueryValue` back to
+        // `Vec<RangeSample>` via the shared adapter.
         let (app, _) = setup_with_data().await;
 
         // when
@@ -931,7 +926,6 @@ mod v2_dispatch {
 // /api/v1/query[_range]?explain=true (dry-run EXPLAIN)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "promql-v2")]
 mod explain {
     use super::*;
     use timeseries::testing::{ExplainResponse, ExplainResult};

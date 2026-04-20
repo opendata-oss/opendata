@@ -220,7 +220,6 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         let rec = self.get(key).await?;
         match rec {
             Some(r) => {
-                #[cfg(feature = "promql-v2")]
                 crate::promql::v2::trace::record_bytes(
                     crate::promql::v2::trace::IoKind::InvertedIndexFetch,
                     r.value.len() as u64,
@@ -250,7 +249,6 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         let rec = self.get(key).await?;
         match rec {
             Some(r) => {
-                #[cfg(feature = "promql-v2")]
                 crate::promql::v2::trace::record_bytes(
                     crate::promql::v2::trace::IoKind::ForwardIndexFetch,
                     r.value.len() as u64,

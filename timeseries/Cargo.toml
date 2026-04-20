@@ -29,7 +29,6 @@ http-server = [
     "dep:metrics-exporter-prometheus",
 ]
 testing = []
-promql-v2 = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
 otel = ["dep:opentelemetry-proto", "dep:prost", "dep:ingest"]
 bench-internals = []
@@ -99,14 +98,9 @@ name = "otel_ingest"
 required-features = ["testing", "otel", "http-server"]
 
 [[bench]]
-name = "evaluator_micorbench"
-harness = false
-required-features = ["bench-internals"]
-
-[[bench]]
 name = "v2_engine_micorbench"
 harness = false
-required-features = ["bench-internals", "promql-v2"]
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "response_serialization"

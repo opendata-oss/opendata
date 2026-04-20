@@ -16,23 +16,17 @@ use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::{MiniQueryReader, MiniTsdb};
 use crate::model::{
-    InstantSample, Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample,
-    Series, SeriesId, TimeBucket,
+    Label, Labels, MetricMetadata, QueryOptions, QueryValue, RangeSample, Sample, Series, SeriesId,
+    TimeBucket,
 };
-use crate::promql::evaluator::{
-    Evaluator, ExprResult, QueryReaderEvalCache, compute_preload_ranges,
-};
-use crate::promql::pipeline::{METADATA_STAGE_READAHEAD, resolve_metadata_parallel};
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::tsdb_metrics;
 use crate::util::Result;
 
-/// Compute the disjoint preload ranges for bucket discovery.
-///
-/// Uses `compute_preload_ranges` to account for `offset`/`@` modifiers.
-/// Falls back to a single `[(default_start, default_end)]` for
-/// selector-free expressions.
+/// Compute the disjoint preload ranges (seconds) a query touches after
+/// applying `offset`/`@` modifiers. Falls back to
+/// `[(default_start, default_end)]` for selector-free expressions.
 pub(crate) fn preload_ranges(
     stmt: &EvalStmt,
     default_start: i64,
@@ -50,16 +44,11 @@ pub(crate) fn preload_ranges(
 ///
 /// 1 GiB — a conservative ceiling that should comfortably fit any
 /// single-digit-GB host's working set while still failing fast on a
-/// runaway query. Not yet plumbed through configuration (no existing
-/// crate-level memory-cap config surfaces); revisit in Phase 5.2 once
-/// the HTTP handler has a natural knob.
-#[cfg(feature = "promql-v2")]
+/// runaway query.
 pub(crate) const DEFAULT_V2_MEMORY_CAP_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Convert `SystemTime` to milliseconds since the UNIX epoch, clamping
-/// pre-epoch values to zero. Mirrors the arithmetic the existing
-/// evaluator entry points perform on `SystemTime`.
-#[cfg(feature = "promql-v2")]
+/// pre-epoch values to zero.
 fn system_time_to_ms(t: SystemTime) -> i64 {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
@@ -69,17 +58,12 @@ fn system_time_to_ms(t: SystemTime) -> i64 {
 
 /// Convert `Duration` to milliseconds, saturating at `i64::MAX` for
 /// pathological inputs.
-#[cfg(feature = "promql-v2")]
 fn duration_to_ms(d: Duration) -> i64 {
     d.as_millis().min(i64::MAX as u128) as i64
 }
 
 /// Compute the preload ranges (seconds) the v2 engine's `QueryReader`
-/// needs to open. The v2 planner does not yet own a `compute_preload_ranges`
-/// equivalent, so this reuses the v1 helper by re-parsing the query.
-/// Phase 5.3 / 7 can short-circuit by consulting the logical plan once
-/// the reshape path stops round-tripping.
-#[cfg(feature = "promql-v2")]
+/// needs to open by re-parsing `query`.
 fn preload_ranges_for_v2(
     query: &str,
     start_ms: i64,
@@ -110,22 +94,260 @@ fn preload_ranges_for_v2(
     Ok(preload_ranges(&stmt, default_start_secs, default_end_secs))
 }
 
-/// Drive the v2 operator tree to completion and reshape into a
-/// [`QueryValue`]. Shared by [`TsdbReadEngine::eval_query_v2`] and
-/// [`TsdbReadEngine::eval_query_range_v2`]; keeps the dispatch logic in
-/// one place. Generic over the [`QueryReader`] type so both the writer's
-/// `TsdbQueryReader` and the reader's `ReaderQueryReader` flow through
-/// the same pipeline without duplication.
+// ── Preload-range computation (ported from v1 evaluator) ──
+
+/// Walk the AST and compute the disjoint time ranges needed for bucket preloading.
+///
+/// For each selector, compute the effective evaluation time by applying
+/// `@` and `offset` modifiers, then expand by `lookback_delta` (vector) or
+/// range (matrix). Returns a sorted, non-overlapping list of
+/// `(earliest_secs, latest_secs)` ranges covering all selectors.
+///
+/// Returns an empty `Vec` when the expression contains no selectors
+/// (e.g. `1 + 2`), allowing the caller to fall back to the default window.
+fn compute_preload_ranges(
+    expr: &Expr,
+    query_start: SystemTime,
+    query_end: SystemTime,
+    lookback_delta: Duration,
+) -> Vec<(i64, i64)> {
+    let start_ms = system_time_to_ms(query_start);
+    let end_ms = system_time_to_ms(query_end);
+    let lookback_ms = lookback_delta.as_millis() as i64;
+    let mut ranges = Vec::new();
+    preload_ranges_inner(
+        expr,
+        start_ms,
+        end_ms,
+        start_ms,
+        end_ms,
+        lookback_ms,
+        &mut ranges,
+    );
+    let ranges_secs: Vec<(i64, i64)> = ranges
+        .into_iter()
+        .map(|(lo, hi)| {
+            let start_secs = lo.div_euclid(1000);
+            let end_secs = hi.div_euclid(1000) + i64::from(hi.rem_euclid(1000) != 0);
+            (start_secs, end_secs)
+        })
+        .collect();
+    normalize_ranges(ranges_secs)
+}
+
+/// Sort ranges by start and merge overlapping ones. Adjacent-but-not-overlapping
+/// ranges are kept separate since they may map to different buckets.
+fn normalize_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_by_key(|&(start, _)| start);
+    let mut merged = Vec::with_capacity(ranges.len());
+    let (mut cur_start, mut cur_end) = ranges[0];
+    for &(start, end) in &ranges[1..] {
+        if start <= cur_end {
+            cur_end = cur_end.max(end);
+        } else {
+            merged.push((cur_start, cur_end));
+            cur_start = start;
+            cur_end = end;
+        }
+    }
+    merged.push((cur_start, cur_end));
+    merged
+}
+
+/// Compute the effective evaluation-time range for a selector after applying
+/// `@` and `offset` modifiers, then return `(earliest_ms, latest_ms)` after
+/// subtracting the backward window (lookback or matrix range).
+fn selector_bounds(
+    at: Option<&promql_parser::parser::AtModifier>,
+    offset: Option<&promql_parser::parser::Offset>,
+    at_start_ms: i64,
+    at_end_ms: i64,
+    eval_start_ms: i64,
+    eval_end_ms: i64,
+    backward_window_ms: i64,
+) -> (i64, i64) {
+    use promql_parser::parser::{AtModifier, Offset};
+
+    let (mut start, mut end) = if let Some(at_mod) = at {
+        match at_mod {
+            AtModifier::At(time) => {
+                let t = system_time_to_ms(*time);
+                (t, t)
+            }
+            AtModifier::Start | AtModifier::End => (at_start_ms, at_end_ms),
+        }
+    } else {
+        (eval_start_ms, eval_end_ms)
+    };
+
+    if let Some(off) = offset {
+        match off {
+            Offset::Pos(d) => {
+                let off_ms = d.as_millis() as i64;
+                start = start.saturating_sub(off_ms);
+                end = end.saturating_sub(off_ms);
+            }
+            Offset::Neg(d) => {
+                let off_ms = d.as_millis() as i64;
+                start = start.saturating_add(off_ms);
+                end = end.saturating_add(off_ms);
+            }
+        }
+    }
+
+    let earliest = start.saturating_sub(backward_window_ms);
+    (earliest, end)
+}
+
+fn preload_ranges_inner(
+    expr: &Expr,
+    at_start_ms: i64,
+    at_end_ms: i64,
+    eval_start_ms: i64,
+    eval_end_ms: i64,
+    lookback_ms: i64,
+    out: &mut Vec<(i64, i64)>,
+) {
+    match expr {
+        Expr::VectorSelector(vs) => {
+            out.push(selector_bounds(
+                vs.at.as_ref(),
+                vs.offset.as_ref(),
+                at_start_ms,
+                at_end_ms,
+                eval_start_ms,
+                eval_end_ms,
+                lookback_ms,
+            ));
+        }
+        Expr::MatrixSelector(ms) => {
+            let range_ms = ms.range.as_millis() as i64;
+            out.push(selector_bounds(
+                ms.vs.at.as_ref(),
+                ms.vs.offset.as_ref(),
+                at_start_ms,
+                at_end_ms,
+                eval_start_ms,
+                eval_end_ms,
+                range_ms,
+            ));
+        }
+        Expr::Subquery(sq) => {
+            let (sq_start, sq_end) = selector_bounds(
+                sq.at.as_ref(),
+                sq.offset.as_ref(),
+                at_start_ms,
+                at_end_ms,
+                eval_start_ms,
+                eval_end_ms,
+                0,
+            );
+            let range_ms = sq.range.as_millis() as i64;
+            let inner_eval_start = sq_start.saturating_sub(range_ms);
+            preload_ranges_inner(
+                &sq.expr,
+                at_start_ms,
+                at_end_ms,
+                inner_eval_start,
+                sq_end,
+                lookback_ms,
+                out,
+            );
+        }
+        Expr::Aggregate(agg) => {
+            preload_ranges_inner(
+                &agg.expr,
+                at_start_ms,
+                at_end_ms,
+                eval_start_ms,
+                eval_end_ms,
+                lookback_ms,
+                out,
+            );
+            if let Some(ref param) = agg.param {
+                preload_ranges_inner(
+                    param,
+                    at_start_ms,
+                    at_end_ms,
+                    eval_start_ms,
+                    eval_end_ms,
+                    lookback_ms,
+                    out,
+                );
+            }
+        }
+        Expr::Binary(b) => {
+            preload_ranges_inner(
+                &b.lhs,
+                at_start_ms,
+                at_end_ms,
+                eval_start_ms,
+                eval_end_ms,
+                lookback_ms,
+                out,
+            );
+            preload_ranges_inner(
+                &b.rhs,
+                at_start_ms,
+                at_end_ms,
+                eval_start_ms,
+                eval_end_ms,
+                lookback_ms,
+                out,
+            );
+        }
+        Expr::Paren(p) => preload_ranges_inner(
+            &p.expr,
+            at_start_ms,
+            at_end_ms,
+            eval_start_ms,
+            eval_end_ms,
+            lookback_ms,
+            out,
+        ),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                preload_ranges_inner(
+                    arg,
+                    at_start_ms,
+                    at_end_ms,
+                    eval_start_ms,
+                    eval_end_ms,
+                    lookback_ms,
+                    out,
+                );
+            }
+        }
+        Expr::Unary(u) => preload_ranges_inner(
+            &u.expr,
+            at_start_ms,
+            at_end_ms,
+            eval_start_ms,
+            eval_end_ms,
+            lookback_ms,
+            out,
+        ),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
+}
+
 /// Execution outcome bundling the reshaped query value with an optional
 /// tracing snapshot. The snapshot is populated when the [`LoweringContext`]
 /// carried a trace collector.
-#[cfg(feature = "promql-v2")]
 pub(crate) struct ExecuteOutcome {
     pub value: QueryValue,
     pub trace: Option<crate::promql::v2::trace::QueryTrace>,
 }
 
-#[cfg(feature = "promql-v2")]
+/// Drive the v2 operator tree to completion and reshape into a
+/// [`QueryValue`]. Shared by [`TsdbReadEngine::eval_query`] and
+/// [`TsdbReadEngine::eval_query_range`]; keeps the dispatch logic in
+/// one place. Generic over the [`QueryReader`] type so both the writer's
+/// `TsdbQueryReader` and the reader's `ReaderQueryReader` flow through
+/// the same pipeline without duplication.
 async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
     query: &str,
     reader: R,
@@ -234,9 +456,8 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
 
 /// Dry-run: parse, lower, optimize, and describe the physical plan
 /// for `query` without opening a reader or executing any operator.
-/// Backs both [`TsdbEngine::explain_query_v2`] and
-/// [`TsdbEngine::explain_query_range_v2`].
-#[cfg(feature = "promql-v2")]
+/// Backs both [`TsdbEngine::explain_query`] and
+/// [`TsdbEngine::explain_query_range`].
 fn explain_v2(
     query: &str,
     ctx: &crate::promql::v2::plan::LoweringContext,
@@ -258,10 +479,7 @@ fn explain_v2(
 }
 
 /// Translate a v2 [`PlanError`](crate::promql::v2::plan::PlanError) into
-/// the crate-wide [`QueryError`]. Parser-level issues map onto the v1
-/// surface's existing variants so the HTTP handler does not need a
-/// v2-specific branch.
-#[cfg(feature = "promql-v2")]
+/// the crate-wide [`QueryError`].
 fn plan_error_to_query_error(e: crate::promql::v2::plan::PlanError) -> QueryError {
     use crate::promql::v2::plan::PlanError;
     match e {
@@ -280,9 +498,34 @@ fn plan_error_to_query_error(e: crate::promql::v2::plan::PlanError) -> QueryErro
 /// Translate an execution-time v2
 /// [`QueryError`](crate::promql::v2::memory::QueryError) onto the
 /// crate-wide [`QueryError`] for the HTTP / embedded boundary.
-#[cfg(feature = "promql-v2")]
 fn v2_query_error_to_query_error(e: crate::promql::v2::memory::QueryError) -> QueryError {
     QueryError::Execution(e.to_string())
+}
+
+/// Collapse a v2 [`QueryValue`] into the `Vec<RangeSample>` wire shape.
+/// Matrix results pass through; scalar results fan out into a single
+/// anonymous series with one sample at each returned timestamp; vector
+/// results become a one-sample-per-series matrix.
+pub(crate) fn query_value_to_range_samples(
+    value: QueryValue,
+) -> std::result::Result<Vec<RangeSample>, QueryError> {
+    match value {
+        QueryValue::Matrix(series) => Ok(series),
+        QueryValue::Scalar {
+            timestamp_ms,
+            value,
+        } => Ok(vec![RangeSample {
+            labels: Labels::empty(),
+            samples: vec![(timestamp_ms, value)],
+        }]),
+        QueryValue::Vector(samples) => Ok(samples
+            .into_iter()
+            .map(|s| RangeSample {
+                labels: s.labels,
+                samples: vec![(s.timestamp_ms, s.value)],
+            })
+            .collect()),
+    }
 }
 
 /// Parse multiple match[] selector strings into VectorSelectors.
@@ -321,91 +564,6 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
 
     // ── Provided: 5 default methods written once ──
 
-    /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
-    async fn eval_query(
-        &self,
-        query: &str,
-        time: Option<std::time::SystemTime>,
-        opts: &QueryOptions,
-    ) -> std::result::Result<QueryValue, QueryError> {
-        let start = Instant::now();
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
-
-        let query_time = time.unwrap_or_else(std::time::SystemTime::now);
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start: query_time,
-            end: query_time,
-            interval: Duration::from_secs(0),
-            lookback_delta,
-        };
-
-        let query_time_secs = query_time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let lookback_start_secs = query_time
-            .checked_sub(lookback_delta)
-            .unwrap_or(UNIX_EPOCH)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
-
-        let ranges = preload_ranges(&stmt, lookback_start_secs, query_time_secs);
-        let reader = self.make_query_reader_for_ranges(&ranges).await?;
-
-        let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
-        let result = evaluate_instant(&reader, stmt, query_time, concurrency).await;
-
-        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "instant").increment(1);
-        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "instant")
-            .record(start.elapsed().as_secs_f64());
-
-        result
-    }
-
-    /// Evaluate a range PromQL query, returning typed `RangeSample`s.
-    async fn eval_query_range(
-        &self,
-        query: &str,
-        start: std::time::SystemTime,
-        end: std::time::SystemTime,
-        step: Duration,
-        opts: &QueryOptions,
-    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        let timer_start = Instant::now();
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
-
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start,
-            end,
-            interval: step,
-            lookback_delta,
-        };
-
-        let default_start_secs = start
-            .checked_sub(lookback_delta)
-            .unwrap_or(UNIX_EPOCH)
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
-        let default_end_secs = end.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-
-        let ranges = preload_ranges(&stmt, default_start_secs, default_end_secs);
-        let reader = self.make_query_reader_for_ranges(&ranges).await?;
-
-        let concurrency = crate::promql::pipeline::PipelineConcurrency::from(opts);
-        let result = evaluate_range(&reader, stmt, concurrency).await;
-
-        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "range").increment(1);
-        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "range")
-            .record(timer_start.elapsed().as_secs_f64());
-
-        result
-    }
-
     /// Discover series matching any of the given selectors.
     async fn find_series(
         &self,
@@ -440,20 +598,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         discover_label_values(&reader, label_name, matchers).await
     }
 
-    /// A/B parallel entry point for the v2 (columnar) engine — instant
-    /// query. See RFC 0007 §"Migration Strategy"; gated behind the
-    /// `promql-v2` feature flag so the baseline build is untouched.
-    ///
-    /// Parses the query, lowers it to the v2 logical plan, runs the
-    /// rule-based optimiser, builds a physical plan over a
-    /// [`crate::promql::v2::QueryReaderSource`] wrapping this engine's
-    /// existing `QueryReader`, drives the operator tree to completion
-    /// and reshapes the collected batches into a [`QueryValue`].
-    ///
-    /// Signatures match [`Self::eval_query`] so HTTP dispatch can swap
-    /// on the feature flag without reshaping call sites.
-    #[cfg(feature = "promql-v2")]
-    async fn eval_query_v2(
+    /// Evaluate an instant PromQL query, returning a [`QueryValue`]
+    /// (scalar, vector or matrix). Parses the query, lowers to the v2
+    /// logical plan, runs the rule-based optimiser, builds a physical
+    /// plan over a [`crate::promql::v2::source_adapter::QueryReaderSource`]
+    /// wrapping this engine's [`QueryReader`], drives the operator tree
+    /// to completion and reshapes collected batches into a `QueryValue`.
+    async fn eval_query(
         &self,
         query: &str,
         time: Option<SystemTime>,
@@ -462,15 +613,22 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     where
         Self::QR: 'static,
     {
-        self.eval_query_v2_traced(query, time, opts, None)
+        let start = Instant::now();
+        let result = self
+            .eval_query_traced(query, time, opts, None)
             .await
-            .map(|o| o.value)
+            .map(|o| o.value);
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "instant").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "instant")
+            .record(start.elapsed().as_secs_f64());
+
+        result
     }
 
-    /// Tracing-aware variant of [`Self::eval_query_v2`]. Pass `trace`
+    /// Tracing-aware variant of [`Self::eval_query`]. Pass `trace`
     /// `Some(...)` to populate [`ExecuteOutcome::trace`] on the result.
-    #[cfg(feature = "promql-v2")]
-    async fn eval_query_v2_traced(
+    async fn eval_query_traced(
         &self,
         query: &str,
         time: Option<SystemTime>,
@@ -507,14 +665,35 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         execute_v2(query, reader, plan_ctx, /*is_instant=*/ true).await
     }
 
-    /// A/B parallel entry point for the v2 engine — range query. Mirrors
-    /// [`Self::eval_query_range`] in shape so the HTTP handler can A/B
-    /// swap cleanly. Unlike the v1 path, v2 returns a full [`QueryValue`]
-    /// because the plan root may produce a scalar (e.g. `1+1` over a
-    /// range grid); the embedded boundary can still collapse that back
-    /// into `Vec<RangeSample>` if desired.
-    #[cfg(feature = "promql-v2")]
-    async fn eval_query_range_v2(
+    /// Evaluate a range PromQL query and project the resulting
+    /// [`QueryValue`] onto the `Vec<RangeSample>` wire contract.
+    async fn eval_query_range(
+        &self,
+        query: &str,
+        range: impl RangeBounds<SystemTime> + Send,
+        step: Duration,
+        opts: &QueryOptions,
+    ) -> std::result::Result<Vec<RangeSample>, QueryError>
+    where
+        Self::QR: 'static,
+    {
+        let start = Instant::now();
+        let result = self
+            .eval_query_range_traced(query, range, step, opts, None)
+            .await
+            .and_then(|o| query_value_to_range_samples(o.value));
+
+        metrics::counter!(tsdb_metrics::TSDB_QUERIES, "type" => "range").increment(1);
+        metrics::histogram!(tsdb_metrics::TSDB_QUERY_DURATION_SECONDS, "type" => "range")
+            .record(start.elapsed().as_secs_f64());
+
+        result
+    }
+
+    /// Like [`Self::eval_query_range`] but returns the raw [`QueryValue`]
+    /// so HTTP handlers can decide whether to keep scalar/vector shapes
+    /// intact.
+    async fn eval_query_range_value(
         &self,
         query: &str,
         range: impl RangeBounds<SystemTime> + Send,
@@ -524,14 +703,13 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     where
         Self::QR: 'static,
     {
-        self.eval_query_range_v2_traced(query, range, step, opts, None)
+        self.eval_query_range_traced(query, range, step, opts, None)
             .await
             .map(|o| o.value)
     }
 
-    /// Tracing-aware variant of [`Self::eval_query_range_v2`].
-    #[cfg(feature = "promql-v2")]
-    async fn eval_query_range_v2_traced(
+    /// Tracing-aware variant of [`Self::eval_query_range`].
+    async fn eval_query_range_traced(
         &self,
         query: &str,
         range: impl RangeBounds<SystemTime> + Send,
@@ -580,19 +758,6 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     }
 }
 
-/// Evaluate a range query using Rust range bounds, converting to
-/// `(start, end)` exactly once before dispatching to `TsdbReadEngine`.
-pub(crate) async fn eval_query_range_bounds<E: TsdbReadEngine + ?Sized>(
-    engine: &E,
-    query: &str,
-    range: impl RangeBounds<SystemTime>,
-    step: Duration,
-    opts: &QueryOptions,
-) -> std::result::Result<Vec<RangeSample>, QueryError> {
-    let (start, end) = crate::util::range_bounds_to_system_time(range);
-    E::eval_query_range(engine, query, start, end, step, opts).await
-}
-
 /// Discover series over a time range specified as Rust range bounds.
 pub(crate) async fn find_series_in_range<E: TsdbReadEngine + ?Sized>(
     engine: &E,
@@ -624,141 +789,51 @@ pub(crate) async fn find_label_values_in_range<E: TsdbReadEngine + ?Sized>(
     E::find_label_values(engine, label_name, matchers, start, end).await
 }
 
-// ── Shared evaluation free functions ────────────────────────────────
+// ── Series / label discovery ────────────────────────────────────────
 
-/// Evaluate an instant PromQL query against the given reader.
-pub(crate) async fn evaluate_instant(
-    reader: &impl QueryReader,
-    stmt: EvalStmt,
-    query_time: std::time::SystemTime,
-    concurrency: crate::promql::pipeline::PipelineConcurrency,
-) -> std::result::Result<QueryValue, QueryError> {
-    let mut evaluator = Evaluator::with_concurrency(reader, concurrency);
-    let result = evaluator.evaluate(stmt).await?;
+/// Cross-bucket readahead used by the discovery helpers below.
+const DISCOVERY_BUCKET_READAHEAD: usize = 32;
 
-    match result {
-        ExprResult::Scalar(value) => {
-            let timestamp_ms = query_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-            Ok(QueryValue::Scalar {
-                timestamp_ms,
-                value,
-            })
+/// Resolve the series matching `selector` within `bucket`, applying any
+/// negative / empty-string post-filters.
+async fn resolve_selector_in_bucket<R: QueryReader>(
+    reader: &R,
+    index_cache: &crate::promql::v2::index_cache::V2IndexCache,
+    bucket: TimeBucket,
+    selector: &VectorSelector,
+) -> std::result::Result<Vec<(SeriesId, Labels)>, QueryError> {
+    use crate::promql::v2::source_adapter::selector_util;
+
+    let candidates = selector_util::find_candidates(reader, index_cache, &bucket, selector)
+        .await
+        .map_err(|e| QueryError::Execution(e.to_string()))?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let forward = index_cache
+        .forward_index(reader, &bucket, &candidates)
+        .await
+        .map_err(|e| QueryError::Execution(e.to_string()))?;
+
+    let needs_filter = selector_util::has_negative_matchers(selector)
+        || selector_util::has_empty_string_matchers(selector);
+    let final_ids = if needs_filter {
+        selector_util::apply_post_filters(forward.as_ref(), candidates, selector)
+            .map_err(|e| QueryError::Execution(e.to_string()))?
+    } else {
+        candidates
+    };
+
+    let mut out = Vec::with_capacity(final_ids.len());
+    for id in final_ids {
+        if let Some(spec) = forward.get_spec(&id) {
+            let mut labels = spec.labels;
+            labels.sort();
+            out.push((id, Labels::new(labels)));
         }
-        ExprResult::InstantVector(samples) => Ok(QueryValue::Vector(
-            samples
-                .into_iter()
-                .map(|s| InstantSample {
-                    labels: Labels::from(s.labels),
-                    timestamp_ms: s.timestamp_ms,
-                    value: s.value,
-                })
-                .collect(),
-        )),
-        ExprResult::RangeVector(samples) => Ok(QueryValue::Matrix(
-            samples
-                .into_iter()
-                .map(|s| RangeSample {
-                    labels: Labels::from(s.labels),
-                    samples: s
-                        .values
-                        .into_iter()
-                        .map(|v| (v.timestamp_ms, v.value))
-                        .collect(),
-                })
-                .collect(),
-        )),
     }
-}
-
-/// Evaluate a range PromQL query against the given reader.
-pub(crate) async fn evaluate_range(
-    reader: &impl QueryReader,
-    stmt: EvalStmt,
-    concurrency: crate::promql::pipeline::PipelineConcurrency,
-) -> std::result::Result<Vec<RangeSample>, QueryError> {
-    let start = stmt.start;
-    let end = stmt.end;
-    let step = stmt.interval;
-    let lookback_delta = stmt.lookback_delta;
-
-    if step.is_zero() {
-        return Err(QueryError::InvalidQuery(
-            "step must be greater than zero".to_string(),
-        ));
-    }
-
-    let mut series_map: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
-    let mut evaluator = Evaluator::with_concurrency(reader, concurrency);
-    let rp_before = evaluator.read_path_stats();
-    let mut current_time = start;
-
-    while current_time <= end {
-        let instant_stmt = EvalStmt {
-            expr: stmt.expr.clone(),
-            start: current_time,
-            end: current_time,
-            interval: Duration::from_secs(0),
-            lookback_delta,
-        };
-
-        let result = evaluator.evaluate(instant_stmt).await?;
-        let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-
-        match result {
-            ExprResult::InstantVector(samples) => {
-                for sample in samples {
-                    let labels = Labels::from(sample.labels);
-                    series_map
-                        .entry(labels)
-                        .or_default()
-                        .push((sample.timestamp_ms, sample.value));
-                }
-            }
-            ExprResult::Scalar(value) => {
-                let labels = Labels::empty();
-                series_map
-                    .entry(labels)
-                    .or_default()
-                    .push((timestamp_ms, value));
-            }
-            ExprResult::RangeVector(_) => {
-                return Err(QueryError::Execution(
-                    "range vectors not supported in range query evaluation".to_string(),
-                ));
-            }
-        }
-
-        current_time += step;
-    }
-
-    let stats = evaluator.stats();
-    let rp_delta = evaluator.read_path_stats().delta_since(&rp_before);
-    tracing::trace!(
-        step_count = stats.step_count,
-        bucket_list_reuses = stats.bucket_list_reuses,
-        bucket_list_init_attempts = stats.bucket_list_init_attempts,
-        selector_hits = stats.selector_hits,
-        selector_misses = stats.selector_misses,
-        series_meta_hits = stats.series_meta_hits,
-        series_meta_misses = stats.series_meta_misses,
-        sample_slice_ops = stats.sample_slice_ops,
-        sample_slice_binary_search_ops = stats.sample_slice_binary_search_ops,
-        label_map_materializations = stats.label_map_materializations,
-        forward_index_hits = rp_delta.forward_index_hits,
-        forward_index_misses = rp_delta.forward_index_misses,
-        inverted_index_hits = rp_delta.inverted_index_hits,
-        inverted_index_misses = rp_delta.inverted_index_misses,
-        sample_hits = rp_delta.sample_hits,
-        sample_misses = rp_delta.sample_misses,
-        metadata_permit_wait_ns = rp_delta.metadata_permit_wait_ns,
-        sample_permit_wait_ns = rp_delta.sample_permit_wait_ns,
-        "range query eval stats"
-    );
-
-    Ok(series_map
-        .into_iter()
-        .map(|(labels, samples)| RangeSample { labels, samples })
-        .collect())
+    Ok(out)
 }
 
 /// Discover series matching any of the given selectors.
@@ -778,15 +853,14 @@ pub(crate) async fn discover_series<R: QueryReader>(
     }
 
     let selectors = parse_selectors(matchers)?;
-    let cache = Arc::new(QueryReaderEvalCache::new());
-    let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
-
+    let index_cache = crate::promql::v2::index_cache::V2IndexCache::new();
     let mut unique_series: HashSet<Labels> = HashSet::new();
-    for bm in metadata {
-        for (_id, spec) in bm.forward_index.all_series() {
-            let mut sorted_labels = spec.labels.clone();
-            sorted_labels.sort();
-            unique_series.insert(Labels::new(sorted_labels));
+    for bucket in &buckets {
+        for selector in &selectors {
+            let found = resolve_selector_in_bucket(reader, &index_cache, *bucket, selector).await?;
+            for (_, labels) in found {
+                unique_series.insert(labels);
+            }
         }
     }
 
@@ -810,19 +884,21 @@ pub(crate) async fn discover_labels<R: QueryReader>(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
-            let cache = Arc::new(QueryReaderEvalCache::new());
-            let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
-
-            for bm in metadata {
-                for (_id, spec) in bm.forward_index.all_series() {
-                    for attr in &spec.labels {
-                        label_names.insert(attr.name.clone());
+            let index_cache = crate::promql::v2::index_cache::V2IndexCache::new();
+            for bucket in &buckets {
+                for selector in &selectors {
+                    let found =
+                        resolve_selector_in_bucket(reader, &index_cache, *bucket, selector).await?;
+                    for (_, labels) in found {
+                        for attr in labels.iter() {
+                            label_names.insert(attr.name.clone());
+                        }
                     }
                 }
             }
         }
         _ => {
-            let width = buckets.len().clamp(1, METADATA_STAGE_READAHEAD);
+            let width = buckets.len().clamp(1, DISCOVERY_BUCKET_READAHEAD);
             let results: Vec<_> = stream::iter(buckets)
                 .map(|bucket| async move { reader.all_inverted_index(&bucket).await })
                 .buffer_unordered(width)
@@ -857,21 +933,21 @@ pub(crate) async fn discover_label_values<R: QueryReader>(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
-            let cache = Arc::new(QueryReaderEvalCache::new());
-            let metadata = resolve_metadata_parallel(reader, &cache, &buckets, &selectors).await?;
-
-            for bm in metadata {
-                for (_id, spec) in bm.forward_index.all_series() {
-                    for attr in &spec.labels {
-                        if attr.name == label_name {
-                            values.insert(attr.value.clone());
+            let index_cache = crate::promql::v2::index_cache::V2IndexCache::new();
+            for bucket in &buckets {
+                for selector in &selectors {
+                    let found =
+                        resolve_selector_in_bucket(reader, &index_cache, *bucket, selector).await?;
+                    for (_, labels) in found {
+                        if let Some(v) = labels.get(label_name) {
+                            values.insert(v.to_string());
                         }
                     }
                 }
             }
         }
         _ => {
-            let width = buckets.len().clamp(1, METADATA_STAGE_READAHEAD);
+            let width = buckets.len().clamp(1, DISCOVERY_BUCKET_READAHEAD);
             let results: Vec<_> = stream::iter(buckets)
                 .map(|bucket| async move { reader.label_values(&bucket, label_name).await })
                 .buffer_unordered(width)
@@ -964,18 +1040,15 @@ impl Tsdb {
         ranges: &[(i64, i64)],
     ) -> Result<TsdbQueryReader> {
         let snapshot = {
-            #[cfg(feature = "promql-v2")]
             let _g = crate::promql::v2::trace::Scope::enter("snapshot");
             self.storage.snapshot().await?
         };
         let buckets = {
-            #[cfg(feature = "promql-v2")]
             let _g = crate::promql::v2::trace::Scope::enter("list_buckets");
             snapshot.get_buckets_for_ranges(ranges).await?
         };
 
         let readers = {
-            #[cfg(feature = "promql-v2")]
             let _g = crate::promql::v2::trace::Scope::enter("build_readers");
             self.build_readers(&snapshot, buckets).await
         };
@@ -1144,21 +1217,6 @@ impl Tsdb {
         Ok(())
     }
 
-    /// Evaluate a range PromQL query, returning typed `RangeSample`s.
-    ///
-    /// This inherent method converts `impl RangeBounds<SystemTime>` to the
-    /// `(start, end)` pair expected by `TsdbReadEngine`. The other 5 read methods
-    /// live on the `TsdbReadEngine` trait directly (identical signatures).
-    pub(crate) async fn eval_query_range(
-        &self,
-        query: &str,
-        range: impl std::ops::RangeBounds<std::time::SystemTime>,
-        step: Duration,
-        opts: &QueryOptions,
-    ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        eval_query_range_bounds(self, query, range, step, opts).await
-    }
-
     /// Return metadata for all (or a specific) metric.
     pub(crate) async fn find_metadata(
         &self,
@@ -1238,40 +1296,20 @@ impl TsdbEngine {
     pub(crate) async fn eval_query_range(
         &self,
         query: &str,
-        range: impl RangeBounds<SystemTime>,
+        range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
         opts: &QueryOptions,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
         match self {
             Self::ReadWrite(tsdb) => tsdb.eval_query_range(query, range, step, opts).await,
-            Self::ReadOnly(reader) => {
-                eval_query_range_bounds(reader.as_ref(), query, range, step, opts).await
-            }
-        }
-    }
-
-    /// A/B v2 entry point for instant queries, dispatched from the HTTP
-    /// handler at compile time via `#[cfg(feature = "promql-v2")]` in
-    /// `server/http.rs`. Routes through the `TsdbReadEngine` trait on
-    /// both arms so read-only deployments exercise the columnar engine.
-    #[cfg(feature = "promql-v2")]
-    pub(crate) async fn eval_query_v2(
-        &self,
-        query: &str,
-        time: Option<SystemTime>,
-        opts: &QueryOptions,
-    ) -> std::result::Result<QueryValue, QueryError> {
-        match self {
-            Self::ReadWrite(tsdb) => tsdb.eval_query_v2(query, time, opts).await,
-            Self::ReadOnly(reader) => reader.eval_query_v2(query, time, opts).await,
+            Self::ReadOnly(reader) => reader.eval_query_range(query, range, step, opts).await,
         }
     }
 
     /// Tracing-aware instant query. Populates [`ExecuteOutcome::trace`]
-    /// when `trace` is `Some`. Otherwise behaves like [`Self::eval_query_v2`]
+    /// when `trace` is `Some`. Otherwise behaves like [`Self::eval_query`]
     /// wrapped in an [`ExecuteOutcome`].
-    #[cfg(feature = "promql-v2")]
-    pub(crate) async fn eval_query_v2_traced(
+    pub(crate) async fn eval_query_traced(
         &self,
         query: &str,
         time: Option<SystemTime>,
@@ -1279,19 +1317,13 @@ impl TsdbEngine {
         trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
     ) -> std::result::Result<ExecuteOutcome, QueryError> {
         match self {
-            Self::ReadWrite(tsdb) => tsdb.eval_query_v2_traced(query, time, opts, trace).await,
-            Self::ReadOnly(reader) => reader.eval_query_v2_traced(query, time, opts, trace).await,
+            Self::ReadWrite(tsdb) => tsdb.eval_query_traced(query, time, opts, trace).await,
+            Self::ReadOnly(reader) => reader.eval_query_traced(query, time, opts, trace).await,
         }
     }
 
-    /// A/B v2 entry point for range queries. Unlike v1 (`Vec<RangeSample>`),
-    /// v2 returns a full [`QueryValue`] because the plan root may emit a
-    /// [`QueryValue::Scalar`] over a range grid (e.g. `1+1`). The HTTP
-    /// handler keeps the wire shape unchanged via a thin adapter. Both
-    /// read-write and read-only engines route through the columnar v2
-    /// pipeline via the shared `TsdbReadEngine` trait default.
-    #[cfg(feature = "promql-v2")]
-    pub(crate) async fn eval_query_range_v2(
+    /// Like [`Self::eval_query_range`] but returns the raw [`QueryValue`].
+    pub(crate) async fn eval_query_range_value(
         &self,
         query: &str,
         range: impl RangeBounds<SystemTime> + Send,
@@ -1299,14 +1331,17 @@ impl TsdbEngine {
         opts: &QueryOptions,
     ) -> std::result::Result<QueryValue, QueryError> {
         match self {
-            Self::ReadWrite(tsdb) => tsdb.eval_query_range_v2(query, range, step, opts).await,
-            Self::ReadOnly(reader) => reader.eval_query_range_v2(query, range, step, opts).await,
+            Self::ReadWrite(tsdb) => tsdb.eval_query_range_value(query, range, step, opts).await,
+            Self::ReadOnly(reader) => {
+                reader
+                    .eval_query_range_value(query, range, step, opts)
+                    .await
+            }
         }
     }
 
-    /// Tracing-aware range query. See [`Self::eval_query_v2_traced`].
-    #[cfg(feature = "promql-v2")]
-    pub(crate) async fn eval_query_range_v2_traced(
+    /// Tracing-aware range query. See [`Self::eval_query_traced`].
+    pub(crate) async fn eval_query_range_traced(
         &self,
         query: &str,
         range: impl RangeBounds<SystemTime> + Send,
@@ -1316,12 +1351,12 @@ impl TsdbEngine {
     ) -> std::result::Result<ExecuteOutcome, QueryError> {
         match self {
             Self::ReadWrite(tsdb) => {
-                tsdb.eval_query_range_v2_traced(query, range, step, opts, trace)
+                tsdb.eval_query_range_traced(query, range, step, opts, trace)
                     .await
             }
             Self::ReadOnly(reader) => {
                 reader
-                    .eval_query_range_v2_traced(query, range, step, opts, trace)
+                    .eval_query_range_traced(query, range, step, opts, trace)
                     .await
             }
         }
@@ -1330,8 +1365,7 @@ impl TsdbEngine {
     /// Dry-run EXPLAIN for instant queries. Parses, lowers, optimises,
     /// and describes the physical plan — does not open a reader or
     /// touch the index cache.
-    #[cfg(feature = "promql-v2")]
-    pub(crate) fn explain_query_v2(
+    pub(crate) fn explain_query(
         &self,
         query: &str,
         time: Option<SystemTime>,
@@ -1346,12 +1380,8 @@ impl TsdbEngine {
         explain_v2(query, &ctx)
     }
 
-    /// Dry-run EXPLAIN for range queries. Same dispatch surface as
-    /// [`Self::eval_query_range_v2`] but returns an
-    /// [`ExplainResult`](crate::promql::v2::plan::ExplainResult) without
-    /// executing the plan.
-    #[cfg(feature = "promql-v2")]
-    pub(crate) fn explain_query_range_v2(
+    /// Dry-run EXPLAIN for range queries.
+    pub(crate) fn explain_query_range(
         &self,
         query: &str,
         range: impl RangeBounds<SystemTime>,
@@ -1574,7 +1604,6 @@ impl QueryReader for TsdbQueryReader {
 mod tests {
     use super::*;
     use crate::model::MetricType;
-    use crate::promql::evaluator::EvalSample;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use common::storage::in_memory::InMemoryStorage;
     use opendata_macros::storage_test;
@@ -1685,10 +1714,8 @@ mod tests {
     }
 
     #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_query_across_multiple_buckets_with_evaluator(storage: Arc<dyn Storage>) {
-        use crate::promql::evaluator::Evaluator;
+    async fn should_query_across_multiple_buckets(storage: Arc<dyn Storage>) {
         use crate::test_utils::assertions::assert_approx_eq;
-        use promql_parser::parser::EvalStmt;
         use std::time::{Duration, UNIX_EPOCH};
 
         // given: 4 hour-aligned buckets
@@ -1809,12 +1836,7 @@ mod tests {
         tsdb.ingest_cache.run_pending_tasks().await;
         assert_eq!(tsdb.ingest_cache.entry_count(), 2);
 
-        // when: query across all 4 buckets using the evaluator
-        // Query range: seconds 3600-18000 covers all 4 buckets
-        let reader = tsdb.query_reader(3600, 18000).await.unwrap();
-
-        // Use the evaluator to run 4 separate instant queries, one per bucket
-        let mut evaluator = Evaluator::new(&reader);
+        // when: query across all 4 buckets via the public eval_query surface
         let query = r#"http_requests"#;
         let lookback = Duration::from_secs(1000);
 
@@ -1828,22 +1850,20 @@ mod tests {
         let expected_prod_values = [10.0, 20.0, 30.0, 40.0];
         let expected_staging_values = [15.0, 25.0, 35.0, 45.0];
 
+        let opts = QueryOptions {
+            lookback_delta: lookback,
+            ..Default::default()
+        };
         for (i, &query_time_secs) in query_times_secs.iter().enumerate() {
-            let expr = promql_parser::parser::parse(query).unwrap();
             let query_time = UNIX_EPOCH + Duration::from_secs(query_time_secs);
-            let stmt = EvalStmt {
-                expr,
-                start: query_time,
-                end: query_time,
-                interval: Duration::from_secs(0),
-                lookback_delta: lookback,
-            };
-
-            let mut results = evaluator
-                .evaluate(stmt)
+            let result = tsdb
+                .eval_query(query, Some(query_time), &opts)
                 .await
-                .unwrap()
-                .expect_instant_vector("Expected instant vector result");
+                .unwrap();
+            let mut results = match result {
+                QueryValue::Vector(s) => s,
+                other => panic!("expected Vector, got {:?}", other),
+            };
             results.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
 
             assert_eq!(
@@ -1855,11 +1875,11 @@ mod tests {
             );
 
             // env=prod
-            assert_eq!(results[0].labels.get("env"), Some(&"prod".to_string()));
+            assert_eq!(results[0].labels.get("env"), Some("prod"));
             assert_approx_eq(results[0].value, expected_prod_values[i]);
 
             // env=staging
-            assert_eq!(results[1].labels.get("env"), Some(&"staging".to_string()));
+            assert_eq!(results[1].labels.get("env"), Some("staging"));
             assert_approx_eq(results[1].value, expected_staging_values[i]);
         }
     }
@@ -1868,8 +1888,6 @@ mod tests {
     async fn should_query_across_multiple_buckets_with_different_series_id_mappings(
         storage: Arc<dyn Storage>,
     ) {
-        use crate::promql::evaluator::Evaluator;
-        use promql_parser::parser::EvalStmt;
         use std::time::{Duration, UNIX_EPOCH};
 
         // given: Two time buckets with overlapping series but different series IDs
@@ -1877,7 +1895,6 @@ mod tests {
         // Bucket 1: hour 60 (covers 3,600,000-7,199,999 ms)
         let bucket1 = TimeBucket::hour(60);
         let mini1 = tsdb.get_or_create_for_ingest(bucket1).await.unwrap();
-        // Add series in bucket 1: foo{a="b",x="y"} and foo{a="c",x="z"}
         mini1
             .ingest(&create_sample(
                 "foo",
@@ -1899,7 +1916,6 @@ mod tests {
         // Bucket 2: hour 120 (covers 7,200,000-10,799,999 ms)
         let bucket2 = TimeBucket::hour(120);
         let mini2 = tsdb.get_or_create_for_ingest(bucket2).await.unwrap();
-        // Add series in bucket 2: foo{a="c",x="z"} and foo{a="d",x="w"}
         mini2
             .ingest(&create_sample(
                 "foo",
@@ -1921,38 +1937,28 @@ mod tests {
         // Flush to storage
         tsdb.flush().await.unwrap();
 
-        // when: Execute a PromQL query that filters by a="c"
-        let reader = tsdb.query_reader(3000, 8000).await.unwrap();
-        let mut evaluator = Evaluator::new(&reader);
-        // Query for foo{a="c"} at time 8000 seconds (in bucket 2)
+        // when: query foo{a="c"} at t=8000s (inside bucket 2)
         let query = r#"foo{a="c"}"#;
         let query_time = UNIX_EPOCH + Duration::from_secs(8000);
-        let lookback = Duration::from_secs(5000);
-        let expr = promql_parser::parser::parse(query).unwrap();
-        let stmt = EvalStmt {
-            expr,
-            start: query_time,
-            end: query_time,
-            interval: Duration::from_secs(0),
-            lookback_delta: lookback,
+        let opts = QueryOptions {
+            lookback_delta: Duration::from_secs(5000),
+            ..Default::default()
         };
-        let results = evaluator
-            .evaluate(stmt)
+        let result = tsdb
+            .eval_query(query, Some(query_time), &opts)
             .await
-            .unwrap()
-            .expect_instant_vector("Expected instant vector result");
+            .unwrap();
+        let samples = match result {
+            QueryValue::Vector(s) => s,
+            other => panic!("expected Vector, got {:?}", other),
+        };
 
         // then: we should only get the series foo{a="c",x="z"} with value 3.0
-        let expected = vec![EvalSample {
-            timestamp_ms: 7_900_000,
-            value: 3.0,
-            labels: [("a", "c"), ("x", "z"), ("__name__", "foo")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            drop_name: false,
-        }];
-        assert_eq!(results, expected);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].labels.get("a"), Some("c"));
+        assert_eq!(samples[0].labels.get("x"), Some("z"));
+        assert_eq!(samples[0].labels.metric_name(), "foo");
+        assert_eq!(samples[0].value, 3.0);
     }
 
     // ── Native read method tests ─────────────────────────────────────
@@ -2640,14 +2646,8 @@ mod tests {
         assert_eq!(samples[0].labels.get("host"), Some("server1"));
     }
 
-    // ── Phase 5.1 v2 wiring tests ─────────────────────────────────────
-    //
-    // These run only with `--features promql-v2` enabled. They exercise
-    // the `eval_query_v2` / `eval_query_range_v2` entry points against
-    // the same `Tsdb` fixture the v1 tests use — the A/B goal of Phase 5
-    // is structurally-identical `QueryValue`s out of either path.
+    // ── v2 engine wiring tests ────────────────────────────────────────
 
-    #[cfg(feature = "promql-v2")]
     mod v2_wiring_tests {
         use super::*;
         use crate::testing::columnar_stress::{
@@ -2683,7 +2683,7 @@ mod tests {
             // when: run the instant selector via the v2 entry point
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("http_requests", Some(query_time), &opts)
+                .eval_query("http_requests", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -2715,7 +2715,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_range_v2("req_total", start..=end, step, &opts)
+                .eval_query_range_value("req_total", start..=end, step, &opts)
                 .await
                 .unwrap();
 
@@ -2744,7 +2744,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("rate(req_total[1m])", Some(query_time), &opts)
+                .eval_query("rate(req_total[1m])", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -2815,7 +2815,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("histogram_quantile(0.9, http_requests)", None, &opts)
+                .eval_query("histogram_quantile(0.9, http_requests)", None, &opts)
                 .await;
             // then
             let err = result.unwrap_err();
@@ -2835,7 +2835,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("time()", Some(query_time), &opts)
+                .eval_query("time()", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -2861,7 +2861,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("vector(time())", Some(query_time), &opts)
+                .eval_query("vector(time())", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -2885,7 +2885,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("minute(vector(1136239445))", Some(query_time), &opts)
+                .eval_query("minute(vector(1136239445))", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -2908,7 +2908,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2(
+                .eval_query(
                     r#"label_replace(http_requests, "tier", "$1-app", "env", "(.*)")"#,
                     Some(query_time),
                     &opts,
@@ -2936,7 +2936,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2(
+                .eval_query(
                     r#"label_join(http_requests, "joined", "/", "__name__", "env")"#,
                     Some(query_time),
                     &opts,
@@ -2967,7 +2967,7 @@ mod tests {
             // when
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("sum by (env) (http_requests)", Some(query_time), &opts)
+                .eval_query("sum by (env) (http_requests)", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -3034,7 +3034,7 @@ mod tests {
 
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("sum_over_time(m[10s:2s])", Some(query_time), &opts)
+                .eval_query("sum_over_time(m[10s:2s])", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -3086,7 +3086,7 @@ mod tests {
 
             let opts = QueryOptions::default();
             let result = tsdb
-                .eval_query_v2("sum by (g) (m)", Some(query_time), &opts)
+                .eval_query("sum by (g) (m)", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -3128,11 +3128,11 @@ mod tests {
 
                     // when
                     let raw_result = tsdb
-                        .eval_query_v2("stress_gauge", Some(query_time), &opts)
+                        .eval_query("stress_gauge", Some(query_time), &opts)
                         .await
                         .unwrap();
                     let count_result = tsdb
-                        .eval_query_v2(
+                        .eval_query(
                             "count by (applicationid) (stress_gauge)",
                             Some(query_time),
                             &opts,
@@ -3140,7 +3140,7 @@ mod tests {
                         .await
                         .unwrap();
                     let sum_result = tsdb
-                        .eval_query_v2(
+                        .eval_query(
                             "sum by (applicationid) (stress_gauge)",
                             Some(query_time),
                             &opts,
@@ -3187,7 +3187,7 @@ mod tests {
             for (_profile_name, opts) in concurrency_profiles() {
                 // when
                 let count_result = tsdb
-                    .eval_query_range_v2(
+                    .eval_query_range_value(
                         "count by (applicationid) (stress_gauge)",
                         start..=end,
                         step,
@@ -3196,7 +3196,7 @@ mod tests {
                     .await
                     .unwrap();
                 let sum_result = tsdb
-                    .eval_query_range_v2(
+                    .eval_query_range_value(
                         "sum by (applicationid) (stress_gauge)",
                         start..=end,
                         step,
@@ -3205,7 +3205,7 @@ mod tests {
                     .await
                     .unwrap();
                 let rate_result = tsdb
-                    .eval_query_range_v2(
+                    .eval_query_range_value(
                         "sum by (applicationid) (rate(stress_counter_total[15m]))",
                         start..=end,
                         step,
@@ -3236,7 +3236,7 @@ mod tests {
         }
 
         /// Larger ignored soak for RFC 0008. Invoke with:
-        /// `cargo test -p timeseries --features promql-v2 should_eval_v2_long_window_stress_soak -- --ignored --nocapture`
+        /// `cargo test -p opendata-timeseries should_eval_v2_long_window_stress_soak -- --ignored --nocapture`
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[ignore]
         async fn should_eval_v2_long_window_stress_soak() {
@@ -3250,7 +3250,7 @@ mod tests {
 
             // when
             let count_result = tsdb
-                .eval_query_range_v2(
+                .eval_query_range_value(
                     "count by (applicationid) (stress_gauge)",
                     start..=end,
                     step,
@@ -3259,7 +3259,7 @@ mod tests {
                 .await
                 .unwrap();
             let sum_result = tsdb
-                .eval_query_range_v2(
+                .eval_query_range_value(
                     "sum by (applicationid) (stress_gauge)",
                     start..=end,
                     step,
@@ -3268,7 +3268,7 @@ mod tests {
                 .await
                 .unwrap();
             let rate_result = tsdb
-                .eval_query_range_v2(
+                .eval_query_range_value(
                     "sum by (applicationid) (rate(stress_counter_total[15m]))",
                     start..=end,
                     step,
@@ -3302,7 +3302,7 @@ mod tests {
         // These verify that the v2 engine runs through the
         // `TsdbReadEngine` trait defaults on both the writer (`Tsdb`)
         // and the read-only `TimeSeriesDbReader`, so reader-only prod
-        // binaries built with `--features promql-v2` exercise the
+        // binaries exercise the
         // columnar engine instead of silently falling back to v1.
 
         /// Build a writer + reader pair on shared storage, ingest a
@@ -3333,7 +3333,7 @@ mod tests {
             // when: the reader's v2 entry point evaluates the selector
             let opts = QueryOptions::default();
             let result = reader
-                .eval_query_v2("req_total", Some(query_time), &opts)
+                .eval_query("req_total", Some(query_time), &opts)
                 .await
                 .unwrap();
 
@@ -3359,7 +3359,7 @@ mod tests {
             // when: the reader's v2 range entry point evaluates the query
             let opts = QueryOptions::default();
             let result = reader
-                .eval_query_range_v2("req_total", start..=end, step, &opts)
+                .eval_query_range_value("req_total", start..=end, step, &opts)
                 .await
                 .unwrap();
 
@@ -3389,11 +3389,11 @@ mod tests {
             let opts = QueryOptions::default();
             let query = "rate(req_total[1m])";
             let writer_result = tsdb
-                .eval_query_range_v2(query, start..=end, step, &opts)
+                .eval_query_range_value(query, start..=end, step, &opts)
                 .await
                 .unwrap();
             let reader_result = reader
-                .eval_query_range_v2(query, start..=end, step, &opts)
+                .eval_query_range_value(query, start..=end, step, &opts)
                 .await
                 .unwrap();
 

@@ -319,78 +319,54 @@ async fn extract_params<T: serde::de::DeserializeOwned>(
 
 /// Handle /api/v1/query
 ///
-/// Query evaluation dispatches between the v1 (row-oriented) and v2
-/// (columnar) engines at **compile time** via `#[cfg(feature = "promql-v2")]`.
-/// Wire shape is unchanged across the A/B boundary: both paths return
-/// `QueryValue`.
-///
-/// When `?explain=true` is set and the v2 engine is enabled, the
-/// handler short-circuits to a dry-run plan description. `?pretty=true`
-/// alongside `explain` switches the response to `text/plain` with a
-/// DataFusion-style indented tree; without `pretty`, the response is
-/// `application/json` wrapping an `ExplainResult`.
+/// When `?explain=true` is set, the handler short-circuits to a dry-run
+/// plan description. `?pretty=true` alongside `explain` switches the
+/// response to `text/plain` with a DataFusion-style indented tree;
+/// without `pretty`, the response is `application/json` wrapping an
+/// `ExplainResult`.
 async fn handle_query(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let params: QueryParams = extract_params(request, &state).await?;
     let time = params.time.as_deref().map(parse_timestamp).transpose()?;
-    #[cfg(feature = "promql-v2")]
     if is_flag_set(params.explain.as_deref()) {
         let result = state
             .tsdb
-            .explain_query_v2(&params.query, time, &QueryOptions::default());
+            .explain_query(&params.query, time, &QueryOptions::default());
         return Ok(render_explain(
             result,
             is_flag_set(params.pretty.as_deref()),
         ));
     }
-    #[cfg(not(feature = "promql-v2"))]
+    let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
+    if tracing_on {
+        let collector = crate::promql::v2::trace::TraceCollector::new();
+        let outcome = state
+            .tsdb
+            .eval_query_traced(
+                &params.query,
+                time,
+                &QueryOptions::default(),
+                Some(collector),
+            )
+            .await;
+        let (value_res, trace) = match outcome {
+            Ok(o) => (Ok(o.value), o.trace),
+            Err(e) => (Err(e), None),
+        };
+        let mut resp = response::query_value_to_response(value_res);
+        resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
+        return Ok(Json(resp).into_response());
+    }
     let result = state
         .tsdb
         .eval_query(&params.query, time, &QueryOptions::default())
         .await;
-    #[cfg(feature = "promql-v2")]
-    {
-        let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
-        if tracing_on {
-            let collector = crate::promql::v2::trace::TraceCollector::new();
-            let outcome = state
-                .tsdb
-                .eval_query_v2_traced(
-                    &params.query,
-                    time,
-                    &QueryOptions::default(),
-                    Some(collector),
-                )
-                .await;
-            let (value_res, trace) = match outcome {
-                Ok(o) => (Ok(o.value), o.trace),
-                Err(e) => (Err(e), None),
-            };
-            let mut resp = response::query_value_to_response(value_res);
-            resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
-            return Ok(Json(resp).into_response());
-        }
-        let result = state
-            .tsdb
-            .eval_query_v2(&params.query, time, &QueryOptions::default())
-            .await;
-        Ok(Json(response::query_value_to_response(result)).into_response())
-    }
-    #[cfg(not(feature = "promql-v2"))]
     Ok(Json(response::query_value_to_response(result)).into_response())
 }
 
 /// Handle /api/v1/query_range
-///
-/// See `handle_query` for the compile-time A/B rationale. v2's
-/// `eval_query_range_v2` returns `QueryValue` (not `Vec<RangeSample>` like
-/// v1) because a plan root may collapse to a scalar over a range grid
-/// (e.g. `1+1`). A thin adapter — local to this handler — projects the
-/// `QueryValue` back onto the `Vec<RangeSample>` wire contract that
-/// `range_result_to_response` expects, keeping the JSON response shape
-/// identical regardless of feature flag.
 ///
 /// `?explain=true` (with optional `?pretty=true`) returns a dry-run
 /// plan description — see [`handle_query`] for the contract.
@@ -402,9 +378,8 @@ async fn handle_query_range(
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
     let step = parse_duration(&params.step)?;
-    #[cfg(feature = "promql-v2")]
     if is_flag_set(params.explain.as_deref()) {
-        let result = state.tsdb.explain_query_range_v2(
+        let result = state.tsdb.explain_query_range(
             &params.query,
             start..=end,
             step,
@@ -415,49 +390,37 @@ async fn handle_query_range(
             is_flag_set(params.pretty.as_deref()),
         ));
     }
-    #[cfg(not(feature = "promql-v2"))]
+    let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
+    if tracing_on {
+        let collector = crate::promql::v2::trace::TraceCollector::new();
+        let outcome = state
+            .tsdb
+            .eval_query_range_traced(
+                &params.query,
+                start..=end,
+                step,
+                &QueryOptions::default(),
+                Some(collector),
+            )
+            .await;
+        let (range_res, trace) = match outcome {
+            Ok(o) => (crate::tsdb::query_value_to_range_samples(o.value), o.trace),
+            Err(e) => (Err(e), None),
+        };
+        let mut resp = response::range_result_to_response(range_res);
+        resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
+        return Ok(Json(resp).into_response());
+    }
     let result = state
         .tsdb
         .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
         .await;
-    #[cfg(feature = "promql-v2")]
-    {
-        let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
-        if tracing_on {
-            let collector = crate::promql::v2::trace::TraceCollector::new();
-            let outcome = state
-                .tsdb
-                .eval_query_range_v2_traced(
-                    &params.query,
-                    start..=end,
-                    step,
-                    &QueryOptions::default(),
-                    Some(collector),
-                )
-                .await;
-            let (range_res, trace) = match outcome {
-                Ok(o) => (query_value_to_range_samples(o.value), o.trace),
-                Err(e) => (Err(e), None),
-            };
-            let mut resp = response::range_result_to_response(range_res);
-            resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
-            return Ok(Json(resp).into_response());
-        }
-        let result = state
-            .tsdb
-            .eval_query_range_v2(&params.query, start..=end, step, &QueryOptions::default())
-            .await
-            .and_then(query_value_to_range_samples);
-        Ok(Json(response::range_result_to_response(result)).into_response())
-    }
-    #[cfg(not(feature = "promql-v2"))]
     Ok(Json(response::range_result_to_response(result)).into_response())
 }
 
 /// Render an EXPLAIN result as either JSON (`pretty=false`) or
 /// `text/plain` (`pretty=true`). Errors are rendered as the normal
 /// `ExplainResponse` error shape regardless of `pretty`.
-#[cfg(feature = "promql-v2")]
 fn render_explain(
     result: Result<crate::promql::v2::plan::ExplainResult, crate::error::QueryError>,
     pretty: bool,
@@ -485,36 +448,6 @@ fn render_explain(
         }
     } else {
         Json(response::explain_result_to_response(result)).into_response()
-    }
-}
-
-/// Collapse a v2 [`QueryValue`] into the `Vec<RangeSample>` wire shape
-/// expected by the `/api/v1/query_range` response builder. Matrix results
-/// pass through; scalar results fan out into a single anonymous series
-/// with one sample at the query's evaluation timestamp (matches v1's
-/// range-scalar flattening in `evaluate_range`). Vector results shouldn't
-/// normally occur on a range grid, but are defensively converted into a
-/// single-step matrix if they do.
-#[cfg(feature = "promql-v2")]
-fn query_value_to_range_samples(
-    value: QueryValue,
-) -> Result<Vec<crate::model::RangeSample>, crate::error::QueryError> {
-    match value {
-        QueryValue::Matrix(series) => Ok(series),
-        QueryValue::Scalar {
-            timestamp_ms,
-            value,
-        } => Ok(vec![crate::model::RangeSample {
-            labels: crate::model::Labels::empty(),
-            samples: vec![(timestamp_ms, value)],
-        }]),
-        QueryValue::Vector(samples) => Ok(samples
-            .into_iter()
-            .map(|s| crate::model::RangeSample {
-                labels: s.labels,
-                samples: vec![(s.timestamp_ms, s.value)],
-            })
-            .collect()),
     }
 }
 
@@ -629,18 +562,9 @@ async fn handle_federate(
     let mut body = String::new();
 
     for selector in &params.matches {
-        // Federate dispatches through the same compile-time A/B boundary
-        // as `handle_query` so flipping `promql-v2` picks up every entry
-        // point uniformly.
-        #[cfg(not(feature = "promql-v2"))]
         let eval = state
             .tsdb
             .eval_query(selector, None, &QueryOptions::default())
-            .await;
-        #[cfg(feature = "promql-v2")]
-        let eval = state
-            .tsdb
-            .eval_query_v2(selector, None, &QueryOptions::default())
             .await;
         let result = eval.map_err(|e| match e {
             crate::error::QueryError::InvalidQuery(msg) => Error::InvalidInput(msg),

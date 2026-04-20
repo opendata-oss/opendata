@@ -132,7 +132,6 @@ impl BucketQueryReader for MiniQueryReader {
 
         match record {
             Some(record) => {
-                #[cfg(feature = "promql-v2")]
                 crate::promql::v2::trace::record_bytes(
                     crate::promql::v2::trace::IoKind::SamplesFetch,
                     record.value.len() as u64,
@@ -153,13 +152,10 @@ impl BucketQueryReader for MiniQueryReader {
                 // Deserialize's bytes are the same bytes the fetch returned —
                 // it's decoding that payload. Attribute here so both kinds
                 // report throughput.
-                #[cfg(feature = "promql-v2")]
                 crate::promql::v2::trace::record_bytes(
                     crate::promql::v2::trace::IoKind::Deserialize,
                     raw_len,
                 );
-                #[cfg(not(feature = "promql-v2"))]
-                let _ = raw_len;
                 Ok(samples)
             }
             None => Ok(Vec::new()),
@@ -168,44 +164,15 @@ impl BucketQueryReader for MiniQueryReader {
 }
 
 // ─── trace helpers ──────────────────────────────────────────────────
-//
-// Expose a thin I/O-kind facade that maps to the v2 tracing module when
-// the `promql-v2` feature is on, and compiles to a no-op otherwise so the
-// storage layer stays feature-agnostic.
 
-#[cfg(feature = "promql-v2")]
 use crate::promql::v2::trace::IoKind as IoKindLocal;
 
-#[cfg(not(feature = "promql-v2"))]
-#[allow(dead_code)]
-enum IoKindLocal {
-    SamplesFetch,
-    Deserialize,
-    ForwardIndexFetch,
-    InvertedIndexFetch,
-    LabelValuesFetch,
-}
-
-#[cfg(feature = "promql-v2")]
 async fn io_trace_async<F: std::future::Future<Output = T>, T>(kind: IoKindLocal, fut: F) -> T {
     crate::promql::v2::trace::record_async(kind, fut).await
 }
 
-#[cfg(not(feature = "promql-v2"))]
-#[inline]
-async fn io_trace_async<F: std::future::Future<Output = T>, T>(_kind: IoKindLocal, fut: F) -> T {
-    fut.await
-}
-
-#[cfg(feature = "promql-v2")]
 fn io_trace_sync<T>(kind: IoKindLocal, f: impl FnOnce() -> T) -> T {
     crate::promql::v2::trace::record_sync(kind, f)
-}
-
-#[cfg(not(feature = "promql-v2"))]
-#[inline]
-fn io_trace_sync<T>(_kind: IoKindLocal, f: impl FnOnce() -> T) -> T {
-    f()
 }
 
 pub(crate) struct MiniTsdb {

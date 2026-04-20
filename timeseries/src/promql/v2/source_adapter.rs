@@ -452,7 +452,7 @@ fn internal_err(msg: impl Into<String>) -> QueryError {
 // sync behaviourally.
 // ---------------------------------------------------------------------------
 
-mod selector_util {
+pub(crate) mod selector_util {
     use super::{
         Label, QueryError, QueryReader, SeriesId, TimeBucket, V2IndexCache, VectorSelector,
         internal_err,
@@ -505,7 +505,7 @@ mod selector_util {
         }
     }
 
-    pub(super) fn has_negative_matchers(selector: &VectorSelector) -> bool {
+    pub(crate) fn has_negative_matchers(selector: &VectorSelector) -> bool {
         selector
             .matchers
             .matchers
@@ -513,7 +513,7 @@ mod selector_util {
             .any(|m| matches!(m.op, MatchOp::NotEqual | MatchOp::NotRe(_)))
     }
 
-    pub(super) fn has_empty_string_matchers(selector: &VectorSelector) -> bool {
+    pub(crate) fn has_empty_string_matchers(selector: &VectorSelector) -> bool {
         selector
             .matchers
             .matchers
@@ -523,7 +523,7 @@ mod selector_util {
 
     /// Mirrors `promql::selector::find_candidates_with_reader` but consults
     /// the reader directly (no `CachedQueryReader`).
-    pub(super) async fn find_candidates<R: QueryReader + ?Sized>(
+    pub(crate) async fn find_candidates<R: QueryReader + ?Sized>(
         reader: &R,
         index_cache: &V2IndexCache,
         bucket: &TimeBucket,
@@ -619,7 +619,7 @@ mod selector_util {
     }
 
     /// Matches the post-filter block in `promql::selector::evaluate_selector_with_reader`.
-    pub(super) fn apply_post_filters(
+    pub(crate) fn apply_post_filters(
         forward: &dyn ForwardIndexLookup,
         candidates: Vec<SeriesId>,
         selector: &VectorSelector,

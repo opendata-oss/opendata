@@ -1,9 +1,7 @@
-//! PromQL v2 execution engine. Replaces the row-oriented AST interpreter in
-//! [`crate::promql::evaluator`] and [`crate::promql::pipeline`] with a
-//! columnar, step-major, pull-based pipeline: each operator yields
-//! [`StepBatch`]es (rectangles of `series × step` values) when polled, and
-//! the query result is the root operator's final batch reshaped onto the HTTP
-//! wire format. Gated behind the `promql-v2` Cargo feature. See
+//! PromQL execution engine. A columnar, step-major, pull-based pipeline:
+//! each operator yields [`StepBatch`]es (rectangles of `series × step`
+//! values) when polled, and the query result is the root operator's final
+//! batch reshaped onto the HTTP wire format. See
 //! `timeseries/rfcs/0007-promql-execution.md` for the full design.
 //!
 //! How the code is laid out:

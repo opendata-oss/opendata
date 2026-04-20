@@ -1,11 +1,13 @@
+use std::future::poll_fn;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use promql_parser::parser::Expr;
+
 use crate::model::{Label, MetricType, Sample, TimeBucket};
-use crate::promql::evaluator::Evaluator;
-use crate::query::test_utils::{MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder};
-use promql_parser::parser::{EvalStmt, Expr, SubqueryExpr, VectorSelector};
+use crate::promql::v2;
+use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
 
 // ---------------------------------------------------------------------------
 // Warm range-query benchmark harness
@@ -14,15 +16,12 @@ use promql_parser::parser::{EvalStmt, Expr, SubqueryExpr, VectorSelector};
 /// Benchmark harness for warm outer range queries.
 ///
 /// Constructs a multi-bucket synthetic dataset and repeatedly evaluates a
-/// range query (stepping from `start` to `end` with a given step) that
-/// reuses the same Evaluator across all steps — matching the real
-/// `evaluate_range` path in `tsdb.rs`.
-///
-/// The query expression is parsed once at construction time so the measured
-/// loop only times evaluator execution.
+/// range query through the v2 columnar pipeline. The query expression is
+/// parsed once at construction time so the measured loop only times
+/// planner + execution cost.
 pub struct WarmRangeQueryHarness {
     reader: Arc<crate::query::test_utils::MockQueryReader>,
-    /// Pre-parsed expression, cloned into each `EvalStmt`.
+    /// Pre-parsed expression, cloned into each run.
     expr: Expr,
     start: SystemTime,
     end: SystemTime,
@@ -37,10 +36,6 @@ const AGG_GROUP_COUNT: usize = 10;
 
 impl WarmRangeQueryHarness {
     /// Build a harness for a plain vector selector range query.
-    ///
-    /// Creates `num_series` series across multiple 1-hour buckets,
-    /// each with `num_labels` extra labels, producing one sample every
-    /// `step` from `start` to `end`.
     pub fn vector_selector(
         num_series: usize,
         num_labels: usize,
@@ -69,9 +64,6 @@ impl WarmRangeQueryHarness {
     }
 
     /// Build a harness for a `sum by (group) (metric)` aggregation range query.
-    ///
-    /// Uses a low-cardinality `group` label so the aggregation actually
-    /// merges series, producing a realistic grouped workload.
     pub fn aggregation(
         num_series: usize,
         num_labels: usize,
@@ -86,7 +78,6 @@ impl WarmRangeQueryHarness {
             step_secs,
             |series_idx, label_idx| {
                 if label_idx == 0 {
-                    // Low-cardinality grouping label
                     format!("group_{}", series_idx % AGG_GROUP_COUNT)
                 } else {
                     format!("value_{series_idx}_{label_idx}")
@@ -106,44 +97,9 @@ impl WarmRangeQueryHarness {
         }
     }
 
-    /// Run the range query once (all steps), returning the result count.
+    /// Run the range query once through the v2 columnar pipeline: lower →
+    /// optimize → build physical plan → poll root to completion.
     pub async fn run_once(&self) -> Result<usize, String> {
-        use crate::promql::pipeline::PipelineConcurrency;
-
-        let stmt = EvalStmt {
-            expr: self.expr.clone(),
-            start: self.start,
-            end: self.end,
-            interval: self.step,
-            lookback_delta: self.lookback_delta,
-        };
-
-        let concurrency = PipelineConcurrency::default();
-        let result = crate::tsdb::evaluate_range(&*self.reader, stmt, concurrency)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(result.len())
-    }
-
-    /// Run the range query `iterations` times, black-boxing each result.
-    pub async fn run_iterations(&self, iterations: usize) -> Result<(), String> {
-        for _ in 0..iterations {
-            let result = self.run_once().await?;
-            black_box(result);
-        }
-        Ok(())
-    }
-
-    /// v2 analogue of [`Self::run_once`]. Drives the same pre-parsed `Expr`
-    /// through the columnar pipeline: lower → optimize → build physical
-    /// plan → poll root to completion. Parsing is kept outside the timed
-    /// path (same as the v1 variant) so the benchmark compares engine
-    /// cost, not parser cost.
-    #[cfg(feature = "promql-v2")]
-    pub async fn run_once_v2(&self) -> Result<usize, String> {
-        use crate::promql::v2;
-        use std::future::poll_fn;
-
         let start_ms = self
             .start
             .duration_since(UNIX_EPOCH)
@@ -184,11 +140,10 @@ impl WarmRangeQueryHarness {
         Ok(cell_count)
     }
 
-    /// v2 analogue of [`Self::run_iterations`].
-    #[cfg(feature = "promql-v2")]
-    pub async fn run_iterations_v2(&self, iterations: usize) -> Result<(), String> {
+    /// Run the range query `iterations` times, black-boxing each result.
+    pub async fn run_iterations(&self, iterations: usize) -> Result<(), String> {
         for _ in 0..iterations {
-            let result = self.run_once_v2().await?;
+            let result = self.run_once().await?;
             black_box(result);
         }
         Ok(())
@@ -219,7 +174,6 @@ fn build_multi_bucket_dataset(
         }
         for step_idx in 0..=num_steps {
             let ts_ms = (step_idx as i64) * (step_secs as i64) * 1000;
-            // Determine which hour bucket this sample belongs to
             let ts_secs = ts_ms / 1000;
             let bucket_start_mins = (ts_secs / 3600) * 60; // hour-aligned
             let bucket = TimeBucket::hour(bucket_start_mins as u32);
@@ -235,85 +189,4 @@ fn build_multi_bucket_dataset(
         }
     }
     builder.build()
-}
-
-/// Reusable benchmark harness for subquery label cache evaluation.
-pub struct SubqueryLabelCacheHarness {
-    reader: crate::query::test_utils::MockQueryReader,
-    stmt: EvalStmt,
-}
-
-impl SubqueryLabelCacheHarness {
-    pub fn new(
-        num_series: usize,
-        num_labels: usize,
-        num_steps: usize,
-        lookback_delta_ms: i64,
-    ) -> Self {
-        let bucket = TimeBucket::hour(0);
-        let mut builder = MockQueryReaderBuilder::new(bucket);
-
-        for series_idx in 0..num_series {
-            let mut labels = vec![Label::metric_name("metric")];
-
-            for label_idx in 0..num_labels {
-                labels.push(Label {
-                    name: format!("label_{label_idx}"),
-                    value: format!("value_{series_idx}"),
-                });
-            }
-
-            for step_idx in 0..num_steps {
-                builder.add_sample(
-                    labels.clone(),
-                    MetricType::Gauge,
-                    Sample {
-                        timestamp_ms: step_idx as i64 * 1000,
-                        value: step_idx as f64,
-                    },
-                );
-            }
-        }
-
-        let subquery = SubqueryExpr {
-            expr: Box::new(Expr::VectorSelector(VectorSelector {
-                name: Some("metric".to_string()),
-                matchers: promql_parser::label::Matchers::empty(),
-                offset: None,
-                at: None,
-            })),
-            range: Duration::from_secs(num_steps as u64),
-            step: Some(Duration::from_secs(1)),
-            offset: None,
-            at: None,
-        };
-
-        let eval_time: SystemTime = UNIX_EPOCH + Duration::from_secs(num_steps as u64);
-        let stmt = EvalStmt {
-            expr: Expr::Subquery(subquery),
-            start: eval_time,
-            end: eval_time,
-            interval: Duration::from_secs(0),
-            lookback_delta: Duration::from_millis(lookback_delta_ms as u64),
-        };
-
-        Self {
-            reader: builder.build(),
-            stmt,
-        }
-    }
-
-    pub async fn run_iterations(&self, iterations: usize) -> Result<(), String> {
-        let mut evaluator = Evaluator::new(&self.reader);
-
-        for _ in 0..iterations {
-            let result = evaluator
-                .evaluate(self.stmt.clone())
-                .await
-                .map_err(|e| e.to_string())?;
-            black_box(result);
-        }
-
-        Ok(())
-    }
 }

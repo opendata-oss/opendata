@@ -28,8 +28,7 @@ use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
-    TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
-    find_series_in_range,
+    TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
 };
 
 // ── ReaderQueryReader ────────────────────────────────────────────────
@@ -241,10 +240,17 @@ impl TimeSeriesDbReader {
     pub async fn query_range(
         &self,
         query: &str,
-        range: impl RangeBounds<SystemTime>,
+        range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        eval_query_range_bounds(self, query, range, step, &QueryOptions::default()).await
+        <Self as TsdbReadEngine>::eval_query_range(
+            self,
+            query,
+            range,
+            step,
+            &QueryOptions::default(),
+        )
+        .await
     }
 
     /// Returns the set of label-sets matching the given series matchers.
@@ -314,14 +320,12 @@ impl TsdbReadEngine for TimeSeriesDbReader {
         ranges: &[(i64, i64)],
     ) -> Result<ReaderQueryReader> {
         let buckets = {
-            #[cfg(feature = "promql-v2")]
             let _g = crate::promql::v2::trace::Scope::enter("list_buckets");
             self.storage.get_buckets_for_ranges(ranges).await?
         };
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
-                #[cfg(feature = "promql-v2")]
                 let _g = crate::promql::v2::trace::Scope::enter("bucket_load");
                 let mini = self.get_or_load_bucket(bucket).await;
                 (bucket, mini)

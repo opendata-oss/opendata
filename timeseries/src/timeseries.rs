@@ -16,8 +16,7 @@ use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
 use crate::storage::coalesce_bucket_list;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
-    Tsdb, TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range,
-    find_labels_in_range, find_series_in_range,
+    Tsdb, TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
 };
 
 /// A time series database for storing and querying metrics.
@@ -197,11 +196,10 @@ impl TimeSeriesDb {
     pub async fn query_range(
         &self,
         query: &str,
-        range: impl RangeBounds<SystemTime>,
+        range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        // Route through shared range helpers so bound conversion happens once.
-        eval_query_range_bounds(
+        <Tsdb as TsdbReadEngine>::eval_query_range(
             &self.tsdb,
             query,
             range,

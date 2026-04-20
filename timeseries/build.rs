@@ -38,7 +38,7 @@ fn main() {
 
             code.push_str(&format!(
                 r#"
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_pass_{fn_name}() {{
     run_test("{stem}", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/promql/promqltest/testdata/{stem}.test")))
         .await
