@@ -204,11 +204,6 @@ resolved series count is ≥ 64.
 wiring is stubbed in `parallelism` and `coalesce_max_shards` defaults to `0`. Needs end-to-end
 correctness work (per-series independence above the leaf isn't free) before it's turned on.
 
-**No global permit layer.** v1 had a separate `QueryReaderEvalCache` metadata/sample semaphore
-throttling real I/O independent of scheduler readahead. v2 collapses that: the cross-bucket
-constants above are both scheduler and I/O ceiling. If we later find storage backends that need hard
-global throttling, it goes inside the `SeriesSource` implementation, not in the engine.
-
 ### Operators
 
 Each operator is a `trait Operator` that pulls from children when they are ready for their next
