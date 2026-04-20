@@ -1,4 +1,4 @@
-//! Reshape stage: the v2 pipeline emits [`StepBatch`]es, but the HTTP layer
+//! Reshape stage: the engine pipeline emits [`StepBatch`]es, but the HTTP layer
 //! speaks [`QueryValue`] (instant samples, range samples, scalars). This
 //! module bridges the two by draining the root operator's batches and
 //! laying them out in the shape the wire boundary expects.
@@ -274,8 +274,8 @@ fn batch_static_schema(batch: &StepBatch) -> Result<&SeriesSchema, ReshapeError>
 mod tests {
     use super::*;
     use crate::model::Label;
-    use crate::promql::v2::batch::{BitSet, SeriesSchema, StepBatch};
-    use crate::promql::v2::operator::StepGrid;
+    use crate::promql::batch::{BitSet, SeriesSchema, StepBatch};
+    use crate::promql::operator::StepGrid;
     use std::sync::Arc;
 
     fn mk_labels(name: &str, env: &str) -> Labels {
@@ -315,23 +315,23 @@ mod tests {
         // Test-only builder — the tests never poll `root`, they just
         // consume `step_grid` and `output_schema` for the reshape call.
         struct Stub {
-            schema: crate::promql::v2::operator::OperatorSchema,
+            schema: crate::promql::operator::OperatorSchema,
         }
-        impl crate::promql::v2::operator::Operator for Stub {
-            fn schema(&self) -> &crate::promql::v2::operator::OperatorSchema {
+        impl crate::promql::operator::Operator for Stub {
+            fn schema(&self) -> &crate::promql::operator::OperatorSchema {
                 &self.schema
             }
             fn next(
                 &mut self,
                 _: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Option<Result<StepBatch, crate::promql::v2::memory::QueryError>>>
+            ) -> std::task::Poll<Option<Result<StepBatch, crate::promql::memory::QueryError>>>
             {
                 std::task::Poll::Ready(None)
             }
         }
         PhysicalPlan {
             root: Box::new(Stub {
-                schema: crate::promql::v2::operator::OperatorSchema::new(schema.clone(), grid),
+                schema: crate::promql::operator::OperatorSchema::new(schema.clone(), grid),
             }),
             output_schema: schema,
             step_grid: grid,

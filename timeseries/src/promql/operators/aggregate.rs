@@ -1429,8 +1429,8 @@ fn coerce_k_size(k_param: i64, input_len: usize) -> usize {
 mod tests {
     use super::*;
     use crate::model::{Label, Labels};
-    use crate::promql::v2::batch::{SchemaRef, SeriesSchema};
-    use crate::promql::v2::operator::StepGrid;
+    use crate::promql::batch::{SchemaRef, SeriesSchema};
+    use crate::promql::operator::StepGrid;
     use std::sync::Arc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 

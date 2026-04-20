@@ -5,8 +5,7 @@
 //!
 //! A series spanning multiple buckets yields one [`SampleBatch`] per bucket
 //! in bucket-timestamp order; operators merge across buckets. Selector
-//! matcher logic is re-implemented in [`selector_util`] rather than pulled
-//! from `promql::selector` (which ties to v1's `CachedQueryReader`).
+//! matcher logic lives in [`selector_util`].
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -19,7 +18,7 @@ use promql_parser::parser::VectorSelector;
 use crate::model::{Label, Labels, Sample, SeriesId, TimeBucket};
 use crate::query::QueryReader;
 
-use super::index_cache::V2IndexCache;
+use super::index_cache::IndexCache;
 use super::memory::QueryError;
 use super::source::{
     ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest, SeriesSource,
@@ -32,26 +31,14 @@ use super::source::{
 //
 // Buckets are fully independent keyspaces in RFC 0001's layout (all record
 // keys are bucket-prefixed, series IDs are bucket-scoped), so cross-bucket
-// fan-out cannot affect correctness. The constants below mirror the v1
-// pipeline's stage-level readahead (see `promql/pipeline.rs`
-// `METADATA_STAGE_READAHEAD` / `SAMPLE_STAGE_READAHEAD`, both 32) so
-// observed concurrency is comparable.
-//
-// Two gaps vs. v1 worth flagging:
-//   - V1 also amplifies within a bucket via `PER_BUCKET_SAMPLE_READAHEAD`
-//     (64 per-series futures in flight). V2 does not — RFC 0007
-//     §"Execution Model" (line 256) prohibits implicit spawn-per-series.
-//     A future "range-coalesced samples" API can close this gap without
-//     breaking the rule.
-//   - V1 has a separate global permit layer (`QueryReaderEvalCache`
-//     metadata/sample semaphores) that throttles real I/O independent of
-//     scheduler readahead. V2 has no such layer; the constants below act
-//     as both scheduler and I/O ceiling.
+// fan-out cannot affect correctness. RFC 0007 §"Execution Model" (line 256)
+// prohibits implicit spawn-per-series, so there is no intra-bucket sample
+// fan-out; the constants below act as both scheduler and I/O ceiling.
 
-/// Cross-bucket readahead for resolve. Mirrors v1's `METADATA_STAGE_READAHEAD`.
+/// Cross-bucket readahead for resolve.
 const METADATA_STAGE_READAHEAD: usize = 32;
 
-/// Cross-bucket readahead for sample batching. Mirrors v1's `SAMPLE_STAGE_READAHEAD`.
+/// Cross-bucket readahead for sample batching.
 const SAMPLE_STAGE_READAHEAD: usize = 32;
 
 /// Per-key index-fetch fan-out inside one bucket's resolve path. Worst-case
@@ -111,7 +98,7 @@ fn bucket_overlaps(bucket: TimeBucket, time_range: TimeRange) -> bool {
 /// the cost.
 pub(crate) struct QueryReaderSource<R: QueryReader> {
     reader: Arc<R>,
-    index_cache: Arc<V2IndexCache>,
+    index_cache: Arc<IndexCache>,
 }
 
 impl<R: QueryReader> QueryReaderSource<R> {
@@ -119,7 +106,7 @@ impl<R: QueryReader> QueryReaderSource<R> {
     pub(crate) fn new(reader: Arc<R>) -> Self {
         Self {
             reader,
-            index_cache: Arc::new(V2IndexCache::new()),
+            index_cache: Arc::new(IndexCache::new()),
         }
     }
 }
@@ -154,7 +141,7 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
 /// per non-empty bucket.
 fn resolve_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
-    index_cache: Arc<V2IndexCache>,
+    index_cache: Arc<IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
@@ -166,7 +153,7 @@ fn resolve_stream<R: QueryReader + 'static>(
 /// buckets are skipped.
 fn async_stream_resolve<R: QueryReader + 'static>(
     reader: Arc<R>,
-    index_cache: Arc<V2IndexCache>,
+    index_cache: Arc<IndexCache>,
     selector: VectorSelector,
     time_range: TimeRange,
 ) -> impl Stream<Item = Result<ResolvedSeriesChunk, QueryError>> + Send {
@@ -221,7 +208,7 @@ fn async_stream_resolve<R: QueryReader + 'static>(
 /// per-`(bucket, series_id)` cache, which the samples path later reuses.
 async fn resolve_one_bucket<R: QueryReader + ?Sized>(
     reader: &R,
-    index_cache: &V2IndexCache,
+    index_cache: &IndexCache,
     bucket: TimeBucket,
     selector: &VectorSelector,
 ) -> Result<Option<ResolvedSeriesChunk>, QueryError> {
@@ -293,7 +280,7 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
 /// slice; series spanning buckets yield one batch per bucket. Operators merge.
 fn samples_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
-    index_cache: Arc<V2IndexCache>,
+    index_cache: Arc<IndexCache>,
     request: SamplesRequest,
 ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
     stream::once(async move {
@@ -310,7 +297,7 @@ fn samples_stream<R: QueryReader + 'static>(
 /// `series_range` indexes into the caller's `request.series`.
 async fn build_sample_batches<R: QueryReader + ?Sized>(
     reader: &R,
-    index_cache: &V2IndexCache,
+    index_cache: &IndexCache,
     request: &SamplesRequest,
 ) -> Result<Vec<SampleBatch>, QueryError> {
     if request.series.is_empty() || request.time_range.is_empty() {
@@ -338,7 +325,7 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
 /// here are pure in-memory hits (populated by `resolve_one_bucket`).
 async fn build_batch_for_run<R: QueryReader + ?Sized>(
     reader: &R,
-    index_cache: &V2IndexCache,
+    index_cache: &IndexCache,
     run: BucketRun,
     series: Arc<[ResolvedSeriesRef]>,
     time_range: TimeRange,
@@ -454,7 +441,7 @@ fn internal_err(msg: impl Into<String>) -> QueryError {
 
 pub(crate) mod selector_util {
     use super::{
-        Label, QueryError, QueryReader, SeriesId, TimeBucket, V2IndexCache, VectorSelector,
+        IndexCache, Label, QueryError, QueryReader, SeriesId, TimeBucket, VectorSelector,
         internal_err,
     };
     use crate::index::ForwardIndexLookup;
@@ -463,8 +450,7 @@ pub(crate) mod selector_util {
     use regex_syntax::hir::{Hir, HirKind};
     use std::collections::HashSet;
 
-    /// Parses `value1|value2|…` into literal alternatives. Mirrors the helper
-    /// in `promql::selector`, which can't be reused here (ties to v1).
+    /// Parses `value1|value2|…` into literal alternatives.
     pub(super) fn parse_limited_regex(pattern: &str) -> Result<Vec<String>, String> {
         let hir = Parser::new()
             .parse(pattern)
@@ -525,7 +511,7 @@ pub(crate) mod selector_util {
     /// the reader directly (no `CachedQueryReader`).
     pub(crate) async fn find_candidates<R: QueryReader + ?Sized>(
         reader: &R,
-        index_cache: &V2IndexCache,
+        index_cache: &IndexCache,
         bucket: &TimeBucket,
         selector: &VectorSelector,
     ) -> Result<Vec<SeriesId>, QueryError> {

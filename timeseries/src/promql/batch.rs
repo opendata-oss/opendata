@@ -1,4 +1,4 @@
-//! The columnar data types that flow between v2 operators.
+//! The columnar data types that flow between operators.
 //!
 //! A query plan is a tree of operators; [`StepBatch`] is the one shape that
 //! moves along every edge. Every supporting type here exists so batches can
@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::model::Labels;
 
-/// The wire shape of the v2 engine — operators produce and consume
+/// The wire shape of the engine — operators produce and consume
 /// `StepBatch`es, and nothing else flows between them.
 ///
 /// Each batch covers a rectangle of the query's output: a contiguous slice of

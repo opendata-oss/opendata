@@ -1,7 +1,7 @@
 //! Errors that can happen before a single batch is polled — lowering
 //! failures, unsupported PromQL constructs, and physical-planner
 //! binding errors. Kept separate from the execution-time
-//! [`crate::promql::v2::memory::QueryError`] and structured (not
+//! [`crate::promql::memory::QueryError`] and structured (not
 //! `String`) so the HTTP layer can map each variant to a status code
 //! without re-parsing the message.
 use thiserror::Error;
@@ -30,7 +30,7 @@ pub enum PlanError {
     InvalidTopLevelString,
 
     /// Features we won't support (e.g. `Expr::Extension`).
-    #[error("PromQL feature not supported by v2 engine: {0}")]
+    #[error("PromQL feature not supported by engine: {0}")]
     UnsupportedFeature(String),
 
     /// Storage error from [`SeriesSource::resolve`](super::super::source::SeriesSource::resolve),

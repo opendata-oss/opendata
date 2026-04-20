@@ -321,17 +321,17 @@ impl ErrorResponse {
 pub struct ExplainResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<crate::promql::v2::plan::ExplainResult>,
+    pub data: Option<crate::promql::plan::ExplainResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
 }
 
-/// Wrap an [`ExplainResult`](crate::promql::v2::plan::ExplainResult)
+/// Wrap an [`ExplainResult`](crate::promql::plan::ExplainResult)
 /// (or error) into an [`ExplainResponse`].
 pub fn explain_result_to_response(
-    result: Result<crate::promql::v2::plan::ExplainResult, QueryError>,
+    result: Result<crate::promql::plan::ExplainResult, QueryError>,
 ) -> ExplainResponse {
     match result {
         Ok(data) => ExplainResponse {

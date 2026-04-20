@@ -21,9 +21,9 @@ use std::task::{Context, Poll};
 use regex::Regex;
 
 use crate::model::{Label, Labels};
-use crate::promql::v2::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
-use crate::promql::v2::memory::{MemoryReservation, QueryError};
-use crate::promql::v2::operator::{Operator, OperatorSchema};
+use crate::promql::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
+use crate::promql::memory::{MemoryReservation, QueryError};
+use crate::promql::operator::{Operator, OperatorSchema};
 
 /// Which label-rewrite function the operator applies to each input
 /// labelset. `regex` / `replacement` / `separator` are plan-time constants
@@ -332,7 +332,7 @@ impl<C: Operator> Operator for LabelManipOp<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::promql::v2::operator::StepGrid;
+    use crate::promql::operator::StepGrid;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
     fn noop_waker() -> Waker {

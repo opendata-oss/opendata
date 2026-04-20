@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::promql::v2::trace::TraceCollector;
+use crate::promql::trace::TraceCollector;
 use promql_parser::parser;
 use promql_parser::parser::LabelModifier;
 use promql_parser::parser::token::{
@@ -25,11 +25,11 @@ use promql_parser::parser::token::{
     T_QUANTILE, T_STDDEV, T_STDVAR, T_SUB, T_SUM, T_TOPK,
 };
 
-use crate::promql::v2::operators::aggregate::AggregateKind;
-use crate::promql::v2::operators::binary::BinaryOpKind;
-use crate::promql::v2::operators::instant_fn::InstantFnKind;
-use crate::promql::v2::operators::label_manip::LabelManipKind;
-use crate::promql::v2::operators::rollup::RollupKind;
+use crate::promql::operators::aggregate::AggregateKind;
+use crate::promql::operators::binary::BinaryOpKind;
+use crate::promql::operators::instant_fn::InstantFnKind;
+use crate::promql::operators::label_manip::LabelManipKind;
+use crate::promql::operators::rollup::RollupKind;
 use regex::Regex;
 
 use super::error::PlanError;
@@ -58,7 +58,7 @@ pub struct LoweringContext {
     /// Consulted by the physical planner; lowering ignores this field.
     pub parallelism: super::parallelism::Parallelism,
     /// `Some` → physical planner wraps every operator in a
-    /// [`TracingOperator`](crate::promql::v2::trace::TracingOperator).
+    /// [`TracingOperator`](crate::promql::trace::TracingOperator).
     pub trace: Option<Arc<TraceCollector>>,
 }
 

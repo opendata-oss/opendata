@@ -27,7 +27,7 @@
 //! `series_count × step_count`-scaled routes through
 //! [`MemoryReservation::try_grow`].
 //!
-//! [`SeriesSource`]: crate::promql::v2::source::SeriesSource
+//! [`SeriesSource`]: crate::promql::source::SeriesSource
 
 use std::future::Future;
 use std::pin::Pin;
@@ -38,7 +38,7 @@ use futures::Stream;
 use futures::stream::StreamExt;
 use promql_parser::parser::{AtModifier, Offset};
 
-use crate::model::{Labels, is_stale_nan};
+use crate::model::is_stale_nan;
 use crate::promql::timestamp::Timestamp;
 
 use super::super::batch::{BitSet, SchemaRef, SeriesSchema, StepBatch};
@@ -323,8 +323,6 @@ enum State<'a> {
     Errored,
     /// Transient placeholder used while swapping state inside `next()`.
     Transitioning,
-    #[allow(dead_code)]
-    _Phantom(std::marker::PhantomData<&'a ()>),
 }
 
 // ---------------------------------------------------------------------------
@@ -644,22 +642,12 @@ impl<S: SeriesSource + Send + Sync + 'static> Operator for VectorSelectorOp<'sta
                     self.state = State::Done;
                     return Poll::Ready(None);
                 }
-                State::Transitioning | State::_Phantom(_) => {
+                State::Transitioning => {
                     unreachable!("transient state observed in next()");
                 }
             }
         }
     }
-}
-
-// Stand-in for `SeriesSchema` constructor from parallel roster data.
-// Not exported — operator callers build the schema out-of-band.
-#[allow(dead_code)]
-pub(crate) fn build_schema_from_labels(
-    labels: Vec<Labels>,
-    fingerprints: Vec<u128>,
-) -> SeriesSchema {
-    SeriesSchema::new(Arc::from(labels), Arc::from(fingerprints))
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +664,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::model::{Label, Labels, STALE_NAN};
-    use crate::promql::v2::source::{ResolvedSeriesChunk, SampleBlock};
+    use crate::promql::source::{ResolvedSeriesChunk, SampleBlock};
 
     // ---- mock source ----------------------------------------------------
 

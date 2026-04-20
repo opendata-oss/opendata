@@ -43,19 +43,11 @@ pub mod physical;
 pub mod plan_types;
 
 pub use error::PlanError;
-#[allow(unused_imports)]
-pub use explain::{
-    ExplainResult, PlanNode, SCHEMA_VERSION, describe_logical, describe_physical, pretty_print,
-};
+#[cfg(any(test, feature = "testing"))]
+pub use explain::PlanNode;
+#[cfg(feature = "http-server")]
+pub use explain::pretty_print;
+pub use explain::{ExplainResult, SCHEMA_VERSION, describe_logical, describe_physical};
 pub use lowering::{LoweringContext, lower};
-#[allow(unused_imports)]
 pub use optimize::optimize;
-#[allow(unused_imports)]
-pub use parallelism::{ExchangeStats, Parallelism};
-#[allow(unused_imports)]
-pub use physical::{
-    InstantVectorSort, PhysicalPlan, build_physical_plan, build_physical_plan_with_stats,
-};
-pub use plan_types::{
-    AggregateGrouping, AtModifier, BinaryMatching, Cardinality, LogicalPlan, MatchingAxis, Offset,
-};
+pub use physical::{InstantVectorSort, PhysicalPlan, build_physical_plan};

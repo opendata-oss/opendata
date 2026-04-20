@@ -510,7 +510,7 @@ fn matching_to_value(m: &BinaryMatching) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::promql::v2::plan::{LoweringContext, lower};
+    use crate::promql::plan::{LoweringContext, lower};
     use promql_parser::parser;
 
     fn lower_query(q: &str, ctx: &LoweringContext) -> LogicalPlan {
@@ -825,7 +825,7 @@ mod tests {
     fn golden(query: &str, ctx: &LoweringContext) -> String {
         let expr = parser::parse(query).expect("parse");
         let unoptimized = lower(&expr, ctx).expect("lower");
-        let optimized = crate::promql::v2::plan::optimize(unoptimized.clone());
+        let optimized = crate::promql::plan::optimize(unoptimized.clone());
         let u_node = describe_logical(&unoptimized);
         let o_node = describe_logical(&optimized);
         let p_node = describe_physical(&optimized, ctx);

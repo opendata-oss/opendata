@@ -1,21 +1,21 @@
-//! Per-query memory accounting for the v2 engine.
+//! Per-query memory accounting for the engine.
 //!
 //! A query allocates across many operators on many tasks; [`MemoryReservation`]
 //! is the shared ledger that keeps their combined footprint under the
-//! per-query cap. Every allocating call site in v2 (batch buffers,
+//! per-query cap. Every allocating call site (batch buffers,
 //! accumulator grids, rechunk scratch, ...) pairs
 //! [`MemoryReservation::try_grow`] with [`MemoryReservation::release`] on
 //! drop — operators that forget either side are memory-leak bugs.
 //!
 //! [`QueryError`] is deliberately isolated from the crate-wide
-//! [`crate::error::QueryError`]: v2 errors are a small closed set (memory
+//! [`crate::error::QueryError`]: engine errors are a small closed set (memory
 //! limit plus a catch-all `Internal` for storage plumbing), and the wire
 //! boundary maps them to `crate::error::QueryError::Execution`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// The v2 engine's error type. Kept separate from
+/// The engine's error type. Kept separate from
 /// [`crate::error::QueryError`] so the engine's error surface stays small and
 /// closed; the wire boundary maps these onto
 /// `crate::error::QueryError::Execution`.

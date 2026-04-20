@@ -21,7 +21,7 @@
 //! `MatrixSelectorOp::next` is degenerate). Other operators are CPU-bound
 //! and never wrapped.
 
-use crate::promql::v2::operators::concurrent::DEFAULT_CHANNEL_BOUND;
+use crate::promql::operators::concurrent::DEFAULT_CHANNEL_BOUND;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parallelism {

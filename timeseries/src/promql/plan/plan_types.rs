@@ -7,15 +7,15 @@
 //! will need to *pick* an operator; resolution and compilation happen
 //! later. Operator-kind enums ([`InstantFnKind`], [`RollupKind`],
 //! [`AggregateKind`], [`BinaryOpKind`]) are re-used from
-//! [`crate::promql::v2::operators`].
+//! [`crate::promql::operators`].
 
 use std::sync::Arc;
 
-use crate::promql::v2::operators::aggregate::AggregateKind;
-use crate::promql::v2::operators::binary::BinaryOpKind;
-use crate::promql::v2::operators::instant_fn::InstantFnKind;
-use crate::promql::v2::operators::label_manip::LabelManipKind;
-use crate::promql::v2::operators::rollup::RollupKind;
+use crate::promql::operators::aggregate::AggregateKind;
+use crate::promql::operators::binary::BinaryOpKind;
+use crate::promql::operators::instant_fn::InstantFnKind;
+use crate::promql::operators::label_manip::LabelManipKind;
+use crate::promql::operators::rollup::RollupKind;
 use promql_parser::parser;
 
 // ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ impl TryFrom<&parser::AtModifier> for AtModifier {
 /// encoding of PromQL's `on(...)` / `ignoring(...)` / `group_left(...)`
 /// / `group_right(...)` clauses. The physical planner compiles this into
 /// a runtime
-/// [`MatchTable`](crate::promql::v2::operators::binary::MatchTable) once
+/// [`MatchTable`](crate::promql::operators::binary::MatchTable) once
 /// both input schemas are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryMatching {
@@ -108,7 +108,7 @@ pub enum Cardinality {
 /// The `by (...)` / `without (...)` clause on a PromQL aggregation,
 /// preserved verbatim from the AST. The physical planner consumes this
 /// to build the
-/// [`GroupMap`](crate::promql::v2::operators::aggregate::GroupMap) once
+/// [`GroupMap`](crate::promql::operators::aggregate::GroupMap) once
 /// the child's series schema is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateGrouping {
@@ -144,7 +144,7 @@ fn labels_to_arc(labels: &promql_parser::label::Labels) -> Arc<[String]> {
 // LogicalPlan
 // ---------------------------------------------------------------------------
 
-/// The v2 engine's logical-plan IR — a tree of PromQL operators as plain
+/// The engine's logical-plan IR — a tree of PromQL operators as plain
 /// data, the single rewrite surface the optimiser walks, and the
 /// post-lowering mirror of the PromQL AST (one variant per operator
 /// family, plus `Scalar` / `Time` for scalar leaves).

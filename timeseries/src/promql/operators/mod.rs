@@ -1,5 +1,5 @@
 //! Every concrete [`Operator`](super::operator::Operator) implementation
-//! that can appear in a v2 query plan. The planner composes these into a
+//! that can appear in a query plan. The planner composes these into a
 //! tree; at runtime, the root operator is polled and each node pulls from
 //! its children.
 //!
@@ -37,22 +37,3 @@ pub(crate) mod rechunk;
 pub(crate) mod rollup;
 pub(crate) mod subquery;
 pub(crate) mod vector_selector;
-
-#[allow(unused_imports)]
-pub(crate) mod prelude {
-    pub(crate) use super::aggregate::{AggregateKind, AggregateOp, GroupMap};
-    pub(crate) use super::binary::{
-        BinaryOp, BinaryOpKind, BinaryShape, ConstScalarOp, MatchTable,
-    };
-    pub(crate) use super::coalesce::CoalesceOp;
-    pub(crate) use super::coercion::{ScalarizeOp, TimeScalarOp};
-    pub(crate) use super::concurrent::{ConcurrentOp, DEFAULT_CHANNEL_BOUND};
-    pub(crate) use super::count_values::CountValuesOp;
-    pub(crate) use super::instant_fn::{InstantFnKind, InstantFnOp};
-    pub(crate) use super::label_manip::{LabelManipKind, LabelManipOp};
-    pub(crate) use super::matrix_selector::{CellIndex, MatrixSelectorOp, MatrixWindowBatch};
-    pub(crate) use super::rechunk::RechunkOp;
-    pub(crate) use super::rollup::{MatrixWindowSource, RollupKind, RollupOp, WindowStream};
-    pub(crate) use super::subquery::{ChildFactory, SubqueryOp};
-    pub(crate) use super::vector_selector::VectorSelectorOp;
-}

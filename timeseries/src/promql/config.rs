@@ -69,7 +69,7 @@ pub struct PrometheusConfig {
     pub tracing: TracingConfig,
 }
 
-/// Controls per-query PromQL v2 tracing.
+/// Controls per-query PromQL tracing.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TracingConfig {

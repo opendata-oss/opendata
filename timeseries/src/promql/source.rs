@@ -1,4 +1,4 @@
-//! The contract between the v2 engine and whatever backend actually stores
+//! The contract between the engine and whatever backend actually stores
 //! samples. Built around the [`SeriesSource`] trait plus the request and
 //! response types it operates on.
 //!
@@ -139,7 +139,7 @@ pub struct SampleBatch {
     pub samples: SampleBlock,
 }
 
-/// The v2 engine's storage-facing trait. Implementations turn a selector
+/// The engine's storage-facing trait. Implementations turn a selector
 /// into resolved series and resolved series into raw samples, and do
 /// nothing else PromQL-flavoured.
 ///

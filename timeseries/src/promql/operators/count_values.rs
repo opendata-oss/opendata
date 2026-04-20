@@ -170,7 +170,7 @@ impl Drop for OutBuffers {
 // CountValuesOp — the operator
 // ---------------------------------------------------------------------------
 
-/// Implements PromQL's `count_values`. The one operator in v2 whose output
+/// Implements PromQL's `count_values`. The one operator whose output
 /// series roster depends on sample values — so it publishes
 /// [`SchemaRef::Deferred`] from [`Self::schema`] and only binds a concrete
 /// [`SeriesSchema`] after it has drained its child.
@@ -507,8 +507,8 @@ impl<C: Operator> Drop for CountValuesOp<C> {
 mod tests {
     use super::*;
     use crate::model::{Label, Labels};
-    use crate::promql::v2::batch::SeriesSchema;
-    use crate::promql::v2::operator::StepGrid;
+    use crate::promql::batch::SeriesSchema;
+    use crate::promql::operator::StepGrid;
     use std::sync::Arc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 

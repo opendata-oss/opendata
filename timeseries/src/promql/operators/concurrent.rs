@@ -1,5 +1,5 @@
 //! `ConcurrentOp` — the one operator that introduces parallelism into the
-//! v2 pipeline. Decouples an I/O-heavy child (typically a selector) from
+//! engine pipeline. Decouples an I/O-heavy child (typically a selector) from
 //! the downstream CPU-bound chain by running the child on a spawned tokio
 //! task that pushes batches through a bounded mpsc channel.
 //!
@@ -117,8 +117,8 @@ impl Operator for ConcurrentOp {
 mod tests {
     use super::*;
     use crate::model::{Label, Labels};
-    use crate::promql::v2::batch::{BitSet, SchemaRef, SeriesSchema};
-    use crate::promql::v2::operator::StepGrid;
+    use crate::promql::batch::{BitSet, SchemaRef, SeriesSchema};
+    use crate::promql::operator::StepGrid;
     use std::sync::Arc;
     use std::time::Duration;
 

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use promql_parser::parser::Expr;
 
 use crate::model::{Label, MetricType, Sample, TimeBucket};
-use crate::promql::v2;
+use crate::promql;
 use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
 
 // ---------------------------------------------------------------------------
@@ -16,7 +16,7 @@ use crate::query::test_utils::MockMultiBucketQueryReaderBuilder;
 /// Benchmark harness for warm outer range queries.
 ///
 /// Constructs a multi-bucket synthetic dataset and repeatedly evaluates a
-/// range query through the v2 columnar pipeline. The query expression is
+/// range query through the columnar pipeline. The query expression is
 /// parsed once at construction time so the measured loop only times
 /// planner + execution cost.
 pub struct WarmRangeQueryHarness {
@@ -97,7 +97,7 @@ impl WarmRangeQueryHarness {
         }
     }
 
-    /// Run the range query once through the v2 columnar pipeline: lower →
+    /// Run the range query once through the columnar pipeline: lower →
     /// optimize → build physical plan → poll root to completion.
     pub async fn run_once(&self) -> Result<usize, String> {
         let start_ms = self
@@ -113,17 +113,17 @@ impl WarmRangeQueryHarness {
         let step_ms = self.step.as_millis() as i64;
         let lookback_ms = self.lookback_delta.as_millis() as i64;
 
-        let ctx = v2::plan::LoweringContext::new(start_ms, end_ms, step_ms, lookback_ms);
-        let logical = v2::plan::lower(&self.expr, &ctx).map_err(|e| e.to_string())?;
-        let logical = v2::plan::optimize(logical);
+        let ctx = promql::plan::LoweringContext::new(start_ms, end_ms, step_ms, lookback_ms);
+        let logical = promql::plan::lower(&self.expr, &ctx).map_err(|e| e.to_string())?;
+        let logical = promql::plan::optimize(logical);
 
-        let source = Arc::new(v2::source_adapter::QueryReaderSource::new(
+        let source = Arc::new(promql::source_adapter::QueryReaderSource::new(
             self.reader.clone(),
         ));
-        // 1 GiB reservation — mirrors the production `DEFAULT_V2_MEMORY_CAP_BYTES`.
-        let reservation = v2::memory::MemoryReservation::new(1024 * 1024 * 1024);
+        // 1 GiB reservation — mirrors the production `DEFAULT_MEMORY_CAP_BYTES`.
+        let reservation = promql::memory::MemoryReservation::new(1024 * 1024 * 1024);
 
-        let mut plan = v2::plan::build_physical_plan(logical, &source, reservation, &ctx)
+        let mut plan = promql::plan::build_physical_plan(logical, &source, reservation, &ctx)
             .await
             .map_err(|e| e.to_string())?;
 

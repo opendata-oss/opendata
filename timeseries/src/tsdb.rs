@@ -40,12 +40,12 @@ pub(crate) fn preload_ranges(
     }
 }
 
-/// Default per-query memory cap for the v2 engine.
+/// Default per-query memory cap for the PromQL engine.
 ///
 /// 1 GiB — a conservative ceiling that should comfortably fit any
 /// single-digit-GB host's working set while still failing fast on a
 /// runaway query.
-pub(crate) const DEFAULT_V2_MEMORY_CAP_BYTES: usize = 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_MEMORY_CAP_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Convert `SystemTime` to milliseconds since the UNIX epoch, clamping
 /// pre-epoch values to zero.
@@ -62,9 +62,9 @@ fn duration_to_ms(d: Duration) -> i64 {
     d.as_millis().min(i64::MAX as u128) as i64
 }
 
-/// Compute the preload ranges (seconds) the v2 engine's `QueryReader`
+/// Compute the preload ranges (seconds) the PromQL engine's `QueryReader`
 /// needs to open by re-parsing `query`.
-fn preload_ranges_for_v2(
+fn preload_ranges_for_query(
     query: &str,
     start_ms: i64,
     end_ms: i64,
@@ -339,22 +339,22 @@ fn preload_ranges_inner(
 /// carried a trace collector.
 pub(crate) struct ExecuteOutcome {
     pub value: QueryValue,
-    pub trace: Option<crate::promql::v2::trace::QueryTrace>,
+    pub trace: Option<crate::promql::trace::QueryTrace>,
 }
 
-/// Drive the v2 operator tree to completion and reshape into a
+/// Drive the operator tree to completion and reshape into a
 /// [`QueryValue`]. Shared by [`TsdbReadEngine::eval_query`] and
 /// [`TsdbReadEngine::eval_query_range`]; keeps the dispatch logic in
 /// one place. Generic over the [`QueryReader`] type so both the writer's
 /// `TsdbQueryReader` and the reader's `ReaderQueryReader` flow through
 /// the same pipeline without duplication.
-async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
+async fn execute_query<R: QueryReader + Send + Sync + 'static>(
     query: &str,
     reader: R,
-    ctx: crate::promql::v2::plan::LoweringContext,
+    ctx: crate::promql::plan::LoweringContext,
     is_instant: bool,
 ) -> std::result::Result<ExecuteOutcome, QueryError> {
-    use crate::promql::v2::trace::{self, Phase};
+    use crate::promql::trace::{self, Phase};
     use std::future::poll_fn;
 
     let trace_collector = ctx.trace.clone();
@@ -378,7 +378,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         let span = tracing::debug_span!("phase", name = "lower");
         let t0 = Instant::now();
         let logical = span
-            .in_scope(|| crate::promql::v2::plan::lower(&expr, &ctx))
+            .in_scope(|| crate::promql::plan::lower(&expr, &ctx))
             .map_err(plan_error_to_query_error)?;
         if let Some(c) = trace_collector.as_ref() {
             c.record_phase(Phase::Lower, t0.elapsed().as_nanos() as u64);
@@ -387,21 +387,20 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         // Optimize -----------------------------------------------------
         let span = tracing::debug_span!("phase", name = "optimize");
         let t0 = Instant::now();
-        let logical = span.in_scope(|| crate::promql::v2::plan::optimize(logical));
+        let logical = span.in_scope(|| crate::promql::plan::optimize(logical));
         if let Some(c) = trace_collector.as_ref() {
             c.record_phase(Phase::Optimize, t0.elapsed().as_nanos() as u64);
         }
 
-        let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
+        let source = Arc::new(crate::promql::source_adapter::QueryReaderSource::new(
             Arc::new(reader),
         ));
-        let reservation =
-            crate::promql::v2::memory::MemoryReservation::new(DEFAULT_V2_MEMORY_CAP_BYTES);
+        let reservation = crate::promql::memory::MemoryReservation::new(DEFAULT_MEMORY_CAP_BYTES);
 
         // Build physical ----------------------------------------------
         let t0 = Instant::now();
         let mut plan = tracing::Instrument::instrument(
-            crate::promql::v2::plan::build_physical_plan(logical, &source, reservation, &ctx),
+            crate::promql::plan::build_physical_plan(logical, &source, reservation, &ctx),
             tracing::debug_span!("phase", name = "build_physical"),
         )
         .await
@@ -418,7 +417,7 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         loop {
             match poll_fn(|cx| plan.root.next(cx)).await {
                 Some(Ok(batch)) => batches.push(batch),
-                Some(Err(e)) => return Err(v2_query_error_to_query_error(e)),
+                Some(Err(e)) => return Err(execution_error_to_query_error(e)),
                 None => break,
             }
         }
@@ -432,9 +431,9 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
         let t0 = Instant::now();
         let reshaped = span.in_scope(|| {
             if is_instant {
-                crate::promql::v2::reshape::reshape_instant(&plan, batches)
+                crate::promql::reshape::reshape_instant(&plan, batches)
             } else {
-                crate::promql::v2::reshape::reshape_range(&plan, batches)
+                crate::promql::reshape::reshape_range(&plan, batches)
             }
         });
         if let Some(c) = trace_collector.as_ref() {
@@ -458,30 +457,29 @@ async fn execute_v2<R: QueryReader + Send + Sync + 'static>(
 /// for `query` without opening a reader or executing any operator.
 /// Backs both [`TsdbEngine::explain_query`] and
 /// [`TsdbEngine::explain_query_range`].
-fn explain_v2(
+fn explain_query(
     query: &str,
-    ctx: &crate::promql::v2::plan::LoweringContext,
-) -> std::result::Result<crate::promql::v2::plan::ExplainResult, QueryError> {
+    ctx: &crate::promql::plan::LoweringContext,
+) -> std::result::Result<crate::promql::plan::ExplainResult, QueryError> {
     let expr =
         promql_parser::parser::parse(query).map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
-    let unoptimized =
-        crate::promql::v2::plan::lower(&expr, ctx).map_err(plan_error_to_query_error)?;
-    let logical_unoptimized = crate::promql::v2::plan::describe_logical(&unoptimized);
-    let optimized = crate::promql::v2::plan::optimize(unoptimized.clone());
-    let logical_optimized = crate::promql::v2::plan::describe_logical(&optimized);
-    let physical = crate::promql::v2::plan::describe_physical(&optimized, ctx);
-    Ok(crate::promql::v2::plan::ExplainResult {
-        schema_version: crate::promql::v2::plan::SCHEMA_VERSION,
+    let unoptimized = crate::promql::plan::lower(&expr, ctx).map_err(plan_error_to_query_error)?;
+    let logical_unoptimized = crate::promql::plan::describe_logical(&unoptimized);
+    let optimized = crate::promql::plan::optimize(unoptimized.clone());
+    let logical_optimized = crate::promql::plan::describe_logical(&optimized);
+    let physical = crate::promql::plan::describe_physical(&optimized, ctx);
+    Ok(crate::promql::plan::ExplainResult {
+        schema_version: crate::promql::plan::SCHEMA_VERSION,
         logical_unoptimized,
         logical_optimized,
         physical,
     })
 }
 
-/// Translate a v2 [`PlanError`](crate::promql::v2::plan::PlanError) into
+/// Translate a [`PlanError`](crate::promql::plan::PlanError) into
 /// the crate-wide [`QueryError`].
-fn plan_error_to_query_error(e: crate::promql::v2::plan::PlanError) -> QueryError {
-    use crate::promql::v2::plan::PlanError;
+fn plan_error_to_query_error(e: crate::promql::plan::PlanError) -> QueryError {
+    use crate::promql::plan::PlanError;
     match e {
         PlanError::UnknownFunction(_)
         | PlanError::InvalidArgument { .. }
@@ -495,14 +493,14 @@ fn plan_error_to_query_error(e: crate::promql::v2::plan::PlanError) -> QueryErro
     }
 }
 
-/// Translate an execution-time v2
-/// [`QueryError`](crate::promql::v2::memory::QueryError) onto the
+/// Translate an execution-time
+/// [`QueryError`](crate::promql::memory::QueryError) onto the
 /// crate-wide [`QueryError`] for the HTTP / embedded boundary.
-fn v2_query_error_to_query_error(e: crate::promql::v2::memory::QueryError) -> QueryError {
+fn execution_error_to_query_error(e: crate::promql::memory::QueryError) -> QueryError {
     QueryError::Execution(e.to_string())
 }
 
-/// Collapse a v2 [`QueryValue`] into the `Vec<RangeSample>` wire shape.
+/// Collapse a [`QueryValue`] into the `Vec<RangeSample>` wire shape.
 /// Matrix results pass through; scalar results fan out into a single
 /// anonymous series with one sample at each returned timestamp; vector
 /// results become a one-sample-per-series matrix.
@@ -599,9 +597,9 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
     }
 
     /// Evaluate an instant PromQL query, returning a [`QueryValue`]
-    /// (scalar, vector or matrix). Parses the query, lowers to the v2
+    /// (scalar, vector or matrix). Parses the query, lowers to the
     /// logical plan, runs the rule-based optimiser, builds a physical
-    /// plan over a [`crate::promql::v2::source_adapter::QueryReaderSource`]
+    /// plan over a [`crate::promql::source_adapter::QueryReaderSource`]
     /// wrapping this engine's [`QueryReader`], drives the operator tree
     /// to completion and reshapes collected batches into a `QueryValue`.
     async fn eval_query(
@@ -633,14 +631,14 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         query: &str,
         time: Option<SystemTime>,
         opts: &QueryOptions,
-        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+        trace: Option<Arc<crate::promql::trace::TraceCollector>>,
     ) -> std::result::Result<ExecuteOutcome, QueryError>
     where
         Self::QR: 'static,
     {
         let query_time = time.unwrap_or_else(SystemTime::now);
         let at_ms = system_time_to_ms(query_time);
-        let mut plan_ctx = crate::promql::v2::plan::LoweringContext::for_instant(
+        let mut plan_ctx = crate::promql::plan::LoweringContext::for_instant(
             at_ms,
             duration_to_ms(opts.lookback_delta),
         );
@@ -649,20 +647,20 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         }
         let collector = plan_ctx.trace.clone();
 
-        let ranges = preload_ranges_for_v2(query, at_ms, at_ms, opts.lookback_delta)?;
+        let ranges = preload_ranges_for_query(query, at_ms, at_ms, opts.lookback_delta)?;
         let t0 = Instant::now();
         let build_reader = self.make_query_reader_for_ranges(&ranges);
         let reader = match collector.clone() {
-            Some(c) => crate::promql::v2::trace::with_trace(c, build_reader).await?,
+            Some(c) => crate::promql::trace::with_trace(c, build_reader).await?,
             None => build_reader.await?,
         };
         if let Some(c) = collector.as_ref() {
             c.record_phase(
-                crate::promql::v2::trace::Phase::ReaderSetup,
+                crate::promql::trace::Phase::ReaderSetup,
                 t0.elapsed().as_nanos() as u64,
             );
         }
-        execute_v2(query, reader, plan_ctx, /*is_instant=*/ true).await
+        execute_query(query, reader, plan_ctx, /*is_instant=*/ true).await
     }
 
     /// Evaluate a range PromQL query and project the resulting
@@ -715,7 +713,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
         opts: &QueryOptions,
-        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+        trace: Option<Arc<crate::promql::trace::TraceCollector>>,
     ) -> std::result::Result<ExecuteOutcome, QueryError>
     where
         Self::QR: 'static,
@@ -730,7 +728,7 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
             ));
         }
 
-        let mut plan_ctx = crate::promql::v2::plan::LoweringContext::new(
+        let mut plan_ctx = crate::promql::plan::LoweringContext::new(
             start_ms,
             end_ms,
             step_ms,
@@ -741,20 +739,20 @@ pub(crate) trait TsdbReadEngine: Send + Sync {
         }
         let collector = plan_ctx.trace.clone();
 
-        let ranges = preload_ranges_for_v2(query, start_ms, end_ms, opts.lookback_delta)?;
+        let ranges = preload_ranges_for_query(query, start_ms, end_ms, opts.lookback_delta)?;
         let t0 = Instant::now();
         let build_reader = self.make_query_reader_for_ranges(&ranges);
         let reader = match collector.clone() {
-            Some(c) => crate::promql::v2::trace::with_trace(c, build_reader).await?,
+            Some(c) => crate::promql::trace::with_trace(c, build_reader).await?,
             None => build_reader.await?,
         };
         if let Some(c) = collector.as_ref() {
             c.record_phase(
-                crate::promql::v2::trace::Phase::ReaderSetup,
+                crate::promql::trace::Phase::ReaderSetup,
                 t0.elapsed().as_nanos() as u64,
             );
         }
-        execute_v2(query, reader, plan_ctx, /*is_instant=*/ false).await
+        execute_query(query, reader, plan_ctx, /*is_instant=*/ false).await
     }
 }
 
@@ -798,11 +796,11 @@ const DISCOVERY_BUCKET_READAHEAD: usize = 32;
 /// negative / empty-string post-filters.
 async fn resolve_selector_in_bucket<R: QueryReader>(
     reader: &R,
-    index_cache: &crate::promql::v2::index_cache::V2IndexCache,
+    index_cache: &crate::promql::index_cache::IndexCache,
     bucket: TimeBucket,
     selector: &VectorSelector,
 ) -> std::result::Result<Vec<(SeriesId, Labels)>, QueryError> {
-    use crate::promql::v2::source_adapter::selector_util;
+    use crate::promql::source_adapter::selector_util;
 
     let candidates = selector_util::find_candidates(reader, index_cache, &bucket, selector)
         .await
@@ -853,7 +851,7 @@ pub(crate) async fn discover_series<R: QueryReader>(
     }
 
     let selectors = parse_selectors(matchers)?;
-    let index_cache = crate::promql::v2::index_cache::V2IndexCache::new();
+    let index_cache = crate::promql::index_cache::IndexCache::new();
     let mut unique_series: HashSet<Labels> = HashSet::new();
     for bucket in &buckets {
         for selector in &selectors {
@@ -884,7 +882,7 @@ pub(crate) async fn discover_labels<R: QueryReader>(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
-            let index_cache = crate::promql::v2::index_cache::V2IndexCache::new();
+            let index_cache = crate::promql::index_cache::IndexCache::new();
             for bucket in &buckets {
                 for selector in &selectors {
                     let found =
@@ -933,7 +931,7 @@ pub(crate) async fn discover_label_values<R: QueryReader>(
     match matchers {
         Some(matches) if !matches.is_empty() => {
             let selectors = parse_selectors(matches)?;
-            let index_cache = crate::promql::v2::index_cache::V2IndexCache::new();
+            let index_cache = crate::promql::index_cache::IndexCache::new();
             for bucket in &buckets {
                 for selector in &selectors {
                     let found =
@@ -1040,16 +1038,16 @@ impl Tsdb {
         ranges: &[(i64, i64)],
     ) -> Result<TsdbQueryReader> {
         let snapshot = {
-            let _g = crate::promql::v2::trace::Scope::enter("snapshot");
+            let _g = crate::promql::trace::Scope::enter("snapshot");
             self.storage.snapshot().await?
         };
         let buckets = {
-            let _g = crate::promql::v2::trace::Scope::enter("list_buckets");
+            let _g = crate::promql::trace::Scope::enter("list_buckets");
             snapshot.get_buckets_for_ranges(ranges).await?
         };
 
         let readers = {
-            let _g = crate::promql::v2::trace::Scope::enter("build_readers");
+            let _g = crate::promql::trace::Scope::enter("build_readers");
             self.build_readers(&snapshot, buckets).await
         };
         Ok(TsdbQueryReader::new(readers))
@@ -1314,7 +1312,7 @@ impl TsdbEngine {
         query: &str,
         time: Option<SystemTime>,
         opts: &QueryOptions,
-        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+        trace: Option<Arc<crate::promql::trace::TraceCollector>>,
     ) -> std::result::Result<ExecuteOutcome, QueryError> {
         match self {
             Self::ReadWrite(tsdb) => tsdb.eval_query_traced(query, time, opts, trace).await,
@@ -1347,7 +1345,7 @@ impl TsdbEngine {
         range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
         opts: &QueryOptions,
-        trace: Option<Arc<crate::promql::v2::trace::TraceCollector>>,
+        trace: Option<Arc<crate::promql::trace::TraceCollector>>,
     ) -> std::result::Result<ExecuteOutcome, QueryError> {
         match self {
             Self::ReadWrite(tsdb) => {
@@ -1370,14 +1368,14 @@ impl TsdbEngine {
         query: &str,
         time: Option<SystemTime>,
         opts: &QueryOptions,
-    ) -> std::result::Result<crate::promql::v2::plan::ExplainResult, QueryError> {
+    ) -> std::result::Result<crate::promql::plan::ExplainResult, QueryError> {
         let query_time = time.unwrap_or_else(SystemTime::now);
         let at_ms = system_time_to_ms(query_time);
-        let ctx = crate::promql::v2::plan::LoweringContext::for_instant(
+        let ctx = crate::promql::plan::LoweringContext::for_instant(
             at_ms,
             duration_to_ms(opts.lookback_delta),
         );
-        explain_v2(query, &ctx)
+        explain_query(query, &ctx)
     }
 
     /// Dry-run EXPLAIN for range queries.
@@ -1387,7 +1385,7 @@ impl TsdbEngine {
         range: impl RangeBounds<SystemTime>,
         step: Duration,
         opts: &QueryOptions,
-    ) -> std::result::Result<crate::promql::v2::plan::ExplainResult, QueryError> {
+    ) -> std::result::Result<crate::promql::plan::ExplainResult, QueryError> {
         let (start, end) = crate::util::range_bounds_to_system_time(range);
         let start_ms = system_time_to_ms(start);
         let end_ms = system_time_to_ms(end);
@@ -1397,13 +1395,13 @@ impl TsdbEngine {
                 "step must be greater than zero".to_string(),
             ));
         }
-        let ctx = crate::promql::v2::plan::LoweringContext::new(
+        let ctx = crate::promql::plan::LoweringContext::new(
             start_ms,
             end_ms,
             step_ms,
             duration_to_ms(opts.lookback_delta),
         );
-        explain_v2(query, &ctx)
+        explain_query(query, &ctx)
     }
 
     pub(crate) async fn find_series(
@@ -2646,9 +2644,9 @@ mod tests {
         assert_eq!(samples[0].labels.get("host"), Some("server1"));
     }
 
-    // ── v2 engine wiring tests ────────────────────────────────────────
+    // ── Engine wiring tests ───────────────────────────────────────────
 
-    mod v2_wiring_tests {
+    mod wiring_tests {
         use super::*;
         use crate::testing::columnar_stress::{
             Oracle, Scenario, ScenarioConfig, assert_grouped_count_matrix,
@@ -2675,12 +2673,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_instant_query_v2_selector_returns_one_sample_per_series() {
+        async fn should_eval_instant_query_selector_returns_one_sample_per_series() {
             // given: two series in a single bucket
             let tsdb = create_tsdb_with_data().await;
             let query_time = UNIX_EPOCH + Duration::from_secs(4100);
 
-            // when: run the instant selector via the v2 entry point
+            // when: run the instant selector via the engine entry point
             let opts = QueryOptions::default();
             let result = tsdb
                 .eval_query("http_requests", Some(query_time), &opts)
@@ -2704,7 +2702,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_range_query_v2_produces_samples_per_step() {
+        async fn should_eval_range_query_produces_samples_per_step() {
             // given: a counter with 3 samples in one bucket
             let tsdb = create_tsdb_with_counter().await;
             // Query window straddling the samples — step 10s.
@@ -2733,7 +2731,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_rate_over_counter_v2_matches_expected_rate() {
+        async fn should_eval_rate_over_counter_matches_expected_rate() {
             // given: counter 10 → 20 → 30 over 20 seconds
             let tsdb = create_tsdb_with_counter().await;
             // Evaluate instant rate over a [1m] window ending at 4020s;
@@ -2772,22 +2770,21 @@ mod tests {
             // memory cap so every operator allocation trips.
             let tsdb = create_tsdb_with_data().await;
             let at_ms = 4_100_000i64;
-            let ctx = crate::promql::v2::plan::LoweringContext::for_instant(at_ms, 300_000);
+            let ctx = crate::promql::plan::LoweringContext::for_instant(at_ms, 300_000);
             let reader = tsdb.query_reader_for_ranges(&[(0, 10_000)]).await.unwrap();
-            let source = Arc::new(crate::promql::v2::source_adapter::QueryReaderSource::new(
+            let source = Arc::new(crate::promql::source_adapter::QueryReaderSource::new(
                 Arc::new(reader),
             ));
             // 1 byte cap — any allocation fails.
-            let reservation = crate::promql::v2::memory::MemoryReservation::new(1);
+            let reservation = crate::promql::memory::MemoryReservation::new(1);
             let expr = promql_parser::parser::parse("http_requests").unwrap();
-            let plan = crate::promql::v2::plan::lower(&expr, &ctx).unwrap();
+            let plan = crate::promql::plan::lower(&expr, &ctx).unwrap();
 
             // when: build + drive. We expect the operator to surface a
             // `MemoryLimit` error either at build time (scratch reservation)
             // or on the first `next()` poll (per-batch output reservation).
             let built =
-                crate::promql::v2::plan::build_physical_plan(plan, &source, reservation, &ctx)
-                    .await;
+                crate::promql::plan::build_physical_plan(plan, &source, reservation, &ctx).await;
             let err: String = match built {
                 Err(e) => e.to_string(),
                 Ok(mut phys) => {
@@ -2810,7 +2807,7 @@ mod tests {
 
         #[tokio::test]
         async fn should_return_query_error_for_unknown_function() {
-            // given: a query using a function v2 does not lower
+            // given: a query using a function the engine does not lower
             let tsdb = create_tsdb_with_data().await;
             // when
             let opts = QueryOptions::default();
@@ -2827,7 +2824,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_time_function_v2_as_scalar() {
+        async fn should_eval_time_function_as_scalar() {
             // given
             let tsdb = create_tsdb_with_data().await;
             let query_time = UNIX_EPOCH + Duration::from_millis(1);
@@ -2853,7 +2850,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_vector_time_v2_as_vector() {
+        async fn should_eval_vector_time_as_vector() {
             // given
             let tsdb = create_tsdb_with_data().await;
             let query_time = UNIX_EPOCH + Duration::from_secs(5);
@@ -2877,7 +2874,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_calendar_function_v2() {
+        async fn should_eval_calendar_function() {
             // given
             let tsdb = create_tsdb_with_data().await;
             let query_time = UNIX_EPOCH;
@@ -2900,7 +2897,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_label_replace_v2() {
+        async fn should_eval_label_replace() {
             // given
             let tsdb = create_tsdb_with_data().await;
             let query_time = UNIX_EPOCH + Duration::from_secs(4100);
@@ -2928,7 +2925,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_label_join_v2() {
+        async fn should_eval_label_join() {
             // given
             let tsdb = create_tsdb_with_data().await;
             let query_time = UNIX_EPOCH + Duration::from_secs(4100);
@@ -2959,7 +2956,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_sum_by_label_v2() {
+        async fn should_eval_sum_by_label() {
             // given: two series under the same metric name, grouped by env
             let tsdb = create_tsdb_with_data().await;
             let query_time = UNIX_EPOCH + Duration::from_secs(4100);
@@ -3017,7 +3014,7 @@ mod tests {
         /// Subquery end-to-end at >512 series (RFC 0007 6.3.9 audit item
         /// 10). Ignored because `SubqueryOp`'s
         /// `tokio::task::block_in_place` path inside
-        /// [`build_subquery`](crate::promql::v2::plan::physical) re-invokes
+        /// [`build_subquery`](crate::promql::plan::physical) re-invokes
         /// the child factory synchronously per outer step and does not
         /// release the child's reservation on drop, causing the 1 GiB
         /// plan-time cap to fill before the query completes. This is a
@@ -3117,7 +3114,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn should_eval_v2_long_window_stress_regression_instant_probes() {
+        async fn should_eval_long_window_stress_regression_instant_probes() {
             // given
             let (scenario, oracle, tsdb) =
                 create_columnar_stress_fixture(ScenarioConfig::regression()).await;
@@ -3176,7 +3173,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn should_eval_v2_long_window_stress_regression_range_queries() {
+        async fn should_eval_long_window_stress_regression_range_queries() {
             // given
             let (scenario, oracle, tsdb) =
                 create_columnar_stress_fixture(ScenarioConfig::regression()).await;
@@ -3236,10 +3233,10 @@ mod tests {
         }
 
         /// Larger ignored soak for RFC 0008. Invoke with:
-        /// `cargo test -p opendata-timeseries should_eval_v2_long_window_stress_soak -- --ignored --nocapture`
+        /// `cargo test -p opendata-timeseries should_eval_long_window_stress_soak -- --ignored --nocapture`
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[ignore]
-        async fn should_eval_v2_long_window_stress_soak() {
+        async fn should_eval_long_window_stress_soak() {
             // given
             let (scenario, oracle, tsdb) =
                 create_columnar_stress_fixture(ScenarioConfig::soak()).await;
@@ -3297,13 +3294,12 @@ mod tests {
             assert_grouped_rate_matrix(&rate_matrix, &scenario, &oracle);
         }
 
-        // ── Read-only reader v2 tests (RFC 0007 unit 7.0) ────────────
+        // ── Read-only reader tests (RFC 0007 unit 7.0) ───────────────
         //
-        // These verify that the v2 engine runs through the
+        // These verify that the engine runs through the
         // `TsdbReadEngine` trait defaults on both the writer (`Tsdb`)
         // and the read-only `TimeSeriesDbReader`, so reader-only prod
-        // binaries exercise the
-        // columnar engine instead of silently falling back to v1.
+        // binaries exercise the columnar engine.
 
         /// Build a writer + reader pair on shared storage, ingest a
         /// counter spanning 3 samples, flush, and return both handles.
@@ -3325,12 +3321,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_instant_query_v2_on_read_only_reader_returns_one_sample_per_series() {
+        async fn should_eval_instant_query_on_read_only_reader_returns_one_sample_per_series() {
             // given: counter ingested via writer, read through a reader
             let (_tsdb, reader) = create_writer_and_reader_with_counter().await;
             let query_time = UNIX_EPOCH + Duration::from_secs(4_020);
 
-            // when: the reader's v2 entry point evaluates the selector
+            // when: the reader's entry point evaluates the selector
             let opts = QueryOptions::default();
             let result = reader
                 .eval_query("req_total", Some(query_time), &opts)
@@ -3349,14 +3345,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn should_eval_range_query_v2_on_read_only_reader_produces_samples_per_step() {
+        async fn should_eval_range_query_on_read_only_reader_produces_samples_per_step() {
             // given: counter ingested via writer, read through a reader
             let (_tsdb, reader) = create_writer_and_reader_with_counter().await;
             let start = UNIX_EPOCH + Duration::from_secs(4_000);
             let end = UNIX_EPOCH + Duration::from_secs(4_020);
             let step = Duration::from_secs(10);
 
-            // when: the reader's v2 range entry point evaluates the query
+            // when: the reader's range entry point evaluates the query
             let opts = QueryOptions::default();
             let result = reader
                 .eval_query_range_value("req_total", start..=end, step, &opts)
@@ -3385,7 +3381,7 @@ mod tests {
             let end = UNIX_EPOCH + Duration::from_secs(4_020);
             let step = Duration::from_secs(10);
 
-            // when: both engines run the identical v2 range query
+            // when: both engines run the identical range query
             let opts = QueryOptions::default();
             let query = "rate(req_total[1m])";
             let writer_result = tsdb

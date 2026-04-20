@@ -124,8 +124,8 @@ impl Operator for CoalesceOp {
 mod tests {
     use super::*;
     use crate::model::{Label, Labels};
-    use crate::promql::v2::batch::{BitSet, SchemaRef, SeriesSchema};
-    use crate::promql::v2::operator::StepGrid;
+    use crate::promql::batch::{BitSet, SchemaRef, SeriesSchema};
+    use crate::promql::operator::StepGrid;
     use std::sync::Arc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 

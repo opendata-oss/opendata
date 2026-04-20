@@ -1,4 +1,4 @@
-//! The [`Operator`] trait that every node in the v2 query plan implements,
+//! The [`Operator`] trait that every node in the query plan implements,
 //! plus the two pieces of plan-time metadata every operator carries:
 //! [`StepGrid`] (the `(start, end, step)` timeline batches land on) and
 //! [`OperatorSchema`] (series roster + step grid — everything a consumer
@@ -52,7 +52,7 @@ impl OperatorSchema {
     }
 }
 
-/// The one trait every v2 query-plan node implements. Consumers call
+/// The one trait every query-plan node implements. Consumers call
 /// [`Self::next`] to pull the next [`StepBatch`], or [`Self::schema`] to
 /// learn the output shape before polling.
 ///

@@ -5,8 +5,8 @@
 //! sorted before keying). Concurrent misses on the same key may both fetch;
 //! last write wins. Errors are never cached.
 //!
-//! Deliberately separate from v1's `CachedQueryReader` / `QueryReaderEvalCache`,
-//! which couple to semaphores, bucket-list memoisation, and stats v2 doesn't need.
+//! Scoped narrowly to index dedup: bucket-list memoisation, semaphores, and
+//! query stats are handled elsewhere.
 
 use std::sync::Arc;
 
@@ -35,14 +35,14 @@ type ForwardSeriesValue = Arc<Option<SeriesSpec>>;
 /// callers don't own fan-out) and per-key (`inverted_index_term` /
 /// `forward_index_one`, used by the source adapter to parallelise at its
 /// own layer and keep per-call traces).
-pub(crate) struct V2IndexCache {
+pub(crate) struct IndexCache {
     inverted: DashMap<InvertedKey, InvertedValue>,
     forward: DashMap<ForwardKey, ForwardValue>,
     inverted_terms: DashMap<(TimeBucket, Label), InvertedTermValue>,
     forward_series: DashMap<(TimeBucket, SeriesId), ForwardSeriesValue>,
 }
 
-impl V2IndexCache {
+impl IndexCache {
     pub(crate) fn new() -> Self {
         Self {
             inverted: DashMap::new(),
@@ -353,7 +353,7 @@ mod tests {
     async fn should_return_same_arc_for_repeated_inverted_index_fetches_with_identical_terms() {
         // given
         let reader = CountingReader::new();
-        let cache = V2IndexCache::new();
+        let cache = IndexCache::new();
         let b = bucket(0);
         let terms = vec![label("__name__", "m")];
 
@@ -370,7 +370,7 @@ mod tests {
     async fn should_normalize_unsorted_terms_when_keying_inverted_index() {
         // given
         let reader = CountingReader::new();
-        let cache = V2IndexCache::new();
+        let cache = IndexCache::new();
         let b = bucket(0);
         let unsorted = vec![label("z", "1"), label("a", "2"), label("m", "3")];
         let sorted = {
@@ -392,7 +392,7 @@ mod tests {
     async fn should_return_same_arc_for_repeated_forward_index_fetches_with_identical_series_ids() {
         // given
         let reader = CountingReader::new();
-        let cache = V2IndexCache::new();
+        let cache = IndexCache::new();
         let b = bucket(0);
         let ids: Vec<SeriesId> = vec![3, 1, 2];
         let ids_other_order: Vec<SeriesId> = vec![1, 2, 3];
@@ -413,7 +413,7 @@ mod tests {
     async fn should_treat_different_buckets_as_separate_cache_entries() {
         // given
         let reader = CountingReader::new();
-        let cache = V2IndexCache::new();
+        let cache = IndexCache::new();
         let b1 = bucket(0);
         let b2 = bucket(60);
         let terms = vec![label("__name__", "m")];
@@ -431,7 +431,7 @@ mod tests {
     async fn should_propagate_reader_errors_without_caching_them() {
         // given: the reader fails the first call, then succeeds
         let reader = TransientFailureReader::new(1);
-        let cache = V2IndexCache::new();
+        let cache = IndexCache::new();
         let b = bucket(0);
         let terms = vec![label("__name__", "m")];
 

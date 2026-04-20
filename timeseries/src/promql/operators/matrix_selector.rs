@@ -525,8 +525,6 @@ enum State<'a> {
     Done,
     Errored,
     Transitioning,
-    #[allow(dead_code)]
-    _Phantom(std::marker::PhantomData<&'a ()>),
 }
 
 // ---------------------------------------------------------------------------
@@ -851,7 +849,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> MatrixSelectorOp<'a, S> {
                     self.state = State::Done;
                     return Poll::Ready(None);
                 }
-                State::Transitioning | State::_Phantom(_) => {
+                State::Transitioning => {
                     unreachable!("transient state observed in windows()");
                 }
             }
@@ -888,7 +886,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::model::{Label, Labels, STALE_NAN};
-    use crate::promql::v2::source::{ResolvedSeriesChunk, SampleBlock};
+    use crate::promql::source::{ResolvedSeriesChunk, SampleBlock};
 
     // ---- mock source (same shape 3a.1 uses) -----------------------------
 

@@ -1460,9 +1460,7 @@ mod tests {
     use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
     use crate::model::{Label, Labels};
-    use crate::promql::v2::source::{
-        ResolvedSeriesChunk, SampleBatch, SampleBlock, SamplesRequest,
-    };
+    use crate::promql::source::{ResolvedSeriesChunk, SampleBatch, SampleBlock, SamplesRequest};
 
     // ---- mock source -----------------------------------------------------
 
@@ -1728,7 +1726,7 @@ mod tests {
         let ctx = make_ctx();
         // Wrap matrix selector in a Rollup so it has a legal parent.
         let plan = LogicalPlan::Rollup {
-            kind: crate::promql::v2::operators::rollup::RollupKind::Rate,
+            kind: crate::promql::operators::rollup::RollupKind::Rate,
             child: Box::new(LogicalPlan::MatrixSelector {
                 selector: make_selector("m"),
                 range_ms: 5_000,
@@ -2029,7 +2027,7 @@ mod tests {
         )]));
         let ctx = LoweringContext::new(0, 5_000, 1_000, 5 * 60_000);
         let plan = LogicalPlan::Rollup {
-            kind: crate::promql::v2::operators::rollup::RollupKind::Rate,
+            kind: crate::promql::operators::rollup::RollupKind::Rate,
             child: Box::new(LogicalPlan::Subquery {
                 child: Box::new(LogicalPlan::VectorSelector {
                     selector: make_selector("m"),
@@ -2093,7 +2091,7 @@ mod tests {
         )]));
         let ctx = make_ctx();
         let plan = LogicalPlan::Rollup {
-            kind: crate::promql::v2::operators::rollup::RollupKind::Rate,
+            kind: crate::promql::operators::rollup::RollupKind::Rate,
             child: Box::new(LogicalPlan::MatrixSelector {
                 selector: make_selector("m"),
                 range_ms: 5_000,
@@ -2270,8 +2268,8 @@ mod tests {
     // Unit 4.5: exchange-operator insertion tests
     // ------------------------------------------------------------------
 
-    use crate::promql::v2::operators::concurrent::DEFAULT_CHANNEL_BOUND;
-    use crate::promql::v2::plan::parallelism::Parallelism;
+    use crate::promql::operators::concurrent::DEFAULT_CHANNEL_BOUND;
+    use crate::promql::plan::parallelism::Parallelism;
 
     /// Build a mock source with `n` identical single-sample series under
     /// metric `m`. Each series gets a distinct `i` label so they pass the
@@ -2499,7 +2497,7 @@ mod tests {
         let source = mock_source_with_n_series(200);
         let ctx = make_ctx();
         let plan = LogicalPlan::Rollup {
-            kind: crate::promql::v2::operators::rollup::RollupKind::Rate,
+            kind: crate::promql::operators::rollup::RollupKind::Rate,
             child: Box::new(LogicalPlan::MatrixSelector {
                 selector: make_selector("m"),
                 range_ms: 5_000,

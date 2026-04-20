@@ -54,7 +54,7 @@ pub(crate) trait BucketQueryReader: Send + Sync {
     /// Fetch a single forward-index entry by series id. Returns `None` if
     /// the series isn't present in the bucket. Intended for callers that
     /// want to own fan-out concurrency themselves (see
-    /// `crate::promql::v2::source_adapter`).
+    /// `crate::promql::source_adapter`).
     async fn forward_index_one(&self, series_id: SeriesId) -> Result<Option<SeriesSpec>>;
 
     /// Fetch a single inverted-index posting by term. Returns `None` if

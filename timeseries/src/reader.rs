@@ -320,13 +320,13 @@ impl TsdbReadEngine for TimeSeriesDbReader {
         ranges: &[(i64, i64)],
     ) -> Result<ReaderQueryReader> {
         let buckets = {
-            let _g = crate::promql::v2::trace::Scope::enter("list_buckets");
+            let _g = crate::promql::trace::Scope::enter("list_buckets");
             self.storage.get_buckets_for_ranges(ranges).await?
         };
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
-                let _g = crate::promql::v2::trace::Scope::enter("bucket_load");
+                let _g = crate::promql::trace::Scope::enter("bucket_load");
                 let mini = self.get_or_load_bucket(bucket).await;
                 (bucket, mini)
             })

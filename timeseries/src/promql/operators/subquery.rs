@@ -503,8 +503,8 @@ impl WindowStream for SubqueryOp {
 mod tests {
     use super::*;
     use crate::model::{Label, Labels, STALE_NAN};
-    use crate::promql::v2::batch::BitSet;
-    use crate::promql::v2::operators::rollup::{RollupKind, RollupOp};
+    use crate::promql::batch::BitSet;
+    use crate::promql::operators::rollup::{RollupKind, RollupOp};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};

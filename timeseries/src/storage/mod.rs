@@ -200,7 +200,7 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     /// Fetch a single inverted-index posting for `(bucket, term)`.
     /// Returns `None` when the term isn't present in the bucket.
     ///
-    /// Per-term granularity by design: callers (e.g. the v2 query
+    /// Per-term granularity by design: callers (e.g. the query
     /// adapter) parallelise at *their* layer so concurrency budget and
     /// caching can be managed end-to-end. The previous batched variant
     /// looped sequentially and was a silent bottleneck.
@@ -220,8 +220,8 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         let rec = self.get(key).await?;
         match rec {
             Some(r) => {
-                crate::promql::v2::trace::record_bytes(
-                    crate::promql::v2::trace::IoKind::InvertedIndexFetch,
+                crate::promql::trace::record_bytes(
+                    crate::promql::trace::IoKind::InvertedIndexFetch,
                     r.value.len() as u64,
                 );
                 let value = InvertedIndexValue::decode(r.value.as_ref())?;
@@ -249,8 +249,8 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         let rec = self.get(key).await?;
         match rec {
             Some(r) => {
-                crate::promql::v2::trace::record_bytes(
-                    crate::promql::v2::trace::IoKind::ForwardIndexFetch,
+                crate::promql::trace::record_bytes(
+                    crate::promql::trace::IoKind::ForwardIndexFetch,
                     r.value.len() as u64,
                 );
                 let value = ForwardIndexValue::decode(r.value.as_ref())?;

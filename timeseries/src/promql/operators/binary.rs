@@ -27,7 +27,7 @@
 //! Set ops (`and`, `or`, `unless`) are label-structural, vector/vector only.
 //!
 //! `/` and `%` follow IEEE 754 (v1's evaluator incorrectly coerced
-//! division-by-zero to NaN; v2 matches `promqltest` goldens).
+//! division-by-zero to NaN; engine matches `promqltest` goldens).
 
 use std::sync::Arc;
 use std::task::{Context, Poll};

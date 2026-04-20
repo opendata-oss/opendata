@@ -24,7 +24,7 @@
 use promql_parser::label::{Matcher, Matchers};
 
 use super::plan_types::LogicalPlan;
-use crate::promql::v2::operators::binary::BinaryOpKind;
+use crate::promql::operators::binary::BinaryOpKind;
 
 /// Upper bound before the optimizer gives up. Small because rule interactions
 /// are shallow.
@@ -162,7 +162,7 @@ fn apply_scalar_op(op: BinaryOpKind, a: f64, b: f64) -> Option<f64> {
         BinaryOpKind::Add => Some(a + b),
         BinaryOpKind::Sub => Some(a - b),
         BinaryOpKind::Mul => Some(a * b),
-        // IEEE 754 division — matches the v2 `BinaryOp::apply_arith` at
+        // IEEE 754 division — matches the `BinaryOp::apply_arith` at
         // `operators/binary.rs:180-193` bit-for-bit (and Prometheus).
         BinaryOpKind::Div => Some(a / b),
         BinaryOpKind::Mod => Some(a % b),
@@ -345,10 +345,10 @@ fn matcher_eq(a: &Matcher, b: &Matcher) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::promql::v2::operators::aggregate::AggregateKind;
-    use crate::promql::v2::operators::rollup::RollupKind;
-    use crate::promql::v2::plan::lowering::{LoweringContext, lower};
-    use crate::promql::v2::plan::plan_types::{AggregateGrouping, Offset};
+    use crate::promql::operators::aggregate::AggregateKind;
+    use crate::promql::operators::rollup::RollupKind;
+    use crate::promql::plan::lowering::{LoweringContext, lower};
+    use crate::promql::plan::plan_types::{AggregateGrouping, Offset};
     use promql_parser::parser;
 
     const START_MS: i64 = 1_700_000_000_000;
@@ -528,7 +528,7 @@ mod tests {
     fn should_not_fold_identities_deferred_to_cost_based() {
         // given: `foo * 1` — the textbook "multiplicative identity"
         // rewrite. We deliberately *do not* implement this because
-        // `0 * NaN` preserves NaN under IEEE 754 (and the v2 Binary
+        // `0 * NaN` preserves NaN under IEEE 754 (and the Binary
         // operator's arith path at operators/binary.rs:180-193) — an
         // identity rewrite would change observability of NaN cells.
         // when + then: the Binary stays untouched (except children are
@@ -563,7 +563,7 @@ mod tests {
         // given: `NaN + 1` — NaN is a well-defined scalar; IEEE 754
         // arithmetic propagates NaN. The existing engine's
         // `apply_binary_op` (evaluator.rs:2153-2177) simply returns
-        // `a + b`, which yields NaN. The v2 Binary operator at
+        // `a + b`, which yields NaN. The Binary operator at
         // operators/binary.rs:180-193 likewise. Folding IS enabled
         // because the result is semantically identical.
         // when: optimized

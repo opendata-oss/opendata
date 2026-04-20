@@ -341,7 +341,7 @@ async fn handle_query(
     }
     let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
     if tracing_on {
-        let collector = crate::promql::v2::trace::TraceCollector::new();
+        let collector = crate::promql::trace::TraceCollector::new();
         let outcome = state
             .tsdb
             .eval_query_traced(
@@ -392,7 +392,7 @@ async fn handle_query_range(
     }
     let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
     if tracing_on {
-        let collector = crate::promql::v2::trace::TraceCollector::new();
+        let collector = crate::promql::trace::TraceCollector::new();
         let outcome = state
             .tsdb
             .eval_query_range_traced(
@@ -422,10 +422,10 @@ async fn handle_query_range(
 /// `text/plain` (`pretty=true`). Errors are rendered as the normal
 /// `ExplainResponse` error shape regardless of `pretty`.
 fn render_explain(
-    result: Result<crate::promql::v2::plan::ExplainResult, crate::error::QueryError>,
+    result: Result<crate::promql::plan::ExplainResult, crate::error::QueryError>,
     pretty: bool,
 ) -> Response {
-    use crate::promql::v2::plan::pretty_print;
+    use crate::promql::plan::pretty_print;
 
     if pretty {
         match result {

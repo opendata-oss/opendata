@@ -132,8 +132,8 @@ impl BucketQueryReader for MiniQueryReader {
 
         match record {
             Some(record) => {
-                crate::promql::v2::trace::record_bytes(
-                    crate::promql::v2::trace::IoKind::SamplesFetch,
+                crate::promql::trace::record_bytes(
+                    crate::promql::trace::IoKind::SamplesFetch,
                     record.value.len() as u64,
                 );
                 let raw_len = record.value.len() as u64;
@@ -152,8 +152,8 @@ impl BucketQueryReader for MiniQueryReader {
                 // Deserialize's bytes are the same bytes the fetch returned —
                 // it's decoding that payload. Attribute here so both kinds
                 // report throughput.
-                crate::promql::v2::trace::record_bytes(
-                    crate::promql::v2::trace::IoKind::Deserialize,
+                crate::promql::trace::record_bytes(
+                    crate::promql::trace::IoKind::Deserialize,
                     raw_len,
                 );
                 Ok(samples)
@@ -165,14 +165,14 @@ impl BucketQueryReader for MiniQueryReader {
 
 // ─── trace helpers ──────────────────────────────────────────────────
 
-use crate::promql::v2::trace::IoKind as IoKindLocal;
+use crate::promql::trace::IoKind as IoKindLocal;
 
 async fn io_trace_async<F: std::future::Future<Output = T>, T>(kind: IoKindLocal, fut: F) -> T {
-    crate::promql::v2::trace::record_async(kind, fut).await
+    crate::promql::trace::record_async(kind, fut).await
 }
 
 fn io_trace_sync<T>(kind: IoKindLocal, f: impl FnOnce() -> T) -> T {
-    crate::promql::v2::trace::record_sync(kind, f)
+    crate::promql::trace::record_sync(kind, f)
 }
 
 pub(crate) struct MiniTsdb {

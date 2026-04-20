@@ -374,16 +374,6 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> WindowStream for MatrixWindowSource
 // ---------------------------------------------------------------------------
 
 mod rollup_fns {
-    // Ported verbatim from `timeseries/src/promql/functions.rs`:
-    // - extrapolated_rate / counter_increase_correction (lines 1008-1077)
-    // - kahan_inc (lines 23-36)
-    // - avg_kahan (lines 77-113)
-    // - variance_kahan (lines 1245-1265)
-    //
-    // Kept here (rather than re-using the old module) because v2
-    // operators must not depend on `evaluator.rs` / `pipeline.rs` /
-    // `functions.rs`. v2 is an independent engine.
-
     /// Kahan-Neumaier compensated summation step. `#[inline(never)]`
     /// matches the existing implementation to guard against compiler
     /// reordering that would change IEEE-754 output (cf. Prometheus
@@ -700,9 +690,9 @@ mod rollup_fns {
 mod tests {
     use super::*;
     use crate::model::{Label, Labels};
-    use crate::promql::v2::batch::{SchemaRef, SeriesSchema};
-    use crate::promql::v2::operator::StepGrid;
-    use crate::promql::v2::operators::matrix_selector::CellIndex;
+    use crate::promql::batch::{SchemaRef, SeriesSchema};
+    use crate::promql::operator::StepGrid;
+    use crate::promql::operators::matrix_selector::CellIndex;
     use std::sync::Arc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 

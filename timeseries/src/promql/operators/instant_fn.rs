@@ -457,8 +457,8 @@ impl<C: Operator> Operator for InstantFnOp<C> {
 mod tests {
     use super::*;
     use crate::model::{Label, Labels};
-    use crate::promql::v2::batch::{BitSet, SchemaRef, SeriesSchema};
-    use crate::promql::v2::operator::StepGrid;
+    use crate::promql::batch::{BitSet, SchemaRef, SeriesSchema};
+    use crate::promql::operator::StepGrid;
     use std::sync::Arc;
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
@@ -1186,8 +1186,8 @@ mod tests {
 
     #[test]
     fn should_apply_abs_over_vector_selector_pipeline() {
-        use crate::promql::v2::operators::vector_selector::{BatchShape, VectorSelectorOp};
-        use crate::promql::v2::source::{
+        use crate::promql::operators::vector_selector::{BatchShape, VectorSelectorOp};
+        use crate::promql::source::{
             ResolvedSeriesChunk, ResolvedSeriesRef, SampleBatch, SampleBlock, SamplesRequest,
             SeriesSource, TimeRange,
         };
