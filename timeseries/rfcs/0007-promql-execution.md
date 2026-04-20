@@ -253,6 +253,46 @@ deduplicates index lookups within the query because `resolve` fan-out (cross-buc
 1024 in-flight gets) would otherwise issue the same `(bucket, term)` or `(bucket, series_id)` fetch
 multiple times from parallel tasks. It caches inverted and forward index fetches.
 
+### Introspection: EXPLAIN and Trace
+
+Every query endpoint accepts two opt-in flags that surface the planner and executor internals without
+changing the result shape.
+
+**`?explain=true`** short-circuits evaluation and returns a three-stage dry run: unoptimised logical,
+optimised logical, and a pure description of the physical tree the planner would build. No operators
+are instantiated and no storage I/O is issued. Add `?pretty=true` to get a DataFusion-style indented
+text tree instead of the JSON `ExplainResult`.
+
+**`?trace=true`** runs the query normally and attaches a structured trace to the response. The
+physical planner inserts a transparent `TracingOperator` around each concrete operator; per-op poll
+time is recorded without the operator knowing. Storage I/O is bucketed separately (`SamplesFetch`,
+`Deserialize`, `ForwardIndexFetch`, inverted-index fetch) and attributed to the currently-polling
+operator via a thread-local node id. The same spans are emitted to `tracing` whenever `RUST_LOG`
+allows, so out-of-band log capture works without the flag.
+
+```
+GET /api/v1/query?query=sum(rate(http_requests_total[5m]))&explain=true&pretty=true
+GET /api/v1/query_range?query=...&start=...&end=...&step=15s&trace=true
+```
+
+## Testing Strategy
+
+Tests are layered to match the architecture: each operator is verified in isolation, the planner is
+pinned with snapshots, and full-pipeline behaviour is exercised by scenarios and HTTP e2e tests.
+
+| Layer            | Location                          | What it covers                                                         |
+|------------------|-----------------------------------|------------------------------------------------------------------------|
+| Operator unit    | `operators/*.rs` `#[cfg(test)]`   | One operator vs. mock child / source; state edges, validity, memory.   |
+| Planner golden   | `plan/explain.rs`                 | Snapshots logical → optimised → physical trees for canonical queries.  |
+| Stress scenario  | `testing/columnar_stress.rs`      | Multi-bucket synthetic load (~1k–18k series) vs. precomputed `Oracle`. |
+| HTTP end-to-end  | `tests/http_server.rs`            | Drives `/api/v1/query{,_range}` through the full stack.                |
+| Microbenchmarks  | `benches/v2_engine_micorbench.rs` | Criterion benches on a `WarmRangeQueryHarness`.                        |
+| Manual Testing   | `N/A`                             | Ran queries with ?explain=true and ?trace=true                         |
+
+**Known gap.** The `rate()` portion of the range-query stress scenario has a ~1.5× inflation at
+bucket boundaries, pointing at cross-bucket counter handling. Instant probes and the count/sum
+portions of the same scenario pass. Tracked for a dedicated fix pass rather than blocking this RFC.
+
 ## Alternatives Considered
 
 1. Use `Arrow` for the on-the-wire protocol. This was tempting since it would implement some SIMD
