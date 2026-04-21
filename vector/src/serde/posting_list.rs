@@ -17,11 +17,20 @@
 //!
 //! ## Value Format
 //!
-//! The value is a FixedElementArray of PostingUpdate entries, **sorted by id**.
-//! Each entry contains:
-//! - `posting_type`: 0x0 for Append, 0x1 for Delete
-//! - `id`: Internal vector ID (u64)
-//! - `vector`: The full vector data (dimensions * f32)
+//! The stored value is a split layout: a sorted-by-id header of fixed-size
+//! `(id, offset)` entries, followed by a contiguous vector data blob.
+//!
+//! ```text
+//! +-----------------------------------------------------------------+
+//! |  count:    u32 LE                                               |
+//! |  postings: count * (id: u64 BE, offset: u32 LE)                 |
+//! |  data:     FixedElementArray<f32>  (LE f32s, back-to-back)      |
+//! +-----------------------------------------------------------------+
+//! ```
+//!
+//! `offset` is a byte offset into the `data` section. The sentinel value
+//! `0xFFFFFFFF` (`u32::MAX`) marks a delete entry — delete entries occupy a
+//! slot in the header but contribute no bytes to `data`.
 //!
 //! ## Merge Operators
 //!
@@ -32,16 +41,19 @@
 
 use super::{Decode, Encode, EncodingError};
 use crate::serde::vector_id::VectorId;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
+use tracing::debug_span;
 
-/// Byte value for append posting type in encoded format.
-pub(crate) const POSTING_UPDATE_TYPE_APPEND_BYTE: u8 = 0x0;
+/// Offset sentinel in the posting header meaning "this is a delete entry".
+pub(crate) const POSTING_DELETE_OFFSET: u32 = u32::MAX;
 
-/// Byte value for delete posting type in encoded format.
-pub(crate) const POSTING_UPDATE_TYPE_DELETE_BYTE: u8 = 0x1;
+/// Size of a single posting header entry: `id(u64) + offset(u32)`.
+const POSTING_ENTRY_SIZE: usize = 8 + 4;
+
+/// Size of the `count` prefix at the start of the encoded value.
+const COUNT_PREFIX_SIZE: usize = 4;
 
 /// A single posting update entry containing vector data.
 ///
@@ -49,13 +61,18 @@ pub(crate) const POSTING_UPDATE_TYPE_DELETE_BYTE: u8 = 0x1;
 /// within a centroid's posting list.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PostingUpdate {
-    /// The type of update: Append or Delete.
+    /// Append a vector to the posting list (or overwrite if id already exists).
     Append {
         /// Internal vector ID.
         id: VectorId,
-        /// The full vector data.
-        vector: Arc<Vec<f32>>,
+        /// Raw f32 vector bytes. Length is always `dimensions * 4`.
+        ///
+        /// The bytes are produced from a `Vec<f32>` via [`Bytes::from_owner`]
+        /// so they are guaranteed to have `align_of::<f32>()` alignment.
+        /// Consumers can `bytemuck::cast_slice` them back to `&[f32]`.
+        vector: Bytes,
     },
+    /// Delete the entry for `id` from the posting list.
     Delete {
         /// Internal vector ID
         id: VectorId,
@@ -63,11 +80,14 @@ pub(crate) enum PostingUpdate {
 }
 
 impl PostingUpdate {
-    /// Create a new append posting update.
+    /// Create a new append posting update from a `Vec<f32>`.
+    ///
+    /// The `Vec<f32>` is moved into a `Bytes` via [`Bytes::from_owner`] so the
+    /// underlying storage keeps its f32 alignment.
     pub(crate) fn append(id: VectorId, vector: Vec<f32>) -> Self {
         Self::Append {
             id,
-            vector: Arc::new(vector),
+            vector: aligned_f32_bytes_from_vec(vector),
         }
     }
 
@@ -97,98 +117,16 @@ impl PostingUpdate {
     }
 
     /// Returns the vector data if this is an Append, None if Delete.
+    ///
+    /// # Panics
+    /// Panics if the backing `Bytes` is not aligned to `align_of::<f32>()`.
+    /// The public constructors (`append`, decode) all produce aligned
+    /// buffers, so this only fires on hand-constructed misaligned values.
     #[allow(dead_code)]
     pub(crate) fn vector(&self) -> Option<&[f32]> {
         match self {
-            Self::Append { vector, .. } => Some(vector.as_slice()),
+            Self::Append { vector, .. } => Some(f32_slice_from_aligned_bytes(vector)),
             Self::Delete { .. } => None,
-        }
-    }
-
-    /// Encode this posting update to bytes.
-    ///
-    /// Format: type (1 byte) + id (8 bytes LE) + vector (N*4 bytes, each f32 LE)
-    pub(crate) fn encode(&self, buf: &mut BytesMut) {
-        match self {
-            Self::Append { id, vector } => {
-                buf.put_u8(POSTING_UPDATE_TYPE_APPEND_BYTE);
-                id.encode(buf);
-                for &val in vector.as_slice() {
-                    buf.put_f32_le(val);
-                }
-            }
-            Self::Delete { id } => {
-                buf.put_u8(POSTING_UPDATE_TYPE_DELETE_BYTE);
-                id.encode(buf);
-            }
-        }
-    }
-
-    /// Decode a posting update from bytes.
-    ///
-    /// Requires knowing the dimensions to determine vector size for Append entries.
-    pub fn decode(buf: &mut &[u8], dimensions: usize) -> Result<Self, EncodingError> {
-        let min_size = 1 + 8; // type + id
-        if buf.remaining() < min_size {
-            return Err(EncodingError {
-                message: format!(
-                    "Buffer too short for PostingUpdate: expected at least {} bytes, got {}",
-                    min_size,
-                    buf.remaining()
-                ),
-            });
-        }
-
-        let posting_type = buf.get_u8();
-        let id = VectorId::decode(buf)?;
-
-        if posting_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
-            let vector_size = dimensions * 4;
-            if buf.remaining() < vector_size {
-                return Err(EncodingError {
-                    message: format!(
-                        "Buffer too short for Append PostingUpdate vector: expected {} bytes, got {}",
-                        vector_size,
-                        buf.remaining()
-                    ),
-                });
-            }
-
-            let mut vector = Vec::with_capacity(dimensions);
-            for _ in 0..dimensions {
-                vector.push(buf.get_f32_le());
-            }
-
-            Ok(PostingUpdate::Append {
-                id,
-                vector: Arc::new(vector),
-            })
-        } else if posting_type == POSTING_UPDATE_TYPE_DELETE_BYTE {
-            Ok(PostingUpdate::Delete { id })
-        } else {
-            Err(EncodingError {
-                message: format!("Invalid posting type: 0x{:02x}", posting_type),
-            })
-        }
-    }
-
-    /// Returns the encoded size in bytes for an Append entry with given dimensionality.
-    #[cfg(test)]
-    pub fn encoded_size_append(dimensions: usize) -> usize {
-        1 + 8 + (dimensions * 4) // type + id + vector
-    }
-
-    /// Returns the encoded size in bytes for a Delete entry.
-    #[cfg(test)]
-    pub fn encoded_size_delete() -> usize {
-        1 + 8 // type + id
-    }
-
-    /// Returns the encoded size of this posting update.
-    pub fn encoded_size(&self) -> usize {
-        match self {
-            PostingUpdate::Append { vector, .. } => 1 + 8 + (vector.len() * 4),
-            PostingUpdate::Delete { .. } => 1 + 8,
         }
     }
 }
@@ -198,25 +136,10 @@ impl PostingUpdate {
 /// Each posting list maps a single centroid ID to the list of vector updates
 /// (appends or deletes) for that cluster.
 ///
-/// ## Value Layout
-///
-/// ```text
-/// +----------------------------------------------------------------+
-/// |  postings: FixedElementArray<PostingUpdate>                    |
-/// |            (no count prefix, elements back-to-back)            |
-/// +----------------------------------------------------------------+
-/// ```
-///
-/// Each PostingUpdate:
-/// ```text
-/// +--------+----------+----------------------------------+
-/// | type   | id       | vector                           |
-/// | 1 byte | 8 bytes  | dimensions * 4 bytes             |
-/// +--------+----------+----------------------------------+
-/// ```
+/// On-disk layout is documented at the module level.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PostingListValue {
-    /// List of posting updates (appends or deletes).
+    /// List of posting updates (appends or deletes), sorted by id.
     pub(crate) postings: Vec<PostingUpdate>,
 }
 
@@ -239,8 +162,6 @@ impl PostingListValue {
         posting_updates: Vec<PostingUpdate>,
     ) -> Result<Self, EncodingError> {
         // Deduplicate by id, keeping the last occurrence (most recent operation).
-        // We iterate in reverse so that when we encounter a duplicate, the first
-        // insertion (= last in original order) wins via the Entry API.
         let mut last_by_id = std::collections::HashMap::new();
         for (idx, update) in posting_updates.iter().enumerate() {
             last_by_id.insert(update.id(), idx);
@@ -272,39 +193,142 @@ impl PostingListValue {
         self.postings.iter()
     }
 
-    /// Encode to bytes (variable-length entries).
+    /// Encode to bytes in the split header/data layout described in the module docs.
     pub(crate) fn encode_to_bytes(&self) -> Bytes {
         if self.postings.is_empty() {
             return Bytes::new();
         }
 
-        let total_size: usize = self.postings.iter().map(|p| p.encoded_size()).sum();
-        let mut buf = BytesMut::with_capacity(total_size);
+        let count = u32::try_from(self.postings.len())
+            .expect("posting list length exceeds u32::MAX entries");
+        let header_size = COUNT_PREFIX_SIZE + POSTING_ENTRY_SIZE * self.postings.len();
+        let data_size: usize = self
+            .postings
+            .iter()
+            .map(|p| match p {
+                PostingUpdate::Append { vector, .. } => vector.len(),
+                PostingUpdate::Delete { .. } => 0,
+            })
+            .sum();
 
-        for posting in &self.postings {
-            posting.encode(&mut buf);
+        let mut buf = BytesMut::with_capacity(header_size + data_size);
+        buf.put_u32_le(count);
+
+        // Write postings header. For each append, record its byte offset in the
+        // yet-to-be-written data section.
+        let mut data_cursor: u32 = 0;
+        for p in &self.postings {
+            match p {
+                PostingUpdate::Append { id, vector } => {
+                    id.encode(&mut buf);
+                    buf.put_u32_le(data_cursor);
+                    data_cursor = data_cursor
+                        .checked_add(u32::try_from(vector.len()).expect("vector too large"))
+                        .expect("posting data section exceeds u32::MAX bytes");
+                }
+                PostingUpdate::Delete { id } => {
+                    id.encode(&mut buf);
+                    buf.put_u32_le(POSTING_DELETE_OFFSET);
+                }
+            }
+        }
+
+        // Data section: append vectors back-to-back in header order.
+        for p in &self.postings {
+            if let PostingUpdate::Append { vector, .. } = p {
+                buf.extend_from_slice(vector);
+            }
         }
 
         buf.freeze()
     }
 
-    /// Decode from bytes (variable-length entries).
+    /// Decode from bytes.
     ///
-    /// Requires knowing the dimensions to determine vector size for Append entries.
-    pub(crate) fn decode_from_bytes(buf: &[u8], dimensions: usize) -> Result<Self, EncodingError> {
+    /// Requires `dimensions` to know how many f32s belong to each append
+    /// entry.
+    ///
+    /// Takes `&Bytes` rather than `&[u8]` so each decoded `Append` can share
+    /// ownership of the input allocation: whenever the input's pointer plus
+    /// the entry offset lands on an f32-aligned address, we hand out a
+    /// `Bytes::slice` into the same buffer with no copy. When the resulting
+    /// address isn't aligned we fall back to copying that entry's vector
+    /// bytes into a fresh aligned allocation.
+    pub(crate) fn decode_from_bytes(buf: &Bytes, dimensions: usize) -> Result<Self, EncodingError> {
         if buf.is_empty() {
             return Ok(PostingListValue::new());
         }
-
-        let mut buf = buf;
-        let mut postings = Vec::new();
-
-        while buf.has_remaining() {
-            let posting = PostingUpdate::decode(&mut buf, dimensions)?;
-            postings.push(posting);
+        if buf.len() < COUNT_PREFIX_SIZE {
+            return Err(EncodingError {
+                message: format!(
+                    "Buffer too short for PostingListValue count: expected at least {} bytes, got {}",
+                    COUNT_PREFIX_SIZE,
+                    buf.len()
+                ),
+            });
         }
 
-        PostingListValue::from_posting_updates(postings)
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let header_size = COUNT_PREFIX_SIZE + POSTING_ENTRY_SIZE * count;
+        if buf.len() < header_size {
+            return Err(EncodingError {
+                message: format!(
+                    "Buffer too short for {} postings: expected at least {} bytes, got {}",
+                    count,
+                    header_size,
+                    buf.len()
+                ),
+            });
+        }
+
+        let data_start = header_size;
+        let data_len = buf.len() - data_start;
+        let vector_bytes = dimensions * 4;
+        let align = std::mem::align_of::<f32>();
+        let buf_ptr = buf.as_ptr() as usize;
+
+        let mut cursor = &buf[COUNT_PREFIX_SIZE..header_size];
+        let mut postings = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = VectorId::decode(&mut cursor)?;
+            let offset = u32::from_le_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+            cursor = &cursor[4..];
+
+            if offset == POSTING_DELETE_OFFSET {
+                postings.push(PostingUpdate::Delete { id });
+                continue;
+            }
+
+            let start = offset as usize;
+            let end = start
+                .checked_add(vector_bytes)
+                .ok_or_else(|| EncodingError {
+                    message: format!(
+                        "posting offset overflow: offset={}, vector_bytes={}",
+                        offset, vector_bytes
+                    ),
+                })?;
+            if end > data_len {
+                return Err(EncodingError {
+                    message: format!(
+                        "posting offset {} out of bounds: data size {}, entry ends at {}",
+                        offset, data_len, end
+                    ),
+                });
+            }
+            let abs_start = data_start + start;
+            let abs_end = data_start + end;
+            let vector = if (buf_ptr + abs_start).is_multiple_of(align) {
+                // Entry sits on an f32-aligned address — share the input
+                // buffer directly.
+                buf.slice(abs_start..abs_end)
+            } else {
+                aligned_f32_bytes_from_slice(&buf[abs_start..abs_end])
+            };
+            postings.push(PostingUpdate::Append { id, vector });
+        }
+
+        Ok(Self { postings })
     }
 }
 
@@ -314,11 +338,13 @@ impl Default for PostingListValue {
     }
 }
 
-/// K-way byte-level merge for posting lists across multiple operands.
+/// K-way merge for posting lists across multiple operands in the new format.
 ///
 /// Merges `existing` (oldest, priority 0) with `operands` (priority 1..N, newest last)
-/// using a min-heap over raw byte cursors. For equal IDs, the highest-priority (newest)
-/// entry wins. Operands are ordered oldest-to-newest per SlateDB convention.
+/// by sort-merging the fixed-size header entries on id, then copying each
+/// winner's vector bytes into a new data section with rewritten offsets.
+/// For equal IDs, the highest-priority (newest) entry wins. Operands are
+/// ordered oldest-to-newest per SlateDB convention.
 ///
 /// Short-circuits: returns the single input as-is when only one source is present.
 pub(crate) fn merge_batch_posting_list(
@@ -326,6 +352,9 @@ pub(crate) fn merge_batch_posting_list(
     operands: &[Bytes],
     dimensions: usize,
 ) -> Bytes {
+    let n_records = operands.len() + existing.is_some() as usize;
+    let _span = debug_span!("merge_posting_list", n_records = n_records).entered();
+
     // Short-circuit: single source, no merge needed
     if operands.is_empty() {
         return existing.unwrap_or_default();
@@ -334,48 +363,78 @@ pub(crate) fn merge_batch_posting_list(
         return operands[0].clone();
     }
 
-    let vector_size = dimensions * 4;
-    let append_size = 1 + 8 + vector_size;
-    let delete_size = 1 + 8;
+    let vector_bytes = dimensions * 4;
 
-    // Each cursor: (Bytes buffer, priority). Higher priority = newer.
-    // existing_value has priority 0, operands[0] has priority 1, ..., operands[N-1] has priority N.
     struct Cursor {
         buf: Bytes,
+        /// Byte offset of the next unread posting header entry into `buf`.
+        header_pos: usize,
+        /// One past the last header entry byte in `buf`.
+        header_end: usize,
+        /// Byte offset of the data section in `buf`.
+        data_start: usize,
         priority: usize,
     }
 
-    let peek_entry =
-        |buf: &[u8], append_size: usize, delete_size: usize| -> Option<(VectorId, usize)> {
-            if buf.is_empty() {
-                return None;
-            }
-            assert!(buf.len() >= delete_size);
-            let entry_type = buf[0];
-            let mut id_buf = &buf[1..];
-            let id = VectorId::decode(&mut id_buf).expect("failed to decode vector id");
-            let entry_size = if entry_type == POSTING_UPDATE_TYPE_APPEND_BYTE {
-                append_size
-            } else {
-                delete_size
-            };
-            Some((id, entry_size))
-        };
+    fn parse_header(buf: Bytes, priority: usize) -> Option<Cursor> {
+        if buf.len() < COUNT_PREFIX_SIZE {
+            return None;
+        }
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if count == 0 {
+            return None;
+        }
+        let header_end = COUNT_PREFIX_SIZE + POSTING_ENTRY_SIZE * count;
+        if buf.len() < header_end {
+            return None;
+        }
+        Some(Cursor {
+            buf,
+            header_pos: COUNT_PREFIX_SIZE,
+            header_end,
+            data_start: header_end,
+            priority,
+        })
+    }
 
-    // Heap entry: (id, Reverse(priority), cursor_index)
-    // BinaryHeap is max-heap, so we use Reverse for id (want smallest first)
-    // and raw priority (want largest/newest to win on ties).
+    fn peek_entry(cursor: &Cursor) -> Option<(VectorId, u32)> {
+        if cursor.header_pos >= cursor.header_end {
+            return None;
+        }
+        let entry = &cursor.buf[cursor.header_pos..cursor.header_pos + POSTING_ENTRY_SIZE];
+        let mut id_buf = &entry[..8];
+        let id = VectorId::decode(&mut id_buf).expect("failed to decode vector id");
+        let offset = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+        Some((id, offset))
+    }
+
+    let mut cursors: Vec<Cursor> = Vec::with_capacity(1 + operands.len());
+    if let Some(ex) = existing
+        && let Some(c) = parse_header(ex, 0)
+    {
+        cursors.push(c);
+    }
+    for (i, op) in operands.iter().enumerate() {
+        if let Some(c) = parse_header(op.clone(), i + 1) {
+            cursors.push(c);
+        }
+    }
+
+    if cursors.is_empty() {
+        return Bytes::new();
+    }
+
+    // Heap: min-heap by id, max-heap by priority (newest wins on ties).
     #[derive(Eq, PartialEq)]
     struct HeapEntry {
         id: VectorId,
         priority: usize,
         cursor_idx: usize,
-        entry_size: usize,
+        offset: u32,
     }
 
     impl Ord for HeapEntry {
         fn cmp(&self, other: &Self) -> Ordering {
-            // Min-heap by id, max-heap by priority for ties
             other
                 .id
                 .cmp(&self.id)
@@ -389,82 +448,163 @@ pub(crate) fn merge_batch_posting_list(
         }
     }
 
-    let mut cursors: Vec<Cursor> = Vec::with_capacity(1 + operands.len());
-
-    if let Some(ex) = existing
-        && !ex.is_empty()
-    {
-        cursors.push(Cursor {
-            buf: ex,
-            priority: 0,
-        });
-    }
-    for (i, op) in operands.iter().enumerate() {
-        if !op.is_empty() {
-            cursors.push(Cursor {
-                buf: op.clone(),
-                priority: i + 1,
-            });
-        }
-    }
-
-    if cursors.is_empty() {
-        return Bytes::new();
-    }
-
-    let total_size: usize = cursors.iter().map(|c| c.buf.len()).sum();
-    let mut result = BytesMut::with_capacity(total_size);
     let mut heap = BinaryHeap::with_capacity(cursors.len());
-
-    // Seed the heap
     for (idx, cursor) in cursors.iter().enumerate() {
-        if let Some((id, entry_size)) = peek_entry(&cursor.buf, append_size, delete_size) {
+        if let Some((id, offset)) = peek_entry(cursor) {
             heap.push(HeapEntry {
                 id,
                 priority: cursor.priority,
                 cursor_idx: idx,
-                entry_size,
+                offset,
             });
         }
     }
 
+    // Estimate output size as the sum of all inputs — an upper bound since
+    // duplicate ids collapse into a single output entry.
+    let total_header_entries: usize = cursors
+        .iter()
+        .map(|c| (c.header_end - COUNT_PREFIX_SIZE) / POSTING_ENTRY_SIZE)
+        .sum();
+    let mut out_header = BytesMut::with_capacity(POSTING_ENTRY_SIZE * total_header_entries);
+    let total_data_bytes: usize = cursors.iter().map(|c| c.buf.len() - c.data_start).sum();
+    let mut out_data = BytesMut::with_capacity(total_data_bytes);
+
+    let mut out_count: u32 = 0;
+
     while let Some(winner) = heap.pop() {
         let id = winner.id;
 
-        // Write the winner's entry bytes
-        let cursor = &mut cursors[winner.cursor_idx];
-        result.put_slice(&cursor.buf[..winner.entry_size]);
-        cursor.buf.advance(winner.entry_size);
+        // Emit winner's entry with rewritten offset.
+        winner_id_encode(&id, &mut out_header);
+        if winner.offset == POSTING_DELETE_OFFSET {
+            out_header.put_u32_le(POSTING_DELETE_OFFSET);
+        } else {
+            let new_offset =
+                u32::try_from(out_data.len()).expect("merged data section exceeds u32::MAX bytes");
+            out_header.put_u32_le(new_offset);
+            let cursor = &cursors[winner.cursor_idx];
+            let src_start = cursor.data_start + winner.offset as usize;
+            let src_end = src_start + vector_bytes;
+            assert!(
+                src_end <= cursor.buf.len(),
+                "winner vector slice out of bounds: {}..{} of {}",
+                src_start,
+                src_end,
+                cursor.buf.len()
+            );
+            out_data.extend_from_slice(&cursor.buf[src_start..src_end]);
+        }
+        out_count += 1;
 
-        // Advance the winner's cursor
-        if let Some((next_id, next_size)) = peek_entry(&cursor.buf, append_size, delete_size) {
+        // Advance the winner's cursor.
+        let cursor = &mut cursors[winner.cursor_idx];
+        cursor.header_pos += POSTING_ENTRY_SIZE;
+        if let Some((next_id, next_offset)) = peek_entry(cursor) {
             heap.push(HeapEntry {
                 id: next_id,
                 priority: cursor.priority,
                 cursor_idx: winner.cursor_idx,
-                entry_size: next_size,
+                offset: next_offset,
             });
         }
 
-        // Skip all other entries with the same id (losers)
+        // Skip all other entries with the same id (losers).
         while heap.peek().is_some_and(|e| e.id == id) {
             let loser = heap.pop().unwrap();
             let cursor = &mut cursors[loser.cursor_idx];
-            cursor.buf.advance(loser.entry_size);
-
-            // Advance the loser's cursor
-            if let Some((next_id, next_size)) = peek_entry(&cursor.buf, append_size, delete_size) {
+            cursor.header_pos += POSTING_ENTRY_SIZE;
+            if let Some((next_id, next_offset)) = peek_entry(cursor) {
                 heap.push(HeapEntry {
                     id: next_id,
                     priority: cursor.priority,
                     cursor_idx: loser.cursor_idx,
-                    entry_size: next_size,
+                    offset: next_offset,
                 });
             }
         }
     }
 
-    result.freeze()
+    if out_count == 0 {
+        return Bytes::new();
+    }
+
+    // Assemble: count || header || data.
+    //
+    // Over-allocate by `align - 1` bytes so we can shift the visible payload
+    // forward by up to that many bytes and land the returned `Bytes` pointer
+    // on an f32-aligned address, regardless of what the allocator gave us.
+    // Downstream readers (e.g. `PostingList::from_value`) can then read the
+    // data section via `bytemuck::cast_slice` with no extra copy.
+    let payload_size = COUNT_PREFIX_SIZE + out_header.len() + out_data.len();
+    let align = std::mem::align_of::<f32>();
+    let mut out = BytesMut::with_capacity(payload_size + align - 1);
+    // `align_offset` returns `usize::MAX` only for pointer kinds we never see
+    // from a real allocation (ZSTs, vtables). Treat it as "already aligned".
+    let skip = match out.as_ptr().align_offset(align) {
+        usize::MAX => 0,
+        n => n,
+    };
+    for _ in 0..skip {
+        out.put_u8(0);
+    }
+    out.put_u32_le(out_count);
+    out.extend_from_slice(&out_header);
+    out.extend_from_slice(&out_data);
+    // `BytesMut::with_capacity(payload_size + align - 1)` above guarantees
+    // the allocation is large enough for `skip + payload_size` bytes, so no
+    // reallocation happened while writing — the pointer we sampled is still
+    // valid. Slicing past the padding yields an aligned-start `Bytes`.
+    out.freeze().slice(skip..)
+}
+
+/// Helper: write a VectorId header via its `Encode` impl.
+fn winner_id_encode(id: &VectorId, buf: &mut BytesMut) {
+    id.encode(buf);
+}
+
+/// Owner wrapper for a `Vec<f32>` exposed as its raw byte representation, so
+/// we can hand ownership to `Bytes::from_owner` while preserving f32
+/// alignment of the underlying allocation.
+struct AlignedF32Buf(Vec<f32>);
+
+impl AsRef<[u8]> for AlignedF32Buf {
+    fn as_ref(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.0)
+    }
+}
+
+/// Turn a `Vec<f32>` into a `Bytes` whose pointer is guaranteed to have
+/// `align_of::<f32>()` alignment (the Vec's natural allocator alignment).
+fn aligned_f32_bytes_from_vec(vector: Vec<f32>) -> Bytes {
+    Bytes::from_owner(AlignedF32Buf(vector))
+}
+
+/// Copy an arbitrary `&[u8]` of vector bytes into a fresh, f32-aligned
+/// `Bytes`. Used during decode where the source bytes might start at any
+/// byte offset within the larger posting list buffer.
+fn aligned_f32_bytes_from_slice(bytes: &[u8]) -> Bytes {
+    assert!(
+        bytes.len().is_multiple_of(std::mem::size_of::<f32>()),
+        "vector byte slice not a multiple of sizeof::<f32>(): {}",
+        bytes.len()
+    );
+    let mut v = vec![0f32; bytes.len() / std::mem::size_of::<f32>()];
+    bytemuck::cast_slice_mut::<f32, u8>(&mut v).copy_from_slice(bytes);
+    aligned_f32_bytes_from_vec(v)
+}
+
+/// Cast a guaranteed-aligned `Bytes` payload to `&[f32]`.
+///
+/// # Panics
+/// Panics if the payload isn't 4-byte aligned. Our constructors never
+/// produce misaligned vectors (see [`aligned_f32_bytes_from_vec`]).
+fn f32_slice_from_aligned_bytes(bytes: &Bytes) -> &[f32] {
+    assert!(
+        (bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+        "vector bytes are not aligned to f32; PostingUpdate constructors must produce aligned buffers"
+    );
+    bytemuck::cast_slice(bytes)
 }
 
 #[cfg(test)]
@@ -514,21 +654,6 @@ mod tests {
 
         fn delete(id_num: impl CompatId) -> super::PostingUpdate {
             super::PostingUpdate::delete(id_num.into_vector_id())
-        }
-
-        fn decode(
-            buf: &mut &[u8],
-            dimensions: usize,
-        ) -> Result<super::PostingUpdate, EncodingError> {
-            super::PostingUpdate::decode(buf, dimensions)
-        }
-
-        fn encoded_size_append(dimensions: usize) -> usize {
-            super::PostingUpdate::encoded_size_append(dimensions)
-        }
-
-        fn encoded_size_delete() -> usize {
-            super::PostingUpdate::encoded_size_delete()
         }
     }
 
@@ -588,6 +713,29 @@ mod tests {
     }
 
     #[test]
+    fn should_interleave_appends_and_deletes() {
+        // given - mixed entries in the same value
+        let postings = vec![
+            PostingUpdate::append(1, vec![1.0, 1.0]),
+            PostingUpdate::delete(2),
+            PostingUpdate::append(3, vec![3.0, 3.0]),
+        ];
+        let value = PostingListValue::from_posting_updates(postings).unwrap();
+
+        // when
+        let encoded = value.encode_to_bytes();
+        let decoded = PostingListValue::decode_from_bytes(&encoded, 2).unwrap();
+
+        // then
+        assert_eq!(decoded.len(), 3);
+        assert!(decoded.postings[0].is_append());
+        assert_eq!(decoded.postings[0].vector().unwrap(), &[1.0, 1.0]);
+        assert!(decoded.postings[1].is_delete());
+        assert!(decoded.postings[2].is_append());
+        assert_eq!(decoded.postings[2].vector().unwrap(), &[3.0, 3.0]);
+    }
+
+    #[test]
     fn should_create_posting_update_append() {
         // given / when
         let update = PostingUpdate::append(42, vec![1.0, 2.0]);
@@ -611,55 +759,28 @@ mod tests {
     }
 
     #[test]
-    fn should_encode_and_decode_single_posting_update() {
-        // given
-        let update = PostingUpdate::append(id(12345), vec![1.5, 2.5, 3.5, 4.5]);
-        let mut buf = BytesMut::new();
-        update.encode(&mut buf);
+    fn should_reject_buffer_too_short_for_header() {
+        // given - only 2 bytes, not enough for u32 count
+        let buf = Bytes::copy_from_slice(&[0u8; 2]);
 
         // when
-        let mut buf_ref: &[u8] = &buf;
-        let decoded = PostingUpdate::decode(&mut buf_ref, 4).unwrap();
-
-        // then
-        assert!(decoded.is_append());
-        assert_eq!(decoded.id(), id(12345));
-        assert_eq!(decoded.vector().unwrap(), &[1.5, 2.5, 3.5, 4.5]);
-    }
-
-    #[test]
-    fn should_calculate_correct_encoded_size() {
-        // when / then
-        assert_eq!(PostingUpdate::encoded_size_append(3), 1 + 8 + 12); // 21 bytes
-        assert_eq!(PostingUpdate::encoded_size_append(128), 1 + 8 + 512); // 521 bytes
-        assert_eq!(PostingUpdate::encoded_size_delete(), 1 + 8); // 9 bytes
-    }
-
-    #[test]
-    fn should_reject_invalid_posting_type() {
-        // given
-        let mut buf = BytesMut::new();
-        buf.put_u8(0xFF); // Invalid type
-        buf.put_u64_le(1);
-        buf.put_f32_le(1.0);
-
-        // when
-        let mut buf_ref: &[u8] = &buf;
-        let result = PostingUpdate::decode(&mut buf_ref, 1);
+        let result = PostingListValue::decode_from_bytes(&buf, 3);
 
         // then
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("Invalid posting type"));
+        assert!(result.unwrap_err().message.contains("Buffer too short"));
     }
 
     #[test]
-    fn should_reject_buffer_too_short() {
-        // given
-        let buf = [0u8; 5]; // Too short for any valid posting
+    fn should_reject_buffer_too_short_for_postings() {
+        // given - claims 2 postings but header is truncated
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 5]); // less than 2 * 12 bytes
+        let buf = buf.freeze();
 
         // when
-        let mut buf_ref: &[u8] = &buf;
-        let result = PostingUpdate::decode(&mut buf_ref, 3);
+        let result = PostingListValue::decode_from_bytes(&buf, 3);
 
         // then
         assert!(result.is_err());
@@ -1171,5 +1292,131 @@ mod tests {
         assert!(decoded.postings[1].is_delete());
         assert_eq!(decoded.postings[2].id(), id(3));
         assert!(decoded.postings[2].is_append());
+    }
+
+    #[test]
+    fn should_reuse_input_buffer_when_decoding_aligned_bytes() {
+        // given - encode something so the value's data section is aligned
+        // relative to the buffer start (encode_to_bytes produces a
+        // header whose size is a multiple of 4, so data starts at a 4-aligned
+        // offset from `buf.as_ptr()`; combined with an aligned allocation
+        // this means every append should be zero-copy).
+        let value = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0, 2.0]),
+            PostingUpdate::append(2, vec![3.0, 4.0]),
+        ])
+        .unwrap();
+        let encoded = value.encode_to_bytes();
+
+        // Skip the test if the allocator happened to give us an unaligned
+        // buffer — decode still succeeds (it'd fall back to copying) but the
+        // pointer-identity assertion wouldn't apply.
+        if !(encoded.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+            return;
+        }
+        let encoded_ptr = encoded.as_ptr() as usize;
+        let encoded_end = encoded_ptr + encoded.len();
+
+        // when
+        let decoded = PostingListValue::decode_from_bytes(&encoded, 2).unwrap();
+
+        // then - each Append's vector Bytes points into the encoded buffer.
+        let mut seen_appends = 0;
+        for p in &decoded.postings {
+            if let super::PostingUpdate::Append { vector, .. } = p {
+                let ptr = vector.as_ptr() as usize;
+                assert!(
+                    ptr >= encoded_ptr && ptr + vector.len() <= encoded_end,
+                    "append vector Bytes ptr {:#x} is not a slice of encoded buffer {:#x}..{:#x}",
+                    ptr,
+                    encoded_ptr,
+                    encoded_end,
+                );
+                seen_appends += 1;
+            }
+        }
+        assert_eq!(seen_appends, 2);
+    }
+
+    #[test]
+    fn should_copy_when_decoding_unaligned_bytes() {
+        // given - an aligned encoded value plus a single byte of leading
+        // padding, then a slice past the padding so the "outer" buffer is
+        // still the original allocation but the viewed start is offset by 1.
+        // The data section's absolute address is therefore 1 mod 4, which
+        // forces the fallback copy path.
+        let value =
+            PostingListValue::from_posting_updates(vec![PostingUpdate::append(1, vec![1.0, 2.0])])
+                .unwrap();
+        let encoded = value.encode_to_bytes();
+
+        // Stitch one byte of padding in front by re-encoding into a larger
+        // buffer; we don't use BytesMut::with_capacity + 1 leading byte
+        // because whether that actually produces an unaligned pointer
+        // depends on the allocator. Instead we concatenate and then slice
+        // past the padding.
+        let mut padded = BytesMut::with_capacity(encoded.len() + 1);
+        padded.put_u8(0);
+        padded.extend_from_slice(&encoded);
+        let padded = padded.freeze().slice(1..);
+        if (padded.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+            // Allocator happened to give us a pointer that's aligned even
+            // after the 1-byte shift — skip; this test is about the
+            // misaligned branch.
+            return;
+        }
+        let padded_ptr_range = padded.as_ptr() as usize..padded.as_ptr() as usize + padded.len();
+
+        // when
+        let decoded = PostingListValue::decode_from_bytes(&padded, 2).unwrap();
+
+        // then - the append's Bytes is a fresh allocation, not a slice of padded
+        let super::PostingUpdate::Append { vector, .. } = &decoded.postings[0] else {
+            panic!("expected Append")
+        };
+        let vp = vector.as_ptr() as usize;
+        assert!(
+            !padded_ptr_range.contains(&vp),
+            "expected copy, but vector ptr {:#x} is still inside input range {:#x}..{:#x}",
+            vp,
+            padded_ptr_range.start,
+            padded_ptr_range.end,
+        );
+        // and the values round-trip correctly
+        assert_eq!(decoded.postings[0].vector().unwrap(), &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn should_return_f32_aligned_bytes_from_merge() {
+        // given - a handful of inputs so we exercise the assembly path
+        // (short-circuits don't go through the padding logic)
+        let existing = PostingListValue::from_posting_updates(vec![
+            PostingUpdate::append(1, vec![1.0, 2.0, 3.0]),
+            PostingUpdate::append(3, vec![4.0, 5.0, 6.0]),
+        ])
+        .unwrap()
+        .encode_to_bytes();
+        let op0 = PostingListValue::from_posting_updates(vec![PostingUpdate::append(
+            2,
+            vec![7.0, 8.0, 9.0],
+        )])
+        .unwrap()
+        .encode_to_bytes();
+        let op1 = PostingListValue::from_posting_updates(vec![PostingUpdate::delete(3)])
+            .unwrap()
+            .encode_to_bytes();
+
+        // when — run merge enough times to exercise every residue class of
+        // the allocator's pointer mod 4. 16 rounds is plenty; each iteration
+        // independently allocates so we see a variety of start pointers.
+        for _ in 0..16 {
+            let merged =
+                merge_batch_posting_list(Some(existing.clone()), &[op0.clone(), op1.clone()], 3);
+            assert!(
+                (merged.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                "merge output not f32-aligned: ptr={:p}",
+                merged.as_ptr()
+            );
+        }
     }
 }

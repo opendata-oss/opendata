@@ -275,10 +275,8 @@ impl SearchIndexDelta {
         let depth = TreeDepth::of(self.centroids_meta.depth);
         assert_eq!(depth.max_inner_level(), centroid_id.level());
         assert!(centroid_id.is_centroid());
-        self.root_updates.push(PostingUpdate::Append {
-            id: centroid_id,
-            vector: Arc::new(vector),
-        });
+        self.root_updates
+            .push(PostingUpdate::append(centroid_id, vector));
         self.root_centroid_count += 1;
     }
 
