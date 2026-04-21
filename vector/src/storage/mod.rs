@@ -371,7 +371,7 @@ mod tests {
 
         // then - read
         let result = storage.get_posting_list(centroid_id, 3).await.unwrap();
-        let result: Vec<_> = PostingList::from_value(result).into_iter().collect();
+        let result: Vec<_> = PostingList::from_value(result, false).into_iter().collect();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].id(), VectorId::data_vector_id(1));
         assert_eq!(result[1].id(), VectorId::data_vector_id(2));

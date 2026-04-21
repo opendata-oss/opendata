@@ -32,7 +32,7 @@ pub(crate) async fn validate(
     }
 
     let root_posting_list =
-        PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
+        PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?, false);
     let centroid_info: HashMap<VectorId, CentroidInfoValue> = snapshot
         .scan_all_centroid_info()
         .await?
@@ -87,7 +87,8 @@ pub(crate) async fn validate_state_and_storage_consistent(
         .get_centroids_meta()
         .await?
         .ok_or_else(|| Error::Internal("missing centroid tree metadata".to_string()))?;
-    let storage_root = PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
+    let storage_root =
+        PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?, false);
     let cached_root = last_applied_snapshot
         .centroid_cache
         .root(u64::MAX)
@@ -516,7 +517,9 @@ async fn load_centroid_postings(
         .scan_all_posting_lists(dimensions)
         .await?
         .into_iter()
-        .map(|(centroid_id, posting_list)| (centroid_id, PostingList::from_value(posting_list)))
+        .map(|(centroid_id, posting_list)| {
+            (centroid_id, PostingList::from_value(posting_list, false))
+        })
         .collect())
 }
 
@@ -766,7 +769,7 @@ mod tests {
         let centroid_cache = AllCentroidsCacheWriter::new(
             Arc::new(
                 root.into_iter()
-                    .map(|(id, vector)| Posting::new(root_posting_id(depth, id), vector))
+                    .map(|(id, vector)| Posting::from_vec(root_posting_id(depth, id), vector))
                     .collect::<PostingList>(),
             ),
             centroid_postings
@@ -778,7 +781,7 @@ mod tests {
                             postings
                                 .into_iter()
                                 .map(|(id, vector)| {
-                                    Posting::new(VectorId::data_vector_id(id), vector)
+                                    Posting::from_vec(VectorId::data_vector_id(id), vector)
                                 })
                                 .collect::<PostingList>(),
                         ),
@@ -819,7 +822,7 @@ mod tests {
             Arc::new(
                 root.clone()
                     .into_iter()
-                    .map(|(id, vector)| Posting::new(root_posting_id(depth, id), vector))
+                    .map(|(id, vector)| Posting::from_vec(root_posting_id(depth, id), vector))
                     .collect::<PostingList>(),
             ),
             centroid_postings
@@ -830,7 +833,7 @@ mod tests {
                         Arc::new(
                             postings
                                 .into_iter()
-                                .map(|(id, vector)| Posting::new(centroid_id(1, id), vector))
+                                .map(|(id, vector)| Posting::from_vec(centroid_id(1, id), vector))
                                 .collect::<PostingList>(),
                         ),
                     )

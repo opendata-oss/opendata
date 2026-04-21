@@ -30,6 +30,7 @@ avx512 = []
 anyhow.workspace = true
 async-trait.workspace = true
 common.workspace = true
+bytemuck.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 fail.workspace = true

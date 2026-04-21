@@ -47,6 +47,7 @@ pub(crate) mod storage;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
+pub(crate) mod utils;
 pub(crate) mod write;
 
 // Public API exports

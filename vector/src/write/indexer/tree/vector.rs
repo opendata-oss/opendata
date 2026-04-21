@@ -586,6 +586,7 @@ mod tests {
                 .get_posting_list(centroid_id(CENTROID_ID_NUM), DIMS)
                 .await
                 .unwrap(),
+            false,
         );
         assert_eq!(posting.len(), 3);
         for p in posting.iter() {
@@ -712,6 +713,7 @@ mod tests {
                 .get_posting_list(centroid_id(CENTROID_ID_NUM), DIMS)
                 .await
                 .unwrap(),
+            false,
         );
         assert_eq!(posting.len(), 1);
     }
@@ -761,13 +763,13 @@ mod tests {
 
         // then
         let posting_a =
-            PostingList::from_value(h.storage.get_posting_list(c_a, DIMS).await.unwrap());
+            PostingList::from_value(h.storage.get_posting_list(c_a, DIMS).await.unwrap(), false);
         let ids_a: HashSet<VectorId> = posting_a.iter().map(|p: &Posting| p.id()).collect();
         assert!(ids_a.contains(&id_a));
         assert!(!ids_a.contains(&id_b));
         assert!(!ids_a.contains(&id_c));
         let posting_b =
-            PostingList::from_value(h.storage.get_posting_list(c_b, DIMS).await.unwrap());
+            PostingList::from_value(h.storage.get_posting_list(c_b, DIMS).await.unwrap(), false);
         let ids_b: HashSet<VectorId> = posting_b.iter().map(|p: &Posting| p.id()).collect();
         assert!(ids_b.contains(&id_b));
         assert!(ids_b.contains(&id_c));
@@ -849,11 +851,11 @@ mod tests {
 
         // then
         let posting_c0 =
-            PostingList::from_value(h.storage.get_posting_list(c0, DIMS).await.unwrap());
+            PostingList::from_value(h.storage.get_posting_list(c0, DIMS).await.unwrap(), false);
         let ids_c0: HashSet<VectorId> = posting_c0.iter().map(|p: &Posting| p.id()).collect();
         assert!(ids_c0.contains(&id_a));
         let posting_c1 =
-            PostingList::from_value(h.storage.get_posting_list(c1, DIMS).await.unwrap());
+            PostingList::from_value(h.storage.get_posting_list(c1, DIMS).await.unwrap(), false);
         let ids_c1: HashSet<VectorId> = posting_c1.iter().map(|p: &Posting| p.id()).collect();
         assert!(!ids_c1.contains(&id_a));
     }

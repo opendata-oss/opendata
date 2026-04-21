@@ -234,7 +234,7 @@ mod tests {
             .await
             .unwrap();
         let centroid_cache = AllCentroidsCacheWriter::new(
-            Arc::new(PostingList::from_iter(vec![Posting::new(
+            Arc::new(PostingList::from_iter(vec![Posting::from_vec(
                 leaf_centroid_id(1),
                 vec![0.0; DIMS],
             )])),

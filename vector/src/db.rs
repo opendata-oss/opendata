@@ -372,7 +372,7 @@ impl VectorDb {
             .await?
             .ok_or_else(|| Error::Storage("missing centroid tree metadata".to_string()))?;
         let root_posting_list =
-            PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
+            PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?, true);
         let centroids: HashMap<VectorId, CentroidInfoValue> = snapshot
             .scan_all_centroid_info()
             .await?
@@ -391,7 +391,10 @@ impl VectorDb {
                 assert_ne!(centroid_id, ROOT_VECTOR_ID);
                 centroids.get(&centroid_id).map(|centroid| {
                     assert!(centroid.level > LEAF_LEVEL);
-                    (centroid_id, Arc::new(PostingList::from_value(posting_list)))
+                    (
+                        centroid_id,
+                        Arc::new(PostingList::from_value(posting_list, true)),
+                    )
                 })
             })
             .collect();
