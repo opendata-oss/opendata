@@ -705,6 +705,7 @@ impl CentroidReader for StoredCentroidReader {
         MaybeCached::Future(Box::pin(async move {
             Ok(Arc::new(PostingList::from_value(
                 snapshot.get_posting_list(centroid_id, dimensions).await?,
+                false,
             )))
         }))
     }
@@ -827,13 +828,16 @@ impl AllCentroidsCacheWriter {
             posting_list: Option<&Arc<PostingList>>,
             updates: Vec<PostingUpdate>,
         ) -> Arc<PostingList> {
-            let Some(posting_list) = posting_list else {
-                return Arc::new(PostingList::from_value(
+            let pl = if let Some(posting_list) = posting_list {
+                posting_list.clone_with_updates(updates, true)
+            } else {
+                PostingList::from_value(
                     PostingListValue::from_posting_updates(updates)
                         .expect("posting updates should always encode"),
-                ));
+                    true,
+                )
             };
-            Arc::new(posting_list.update_and_flatten(updates))
+            Arc::new(pl)
         }
 
         let mut inner = self.inner.lock().expect("lock poisoned");
@@ -1118,9 +1122,9 @@ mod tests {
         let target_level = TreeLevel::leaf(TreeDepth::of(3));
         let postings = Arc::new(
             vec![
-                Posting::new(vector_id(1, 10), vec![1.0, 0.0]),
-                Posting::new(vector_id(1, 11), vec![0.0, 1.0]),
-                Posting::new(vector_id(1, 12), vec![3.0, 0.0]),
+                Posting::from_vec(vector_id(1, 10), vec![1.0, 0.0]),
+                Posting::from_vec(vector_id(1, 11), vec![0.0, 1.0]),
+                Posting::from_vec(vector_id(1, 12), vec![3.0, 0.0]),
             ]
             .into_iter()
             .collect(),
@@ -1148,16 +1152,19 @@ mod tests {
         let target_level = TreeLevel::leaf(TreeDepth::of(3));
         let postings_a = Arc::new(
             vec![
-                Posting::new(vector_id(1, 10), vec![1.0, 0.0]),
-                Posting::new(vector_id(1, 11), vec![0.0, 1.0]),
+                Posting::from_vec(vector_id(1, 10), vec![1.0, 0.0]),
+                Posting::from_vec(vector_id(1, 11), vec![0.0, 1.0]),
             ]
             .into_iter()
             .collect(),
         );
         let postings_b = Arc::new(
-            vec![Posting::new(VectorId::centroid_id(1, 10), vec![1.0, 0.0])]
-                .into_iter()
-                .collect(),
+            vec![Posting::from_vec(
+                VectorId::centroid_id(1, 10),
+                vec![1.0, 0.0],
+            )]
+            .into_iter()
+            .collect(),
         );
 
         // when
@@ -1192,7 +1199,7 @@ mod tests {
         Arc::new(
             postings
                 .into_iter()
-                .map(|(level, id, vector)| Posting::new(vector_id(level, id), vector))
+                .map(|(level, id, vector)| Posting::from_vec(vector_id(level, id), vector))
                 .collect(),
         )
     }
@@ -1227,7 +1234,7 @@ mod tests {
     ) -> Arc<PostingList> {
         let key = PostingListKey::new(centroid_id).encode();
         let value = posting_list_value(postings);
-        let posting_list = Arc::new(PostingList::from_value(value.clone()));
+        let posting_list = Arc::new(PostingList::from_value(value.clone(), false));
         storage
             .put(vec![Record::new(key, value.encode_to_bytes()).into()])
             .await

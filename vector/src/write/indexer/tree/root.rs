@@ -147,7 +147,8 @@ mod tests {
         // then
         assert_eq!(h.state.centroids_meta().depth, original_depth);
         assert_eq!(h.state.root_centroid_count(), original_root_count);
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let root_ids: HashSet<_> = root.iter().map(|p| p.id()).collect();
         assert_eq!(root_ids, HashSet::from([C0, C1]));
     }
@@ -176,7 +177,8 @@ mod tests {
         // then
         assert_eq!(h.state.centroids_meta().depth, 4);
         assert_eq!(h.state.root_centroid_count(), 2);
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         assert_eq!(root.len(), 2);
         let new_root_ids: Vec<_> = root.iter().map(|p| p.id()).collect();
         assert!(new_root_ids.iter().all(|id| id.level() == 2));
@@ -187,6 +189,7 @@ mod tests {
                     .get_posting_list(*new_root_id, DIMS)
                     .await
                     .unwrap(),
+                false,
             );
             assert!(!posting.is_empty());
             for child in posting.iter() {
