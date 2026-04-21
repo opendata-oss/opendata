@@ -404,7 +404,7 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
                 "every logical series must have at least one source handle",
             );
             for sref in series_refs.iter() {
-                flat.push(*sref);
+                flat.push(sref.clone());
                 request_to_series.push(series_off);
             }
         }
@@ -743,10 +743,15 @@ mod tests {
     }
 
     fn mk_request_series(n: usize) -> Arc<[Arc<[ResolvedSeriesRef]>]> {
+        let name: Arc<str> = Arc::from("m");
         Arc::from(
             (0..n)
                 .map(|i| {
-                    Arc::<[ResolvedSeriesRef]>::from(vec![ResolvedSeriesRef::new(1, i as u32)])
+                    Arc::<[ResolvedSeriesRef]>::from(vec![ResolvedSeriesRef::new(
+                        1,
+                        i as u32,
+                        name.clone(),
+                    )])
                 })
                 .collect::<Vec<_>>(),
         )
@@ -881,9 +886,10 @@ mod tests {
             (vec![20], vec![2.0]),
         ]));
         let schema = mk_schema(1);
+        let name: Arc<str> = Arc::from("m");
         let request_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![Arc::from(vec![
-            ResolvedSeriesRef::new(1, 0),
-            ResolvedSeriesRef::new(2, 1),
+            ResolvedSeriesRef::new(1, 0, name.clone()),
+            ResolvedSeriesRef::new(2, 1, name.clone()),
         ])]);
         let grid = mk_grid(10, 10, 2);
         let reservation = MemoryReservation::new(1 << 20);

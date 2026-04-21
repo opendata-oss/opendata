@@ -93,9 +93,13 @@ fn bucket_overlaps(bucket: TimeBucket, time_range: TimeRange) -> bool {
 // ---------------------------------------------------------------------------
 
 /// [`SeriesSource`] over the crate-internal [`QueryReader`]. One instance per
-/// query. Stateless between calls — `samples` re-consults the forward index
-/// on-demand for `(bucket, series_id) → metric_name`; the index cache absorbs
-/// the cost.
+/// query. `resolve` consults the query-scoped index cache; `samples` needs no
+/// cache at all — metric names ride on `ResolvedSeriesRef`.
+///
+/// The cache lives for the entire query lifetime rather than being dropped
+/// after `build_physical_plan`: subquery operators re-enter the planner at
+/// execution time (see `build_subquery` → `build_node` → `resolve_leaf`),
+/// and that path needs the cache warm for the inner subtree's resolves.
 pub(crate) struct QueryReaderSource<R: QueryReader> {
     reader: Arc<R>,
     index_cache: Arc<IndexCache>,
@@ -128,8 +132,7 @@ impl<R: QueryReader + 'static> SeriesSource for QueryReaderSource<R> {
         request: SamplesRequest,
     ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
         let reader = self.reader.clone();
-        let index_cache = self.index_cache.clone();
-        samples_stream(reader, index_cache, request)
+        samples_stream(reader, request)
     }
 }
 
@@ -261,8 +264,13 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
         })?;
         let mut labs = spec.labels.clone();
         labs.sort();
+        let metric_name: Arc<str> = labs
+            .iter()
+            .find(|l| l.name == "__name__")
+            .map(|l| Arc::from(l.value.as_str()))
+            .unwrap_or_else(|| Arc::from(""));
         labels_vec.push(Labels::new(labs));
-        handles.push(ResolvedSeriesRef::new(bucket_id, *sid));
+        handles.push(ResolvedSeriesRef::new(bucket_id, *sid, metric_name));
     }
 
     Ok(Some(ResolvedSeriesChunk {
@@ -280,11 +288,10 @@ async fn resolve_one_bucket<R: QueryReader + ?Sized>(
 /// slice; series spanning buckets yield one batch per bucket. Operators merge.
 fn samples_stream<R: QueryReader + 'static>(
     reader: Arc<R>,
-    index_cache: Arc<IndexCache>,
     request: SamplesRequest,
 ) -> impl Stream<Item = Result<SampleBatch, QueryError>> + Send {
     stream::once(async move {
-        match build_sample_batches(reader.as_ref(), &index_cache, &request).await {
+        match build_sample_batches(reader.as_ref(), &request).await {
             Ok(batches) => batches.into_iter().map(Ok).collect::<Vec<_>>(),
             Err(e) => vec![Err(e)],
         }
@@ -297,7 +304,6 @@ fn samples_stream<R: QueryReader + 'static>(
 /// `series_range` indexes into the caller's `request.series`.
 async fn build_sample_batches<R: QueryReader + ?Sized>(
     reader: &R,
-    index_cache: &IndexCache,
     request: &SamplesRequest,
 ) -> Result<Vec<SampleBatch>, QueryError> {
     if request.series.is_empty() || request.time_range.is_empty() {
@@ -311,7 +317,7 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
     let time_range = request.time_range;
     let out: Vec<SampleBatch> = stream::iter(runs.into_iter().map(|run| {
         let series = request.series.clone();
-        async move { build_batch_for_run(reader, index_cache, run, series, time_range).await }
+        async move { build_batch_for_run(reader, run, series, time_range).await }
     }))
     .buffered(SAMPLE_STAGE_READAHEAD)
     .try_collect()
@@ -321,11 +327,11 @@ async fn build_sample_batches<R: QueryReader + ?Sized>(
 }
 
 /// Per-series loop stays sequential — implicit spawn-per-series is prohibited.
-/// Concurrency is the per-run dispatch one layer up. Forward-index lookups
-/// here are pure in-memory hits (populated by `resolve_one_bucket`).
+/// Concurrency is the per-run dispatch one layer up. Metric names ride on the
+/// `ResolvedSeriesRef`, populated by `resolve_one_bucket` — no forward-index
+/// lookup here.
 async fn build_batch_for_run<R: QueryReader + ?Sized>(
     reader: &R,
-    index_cache: &IndexCache,
     run: BucketRun,
     series: Arc<[ResolvedSeriesRef]>,
     time_range: TimeRange,
@@ -347,24 +353,8 @@ async fn build_batch_for_run<R: QueryReader + ?Sized>(
 
     for (col_idx, series_ref) in series[run.range.clone()].iter().enumerate() {
         let sid = series_ref.series_id as SeriesId;
-        let spec_slot = index_cache
-            .forward_index_one(reader, &bucket, sid)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?;
-        let spec = spec_slot.as_ref().as_ref().ok_or_else(|| {
-            internal_err(format!(
-                "series {} missing from forward index in bucket {:?}",
-                sid, bucket
-            ))
-        })?;
-        let metric_name = spec
-            .labels
-            .iter()
-            .find(|l| l.name == "__name__")
-            .map(|l| l.value.as_str())
-            .unwrap_or("");
         let samples: Vec<Sample> = reader
-            .samples(&bucket, sid, metric_name, start_ms, end_ms)
+            .samples(&bucket, sid, &series_ref.metric_name, start_ms, end_ms)
             .await
             .map_err(|e| internal_err(e.to_string()))?;
 
@@ -818,20 +808,42 @@ mod tests {
     #[test]
     fn should_group_contiguous_bucket_runs_preserving_order() {
         // given: a request-series slice with three buckets in mixed order
+        let name: Arc<str> = Arc::from("m");
         let series = vec![
-            ResolvedSeriesRef::new(encode_bucket(TimeBucket { start: 0, size: 1 }), 1),
-            ResolvedSeriesRef::new(encode_bucket(TimeBucket { start: 0, size: 1 }), 2),
-            ResolvedSeriesRef::new(encode_bucket(TimeBucket { start: 60, size: 1 }), 7),
-            ResolvedSeriesRef::new(encode_bucket(TimeBucket { start: 60, size: 1 }), 8),
+            ResolvedSeriesRef::new(
+                encode_bucket(TimeBucket { start: 0, size: 1 }),
+                1,
+                name.clone(),
+            ),
+            ResolvedSeriesRef::new(
+                encode_bucket(TimeBucket { start: 0, size: 1 }),
+                2,
+                name.clone(),
+            ),
+            ResolvedSeriesRef::new(
+                encode_bucket(TimeBucket { start: 60, size: 1 }),
+                7,
+                name.clone(),
+            ),
+            ResolvedSeriesRef::new(
+                encode_bucket(TimeBucket { start: 60, size: 1 }),
+                8,
+                name.clone(),
+            ),
             ResolvedSeriesRef::new(
                 encode_bucket(TimeBucket {
                     start: 120,
                     size: 1,
                 }),
                 5,
+                name.clone(),
             ),
             // back to the first bucket — a new run, not merged.
-            ResolvedSeriesRef::new(encode_bucket(TimeBucket { start: 0, size: 1 }), 9),
+            ResolvedSeriesRef::new(
+                encode_bucket(TimeBucket { start: 0, size: 1 }),
+                9,
+                name.clone(),
+            ),
         ];
 
         // when: partition into runs
@@ -861,10 +873,11 @@ mod tests {
     fn should_treat_whole_series_as_one_run_when_all_share_bucket() {
         // given: all series in the same bucket
         let bid = encode_bucket(TimeBucket { start: 0, size: 1 });
+        let name: Arc<str> = Arc::from("m");
         let series = vec![
-            ResolvedSeriesRef::new(bid, 1),
-            ResolvedSeriesRef::new(bid, 2),
-            ResolvedSeriesRef::new(bid, 3),
+            ResolvedSeriesRef::new(bid, 1, name.clone()),
+            ResolvedSeriesRef::new(bid, 2, name.clone()),
+            ResolvedSeriesRef::new(bid, 3, name.clone()),
         ];
 
         // when: partition
@@ -1274,7 +1287,7 @@ mod integration_tests {
 
         let mut merged: Vec<ResolvedSeriesRef> = Vec::new();
         for c in &chunks {
-            merged.extend(c.series.iter().copied());
+            merged.extend(c.series.iter().cloned());
         }
         let request = SamplesRequest::new(Arc::from(merged), TimeRange::new(0, 7_200_000));
         let batches = collect_ok(src.samples(request)).await;

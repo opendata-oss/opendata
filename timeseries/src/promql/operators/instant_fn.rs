@@ -1244,9 +1244,10 @@ mod tests {
             ],
         });
         let schema = mk_schema(2);
+        let name: Arc<str> = Arc::from("m");
         let request_series: Arc<[Arc<[ResolvedSeriesRef]>]> = Arc::from(vec![
-            Arc::from(vec![ResolvedSeriesRef::new(1, 0)]),
-            Arc::from(vec![ResolvedSeriesRef::new(1, 1)]),
+            Arc::from(vec![ResolvedSeriesRef::new(1, 0, name.clone())]),
+            Arc::from(vec![ResolvedSeriesRef::new(1, 1, name.clone())]),
         ]);
         let grid = StepGrid {
             start_ms: 10,

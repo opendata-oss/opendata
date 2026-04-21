@@ -55,18 +55,27 @@ impl TimeRange {
 
 /// Opaque handle minted by [`SeriesSource::resolve`] and threaded back into
 /// [`SamplesRequest::series`]. Callers treat the contents as opaque.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `metric_name` is carried here so the samples path can issue
+/// `reader.samples(..)` without a forward-index re-lookup — the planner's
+/// resolve pass already has the `SeriesSpec` in hand.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedSeriesRef {
     pub bucket_id: u64,
     /// Bucket-scoped series identifier (matches [`crate::model::SeriesId`]).
     pub series_id: u32,
+    /// `__name__` label value for this series. Populated by the resolver from
+    /// the forward index and threaded through to `SeriesSource::samples` so
+    /// the adapter needn't re-fetch the `SeriesSpec`.
+    pub metric_name: Arc<str>,
 }
 
 impl ResolvedSeriesRef {
-    pub fn new(bucket_id: u64, series_id: u32) -> Self {
+    pub fn new(bucket_id: u64, series_id: u32, metric_name: Arc<str>) -> Self {
         Self {
             bucket_id,
             series_id,
+            metric_name,
         }
     }
 }
@@ -198,26 +207,29 @@ mod tests {
 
     #[test]
     fn should_construct_resolved_series_ref_as_opaque_handle() {
-        // given: a bucket id and a bucket-scoped series id
+        // given: a bucket id, a bucket-scoped series id, and a metric name
         let bucket = 42u64;
         let sid = 7u32;
+        let name: Arc<str> = Arc::from("http_requests_total");
 
         // when: mint a handle
-        let handle = ResolvedSeriesRef::new(bucket, sid);
+        let handle = ResolvedSeriesRef::new(bucket, sid, name.clone());
 
-        // then: the struct preserves both fields and is hashable / copy
+        // then: the struct preserves all fields and is hashable / clone
         assert_eq!(handle.bucket_id, bucket);
         assert_eq!(handle.series_id, sid);
-        let copy = handle;
-        assert_eq!(copy, handle);
+        assert_eq!(&*handle.metric_name, "http_requests_total");
+        let cloned = handle.clone();
+        assert_eq!(cloned, handle);
     }
 
     #[test]
     fn should_build_sample_request_from_resolved_series_and_time_range() {
         // given: a caller-resolved series slice and an absolute window
+        let name: Arc<str> = Arc::from("m");
         let series: Arc<[ResolvedSeriesRef]> = Arc::from(vec![
-            ResolvedSeriesRef::new(1, 10),
-            ResolvedSeriesRef::new(1, 11),
+            ResolvedSeriesRef::new(1, 10, name.clone()),
+            ResolvedSeriesRef::new(1, 11, name.clone()),
         ]);
         let tr = TimeRange::new(0, 60_000);
 

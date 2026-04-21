@@ -343,12 +343,12 @@ where
         for (label, sref) in chunk.labels.iter().zip(chunk.series.iter()) {
             let canonical = canonicalize_labels(label);
             match roster_index.get(&canonical).copied() {
-                Some(idx) => refs[idx].push(*sref),
+                Some(idx) => refs[idx].push(sref.clone()),
                 None => {
                     roster_index.insert(canonical.clone(), labels.len());
                     fingerprints.push(labels_fingerprint(&canonical));
                     labels.push(canonical);
-                    refs.push(vec![*sref]);
+                    refs.push(vec![sref.clone()]);
                 }
             }
         }
@@ -1500,8 +1500,9 @@ mod tests {
                 return stream::iter(vec![Err(err)]).left_stream();
             }
             let labels: Vec<Labels> = self.series.iter().map(|(l, _)| l.clone()).collect();
+            let name: Arc<str> = Arc::from("m");
             let refs: Vec<ResolvedSeriesRef> = (0..self.series.len())
-                .map(|i| ResolvedSeriesRef::new(1, i as u32))
+                .map(|i| ResolvedSeriesRef::new(1, i as u32, name.clone()))
                 .collect();
             let chunk = ResolvedSeriesChunk {
                 bucket_id: 1,
@@ -1656,11 +1657,12 @@ mod tests {
     fn should_dedup_leaf_roster_by_fingerprint_and_group_bucket_requests() {
         // given: the same logical series appears in two bucket-scoped resolve
         // chunks, plus one distinct series in only the newer bucket.
+        let name: Arc<str> = Arc::from("m");
         let source = Arc::new(ChunkedResolveSource::new(vec![
             ResolvedSeriesChunk {
                 bucket_id: 10,
                 labels: Arc::from(vec![labels_of(&[("__name__", "m"), ("pod", "a")])]),
-                series: Arc::from(vec![ResolvedSeriesRef::new(10, 7)]),
+                series: Arc::from(vec![ResolvedSeriesRef::new(10, 7, name.clone())]),
             },
             ResolvedSeriesChunk {
                 bucket_id: 20,
@@ -1669,8 +1671,8 @@ mod tests {
                     labels_of(&[("__name__", "m"), ("pod", "b")]),
                 ]),
                 series: Arc::from(vec![
-                    ResolvedSeriesRef::new(20, 11),
-                    ResolvedSeriesRef::new(20, 12),
+                    ResolvedSeriesRef::new(20, 11, name.clone()),
+                    ResolvedSeriesRef::new(20, 12, name.clone()),
                 ]),
             },
         ]));
@@ -1702,13 +1704,13 @@ mod tests {
         assert_eq!(
             resolved.request_series[0].as_ref(),
             &[
-                ResolvedSeriesRef::new(10, 7),
-                ResolvedSeriesRef::new(20, 11),
+                ResolvedSeriesRef::new(10, 7, name.clone()),
+                ResolvedSeriesRef::new(20, 11, name.clone()),
             ]
         );
         assert_eq!(
             resolved.request_series[1].as_ref(),
-            &[ResolvedSeriesRef::new(20, 12)]
+            &[ResolvedSeriesRef::new(20, 12, name.clone())]
         );
         assert_ne!(
             resolved.schema.fingerprint(0),
