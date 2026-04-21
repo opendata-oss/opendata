@@ -278,7 +278,7 @@ impl SearchIndexDelta {
         for new_c_vec in new_root_centroids {
             let (new_c_id, new_c) = self.add_centroid(new_level, new_c_vec, ROOT_VECTOR_ID);
             info!("writing new root centroid {}/{}", new_level, new_c_id);
-            new_root_postings.push(Posting::new(new_c_id, new_c.vector))
+            new_root_postings.push(Posting::from_vec(new_c_id, new_c.vector))
         }
         for p in &new_root_postings {
             assert_eq!(p.id().level(), depth.max_inner_level())
@@ -299,10 +299,8 @@ impl SearchIndexDelta {
         let depth = TreeDepth::of(self.centroids_meta.depth);
         assert_eq!(depth.max_inner_level(), centroid_id.level());
         assert!(centroid_id.is_centroid());
-        self.root_updates.push(PostingUpdate::Append {
-            id: centroid_id,
-            vector: Arc::new(vector),
-        });
+        self.root_updates
+            .push(PostingUpdate::append(centroid_id, vector));
         self.root_centroid_count += 1;
     }
 
@@ -625,7 +623,7 @@ impl<'a> DirtyCentroidReader<'a> {
         posting_list: &PostingList,
         updates: &[PostingUpdate],
     ) -> Arc<PostingList> {
-        Arc::new(posting_list.update_in_place(updates.to_vec()))
+        Arc::new(posting_list.clone_with_updates(updates.to_vec(), false))
     }
 }
 
@@ -635,7 +633,7 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
             let mut root = root.clone();
             root.extend(self.delta.root_updates.iter().cloned());
             let root = PostingListValue::from_posting_updates(root).expect("unreachable");
-            MaybeCached::Value(Arc::new(PostingList::from_value(root)))
+            MaybeCached::Value(Arc::new(PostingList::from_value(root, false)))
         } else {
             let stored = self.reader.clone();
             let updates = self.delta.root_updates.clone();
@@ -1002,7 +1000,7 @@ mod tests {
         let actual_storage = storage.get_root_posting_list(DIMS).await.unwrap();
         assert_eq!(actual_storage, expected_storage);
 
-        let expected_cache = PostingList::from_value(expected_storage);
+        let expected_cache = PostingList::from_value(expected_storage, false);
         let actual_cache = state.centroid_cache().root(u64::MAX).unwrap();
         assert_eq!(actual_cache.as_ref(), &expected_cache);
     }
@@ -1275,7 +1273,8 @@ mod tests {
             Some(CentroidsValue::new(4))
         );
         assert_eq!(state.root_centroid_count(), 2);
-        let root = PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let expected = vec![
             (internal_centroid(2, 1), vec![1.0, 0.0]),
             (internal_centroid(2, 2), vec![0.0, 1.0]),
@@ -1325,7 +1324,8 @@ mod tests {
 
         // then:
         assert_eq!(state.root_centroid_count(), 1);
-        let posting = PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap());
+        let posting =
+            PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap(), false);
         assert_eq!(
             posting
                 .iter()
@@ -1494,7 +1494,7 @@ mod tests {
 
         // then:
         let posting =
-            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap());
+            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap(), false);
         assert_eq!(
             posting
                 .iter()
@@ -1542,7 +1542,7 @@ mod tests {
 
         // then:
         let posting =
-            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap());
+            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap(), false);
         assert!(posting.is_empty());
         let cached = state.centroid_cache().posting(parent, u64::MAX).unwrap();
         assert_eq!(cached.as_ref(), &posting);
