@@ -26,7 +26,7 @@ There are the following problems in the original implementation:
    range and re-runs the evaluator evaluation. This pipeline does not properly amortize repeated
    work like label hashing, metadata lookups and per-series iteration. We papered over some of this
    using intra-query caches, but this fix was imperfect.
-2. **Row-Oriented Compu**t**ation:** the data model stored samples keyed by label. This meant that
+2. **Row-Oriented Computation:** the data model stored samples keyed by label. This meant that
    each step evaluation would binary search for the closest matching sample (in the step’s
    neighborhood according to lookback window), and perform an indexed array lookup. This not only
    repeats work that is unnecessary for every step of evaluation it also is extremely inefficient
@@ -88,10 +88,17 @@ The EXPLAIN examples below walk a concrete query through the planning half of th
 
 ## Planning Stage
 
-Planning is split into two stages with a hard boundary between them: `Expr → LogicalPlan` is the *
-*rewritable** stage, `LogicalPlan → PhysicalPlan` is the compiling stage. Everything that wants to
-inspect, modify, or explain a query touches `LogicalPlan`; once we cross into physical, the tree is
-opaque and only the executor talks to it.
+Planning is split into three passes with a hard boundary between logical and physical:
+
+1. `Expr → LogicalPlan` — binding: lowers the parser AST into a typed logical tree, attaching
+   query-level context (step grid, lookback, storage handles).
+2. `LogicalPlan → LogicalPlan` — optimization: a rewritable pass for constant folding, CSE,
+   label pushdown, etc. The current optimizer is intentionally minimal.
+3. `LogicalPlan → PhysicalPlan` — compilation: resolves storage, binds the series roster, and
+   emits the operator tree the executor runs.
+
+Everything that wants to inspect, modify, or explain a query touches `LogicalPlan`; once we
+cross into physical, the tree is opaque and only the executor talks to it.
 
 We introduce a dedicated logical plan instead of reusing the AST module we depend on because it
 allows us to attach information such as the query’s timestamps and reinterpret concepts in more
@@ -102,6 +109,30 @@ The physical plan is a tree of `Operators` that are each individually testable a
 input/output types (defined below).
 
 ## Physical Plan Execution
+
+### Operator Trait
+
+Every node in the physical tree implements `Operator`. It is pull-based and object-safe so the
+planner can build `Box<dyn Operator>` trees without monomorphising over every combination.
+
+```rust
+pub trait Operator: Send {
+    fn schema(&self) -> &OperatorSchema;
+    fn next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<StepBatch, QueryError>>>;
+}
+```
+
+- `schema()` is callable before any `next()` so downstream operators can size buffers and
+  precompute state up front.
+- `next()` returning `Ready(None)` is terminal — callers must not poll again.
+- Each operator owns its own iteration cursor, which is how e.g. `VectorSelectorOp` knows which
+  slice of its resolved series/step tile to emit on each call.
+
+The executor drives the query by polling the root operator in a loop until it yields `None`.
+
+Range-vector producers (`MatrixSelectorOp`, `SubqueryOp`) use a parallel trait, `WindowStream`,
+whose `poll_windows` returns a `MatrixWindowBatch` instead of a `StepBatch`. `RollupOp` is the
+only consumer. See [Range-Vector Batches](#range-vector-batches).
 
 ### Core Data Model
 
@@ -149,7 +180,8 @@ working set that stays in L2. Both step-wise ops (`sum by` across series at one 
 ops (`rate` across steps of one series) have cache-friendly traversal. Operators that need the other
 axis insert a `Rechunk` breaker.
 
-Here is the actual struct. Note that we us validity bitsets to distinguish between 0/null values.
+Here is the actual struct. Note that we use validity bitsets to distinguish between 0/null
+values.
 
 ```rust
 struct StepBatch {
@@ -170,7 +202,8 @@ struct StepBatch {
 
 The `SeriesSchema` is constant for the lifetime of a single query. It is built once and contains
 the full roster of series that the query touches, allowing operators to reference them by index
-instead of re-hashing labels:
+instead of re-hashing labels. Series are indexed globally by fingerprint across all buckets the
+query touches — identical labels in two buckets collapse to one entry.
 
 ```rust
 struct SeriesSchema {
@@ -179,6 +212,39 @@ struct SeriesSchema {
     fingerprints: Arc<[u128]>,            // stable cross-bucket fingerprint per series
 }
 ```
+
+### Range-Vector Batches
+
+`StepBatch` holds one `f64` per `(step, series)` cell, which is the right shape for instant
+vectors but can't represent a range vector (which is a *list* of samples per cell). Range-vector
+producers — `MatrixSelectorOp` and `SubqueryOp` — emit a different envelope,
+`MatrixWindowBatch`, and communicate through the parallel `WindowStream` trait introduced above.
+
+`RollupOp` is the only consumer: it pairs with a range-vector child and reduces each window
+down to a single float per cell, re-emitting as a `StepBatch`. Since PromQL has no grammar
+that returns a raw range vector, `MatrixWindowBatch` never escapes to the result layer.
+
+```
+StepBatch cell            MatrixWindowBatch cell
+───────────────────       ──────────────────────────────
+one f64 + validity        {offset, len} into flat (ts, val) pool
+
+  ─ values grid ─           ─ cells grid ─        ─ flat sample pool ─
+  ┌──┬──┬──┐                ┌──┬──┬──┐            [t0 t1 t2 t3 t4 ...]
+  │ 1│ 2│ 3│                │L1│L0│L2│            [v0 v1 v2 v3 v4 ...]
+  ├──┼──┼──┤                ├──┼──┼──┤
+  │ 4│ 5│ 6│                │L1│L1│L0│
+  └──┴──┴──┘                └──┴──┴──┘
+```
+
+`MatrixWindowBatch` carries the same `step_timestamps` / `series` / `step_range` / `series_range`
+header as `StepBatch`, plus three flat columns (`timestamps`, `values`, `cells`) and an optional
+`effective_times` slice for `@` / `offset` folding.
+
+**Known limitation.** A query whose root expression returns a range vector can't be answered
+today; the root operator is a `StepBatch` producer. Supporting this would require generalising
+the root's output type or reshaping `MatrixWindowBatch` at the result boundary; noted as future
+work.
 
 ### Data Source / Storage API
 
@@ -203,6 +269,23 @@ Both methods return `futures::Stream`s. A selector typically spans multiple stor
 streaming lets the engine fan out across buckets and pipeline per-bucket results without waiting
 for the slowest one.
 
+`resolve` is effectively an inverted-index lookup (matcher → series ids) followed by forward-index
+hydration (series id → labels, metric name), producing one chunk per storage bucket:
+
+```rust
+pub struct ResolvedSeriesChunk {
+    pub bucket_id: u64,
+    pub labels: Arc<[Labels]>,
+    pub series: Arc<[ResolvedSeriesRef]>,
+}
+
+pub struct ResolvedSeriesRef {
+    pub bucket_id: u64,
+    pub series_id: u32,
+    pub metric_name: Arc<str>,
+}
+```
+
 The trait is deliberately PromQL-unaware: lookback deltas, offsets, step alignment, and rollup
 windows live in the leaf operators (`VectorSelector`, `MatrixSelector`), not in storage.
 
@@ -222,10 +305,12 @@ No other operator communicates with the storage layer.
 
 There are a few areas where we can introduce parallelism and concurrency:
 
-**Inside the storage fetching.** Selectors typically span multiple storage buckets and since buckets
-are disjoint keyspaces, fan-out is safe). The implementation uses a buffered stream with max
-concurrency 32 for both metadata and sample streams. These constants mirror v1's
-`METADATA_STAGE_READAHEAD` / `SAMPLE_STAGE_READAHEAD` so observed concurrency is comparable.
+**Inside the storage fetching.** Selectors typically span multiple storage buckets, and within a
+bucket the per-series reads are independent, so fan-out is safe at both granularities. The
+implementation uses a buffered stream with max concurrency 32 for both metadata and sample
+streams; the bound applies to whichever granularity the source chose to split work at. These
+constants mirror v1's `METADATA_STAGE_READAHEAD` / `SAMPLE_STAGE_READAHEAD` so observed
+concurrency is comparable.
 
 **Pipelining operator execution.** A selector leaf produces I/O-bound batches but downstream ops are
 CPU-bound. `ConcurrentOp` decouples them: the child runs on a spawned tokio task and pushes into a
@@ -239,8 +324,10 @@ correctness work (per-series independence above the leaf isn't free) before it's
 
 **No global permit layer.** v1 had a separate `QueryReaderEvalCache` metadata/sample semaphore
 throttling real I/O independent of scheduler readahead. v2 collapses that: the cross-bucket
-constants above are both scheduler and I/O ceiling. If we later find storage backends that need hard
-global throttling, it goes inside the `SeriesSource` implementation, not in the engine.
+constants above are both scheduler and I/O ceiling. If we later find storage backends that need
+hard global throttling, it goes inside the `SeriesSource` implementation —
+`ObjectStore::LimitStore` already provides this out of the box and is the preferred knob,
+keeping the throttle at the storage layer instead of adding an engine-level semaphore.
 
 ## Operators
 
@@ -256,16 +343,19 @@ operators.
 | `Rollup`         | Unified range-function driver (rate, increase, `*_over_time`, ...).       | No           |
 | `InstantFn`      | Pointwise scalar functions (abs, ln, clamp, histogram_quantile, ...).     | No           |
 | `Binary`         | Vector/vector or vector/scalar binop. Pre-computed series matching.       | No           |
-| `Aggregate`      | sum/avg/min/max/count/stddev/topk/bottomk/quantile by labels.             | partial      |
-| `Subquery`       | Re-grids child onto inner step; feeds outer MatrixSelector semantics.     | Yes          |
+| `Aggregate`      | sum/avg/min/max/count/stddev/topk/bottomk/quantile by labels.             | Yes          |
+| `Subquery`       | Re-grids child onto inner step; feeds outer MatrixSelector semantics. See [Subquery](#subquery). | Yes          |
 | `Rechunk`        | Transposes series-major ↔ step-major when ops need the other axis.        | Yes          |
 | `CountValues`    | Data-dependent schema. Drains child, emits with runtime-derived labelset. | Yes          |
 | `Concurrent`     | Producer/consumer decoupling with a bounded mpsc channel.                 | No           |
 | `Coalesce`       | Fan-in: merges parallel child streams that share schema.                  | No           |
 
-`Aggregate` with `topk`/`bottomk`/`quantile` buffers a whole step before emitting; `sum`/`avg`/etc.
-are streaming. Group maps and series matching are computed at plan time and reused for every batch
-since they are invariant across steps.
+`Aggregate` is a full breaker: a single group's members may span multiple child batches, so it
+drains the child before emitting. Series matching (for binary ops and aggregations) is resolved
+at plan time via a `GroupMap` keyed by the grouping labels and reused for every batch since the
+mapping is invariant across steps. A natural future improvement is to hash-partition series by
+group so `Aggregate` can emit per-group as soon as a group fills — see
+[Coalesce and Rechunk](#coalesce-and-rechunk) for the partitioning strategy.
 
 ### Subquery
 
@@ -290,7 +380,10 @@ point fetches across multiple outer steps).
 
 `SubqueryOp` is a breaker: the whole inner range must land before the outer operator produces
 its first value, so a range query with a subquery at the root can't stream results as outer
-steps complete. 
+steps complete.
+
+v1 evaluates each inner step serially. The natural extension is `Coalesce`-based partitioning
+across inner steps once the sharding story lands.
 
 ### Coalesce and Rechunk
 
@@ -298,9 +391,16 @@ Both operators live in the `LogicalPlan` enum but are not yet inserted by the pl
 (`coalesce_max_shards` defaults to `0`; a `Rechunk` in a lowered plan errors today). They're
 reserved for future work:
 
-- **Vertical sharding via `Coalesce`.** A selector splits its resolved series list across
-  shards that run in parallel through the shared tree, and `Coalesce` merges at the first common
-  ancestor. Needs per-series-independence guarantees above the leaf before it's safe to turn on.
+- **Vertical sharding via `Coalesce`.** A *shard* here is a disjoint subset of the query's work
+  — typically a slice of the resolved series roster, but a shard could equally be a subset of
+  the step grid (time-axis sharding is not planned for v1 but the operator generalises).
+  Shards run the same subplan in parallel and `Coalesce` merges at the first common ancestor.
+  Needs per-series-independence guarantees above the leaf before it's safe to turn on.
+
+  For aggregations the planner will push the grouping schema down to the vector selectors (e.g.
+  `sum by (container)` shards on `container`), so each shard owns a disjoint set of groups and
+  the final `Coalesce` does a trivial merge. High-cardinality groupings will be capped per
+  partition to avoid fragmenting the plan.
 - **Partial-then-final aggregation.** Shards compute partial aggregates; `Coalesce` streams
   them into a final combine. Trivial for `sum`/`count`, harder for `topk`/`quantile`.
 - **Series-major consumers via `Rechunk`.** A future SIMD'd `*_over_time` or cross-step
@@ -317,16 +417,22 @@ the query's `MemoryReservation`) and sidesteps the cross-query contention proble
 
 There are two categories of per-query state with different concurrency contracts:
 
-**Frozen State:** The`build_physical_plan`, handed to operators as `Arc<…>`, never mutated during
-execution. This has the series roster, which is the resolved `SeriesSchema` produced by draining
-`SeriesSource::resolve(..)` streams. Indexed by `series_idx: u32`; labels, fingerprint, and bucket
-membership baked in. Operators use the index for dense-array state (group maps, binary-match tables)
-compiled once from the roster at plan time.
+**Frozen State:** Built by `build_physical_plan` and handed to operators as `Arc<…>`, never
+mutated during execution. This is the series roster — the resolved `SeriesSchema` produced by
+draining `SeriesSource::resolve(..)` streams. Indexed by `series_idx: u32`; labels, fingerprint,
+and bucket membership baked in. Operators use the index for dense-array state (group maps,
+binary-match tables) compiled once from the roster at plan time.
 
-**Index Cache:** This is a concurrent cache that lives for the duration of the query. it
-deduplicates index lookups within the query because `resolve` fan-out (cross-bucket × per-key, up to
-1024 in-flight gets) would otherwise issue the same `(bucket, term)` or `(bucket, series_id)` fetch
-multiple times from parallel tasks. It caches inverted and forward index fetches.
+**Index Cache:** A concurrent cache scoped to `build_physical_plan` only. It deduplicates index
+lookups during resolution because `resolve` fan-out (cross-bucket × per-key, up to 1024 in-flight
+gets) would otherwise issue the same `(bucket, term)` or `(bucket, series_id)` fetch multiple
+times from parallel tasks. Once the planner has hydrated the roster and metric names, the cache
+is dropped before execution begins. Execution-time operators only touch the storage indexes
+indirectly through pre-resolved handles (`ResolvedSeriesRef`), which keeps a clean plan-vs-
+execute boundary for a future distributed executor.
+
+The current `SubqueryOp` violates this boundary by re-invoking the planner synchronously during
+execution; cleanup is tracked as follow-up work.
 
 ## Introspection: EXPLAIN and Trace
 
