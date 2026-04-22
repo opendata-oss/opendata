@@ -475,44 +475,88 @@ impl<'a> LeveledCentroidIndex<'a> {
             return Vec::new();
         }
 
+        // Parallelize scoring over posting lists: each rayon task walks one
+        // posting list end-to-end, which keeps scheduling overhead small
+        // (scoring a single f32 pair is far cheaper than a rayon job).
+        // The final merge — dedup by id and pick the global top-k — runs
+        // sequentially.
         if k == usize::MAX {
+            // Exhaustive path: every posting ends up in the result. Score each
+            // list in parallel, then dedup + sort.
+            let per_list: Vec<Vec<RankedPosting>> = postings
+                .into_par_iter()
+                .map(|posting_list| {
+                    posting_list
+                        .iter()
+                        .map(|posting| {
+                            assert_eq!(posting.id().level(), postings_level.level());
+                            RankedPosting {
+                                posting,
+                                distance: compute_distance(
+                                    query,
+                                    posting.vector(),
+                                    distance_metric,
+                                ),
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+
             let mut seen = HashSet::new();
-            let mut ranked = Vec::new();
-            for posting_list in postings {
-                for posting in posting_list.iter() {
-                    assert_eq!(posting.id().level(), postings_level.level());
-                    if !seen.insert(posting.id()) {
-                        continue;
+            let mut ranked: Vec<RankedPosting> = Vec::new();
+            for list in per_list {
+                for rp in list {
+                    if seen.insert(rp.posting.id()) {
+                        ranked.push(rp);
                     }
-                    ranked.push(RankedPosting {
-                        posting,
-                        distance: compute_distance(query, posting.vector(), distance_metric),
-                    });
                 }
             }
             ranked.sort_unstable();
             return ranked.into_iter().map(|rp| rp.posting.clone()).collect();
         }
 
-        let mut ranked = BinaryHeap::with_capacity(k);
+        // Bounded-k path: each rayon task builds a per-list top-k heap. Final
+        // reduction merges the per-list top-ks, dedups by id, and keeps the
+        // global top-k.
+        let per_list_topk: Vec<Vec<RankedPosting>> = postings
+            .into_par_iter()
+            .map(|posting_list| {
+                let mut heap: BinaryHeap<RankedPosting> = BinaryHeap::with_capacity(k);
+                for posting in posting_list.iter() {
+                    assert_eq!(posting.id().level(), postings_level.level());
+                    let candidate = RankedPosting {
+                        posting,
+                        distance: compute_distance(query, posting.vector(), distance_metric),
+                    };
+                    if heap.len() < k {
+                        heap.push(candidate);
+                    } else if let Some(worst) = heap.peek()
+                        && candidate < *worst
+                    {
+                        heap.pop();
+                        heap.push(candidate);
+                    }
+                }
+                // Sorted ascending so the final merge can iterate best-first
+                // and stop pushing into the global heap once it stabilises.
+                heap.into_sorted_vec()
+            })
+            .collect();
+
+        let mut ranked: BinaryHeap<RankedPosting> = BinaryHeap::with_capacity(k);
         let mut heap_ids = HashSet::with_capacity(k);
 
-        for posting_list in postings {
-            for posting in posting_list.iter() {
-                assert_eq!(posting.id().level(), postings_level.level());
-                let distance = compute_distance(query, posting.vector(), distance_metric);
-                let candidate = RankedPosting { posting, distance };
-
+        for list in per_list_topk {
+            for candidate in list {
                 if heap_ids.contains(&candidate.posting.id()) {
                     continue;
                 }
-
                 if ranked.len() < k {
                     heap_ids.insert(candidate.posting.id());
                     ranked.push(candidate);
                     continue;
                 }
-
                 let Some(worst) = ranked.peek() else {
                     continue;
                 };
@@ -521,6 +565,10 @@ impl<'a> LeveledCentroidIndex<'a> {
                     heap_ids.remove(&removed.posting.id());
                     heap_ids.insert(candidate.posting.id());
                     ranked.push(candidate);
+                } else {
+                    // Remaining entries in this list are all farther than
+                    // `worst` (list is sorted ascending) — skip the tail.
+                    break;
                 }
             }
         }
