@@ -4900,6 +4900,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bencher",
+ "futures",
  "opendata-common",
  "opendata-vector",
  "serde_yaml",
