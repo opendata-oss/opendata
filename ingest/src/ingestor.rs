@@ -42,6 +42,7 @@ impl DurabilityWatcher {
 
 pub struct WriteHandle {
     pub watcher: DurabilityWatcher,
+    pub ingestion_time_ms: i64,
 }
 
 enum IngestMessage {
@@ -391,6 +392,7 @@ impl Ingestor {
             .await?;
         Ok(WriteHandle {
             watcher: durability_watcher,
+            ingestion_time_ms,
         })
     }
 
@@ -621,23 +623,25 @@ mod tests {
     #[tokio::test]
     async fn should_record_metadata_and_ingestion_time_in_queue_entry() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let fixed_time = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+        let millis = 1_700_000_000_000i64;
+        let fixed_time = UNIX_EPOCH + Duration::from_millis(millis as u64);
         let clock = Arc::new(MockClock::with_time(fixed_time));
 
         let ingestor = Ingestor::with_object_store(test_config(), store.clone(), clock).unwrap();
 
         let metadata = Bytes::from(r#"{"topic":"events"}"#);
-        ingestor
+        let handle = ingestor
             .ingest(vec![Bytes::from("payload")], metadata.clone())
             .await
             .unwrap();
+        assert_eq!(handle.ingestion_time_ms, millis);
         ingestor.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].metadata.len(), 1);
         assert_eq!(entries[0].metadata[0].payload, metadata);
-        assert_eq!(entries[0].metadata[0].ingestion_time_ms, 1_700_000_000_000);
+        assert_eq!(entries[0].metadata[0].ingestion_time_ms, millis);
     }
 
     #[tokio::test]
