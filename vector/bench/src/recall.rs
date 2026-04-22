@@ -1041,62 +1041,74 @@ impl Benchmark for RecallBenchmark {
         let mut total_recall = 0.0;
         let mut latencies_us = Vec::with_capacity(queries.len());
 
-        // Rate-limiting clock: ticks at `qps_limit` Hz. `tokio::time::interval`
-        // fires its first tick immediately so we don't delay query #0.
-        let mut ticker = tokio::time::interval(tick_period);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Producer/consumer rate limiter:
+        //   - One producer pushes a (index, vector) into the channel every
+        //     `tick_period` (1/qps_limit), then closes the channel when the
+        //     input is exhausted.
+        //   - `concurrency` consumers pull from the channel. Each consumer
+        //     loops calling `rx.recv().await` and issues the query; the
+        //     `async_channel` MPMC receiver lets them compete for work
+        //     without a shared lock.
+        //
+        // Channel is bounded to `concurrency` so a slow DB back-pressures
+        // the producer rather than letting the pending-query queue grow.
+        let (tx, rx) = async_channel::bounded::<(usize, Vec<f32>)>(concurrency);
 
-        // In-flight query futures. Bounded by `concurrency` — once full we
-        // drain one before submitting the next. Futures are boxed to give
-        // `FuturesUnordered` a uniform item type.
-        type QueryFuture<'a> = std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = anyhow::Result<(usize, f64, Vec<SearchResult>)>>
-                    + Send
-                    + 'a,
-            >,
-        >;
-        let mut in_flight: futures::stream::FuturesUnordered<QueryFuture<'_>> =
-            futures::stream::FuturesUnordered::new();
+        let producer = async {
+            let mut ticker = tokio::time::interval(tick_period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            for (i, query) in queries.iter().enumerate() {
+                ticker.tick().await;
+                // send() only errors when every receiver has dropped — that
+                // only happens at shutdown, so treat it as a shutdown signal.
+                if tx.send((i, query.clone())).await.is_err() {
+                    break;
+                }
+            }
+            drop(tx);
+        };
 
         let nprobe = dataset.nprobe;
         let db_ref = &db;
-        let mut query_iter = queries.iter().enumerate();
-        let mut drained = 0usize;
-        let total = queries.len();
+        let consumers: Vec<_> = (0..concurrency)
+            .map(|_| {
+                let rx = rx.clone();
+                async move {
+                    let mut results = Vec::new();
+                    while let Ok((i, query)) = rx.recv().await {
+                        let q = Query::new(query).with_limit(k);
+                        let t = std::time::Instant::now();
+                        let search_results = db_ref
+                            .search_with_options(
+                                &q,
+                                SearchOptions {
+                                    nprobe: Some(nprobe),
+                                },
+                            )
+                            .await?;
+                        let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+                        results.push((i, elapsed_us, search_results));
+                    }
+                    anyhow::Ok::<Vec<(usize, f64, Vec<SearchResult>)>>(results)
+                }
+            })
+            .collect();
+        // `rx` is kept alive in this scope but never consumed here; that's
+        // fine — `async_channel` closes the channel when the last sender
+        // drops (the producer), so consumers break out of `recv().await`
+        // regardless.
+        drop(rx);
 
-        while drained < total {
-            // Submit new queries up to the concurrency cap, paced by ticks.
-            if in_flight.len() < concurrency
-                && let Some((i, query)) = query_iter.next()
-            {
-                ticker.tick().await;
-                let q = Query::new(query.clone()).with_limit(k);
-                in_flight.push(Box::pin(async move {
-                    let t = std::time::Instant::now();
-                    let results = db_ref
-                        .search_with_options(
-                            &q,
-                            SearchOptions {
-                                nprobe: Some(nprobe),
-                            },
-                        )
-                        .await?;
-                    let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-                    anyhow::Ok::<(usize, f64, Vec<SearchResult>)>((i, elapsed_us, results))
-                }) as QueryFuture<'_>);
-                continue;
+        let (_, consumer_results) =
+            tokio::join!(producer, futures::future::try_join_all(consumers));
+        let consumer_results = consumer_results?;
+
+        for batch in consumer_results {
+            for (i, elapsed_us, results) in batch {
+                query_latency.record(elapsed_us);
+                latencies_us.push(elapsed_us);
+                total_recall += recall_at_k(&results, &ground_truth[i], k);
             }
-
-            // At concurrency cap (or no more to submit): wait for a result.
-            let Some(result) = futures::StreamExt::next(&mut in_flight).await else {
-                break;
-            };
-            let (i, elapsed_us, results) = result?;
-            query_latency.record(elapsed_us);
-            latencies_us.push(elapsed_us);
-            total_recall += recall_at_k(&results, &ground_truth[i], k);
-            drained += 1;
         }
         let query_secs = query_start.elapsed().as_secs_f64();
         let avg_recall = total_recall / queries.len() as f64;

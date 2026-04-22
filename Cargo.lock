@@ -4887,6 +4887,7 @@ name = "vector-bench"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "bencher",
  "futures",
