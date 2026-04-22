@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::{tracing, StorageConfig};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
 use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
+use common::{StorageConfig, tracing};
 use tokio::sync::mpsc;
 use vector::{
     Config, DistanceMetric, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorDb,
@@ -32,6 +32,10 @@ use vector::{
 const DEFAULT_NUM_QUERIES: usize = 100;
 const BASE_VECTOR_CHUNK_SIZE: usize = 1_000_000;
 const INGEST_WRITE_BATCH_SIZE: usize = 10;
+/// Default number of concurrent queries during the warm query phase.
+const DEFAULT_QUERY_CONCURRENCY: usize = 8;
+/// Default ceiling on queries-per-second during the warm query phase.
+const DEFAULT_QUERY_QPS_LIMIT: usize = 32;
 
 fn load_vector_config(path: &str) -> Config {
     let contents =
@@ -306,6 +310,13 @@ struct Dataset {
     /// Maximum number of base vectors to ingest. `None` = all.
     max_vectors: Option<usize>,
     normalize: bool,
+    /// Number of queries allowed in flight concurrently during the warm
+    /// query phase. Default: `DEFAULT_QUERY_CONCURRENCY`.
+    query_concurrency: usize,
+    /// Ceiling on queries-per-second during the warm query phase. The bench
+    /// paces new query submissions to stay at or below this rate.
+    /// Default: `DEFAULT_QUERY_QPS_LIMIT`.
+    query_qps_limit: usize,
 }
 
 impl Dataset {
@@ -470,6 +481,8 @@ impl From<&Dataset> for Params {
         p.insert("merge_threshold", d.merge_threshold.to_string());
         p.insert("nprobe", d.nprobe.to_string());
         p.insert("num_queries", d.num_queries.to_string());
+        p.insert("query_concurrency", d.query_concurrency.to_string());
+        p.insert("query_qps_limit", d.query_qps_limit.to_string());
         p.insert("format", format_to_str(d.format));
         if let Some(max) = d.max_vectors {
             p.insert("max_vectors", max.to_string());
@@ -532,6 +545,12 @@ impl From<Params> for Dataset {
             query_pruning_factor,
             nprobe: p.get_parse("nprobe").unwrap_or(default.nprobe),
             num_queries: p.get_parse("num_queries").unwrap_or(default.num_queries),
+            query_concurrency: p
+                .get_parse("query_concurrency")
+                .unwrap_or(default.query_concurrency),
+            query_qps_limit: p
+                .get_parse("query_qps_limit")
+                .unwrap_or(default.query_qps_limit),
             format: p.get("format").map(str_to_format).unwrap_or(default.format),
             block_cache_bytes,
             max_vectors: p.get_parse("max_vectors").ok().or(default.max_vectors),
@@ -572,6 +591,8 @@ const SIFT1M: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const COHERE1M: Dataset = Dataset {
@@ -594,6 +615,8 @@ const COHERE1M: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const DEEP10M: Dataset = Dataset {
@@ -616,6 +639,8 @@ const DEEP10M: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const DEEP1B: Dataset = Dataset {
@@ -638,6 +663,8 @@ const DEEP1B: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
@@ -660,6 +687,8 @@ const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 // BigANN / SIFT1B variants — all share the same base and query files but
@@ -685,6 +714,8 @@ const SIFT10M: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const SIFT50M: Dataset = Dataset {
@@ -707,6 +738,8 @@ const SIFT50M: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: Some(50_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const SIFT100M: Dataset = Dataset {
@@ -729,6 +762,8 @@ const SIFT100M: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: Some(100_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const SIFT1B: Dataset = Dataset {
@@ -751,6 +786,8 @@ const SIFT1B: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const ALL_DATASETS: &[&Dataset] = &[
@@ -928,8 +965,7 @@ impl Benchmark for RecallBenchmark {
             StorageConfig::SlateDb(slate_config) => {
                 println!("CREATE STATIC OBJECT STORE");
                 let store = create_object_store(&slate_config.object_store)?;
-                let tracing = Arc::new(
-                    tracing::object_store::TracedObjectStore::new(store));
+                let tracing = Arc::new(tracing::object_store::TracedObjectStore::new(store));
                 Some(tracing)
             }
             _ => None,
@@ -993,24 +1029,74 @@ impl Benchmark for RecallBenchmark {
 
         let query_latency = bench.histogram("query_latency_us");
 
+        let concurrency = dataset.query_concurrency.max(1);
+        let qps_limit = dataset.query_qps_limit.max(1);
+        let tick_period = std::time::Duration::from_secs_f64(1.0 / qps_limit as f64);
+        println!(
+            "  warm query phase: concurrency = {}, qps_limit = {}",
+            concurrency, qps_limit,
+        );
+
         let query_start = std::time::Instant::now();
         let mut total_recall = 0.0;
         let mut latencies_us = Vec::with_capacity(queries.len());
-        for (i, query) in queries.iter().enumerate() {
-            let t = std::time::Instant::now();
-            let q = Query::new(query.clone()).with_limit(k);
-            let results = db
-                .search_with_options(
-                    &q,
-                    SearchOptions {
-                        nprobe: Some(dataset.nprobe),
-                    },
-                )
-                .await?;
-            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+
+        // Rate-limiting clock: ticks at `qps_limit` Hz. `tokio::time::interval`
+        // fires its first tick immediately so we don't delay query #0.
+        let mut ticker = tokio::time::interval(tick_period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // In-flight query futures. Bounded by `concurrency` — once full we
+        // drain one before submitting the next. Futures are boxed to give
+        // `FuturesUnordered` a uniform item type.
+        type QueryFuture<'a> = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<(usize, f64, Vec<SearchResult>)>>
+                    + Send
+                    + 'a,
+            >,
+        >;
+        let mut in_flight: futures::stream::FuturesUnordered<QueryFuture<'_>> =
+            futures::stream::FuturesUnordered::new();
+
+        let nprobe = dataset.nprobe;
+        let db_ref = &db;
+        let mut query_iter = queries.iter().enumerate();
+        let mut drained = 0usize;
+        let total = queries.len();
+
+        while drained < total {
+            // Submit new queries up to the concurrency cap, paced by ticks.
+            if in_flight.len() < concurrency
+                && let Some((i, query)) = query_iter.next()
+            {
+                ticker.tick().await;
+                let q = Query::new(query.clone()).with_limit(k);
+                in_flight.push(Box::pin(async move {
+                    let t = std::time::Instant::now();
+                    let results = db_ref
+                        .search_with_options(
+                            &q,
+                            SearchOptions {
+                                nprobe: Some(nprobe),
+                            },
+                        )
+                        .await?;
+                    let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+                    anyhow::Ok::<(usize, f64, Vec<SearchResult>)>((i, elapsed_us, results))
+                }) as QueryFuture<'_>);
+                continue;
+            }
+
+            // At concurrency cap (or no more to submit): wait for a result.
+            let Some(result) = futures::StreamExt::next(&mut in_flight).await else {
+                break;
+            };
+            let (i, elapsed_us, results) = result?;
             query_latency.record(elapsed_us);
             latencies_us.push(elapsed_us);
             total_recall += recall_at_k(&results, &ground_truth[i], k);
+            drained += 1;
         }
         let query_secs = query_start.elapsed().as_secs_f64();
         let avg_recall = total_recall / queries.len() as f64;

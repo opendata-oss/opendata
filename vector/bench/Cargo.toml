@@ -11,4 +11,5 @@ vector = { path = "..", package = "opendata-vector" }
 serde_yaml.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 tokio.workspace = true
