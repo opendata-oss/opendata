@@ -557,6 +557,8 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 | `merge_threshold`   | usize  | Centroid merge threshold (default: from dataset)                   |
 | `nprobe`            | usize  | Number of centroids to probe at query time (default: from dataset) |
 | `num_queries`       | usize  | Number of queries to run (default: 100)                            |
+| `query_concurrency` | usize  | Concurrent in-flight queries during the warm query phase (default: 8) |
+| `query_qps_limit`   | usize  | Rate cap on warm-phase query submissions, in QPS (default: 32)     |
 | `block_cache_bytes` | u64    | Block cache size in bytes (default: none)                          |
 | `data_dir`          | string | Directory containing dataset files (default: `vector/bench/data/`) |
 | `vector_config`     | string | Path to a YAML file with vector `Config` overrides                 |
