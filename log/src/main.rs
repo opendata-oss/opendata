@@ -1,5 +1,9 @@
 //! OpenData Log HTTP Server binary entry point.
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::sync::Arc;
 
 use clap::Parser;

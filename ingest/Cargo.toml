@@ -19,7 +19,7 @@ path = "src/bin/opendata_ingest/main.rs"
 required-features = ["cli"]
 
 [features]
-cli = ["dep:clap", "dep:base64", "dep:serde_json"]
+cli = ["dep:clap", "dep:base64", "dep:serde_json", "dep:tikv-jemallocator"]
 
 [dependencies]
 common.workspace = true
@@ -37,6 +37,9 @@ base64 = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 zstd.workspace = true
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

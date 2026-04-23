@@ -20,7 +20,7 @@ required-features = ["http-server"]
 
 [features]
 default = []
-http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "dep:metrics-exporter-prometheus"]
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "dep:metrics-exporter-prometheus", "dep:tikv-jemallocator"]
 
 [dependencies]
 async-trait.workspace = true
@@ -42,6 +42,9 @@ tower = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 prometheus-client = { version = "0.22", optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64.workspace = true
