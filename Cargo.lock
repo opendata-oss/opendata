@@ -2094,6 +2094,7 @@ dependencies = [
  "bencher",
  "bytes",
  "opendata-log",
+ "tikv-jemallocator",
  "tokio",
 ]
 
@@ -2603,6 +2604,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "slatedb",
+ "tikv-jemallocator",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2643,6 +2645,7 @@ dependencies = [
  "serde_with",
  "slatedb",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
  "tower",
  "tracing",
@@ -4389,6 +4392,7 @@ dependencies = [
  "bencher",
  "opendata-timeseries",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
 ]
 
@@ -4897,6 +4901,7 @@ dependencies = [
  "opendata-common",
  "opendata-vector",
  "serde_yaml",
+ "tikv-jemallocator",
  "tokio",
  "tracing-subscriber",
 ]

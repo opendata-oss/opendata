@@ -22,6 +22,10 @@
 //! opendata-ingest manifest dump /tmp/manifest | jq '.entries | length'
 //! ```
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 
 mod manifest;

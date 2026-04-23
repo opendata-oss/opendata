@@ -1,5 +1,9 @@
 //! Benchmarks for the vector database.
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod recall;
 
 use bencher::Benchmark;
