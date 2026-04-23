@@ -447,8 +447,13 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
             .await
             .map_err(|e| WriteError::FlushError(e.to_string()))?;
         self.last_flushed_epoch = epoch_range.end - 1;
-        self.watermarks.update_written(self.last_flushed_epoch);
+        // Publish the refreshed view first so any waiter awoken by the
+        // watermark notification below observes a view that already includes
+        // this flush. Reversing the order races on multi-thread runtimes:
+        // a waiter on `Written` can schedule on another worker and read
+        // `view.snapshot` before this task completes the view update.
         self.view.update_flush_finished(snapshot, epoch_range);
+        self.watermarks.update_written(self.last_flushed_epoch);
         Ok(())
     }
 }
