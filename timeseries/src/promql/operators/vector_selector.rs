@@ -475,45 +475,47 @@ impl<'a, S: SeriesSource + Send + Sync + 'a> VectorSelectorOp<'a, S> {
         // the step timestamp.
         let mut source_timestamps = vec![0i64; cell_count];
 
+        // Forward two-pointer per series: `effective_times` is non-decreasing
+        // across steps (monotonic grid, or constant when `@` is set), and
+        // each series' timestamps are ascending, so a cursor advancing past
+        // samples with `ts <= window_hi` is correct across all steps. The
+        // candidate is always `cursor - 1` (the newest in-window sample).
+        // This turns the old O(step_count × series × ts.len()) reverse scan
+        // into O(step_count × series + Σ ts.len()).
+        let mut cursors = vec![0usize; chunk_len];
+
         for step_off in 0..step_count {
             let step_idx = step_chunk_start + step_off;
             let effective = self.effective_times.get(step_idx);
             let window_lo = effective.saturating_sub(self.lookback_ms); // exclusive
             let window_hi = effective; // inclusive
 
-            for series_off in 0..chunk_len {
+            for (series_off, cursor) in cursors.iter_mut().enumerate() {
                 let ts = &samples.timestamps[series_off];
                 let vs = &samples.values[series_off];
-                // Walk from the newest sample backward; caller already
-                // sorted per-series samples ascending by timestamp, so we
-                // scan from the end and stop at the first in-window
-                // non-stale sample.
-                let mut selected: Option<(f64, i64)> = None;
-                for i in (0..ts.len()).rev() {
-                    let t = ts[i];
-                    if t > window_hi {
-                        continue;
-                    }
-                    if t <= window_lo {
-                        break;
-                    }
-                    let v = vs[i];
-                    if is_stale_nan(v) {
-                        // Per task spec: STALE_NAN terminates the lookback;
-                        // treat this cell as absent.
-                        break;
-                    }
-                    selected = Some((v, t));
-                    break;
+                while *cursor < ts.len() && ts[*cursor] <= window_hi {
+                    *cursor += 1;
+                }
+                if *cursor == 0 {
+                    continue;
+                }
+                let idx = *cursor - 1;
+                let t = ts[idx];
+                if t <= window_lo {
+                    continue;
+                }
+                let v = vs[idx];
+                if is_stale_nan(v) {
+                    // STALE_NAN terminates the lookback; treat the cell as
+                    // absent. Per-step; the cursor stays put so later steps
+                    // with wider `window_hi` may select a newer sample.
+                    continue;
                 }
 
                 let cell = step_off * chunk_len + series_off;
-                if let Some((v, t)) = selected {
-                    buffers.values[cell] = v;
-                    buffers.validity.set(cell);
-                    source_timestamps[cell] = t;
-                }
-                // else: values[cell] stays NaN, validity bit stays clear.
+                buffers.values[cell] = v;
+                buffers.validity.set(cell);
+                source_timestamps[cell] = t;
             }
         }
 

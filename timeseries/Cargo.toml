@@ -27,6 +27,7 @@ http-server = [
     "dep:tower-http",
     "dep:clap",
     "dep:metrics-exporter-prometheus",
+    "dep:tikv-jemallocator",
 ]
 testing = []
 remote-write = ["http-server", "dep:prost", "dep:snap"]
@@ -71,6 +72,9 @@ regex-syntax = "0.8"
 roaring = "0.7"
 rust-embed = { version = "8", features = ["mime-guess"] }
 tsz = "0.1"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 # Optional dependencies for remote-write and otel features
 ingest = { workspace = true, optional = true }
