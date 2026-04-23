@@ -1077,7 +1077,10 @@ impl Tsdb {
     /// First flushes each bucket's delta to the storage memtable in parallel,
     /// then issues a single `storage.flush()` to persist everything durably.
     pub(crate) async fn flush(&self) -> Result<()> {
-        // Note: moka's iter() returns a clone of the current entries
+        // `iter()` does not include entries whose insert is still queued
+        // in moka's internal write buffer; drain it first so a bucket
+        // created moments before flush isn't silently skipped.
+        self.ingest_cache.run_pending_tasks().await;
         let futs: futures::stream::FuturesUnordered<_> = self
             .ingest_cache
             .iter()
