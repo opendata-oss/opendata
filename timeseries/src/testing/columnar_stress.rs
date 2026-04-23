@@ -179,9 +179,12 @@ pub(crate) fn build_oracle(scenario: &Scenario) -> Oracle {
                 sum_by_app[step_idx][spec.application_idx] += spec.gauge_weight;
             }
 
-            if safe_rate_window(spec, timestamp_ms, scenario.config.rate_window_ms) {
-                let rate = spec.counter_inc_per_scrape as f64
-                    / (scenario.config.scrape_interval_ms as f64 / 1000.0);
+            if let Some(rate) = prom_extrapolated_rate(
+                spec,
+                timestamp_ms,
+                scenario.config.rate_window_ms,
+                scenario.config.scrape_interval_ms,
+            ) {
                 let slot = &mut rate_by_app[step_idx][spec.application_idx];
                 *slot = Some(slot.unwrap_or(0.0) + rate);
             }
@@ -473,8 +476,76 @@ fn probe_timestamps(config: &ScenarioConfig) -> Vec<i64> {
     timestamps.into_iter().collect()
 }
 
-fn safe_rate_window(spec: &SeriesSpec, timestamp_ms: i64, rate_window_ms: i64) -> bool {
-    spec.start_ms + rate_window_ms <= timestamp_ms && timestamp_ms <= spec.end_ms
+/// Mirrors the engine's `extrapolated_rate` (see `promql::operators::rollup`)
+/// for a single synthetic series. The oracle must replicate extrapolation
+/// because, at bucket boundaries, "dying" hour-local series still have
+/// samples in the 15m rate window and Prometheus extrapolates over their
+/// partial coverage.
+fn prom_extrapolated_rate(
+    spec: &SeriesSpec,
+    timestamp_ms: i64,
+    rate_window_ms: i64,
+    scrape_interval_ms: i64,
+) -> Option<f64> {
+    let window_start_ms = timestamp_ms - rate_window_ms;
+    let window_end_ms = timestamp_ms;
+
+    // Samples the series has in the window (window_start_ms, window_end_ms].
+    // Series samples are at `spec.start_ms + k*scrape_interval_ms`, for
+    // k = 0.. while that timestamp <= spec.end_ms. Values are strictly
+    // monotonic (no counter resets in this fixture).
+    let effective_hi = window_end_ms.min(spec.end_ms);
+    if effective_hi < spec.start_ms {
+        return None;
+    }
+    let k_lo = if window_start_ms < spec.start_ms {
+        0
+    } else {
+        (window_start_ms - spec.start_ms) / scrape_interval_ms + 1
+    };
+    let first_sample_ts = spec.start_ms + k_lo * scrape_interval_ms;
+    if first_sample_ts > effective_hi {
+        return None;
+    }
+    let k_hi = (effective_hi - spec.start_ms) / scrape_interval_ms;
+    let n = (k_hi - k_lo + 1) as usize;
+    if n < 2 {
+        return None;
+    }
+
+    let first_t = first_sample_ts;
+    let last_t = spec.start_ms + k_hi * scrape_interval_ms;
+    let first_v = k_lo as f64 * spec.counter_inc_per_scrape as f64;
+    let last_v = k_hi as f64 * spec.counter_inc_per_scrape as f64;
+
+    let range_seconds = rate_window_ms as f64 / 1000.0;
+    let time_diff_seconds = (last_t - first_t) as f64 / 1000.0;
+    if time_diff_seconds <= 0.0 {
+        return None;
+    }
+
+    let result = last_v - first_v;
+    let avg_interval = time_diff_seconds / (n - 1) as f64;
+    let extrapolation_threshold = avg_interval * 1.1;
+
+    let mut duration_to_start = (first_t - window_start_ms) as f64 / 1000.0;
+    let mut duration_to_end = (window_end_ms - last_t) as f64 / 1000.0;
+
+    if duration_to_start >= extrapolation_threshold {
+        duration_to_start = avg_interval / 2.0;
+    }
+    if result > 0.0 && first_v >= 0.0 {
+        let duration_to_zero = first_v * (time_diff_seconds / result);
+        if duration_to_zero < duration_to_start {
+            duration_to_start = duration_to_zero;
+        }
+    }
+    if duration_to_end >= extrapolation_threshold {
+        duration_to_end = avg_interval / 2.0;
+    }
+
+    let factor = (time_diff_seconds + duration_to_start + duration_to_end) / time_diff_seconds;
+    Some(result * factor / range_seconds)
 }
 
 fn latest_scrape_at_or_before(
