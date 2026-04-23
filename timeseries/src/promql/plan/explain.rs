@@ -3,7 +3,7 @@
 //! logical, and physical.
 //!
 //! [`describe_physical`] mirrors
-//! [`super::physical::build_node`]'s per-variant dispatch but
+//! `super::physical::build_node`'s per-variant dispatch but
 //! instantiates no operators and performs no I/O, so HTTP handlers can
 //! render it as a dry run. The physical describer duplicates
 //! `build_node`'s dispatch;
@@ -188,7 +188,7 @@ pub fn describe_logical(plan: &LogicalPlan) -> PlanNode {
 // describe_physical — mirror of build_node without I/O
 // ---------------------------------------------------------------------------
 
-/// Describe the physical tree that [`super::physical::build_node`]
+/// Describe the physical tree that `super::physical::build_node`
 /// would build for `plan`. No operators, no source, no reservation.
 ///
 /// Decisions that depend on runtime state (e.g. `ConcurrentOp`

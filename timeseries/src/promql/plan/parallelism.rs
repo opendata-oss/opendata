@@ -15,7 +15,7 @@
 //! decoupled I/O. `0` wraps every leaf; `u64::MAX` disables wrapping
 //! entirely.
 //!
-//! Wrapping happens in [`super::physical::build_node`] for
+//! Wrapping happens in `super::physical::build_node` for
 //! `VectorSelector` (wraps the op directly) and `Rollup` over
 //! `MatrixSelector` (wraps the whole rollup, because
 //! `MatrixSelectorOp::next` is degenerate). Other operators are CPU-bound

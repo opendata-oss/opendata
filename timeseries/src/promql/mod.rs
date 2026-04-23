@@ -16,7 +16,7 @@
 //!   the per-bucket `QueryReader`.
 //! - [`operators`]: concrete operator implementations (selectors, functions,
 //!   aggregations, binary ops, subqueries, plumbing).
-//! - [`plan`]: PromQL `Expr` → [`LogicalPlan`](plan::LogicalPlan) lowering,
+//! - [`plan`]: PromQL `Expr` → [`LogicalPlan`](plan::plan_types::LogicalPlan) lowering,
 //!   rule-based optimisation, and physical-plan construction (series
 //!   resolution, group maps, match tables).
 //! - [`reshape`]: converts the stream of collected

@@ -3,10 +3,10 @@
 //! a range function" construct.
 //!
 //! A subquery is logically an inner range-vector producer and feeds
-//! into a downstream [`RollupOp`], so `SubqueryOp` implements the same
+//! into a downstream [`RollupOp`](super::rollup::RollupOp), so `SubqueryOp` implements the same
 //! [`WindowStream`] contract `MatrixSelectorOp` does — it emits
 //! [`MatrixWindowBatch`]es, one per outer step. `Operator::next` is a
-//! degenerate "immediate EOS", same arrangement as [`MatrixSelectorOp`].
+//! degenerate "immediate EOS", same arrangement as [`MatrixSelectorOp`](super::matrix_selector::MatrixSelectorOp).
 //!
 //! The hard part is that the inner child has to be re-evaluated for each
 //! outer step (the inner window slides). The operator owns a

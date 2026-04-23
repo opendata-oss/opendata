@@ -13,7 +13,7 @@
 //! Operator invariants:
 //! - [`Operator::schema`] is callable before any [`Operator::next`], so
 //!   downstream operators can size buffers and precompute maps up front.
-//! - [`Operator::next`] returning [`Poll::Ready(None)`] is terminal; callers
+//! - [`Operator::next`] returning `Poll::Ready(None)` is terminal; callers
 //!   must not poll again.
 
 use std::task::{Context, Poll};

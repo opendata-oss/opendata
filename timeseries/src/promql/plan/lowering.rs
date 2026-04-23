@@ -11,7 +11,7 @@
 //! [`PlanError::InvalidArgument`].
 //!
 //! Constant folding, CSE, and type-checking beyond operator-enum
-//! coverage happen elsewhere ([`super::optimize`] and the physical
+//! coverage happen elsewhere ([`mod@super::optimize`] and the physical
 //! planner).
 
 use std::sync::Arc;

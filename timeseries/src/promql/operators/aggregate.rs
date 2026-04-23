@@ -106,7 +106,7 @@ pub enum AggregateKind {
     Bottomk(i64),
     /// `quantile(q, v)` — per-group, per-step q-th quantile with linear
     /// interpolation between ranks. Shares the streaming output-schema
-    /// shape (one cell per group). See [`rollup_fns::quantile`] in
+    /// shape (one cell per group). See `rollup_fns::quantile` in
     /// `operators::rollup` for the canonical reducer; this operator
     /// calls into the same implementation.
     Quantile(f64),

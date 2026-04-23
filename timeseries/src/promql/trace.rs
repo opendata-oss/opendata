@@ -194,7 +194,7 @@ struct OperatorStatsInner {
 }
 
 /// Per-query collector. Thread-safe since operators may run on spawned tasks
-/// (e.g. [`super::operators::ConcurrentOp`]).
+/// (e.g. [`super::operators::concurrent::ConcurrentOp`]).
 #[derive(Debug, Default)]
 pub struct TraceCollector {
     inner: Mutex<Inner>,

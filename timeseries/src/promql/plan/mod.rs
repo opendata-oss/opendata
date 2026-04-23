@@ -18,13 +18,14 @@
 //!   PhysicalPlan (dyn Operator tree, opaque)
 //! ```
 //!
-//! [`LogicalPlan`] is the only rewrite surface the optimiser and EXPLAIN
-//! touch; the physical tree is compiled and opaque.
+//! [`LogicalPlan`](plan_types::LogicalPlan) is the only rewrite surface the
+//! optimiser and EXPLAIN touch; the physical tree is compiled and opaque.
 //!
-//! - [`plan_types`], [`error`]: [`LogicalPlan`] and plan-time errors.
-//! - [`lowering`]: `Expr` → [`LogicalPlan`] under a caller-supplied
-//!   [`LoweringContext`] (query grid, lookback, etc.).
-//! - [`optimize`]: rule-based rewrites (constant folding, matcher dedup).
+//! - [`plan_types`], [`error`]: [`LogicalPlan`](plan_types::LogicalPlan) and
+//!   plan-time errors.
+//! - [`lowering`]: `Expr` → [`LogicalPlan`](plan_types::LogicalPlan) under a
+//!   caller-supplied [`LoweringContext`] (query grid, lookback, etc.).
+//! - [`mod@optimize`]: rule-based rewrites (constant folding, matcher dedup).
 //! - [`parallelism`]: policy for where to insert exchange operators
 //!   (`ConcurrentOp`).
 //! - [`physical`]: resolves series via [`SeriesSource`], builds group

@@ -62,7 +62,7 @@ pub struct StepBatch {
     /// `timestamp()` semantics. [`InstantFnKind::Timestamp`] consults this column
     /// before falling back to the step timestamp.
     ///
-    /// [`VectorSelectorOp`]: super::operators::VectorSelectorOp
+    /// [`VectorSelectorOp`]: super::operators::vector_selector::VectorSelectorOp
     /// [`InstantFnKind::Timestamp`]: super::operators::instant_fn::InstantFnKind::Timestamp
     pub source_timestamps: Option<Arc<[i64]>>,
 }
@@ -126,7 +126,7 @@ impl StepBatch {
     }
 
     /// Attach per-cell source-sample timestamps. Only
-    /// [`super::operators::VectorSelectorOp`] should call this.
+    /// [`super::operators::vector_selector::VectorSelectorOp`] should call this.
     pub fn with_source_timestamps(mut self, source_timestamps: Arc<[i64]>) -> Self {
         debug_assert_eq!(
             source_timestamps.len(),

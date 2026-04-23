@@ -329,7 +329,7 @@ fn dedupe_matchers(matchers: Matchers) -> Matchers {
     }
 }
 
-/// Structural matcher equality. [`MatchOp`] already derives `PartialEq` in
+/// Structural matcher equality. `MatchOp` already derives `PartialEq` in
 /// promql-parser 0.8 (regex compares on source string), so `Matcher`'s
 /// derived `PartialEq` is a complete structural check. Helper kept as a
 /// one-liner for readability / to isolate the dependency on the derived

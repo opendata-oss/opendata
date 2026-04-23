@@ -335,8 +335,9 @@ fn preload_ranges_inner(
 }
 
 /// Execution outcome bundling the reshaped query value with an optional
-/// tracing snapshot. The snapshot is populated when the [`LoweringContext`]
-/// carried a trace collector.
+/// tracing snapshot. The snapshot is populated when the
+/// [`LoweringContext`](crate::promql::plan::LoweringContext) carried a
+/// trace collector.
 pub(crate) struct ExecuteOutcome {
     pub value: QueryValue,
     pub trace: Option<crate::promql::trace::QueryTrace>,

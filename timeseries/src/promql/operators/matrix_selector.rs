@@ -1,6 +1,6 @@
 //! `MatrixSelectorOp` — the storage leaf for PromQL range vectors
 //! (`metric[5m]`). It fetches raw samples and repackages them into
-//! per-step windows for [`RollupOp`] (`rate`, `*_over_time`, ...) and for
+//! per-step windows for [`RollupOp`](super::rollup::RollupOp) (`rate`, `*_over_time`, ...) and for
 //! [`SubqueryOp`](super::subquery::SubqueryOp) to consume.
 //!
 //! `metric[range]` produces a *vector of samples* per step, which doesn't
@@ -8,7 +8,7 @@
 //! emit `StepBatch`es on its main `Operator::next` loop (that path is a
 //! degenerate "immediate EOS"); the real output is
 //! [`MatrixSelectorOp::windows`], which emits [`MatrixWindowBatch`]es.
-//! [`RollupOp`] drives this via the [`super::rollup::WindowStream`]
+//! [`RollupOp`](super::rollup::RollupOp) drives this via the [`super::rollup::WindowStream`]
 //! trait, which [`super::rollup::MatrixWindowSource`] implements over a
 //! `MatrixSelectorOp`.
 //!
@@ -157,14 +157,12 @@ pub struct MatrixWindowBatch {
     /// [`Self::step_timestamps`] (absolute, indexed by global step idx)
     /// so consumers slice via `step_range` the same way.
     ///
-    /// [`RollupOp`] prefers this over `step_timestamps` when computing
+    /// [`RollupOp`](super::rollup::RollupOp) prefers this over `step_timestamps` when computing
     /// `(window_start, window_end)` for rate-family extrapolation; without
     /// it, `rate(metric[100s] @ 100)` at outer step `t=25s` would compute
     /// rate over the window `(-75s, 25s]` while the packed samples
     /// actually cover `(0, 100s]`, producing a negative rate disjoint
     /// from the data.
-    ///
-    /// [`RollupOp`]: super::rollup::RollupOp
     pub effective_times: Option<Arc<[i64]>>,
 }
 
