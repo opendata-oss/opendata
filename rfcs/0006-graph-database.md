@@ -188,8 +188,12 @@ repeat count times:
 ```
 
 - `prop_key_id` is the catalog-assigned integer ID of the property key.
-- `value_bytes` is the Grafeo `Value` serialized via bincode. Length-prefixed so the blob
-  can be walked without knowing individual value sizes.
+- `value_bytes` is the Grafeo `Value` serialized via `bincode` using
+  [`Value::serialize` / `Value::deserialize`](https://github.com/GrafeoDB/grafeo/blob/main/crates/grafeo-common/src/types/value.rs)
+  in `grafeo-common`. The format is bincode-stable within a Grafeo minor version; any
+  backwards-incompatible change rides a prefix-version bump per
+  [RFC 0001](../../rfcs/0001-record-key-prefix.md). Length-prefixed so the blob can be
+  walked without knowing individual value sizes.
 - Entries are stored in insertion order, not sorted. Property counts per entity are small in
   practice (LPG schemas typically have tens of properties, not thousands), so linear scan on
   get/set/remove is cheap relative to the single SlateDB get. Sorting would add work on the
@@ -306,9 +310,10 @@ reading the prior packed blob to delete the stale one. Reading the blob would tr
 O(N) merge-operand resolution in SlateDB, which is pathologically slow under repeated
 updates. Instead, stale index entries are filtered at read time in `find_nodes_by_property`
 and `find_nodes_in_range` by verifying candidates against the current property value.
-Staleness is bounded by the number of *distinct indexed values* per (node, property) pair,
-not by total write count. Setting `age` to 30 then 40 then 30 again produces at most 2 stale
-entries, not 3.
+Staleness is bounded by the number of *distinct indexed values* per (node, property) pair
+minus one (the current value), not by total write count. Setting `age` to 30 then 40 then
+30 again produces at most 1 stale entry, not 2: two distinct values yield two live index
+entries, one of which always matches the current value.
 
 ### Adjacency Design
 
@@ -403,13 +408,21 @@ lookup becomes a prefix scan over version chains.
 
 ## Open Questions
 
-1. **Property index scope**: Should indexes also cover edge properties?
-2. **Multi-graph support**: Graph namespace prefix in keys vs. separate SlateDB instances?
+None at this time.
 
 ## Future Considerations
 
 - **HTTP API**: Read/write endpoints following the timeseries and log patterns.
 - **Graph algorithms**: Grafeo's `algos` feature as server-side procedures.
+- **Edge property indexing**: Node properties are indexed via `PropertyIndex` (`0x80`);
+  edge properties are not. No MVP query pattern needs it. The key layout is
+  forward-compatible: a new `EdgePropertyIndex` record tag (e.g. `0x81`) can mirror the
+  node-side layout when demand shows up, without touching existing records.
+- **Multi-graph support**: Each graph is a separate SlateDB instance, matching how every
+  other OpenData subsystem is scoped. Stamping a graph-id prefix across the ~2B keys in
+  the scale analysis would compound keyspace cost for the single-graph case. A
+  namespace-prefix variant can be added later under a version bump without breaking
+  single-graph deployments.
 - **High-degree adjacency chunking**: See "High-degree overflow" in Value Encoding for the
   planned chunk + delta-bit-pack + zone-map upgrade path.
 - **PropertyIndex vacuuming**: Blind-write updates leave stale entries that are filtered at
@@ -444,4 +457,4 @@ lookup becomes a prefix scan over version chains.
 | 2026-04-03 | Introduced merge-operator-based packed storage. Added keyspace analysis. Renamed SlateGraphStore to GraphStorage. Condensed RFC. |
 | 2026-04-03 | Defined SortableValue encoding inline. Noted subsystem 0x05 registration in RFC 0001. Removed unused backward_edges config flag. |
 | 2026-04-17 | Committed to the packed layout as the sole storage layout. Dropped Individual. Specified byte-level packed props, packed adjacency, and merge operand formats with rationale. Documented high-degree overflow and planned chunking upgrade path. Moved deferred items (staleness counter, per-type stats, fencing, sync/async bridge) from Open Questions into Future Considerations. Bumped Grafeo to v0.5.40. |
-| 2026-04-24 | Added per-label and per-edge-type Metadata counters (`LabelNodeCount`, `EdgeTypeCount`) to give the optimizer accurate per-type cardinality without scans. Dropped unused `prop_count:u16` field from EdgeRecord (20-byte value, not 22). Documented `sub_type` high-nibble convention (0x0? aggregate / 0x1? per-type) and key sizes (4-byte / 8-byte). Specified missing-counter fallback (`EdgeTypeCount` → global avg; `LabelNodeCount` → 0). Noted that merge-operand tags are scoped per record type (0x01/0x02 are reused across property and adjacency operands). Bumped Grafeo to v0.5.40. |
+| 2026-04-24 | Added per-label / per-edge-type counters (`LabelNodeCount`, `EdgeTypeCount`) with missing-counter fallback. Documented `sub_type` high-nibble convention and record-type-scoped operand tags. Dropped unused `prop_count:u16` from EdgeRecord. Corrected PropertyIndex staleness bound to `distinct_indexed_values - 1`. Linked `Value::serialize` / `Value::deserialize` in `grafeo-common`. Closed Open Questions: edge property indexing deferred; multi-graph = one SlateDB instance per graph. Grafeo v0.5.40. |
