@@ -13,10 +13,10 @@ use common::{StorageBuilder, StorageSemantics};
 use crate::config::Config;
 use crate::error::{QueryError, Result};
 use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
+use crate::storage::coalesce_bucket_list;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
-    Tsdb, TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range,
-    find_labels_in_range, find_series_in_range,
+    Tsdb, TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
 };
 
 /// A time series database for storing and querying metrics.
@@ -84,6 +84,10 @@ impl TimeSeriesDb {
             )
             .build()
             .await?;
+        // Flatten accumulated BucketList merge operands into a single Put so
+        // later reads don't have to replay them across SSTs. Runs before any
+        // writer is started, so no concurrent merges can race the Put.
+        coalesce_bucket_list(storage.as_ref()).await?;
         let tsdb = Tsdb::new(storage);
         Ok(Self { tsdb })
     }
@@ -192,11 +196,10 @@ impl TimeSeriesDb {
     pub async fn query_range(
         &self,
         query: &str,
-        range: impl RangeBounds<SystemTime>,
+        range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        // Route through shared range helpers so bound conversion happens once.
-        eval_query_range_bounds(
+        <Tsdb as TsdbReadEngine>::eval_query_range(
             &self.tsdb,
             query,
             range,

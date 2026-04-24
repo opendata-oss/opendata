@@ -717,3 +717,341 @@ async fn test_slatedb_metrics_reflect_writes() {
         write_ops_after
     );
 }
+
+// ---------------------------------------------------------------------------
+// HTTP handler dispatch tests. Exercise `server/http.rs`: the handler
+// calls `eval_query` / `eval_query_range[_traced]`, and the range adapter
+// reshapes `QueryValue` back to the `Vec<RangeSample>` wire shape consumed
+// by `range_result_to_response`.
+// ---------------------------------------------------------------------------
+
+mod v2_dispatch {
+    use super::*;
+
+    #[tokio::test]
+    async fn should_dispatch_query_endpoint_to_v2() {
+        // given — `handle_query` invokes the columnar engine and returns
+        // the standard wire shape.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query?query=http_requests_total&time={}",
+            SAMPLE_TS_SECS
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: QueryResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("query response has data");
+        match data.result {
+            QueryResultValue::Vector(v) => {
+                // Must resolve at least one of the two ingested series —
+                // proves the request reached the engine behind the v2
+                // dispatch. Exact series count depends on lookback
+                // semantics, which unit 5.2 does not rewire.
+                assert!(
+                    !v.is_empty(),
+                    "expected at least one http_requests_total series"
+                );
+            }
+            other => panic!("expected vector result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_dispatch_query_range_endpoint_to_v2() {
+        // given — the range handler projects `QueryValue` back to
+        // `Vec<RangeSample>` via the shared adapter.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query_range?query=http_requests_total&start={}&end={}&step=60s",
+            SAMPLE_TS_SECS - 60,
+            SAMPLE_TS_SECS + 60,
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: QueryRangeResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("query_range response has data");
+        assert_eq!(data.result_type, "matrix");
+        assert!(!data.result.is_empty(), "expected at least one series");
+    }
+
+    #[tokio::test]
+    async fn should_return_scalar_via_range_adapter_when_query_is_constant() {
+        // given — v2 returns `QueryValue::Scalar` for a range-grid scalar
+        // (`1+1`); the HTTP adapter must collapse this into
+        // `Vec<RangeSample>` so the wire shape stays "matrix".
+        let (app, _) = setup().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query_range?query=1%2B1&start={}&end={}&step=60s",
+            SAMPLE_TS_SECS,
+            SAMPLE_TS_SECS + 120,
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: QueryRangeResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("response has data");
+        assert_eq!(data.result_type, "matrix");
+        assert_eq!(data.result.len(), 1, "scalar collapses to one series");
+    }
+
+    #[tokio::test]
+    async fn should_omit_trace_field_when_tracing_not_requested() {
+        // given — default server config disables tracing; no ?trace param.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query?query=http_requests_total&time={}",
+            SAMPLE_TS_SECS
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json.get("trace").is_none(),
+            "trace should be omitted when not requested: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_populate_trace_field_when_trace_param_set() {
+        // given — ?trace=true on an instant query.
+        let (app, _) = setup_with_data().await;
+
+        // when
+        let uri = format!(
+            "/api/v1/query?query=http_requests_total&time={}&trace=true",
+            SAMPLE_TS_SECS
+        );
+        let resp = app
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let trace = json
+            .get("trace")
+            .unwrap_or_else(|| panic!("trace missing: {body}"));
+        let phases = trace
+            .get("phases")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("phases missing: {body}"));
+        // Expect every phase name we emit from execute_v2.
+        let names: Vec<&str> = phases
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
+            .collect();
+        for expected in [
+            "parse",
+            "lower",
+            "optimize",
+            "build_physical",
+            "execute",
+            "reshape",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing phase {expected} in {names:?}"
+            );
+        }
+        let operators = trace
+            .get("operators")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("operators missing: {body}"));
+        assert!(
+            operators
+                .iter()
+                .any(|o| o.get("opName")
+                    == Some(&serde_json::Value::String("VectorSelector".into()))),
+            "expected a VectorSelector operator entry: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_map_v2_invalid_query_to_error_response() {
+        // given — unknown PromQL functions are rejected by the v2 planner
+        // as `PlanError::UnknownFunction`, mapping to
+        // `QueryError::InvalidQuery` → bad_data HTTP body.
+        let (app, _) = setup().await;
+
+        // when — `does_not_exist` is not a real PromQL function; v2's
+        // lowerer rejects it before any IO.
+        let req = Request::get("/api/v1/query?query=does_not_exist(http_requests_total)&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: QueryResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.status, "error");
+        assert!(parsed.error_type.is_some());
+        assert!(parsed.data.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /api/v1/query[_range]?explain=true (dry-run EXPLAIN)
+// ---------------------------------------------------------------------------
+
+mod explain {
+    use super::*;
+    use timeseries::testing::{ExplainResponse, ExplainResult};
+
+    #[tokio::test]
+    async fn should_return_explain_response_on_instant_query() {
+        // given: a fresh TSDB with no data — EXPLAIN must not touch the reader
+        let (app, _) = setup().await;
+
+        // when: GET /api/v1/query?query=...&explain=true&time=100
+        let req = Request::get(
+            "/api/v1/query?query=sum+by(job)(rate(http_requests_total[1m]))&explain=true&time=100",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: JSON response carries all three stages and schemaVersion=1
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: ExplainResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data: ExplainResult = parsed.data.expect("explain response has data");
+        assert_eq!(data.schema_version, 1);
+        assert_eq!(data.logical_unoptimized.op, "Aggregate");
+        assert_eq!(data.logical_optimized.op, "Aggregate");
+        assert!(
+            data.physical.op == "AggregateOp" || data.physical.op == "ConcurrentOp",
+            "unexpected physical root: {}",
+            data.physical.op
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_pretty_explain_as_text_plain() {
+        // given: a query with explain=true&pretty=true
+        let (app, _) = setup().await;
+
+        // when: GET with both flags
+        let req = Request::get("/api/v1/query?query=foo&explain=true&pretty=true&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: Content-Type is text/plain and body has three stage headers
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "unexpected content-type: {content_type}"
+        );
+        let body = body_string(resp).await;
+        assert!(body.contains("=== Logical (unoptimized) ==="));
+        assert!(body.contains("=== Logical (optimized) ==="));
+        assert!(body.contains("=== Physical ==="));
+        assert!(body.contains("VectorSelector"));
+    }
+
+    #[tokio::test]
+    async fn should_return_explain_response_on_range_query() {
+        // given: no data — EXPLAIN is a dry-run
+        let (app, _) = setup().await;
+
+        // when: GET /api/v1/query_range with explain=true
+        let req = Request::get(
+            "/api/v1/query_range?query=rate(http_requests_total[5m])&start=100&end=200&step=60s&explain=true",
+        )
+        .body(Body::empty())
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: JSON body carries the three stages
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: ExplainResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("range explain has data");
+        assert_eq!(data.logical_unoptimized.op, "Rollup");
+        // physical root wraps MatrixSelectorOp in RollupOp (possibly under ConcurrentOp)
+        let root_op = data.physical.op.as_str();
+        assert!(
+            root_op == "RollupOp" || root_op == "ConcurrentOp",
+            "unexpected physical root: {root_op}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_accept_explain_one_as_true() {
+        // given: ?explain=1 (numeric-style boolean) — widely used variant
+        let (app, _) = setup().await;
+
+        // when
+        let req = Request::get("/api/v1/query?query=foo&explain=1&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: JSON response with schemaVersion (i.e. actual explain path taken)
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: ExplainResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "success");
+        assert_eq!(parsed.data.unwrap().schema_version, 1);
+    }
+
+    #[tokio::test]
+    async fn should_return_explain_error_for_invalid_query() {
+        // given: an invalid query with explain=true
+        let (app, _) = setup().await;
+
+        // when: planner rejects the query; dry-run should still return a
+        // structured error with explain-response shape.
+        let req = Request::get("/api/v1/query?query=does_not_exist(foo)&explain=true&time=100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // then: status=error, error_type populated, data omitted.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed: ExplainResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(parsed.status, "error");
+        assert!(parsed.error_type.is_some());
+        assert!(parsed.data.is_none());
+    }
+}

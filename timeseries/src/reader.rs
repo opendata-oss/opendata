@@ -28,8 +28,7 @@ use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
-    TsdbReadEngine, eval_query_range_bounds, find_label_values_in_range, find_labels_in_range,
-    find_series_in_range,
+    TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
 };
 
 // ── ReaderQueryReader ────────────────────────────────────────────────
@@ -109,6 +108,28 @@ impl QueryReader for ReaderQueryReader {
             crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
         })?;
         mini.samples(series_id, metric_name, start_ms, end_ms).await
+    }
+
+    async fn forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<crate::index::SeriesSpec>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.forward_index_one(series_id).await
+    }
+
+    async fn inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<roaring::RoaringBitmap>> {
+        let mini = self.mini_readers.get(bucket).ok_or_else(|| {
+            crate::error::Error::Internal(format!("Bucket {:?} not found", bucket))
+        })?;
+        mini.inverted_index_term(term).await
     }
 }
 
@@ -219,10 +240,17 @@ impl TimeSeriesDbReader {
     pub async fn query_range(
         &self,
         query: &str,
-        range: impl RangeBounds<SystemTime>,
+        range: impl RangeBounds<SystemTime> + Send,
         step: Duration,
     ) -> std::result::Result<Vec<RangeSample>, QueryError> {
-        eval_query_range_bounds(self, query, range, step, &QueryOptions::default()).await
+        <Self as TsdbReadEngine>::eval_query_range(
+            self,
+            query,
+            range,
+            step,
+            &QueryOptions::default(),
+        )
+        .await
     }
 
     /// Returns the set of label-sets matching the given series matchers.
@@ -291,10 +319,14 @@ impl TsdbReadEngine for TimeSeriesDbReader {
         &self,
         ranges: &[(i64, i64)],
     ) -> Result<ReaderQueryReader> {
-        let buckets = self.storage.get_buckets_for_ranges(ranges).await?;
+        let buckets = {
+            let _g = crate::promql::trace::Scope::enter("list_buckets");
+            self.storage.get_buckets_for_ranges(ranges).await?
+        };
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
+                let _g = crate::promql::trace::Scope::enter("bucket_load");
                 let mini = self.get_or_load_bucket(bucket).await;
                 (bucket, mini)
             })

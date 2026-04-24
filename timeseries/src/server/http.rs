@@ -20,11 +20,10 @@ use crate::otel::{OtelConfig, OtelConverter};
 use crate::promql::config::{OtelServerConfig, PrometheusConfig};
 use crate::promql::request::{
     FederateParams, LabelValuesParams, LabelsParams, MetadataParams, QueryParams, QueryRangeParams,
-    SeriesParams,
+    SeriesParams, is_flag_set,
 };
 use crate::promql::response::{
-    self, FederateResponse, LabelValuesResponse, LabelsResponse, MetadataResponse,
-    QueryRangeResponse, QueryResponse, SeriesResponse,
+    self, FederateResponse, LabelValuesResponse, LabelsResponse, MetadataResponse, SeriesResponse,
 };
 use crate::promql::scraper::Scraper;
 use crate::tsdb::TsdbEngine;
@@ -42,6 +41,9 @@ pub(crate) struct AppState {
     pub(crate) metrics: Arc<Metrics>,
     #[cfg(feature = "otel")]
     pub(crate) otel_converter: Arc<OtelConverter>,
+    /// Server-level tracing config. A request with `?trace=true` always
+    /// traces regardless; this flag forces tracing on for *every* query.
+    pub(crate) tracing_config: crate::promql::config::TracingConfig,
 }
 
 /// Server configuration
@@ -66,6 +68,7 @@ pub(crate) fn build_router(
     tsdb: Arc<TsdbEngine>,
     metrics: Arc<Metrics>,
     _otel_config: OtelServerConfig,
+    tracing_config: crate::promql::config::TracingConfig,
 ) -> Router {
     let state = AppState {
         tsdb,
@@ -75,6 +78,7 @@ pub(crate) fn build_router(
             include_resource_attrs: _otel_config.include_resource_attrs,
             include_scope_attrs: _otel_config.include_scope_attrs,
         })),
+        tracing_config,
     };
 
     let app = Router::new()
@@ -208,6 +212,7 @@ impl TimeSeriesHttpServer {
             self.tsdb.clone(),
             metrics,
             self.config.prometheus_config.otel.clone(),
+            self.config.prometheus_config.tracing.clone(),
         );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.port));
@@ -313,33 +318,137 @@ async fn extract_params<T: serde::de::DeserializeOwned>(
 }
 
 /// Handle /api/v1/query
+///
+/// When `?explain=true` is set, the handler short-circuits to a dry-run
+/// plan description. `?pretty=true` alongside `explain` switches the
+/// response to `text/plain` with a DataFusion-style indented tree;
+/// without `pretty`, the response is `application/json` wrapping an
+/// `ExplainResult`.
 async fn handle_query(
     State(state): State<AppState>,
     request: Request,
-) -> Result<Json<QueryResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let params: QueryParams = extract_params(request, &state).await?;
-    let time = params.time.map(|s| parse_timestamp(&s)).transpose()?;
+    let time = params.time.as_deref().map(parse_timestamp).transpose()?;
+    if is_flag_set(params.explain.as_deref()) {
+        let result = state
+            .tsdb
+            .explain_query(&params.query, time, &QueryOptions::default());
+        return Ok(render_explain(
+            result,
+            is_flag_set(params.pretty.as_deref()),
+        ));
+    }
+    let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
+    if tracing_on {
+        let collector = crate::promql::trace::TraceCollector::new();
+        let outcome = state
+            .tsdb
+            .eval_query_traced(
+                &params.query,
+                time,
+                &QueryOptions::default(),
+                Some(collector),
+            )
+            .await;
+        let (value_res, trace) = match outcome {
+            Ok(o) => (Ok(o.value), o.trace),
+            Err(e) => (Err(e), None),
+        };
+        let mut resp = response::query_value_to_response(value_res);
+        resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
+        return Ok(Json(resp).into_response());
+    }
     let result = state
         .tsdb
         .eval_query(&params.query, time, &QueryOptions::default())
         .await;
-    Ok(Json(response::query_value_to_response(result)))
+    Ok(Json(response::query_value_to_response(result)).into_response())
 }
 
 /// Handle /api/v1/query_range
+///
+/// `?explain=true` (with optional `?pretty=true`) returns a dry-run
+/// plan description — see [`handle_query`] for the contract.
 async fn handle_query_range(
     State(state): State<AppState>,
     request: Request,
-) -> Result<Json<QueryRangeResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let params: QueryRangeParams = extract_params(request, &state).await?;
     let start = parse_timestamp(&params.start)?;
     let end = parse_timestamp(&params.end)?;
     let step = parse_duration(&params.step)?;
+    if is_flag_set(params.explain.as_deref()) {
+        let result = state.tsdb.explain_query_range(
+            &params.query,
+            start..=end,
+            step,
+            &QueryOptions::default(),
+        );
+        return Ok(render_explain(
+            result,
+            is_flag_set(params.pretty.as_deref()),
+        ));
+    }
+    let tracing_on = state.tracing_config.enabled || is_flag_set(params.trace.as_deref());
+    if tracing_on {
+        let collector = crate::promql::trace::TraceCollector::new();
+        let outcome = state
+            .tsdb
+            .eval_query_range_traced(
+                &params.query,
+                start..=end,
+                step,
+                &QueryOptions::default(),
+                Some(collector),
+            )
+            .await;
+        let (range_res, trace) = match outcome {
+            Ok(o) => (crate::tsdb::query_value_to_range_samples(o.value), o.trace),
+            Err(e) => (Err(e), None),
+        };
+        let mut resp = response::range_result_to_response(range_res);
+        resp.trace = trace.and_then(|t| serde_json::to_value(t).ok());
+        return Ok(Json(resp).into_response());
+    }
     let result = state
         .tsdb
         .eval_query_range(&params.query, start..=end, step, &QueryOptions::default())
         .await;
-    Ok(Json(response::range_result_to_response(result)))
+    Ok(Json(response::range_result_to_response(result)).into_response())
+}
+
+/// Render an EXPLAIN result as either JSON (`pretty=false`) or
+/// `text/plain` (`pretty=true`). Errors are rendered as the normal
+/// `ExplainResponse` error shape regardless of `pretty`.
+fn render_explain(
+    result: Result<crate::promql::plan::ExplainResult, crate::error::QueryError>,
+    pretty: bool,
+) -> Response {
+    use crate::promql::plan::pretty_print;
+
+    if pretty {
+        match result {
+            Ok(explain) => {
+                let mut body = String::new();
+                body.push_str("=== Logical (unoptimized) ===\n");
+                body.push_str(&pretty_print(&explain.logical_unoptimized));
+                body.push_str("\n=== Logical (optimized) ===\n");
+                body.push_str(&pretty_print(&explain.logical_optimized));
+                body.push_str("\n=== Physical ===\n");
+                body.push_str(&pretty_print(&explain.physical));
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    body,
+                )
+                    .into_response()
+            }
+            Err(e) => Json(response::explain_result_to_response(Err(e))).into_response(),
+        }
+    } else {
+        Json(response::explain_result_to_response(result)).into_response()
+    }
 }
 
 /// Handle /api/v1/series
@@ -453,15 +562,15 @@ async fn handle_federate(
     let mut body = String::new();
 
     for selector in &params.matches {
-        let result = state
+        let eval = state
             .tsdb
             .eval_query(selector, None, &QueryOptions::default())
-            .await
-            .map_err(|e| match e {
-                crate::error::QueryError::InvalidQuery(msg) => Error::InvalidInput(msg),
-                crate::error::QueryError::Execution(msg) => Error::Internal(msg),
-                crate::error::QueryError::Timeout => Error::Internal("query timed out".to_string()),
-            })?;
+            .await;
+        let result = eval.map_err(|e| match e {
+            crate::error::QueryError::InvalidQuery(msg) => Error::InvalidInput(msg),
+            crate::error::QueryError::Execution(msg) => Error::Internal(msg),
+            crate::error::QueryError::Timeout => Error::Internal("query timed out".to_string()),
+        })?;
 
         let samples = match result {
             QueryValue::Vector(s) => s,

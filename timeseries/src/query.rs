@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use roaring::RoaringBitmap;
 
-use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
+use crate::index::{ForwardIndexLookup, InvertedIndexLookup, SeriesSpec};
 use crate::model::{Label, Sample};
 use crate::model::{SeriesId, TimeBucket};
 use crate::util::Result;
@@ -49,6 +50,16 @@ pub(crate) trait BucketQueryReader: Send + Sync {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>>;
+
+    /// Fetch a single forward-index entry by series id. Returns `None` if
+    /// the series isn't present in the bucket. Intended for callers that
+    /// want to own fan-out concurrency themselves (see
+    /// `crate::promql::source_adapter`).
+    async fn forward_index_one(&self, series_id: SeriesId) -> Result<Option<SeriesSpec>>;
+
+    /// Fetch a single inverted-index posting by term. Returns `None` if
+    /// the term isn't present in the bucket. See [`Self::forward_index_one`].
+    async fn inverted_index_term(&self, term: &Label) -> Result<Option<RoaringBitmap>>;
 }
 
 /// Trait for read-only queries that may span multiple time buckets.
@@ -90,6 +101,22 @@ pub(crate) trait QueryReader: Send + Sync {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<Sample>>;
+
+    /// Fetch a single forward-index entry within `bucket`. See
+    /// [`BucketQueryReader::forward_index_one`].
+    async fn forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<SeriesSpec>>;
+
+    /// Fetch a single inverted-index posting within `bucket`. See
+    /// [`BucketQueryReader::inverted_index_term`].
+    async fn inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<RoaringBitmap>>;
 }
 
 #[cfg(any(test, feature = "bench-internals"))]
@@ -204,6 +231,28 @@ pub(crate) mod test_utils {
                     "MockQueryReader does not have bucket {:?}",
                     bucket
                 )))
+            }
+        }
+
+        async fn forward_index_one(
+            &self,
+            bucket: &TimeBucket,
+            series_id: SeriesId,
+        ) -> Result<Option<SeriesSpec>> {
+            match self.bucket_data.get(bucket) {
+                Some((fwd, _, _)) => Ok(fwd.get_spec(&series_id)),
+                None => Ok(None),
+            }
+        }
+
+        async fn inverted_index_term(
+            &self,
+            bucket: &TimeBucket,
+            term: &Label,
+        ) -> Result<Option<RoaringBitmap>> {
+            match self.bucket_data.get(bucket) {
+                Some((_, inv, _)) => Ok(inv.postings.get(term).map(|entry| entry.value().clone())),
+                None => Ok(None),
             }
         }
     }

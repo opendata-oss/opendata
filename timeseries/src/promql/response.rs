@@ -30,6 +30,7 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
             }),
             error: None,
             error_type: None,
+            trace: None,
         },
         Ok(QueryValue::Vector(samples)) => {
             let result: Vec<VectorSeries> = samples.into_iter().map(VectorSeries).collect();
@@ -42,6 +43,7 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
                 }),
                 error: None,
                 error_type: None,
+                trace: None,
             }
         }
         Ok(QueryValue::Matrix(range_samples)) => {
@@ -55,6 +57,7 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
                 }),
                 error: None,
                 error_type: None,
+                trace: None,
             }
         }
         Err(e) => {
@@ -64,6 +67,7 @@ pub fn query_value_to_response(result: Result<QueryValue, QueryError>) -> QueryR
                 data: None,
                 error: Some(err.error),
                 error_type: Some(err.error_type),
+                trace: None,
             }
         }
     }
@@ -85,6 +89,7 @@ pub fn range_result_to_response(
                 }),
                 error: None,
                 error_type: None,
+                trace: None,
             }
         }
         Err(e) => {
@@ -94,6 +99,7 @@ pub fn range_result_to_response(
                 data: None,
                 error: Some(err.error),
                 error_type: Some(err.error_type),
+                trace: None,
             }
         }
     }
@@ -305,6 +311,48 @@ impl ErrorResponse {
 }
 
 // ---------------------------------------------------------------------------
+// EXPLAIN response
+// ---------------------------------------------------------------------------
+
+/// Dry-run EXPLAIN response for `/api/v1/query[?explain=true]` and
+/// `/api/v1/query_range[?explain=true]`. Mirrors the shape of
+/// [`QueryResponse`] so the HTTP handler can unify error rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplainResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<crate::promql::plan::ExplainResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+}
+
+/// Wrap an [`ExplainResult`](crate::promql::plan::ExplainResult)
+/// (or error) into an [`ExplainResponse`].
+pub fn explain_result_to_response(
+    result: Result<crate::promql::plan::ExplainResult, QueryError>,
+) -> ExplainResponse {
+    match result {
+        Ok(data) => ExplainResponse {
+            status: "success".to_string(),
+            data: Some(data),
+            error: None,
+            error_type: None,
+        },
+        Err(e) => {
+            let err = query_error_response(e);
+            ExplainResponse {
+                status: err.status,
+                data: None,
+                error: Some(err.error),
+                error_type: Some(err.error_type),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /api/v1/query (instant query)
 // ---------------------------------------------------------------------------
 
@@ -317,6 +365,11 @@ pub struct QueryResponse {
     pub error: Option<String>,
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
+    /// Populated when the request enabled per-query tracing (either via
+    /// `?trace=true` or `tracing.enabled` in the server config). Absent
+    /// otherwise so the wire shape stays unchanged for normal callers.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +450,9 @@ pub struct QueryRangeResponse {
     pub error: Option<String>,
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
+    /// See [`QueryResponse::trace`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -831,6 +887,7 @@ mod tests {
             }),
             error: None,
             error_type: None,
+            trace: None,
         };
         let json = serde_json::to_string(&qr).unwrap();
         let parsed: QueryResponse = serde_json::from_str(&json).unwrap();
@@ -856,6 +913,7 @@ mod tests {
             }),
             error: None,
             error_type: None,
+            trace: None,
         };
         let json = serde_json::to_string(&qr).unwrap();
         let parsed: QueryResponse = serde_json::from_str(&json).unwrap();
@@ -1174,6 +1232,7 @@ mod tests {
             data: None,
             error: Some("bad".into()),
             error_type: Some("bad_data".into()),
+            trace: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert!(json.get("data").is_none(), "QueryResponse: {json}");
@@ -1183,6 +1242,7 @@ mod tests {
             data: None,
             error: Some("bad".into()),
             error_type: Some("bad_data".into()),
+            trace: None,
         };
         let json = serde_json::to_value(&query_range).unwrap();
         assert!(json.get("data").is_none(), "QueryRangeResponse: {json}");

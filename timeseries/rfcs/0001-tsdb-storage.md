@@ -199,6 +199,21 @@ will be replaced by the new coarse buckets in the listing.
 - `bucket_size` (u8): The size of the time bucket in hours
 - `time_bucket` (u32): The number of minutes since the UNIX epoch
 
+**Write Protocol:**
+
+Updates go through the merge operator so concurrent ingesters can register new
+buckets without coordination. To keep the merge stream small, flushers read the
+current `BucketList` first and only emit a single-element merge when their
+bucket is not already present. The merge operator deduplicates, so concurrent
+first-sightings from independent flushers remain correct. The singleton key
+stays hot in SlateDB's block cache (it is read on every query), so the pre-check
+is effectively free.
+
+On startup, before ingestion begins, the materialized `BucketList` is written
+back as a single `Put`. This flattens any merge operands accumulated in prior
+process lifetimes into one record so later reads don't have to replay them
+across SSTs.
+
 ### `SeriesDictionary` (`RecordType::SeriesDictionary` = `0x02`)
 
 The series dictionary maps label sets (label/value pairs) to series IDs.
@@ -532,3 +547,4 @@ This was rejected in favor of separate deployments per namespace:
 | 2025-12-17 | Initial draft |
 | 2026-01-18 | Updated InvertedIndex key encoding: attribute uses terminated bytes, value uses raw UTF-8 (backward incompatible) |
 | 2026-04-01 | Added metric_name to TimeSeries key: layout changed from `<bucket, series_id>` to `<bucket, metric_name, series_id>` for storage locality (backward incompatible, #349) |
+| 2026-04-19 | Documented BucketList write protocol: flushers read-check before emitting a merge to avoid per-flush merge churn on the hot singleton key; startup coalesces merge operands into a single Put |

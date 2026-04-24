@@ -63,6 +63,20 @@ pub struct PrometheusConfig {
     /// to pre-populate the block cache. Enabled by default (24h, with samples).
     #[serde(default = "default_cache_warmer")]
     pub cache_warmer: Option<CacheWarmerConfig>,
+    /// Per-query tracing configuration. Controls whether each query collects
+    /// per-phase / per-operator timing and returns it in the response.
+    #[serde(default)]
+    pub tracing: TracingConfig,
+}
+
+/// Controls per-query PromQL tracing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TracingConfig {
+    /// When true, every query is traced and its trace is returned inline
+    /// in the response. When false, tracing is opt-in per query via
+    /// `?trace=true`.
+    pub enabled: bool,
 }
 
 fn default_flush_interval_secs() -> u64 {
@@ -123,6 +137,7 @@ impl Default for PrometheusConfig {
             reader: default_reader_options(),
             cache_capacity: default_cache_capacity(),
             cache_warmer: default_cache_warmer(),
+            tracing: TracingConfig::default(),
         }
     }
 }

@@ -4,7 +4,9 @@
 //! SlateDB-backed TSDB. HTTP-specific helpers live in the [`http`]
 //! submodule, which is only available when the `http-server` feature
 //! is enabled.
+#![allow(unused_imports)]
 
+pub mod columnar_stress;
 #[cfg(feature = "http-server")]
 pub mod http;
 
@@ -42,6 +44,8 @@ use crate::tsdb::Tsdb;
 pub use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
 // Re-export production types so integration tests use the real types.
+pub use crate::promql::plan::{ExplainResult, PlanNode};
+pub use crate::promql::response::ExplainResponse;
 pub use crate::promql::response::{
     ErrorResponse, LabelValuesResponse, LabelsResponse, MatrixSeries, MetadataResponse,
     QueryRangeResponse, QueryRangeResult, QueryResponse, QueryResult, QueryResultValue,

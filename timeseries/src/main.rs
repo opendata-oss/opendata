@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod config;
 mod delta;
 mod error;
@@ -17,6 +21,8 @@ mod server;
 mod storage;
 #[cfg(test)]
 mod test_utils;
+#[cfg(any(test, feature = "testing"))]
+mod testing;
 mod timeseries;
 mod tsdb;
 mod tsdb_metrics;

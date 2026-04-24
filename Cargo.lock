@@ -2094,6 +2094,7 @@ dependencies = [
  "bencher",
  "bytes",
  "opendata-log",
+ "tikv-jemallocator",
  "tokio",
 ]
 
@@ -2603,6 +2604,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "slatedb",
+ "tikv-jemallocator",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2643,6 +2645,7 @@ dependencies = [
  "serde_with",
  "slatedb",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
  "tower",
  "tracing",
@@ -2715,6 +2718,7 @@ dependencies = [
  "snap",
  "tempfile",
  "thiserror 2.0.17",
+ "tikv-jemallocator",
  "tokio",
  "tokio-util",
  "tower",
@@ -4327,6 +4331,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
 name = "time"
 version = "0.3.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4368,6 +4392,7 @@ dependencies = [
  "bencher",
  "opendata-timeseries",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
 ]
 
@@ -4876,6 +4901,7 @@ dependencies = [
  "opendata-common",
  "opendata-vector",
  "serde_yaml",
+ "tikv-jemallocator",
  "tokio",
  "tracing-subscriber",
 ]

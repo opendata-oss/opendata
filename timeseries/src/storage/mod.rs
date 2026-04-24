@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use common::storage::RecordOp;
+use common::storage::{PutRecordOp, RecordOp};
 use common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
@@ -159,7 +159,11 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         Ok(inverted_index)
     }
 
-    /// Load only the specified terms from the inverted index.
+    /// Load only the specified terms from the inverted index. Legacy
+    /// batch path — kept for the v1 evaluator / pipeline which still
+    /// calls it. New callers should use [`Self::get_inverted_index_term`]
+    /// and fan out in parallel themselves so each per-term latency is
+    /// independently traceable.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_inverted_index_terms(
         &self,
@@ -168,22 +172,16 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     ) -> Result<InvertedIndex> {
         let result = InvertedIndex::default();
         for term in terms {
-            let key = InvertedIndexKey {
-                time_bucket: bucket.start,
-                bucket_size: bucket.size,
-                attribute: term.name.clone(),
-                value: term.value.clone(),
-            }
-            .encode();
-            if let Some(record) = self.get(key).await? {
-                let value = InvertedIndexValue::decode(record.value.as_ref())?;
-                result.postings.insert(term.clone(), value.postings);
+            if let Some(postings) = self.get_inverted_index_term(bucket, term).await? {
+                result.postings.insert(term.clone(), postings);
             }
         }
         Ok(result)
     }
 
-    /// Load only the specified series from the forward index.
+    /// Load only the specified series from the forward index. Legacy
+    /// batch path — see [`Self::get_inverted_index_terms`] for context.
+    /// New callers should use [`Self::get_forward_index_one`].
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_forward_index_series(
         &self,
@@ -192,18 +190,74 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     ) -> Result<ForwardIndex> {
         let result = ForwardIndex::default();
         for &series_id in series_ids {
-            let key = ForwardIndexKey {
-                time_bucket: bucket.start,
-                bucket_size: bucket.size,
-                series_id,
-            }
-            .encode();
-            if let Some(record) = self.get(key).await? {
-                let value = ForwardIndexValue::decode(record.value.as_ref())?;
-                result.series.insert(series_id, value.into());
+            if let Some(spec) = self.get_forward_index_one(bucket, series_id).await? {
+                result.series.insert(series_id, spec);
             }
         }
         Ok(result)
+    }
+
+    /// Fetch a single inverted-index posting for `(bucket, term)`.
+    /// Returns `None` when the term isn't present in the bucket.
+    ///
+    /// Per-term granularity by design: callers (e.g. the query
+    /// adapter) parallelise at *their* layer so concurrency budget and
+    /// caching can be managed end-to-end. The previous batched variant
+    /// looped sequentially and was a silent bottleneck.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_inverted_index_term(
+        &self,
+        bucket: &TimeBucket,
+        term: &Label,
+    ) -> Result<Option<RoaringBitmap>> {
+        let key = InvertedIndexKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            attribute: term.name.clone(),
+            value: term.value.clone(),
+        }
+        .encode();
+        let rec = self.get(key).await?;
+        match rec {
+            Some(r) => {
+                crate::promql::trace::record_bytes(
+                    crate::promql::trace::IoKind::InvertedIndexFetch,
+                    r.value.len() as u64,
+                );
+                let value = InvertedIndexValue::decode(r.value.as_ref())?;
+                Ok(Some(value.postings))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a single forward-index entry for `(bucket, series_id)`.
+    /// Returns `None` when the series isn't present in the bucket.
+    /// See [`Self::get_inverted_index_term`] for why this is per-key.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn get_forward_index_one(
+        &self,
+        bucket: &TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<SeriesSpec>> {
+        let key = ForwardIndexKey {
+            time_bucket: bucket.start,
+            bucket_size: bucket.size,
+            series_id,
+        }
+        .encode();
+        let rec = self.get(key).await?;
+        match rec {
+            Some(r) => {
+                crate::promql::trace::record_bytes(
+                    crate::promql::trace::IoKind::ForwardIndexFetch,
+                    r.value.len() as u64,
+                );
+                let value = ForwardIndexValue::decode(r.value.as_ref())?;
+                Ok(Some(value.into()))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Load the series dictionary using the provided insert function and
@@ -226,6 +280,23 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
         }
 
         Ok(max_series_id)
+    }
+
+    /// Check whether `bucket` is already present in the stored `BucketList`.
+    ///
+    /// Used by the flush path to suppress redundant single-element merges
+    /// on a bucket that has already been announced. The `BucketListKey` is
+    /// a global singleton that stays hot in SlateDB's block cache (read on
+    /// every query and warmed at startup), so this is a cache hit in the
+    /// common case.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn bucket_list_contains(&self, bucket: TimeBucket) -> Result<bool> {
+        let key = BucketListKey.encode();
+        let Some(record) = self.get(key).await? else {
+            return Ok(false);
+        };
+        let list = BucketListValue::decode(record.value.as_ref())?;
+        Ok(list.buckets.contains(&(bucket.size, bucket.start)))
     }
 
     /// Get all unique values for a specific label name within a bucket.
@@ -347,6 +418,26 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
 // Implement the trait for all types that implement Storage
 impl<T: ?Sized + Storage> OpenTsdbStorageExt for T {}
 
+/// Read the current `BucketList` value and rewrite it as a single `Put`,
+/// collapsing the merge chain that accrues across ingestion batches into
+/// one flat record. Intended to run once at startup before ingestion
+/// begins, so later reads don't have to replay operands scattered across
+/// SSTs. Safe only when there are no concurrent writers.
+#[tracing::instrument(level = "info", skip_all)]
+pub(crate) async fn coalesce_bucket_list(storage: &dyn Storage) -> Result<()> {
+    let key = BucketListKey.encode();
+    let Some(record) = storage.get(key.clone()).await? else {
+        return Ok(());
+    };
+    storage
+        .put(vec![PutRecordOp::new(Record {
+            key,
+            value: record.value,
+        })])
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +520,124 @@ mod tests {
         let s = storage_with_buckets(&[0, 60]).await;
         let buckets = s.get_buckets_for_ranges(&[(3600, 7200)]).await.unwrap();
         assert_eq!(starts(&buckets), vec![60]);
+    }
+
+    // ── bucket_list_contains tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_return_true_when_bucket_in_list() {
+        // given
+        let storage = storage_with_buckets(&[0, 60, 120]).await;
+
+        // when
+        let present = storage
+            .bucket_list_contains(TimeBucket { size: 1, start: 60 })
+            .await
+            .unwrap();
+
+        // then
+        assert!(present);
+    }
+
+    #[tokio::test]
+    async fn should_return_false_when_bucket_absent() {
+        // given
+        let storage = storage_with_buckets(&[0, 60]).await;
+
+        // when
+        let present = storage
+            .bucket_list_contains(TimeBucket {
+                size: 1,
+                start: 180,
+            })
+            .await
+            .unwrap();
+
+        // then
+        assert!(!present);
+    }
+
+    #[tokio::test]
+    async fn should_return_false_when_bucket_list_key_missing() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+
+        // when
+        let present = storage
+            .bucket_list_contains(TimeBucket { size: 1, start: 0 })
+            .await
+            .unwrap();
+
+        // then
+        assert!(!present);
+    }
+
+    #[tokio::test]
+    async fn should_distinguish_buckets_with_same_start_but_different_size() {
+        // given: only a size=1 bucket at start=60 is present
+        let storage = storage_with_buckets(&[60]).await;
+
+        // when
+        let size_one = storage
+            .bucket_list_contains(TimeBucket { size: 1, start: 60 })
+            .await
+            .unwrap();
+        let size_two = storage
+            .bucket_list_contains(TimeBucket { size: 2, start: 60 })
+            .await
+            .unwrap();
+
+        // then
+        assert!(size_one);
+        assert!(!size_two);
+    }
+
+    // ── coalesce_bucket_list tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_coalesce_bucket_list_preserving_merged_value() {
+        // given: several merge operands have accrued on the BucketList key
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+        let ops = vec![
+            storage
+                .merge_bucket_list(TimeBucket { size: 1, start: 0 })
+                .unwrap(),
+            storage
+                .merge_bucket_list(TimeBucket { size: 1, start: 60 })
+                .unwrap(),
+            storage
+                .merge_bucket_list(TimeBucket {
+                    size: 1,
+                    start: 120,
+                })
+                .unwrap(),
+        ];
+        storage.apply(ops).await.unwrap();
+
+        // when
+        coalesce_bucket_list(storage.as_ref()).await.unwrap();
+
+        // then: readable value still reflects the full merged list
+        let buckets = storage.get_buckets_in_range(None, None).await.unwrap();
+        assert_eq!(starts(&buckets), vec![0, 60, 120]);
+    }
+
+    #[tokio::test]
+    async fn should_be_noop_when_bucket_list_absent() {
+        // given
+        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
+            OpenTsdbMergeOperator,
+        )));
+
+        // when
+        coalesce_bucket_list(storage.as_ref()).await.unwrap();
+
+        // then: key is still absent
+        let record = storage.get(BucketListKey.encode()).await.unwrap();
+        assert!(record.is_none());
     }
 }
