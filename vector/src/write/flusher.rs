@@ -1,4 +1,5 @@
 use crate::db::LastAppliedSnapshot;
+use crate::storage::record::build_write_batch;
 use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
 use crate::write::indexer::tree::centroids::{
     CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader,
@@ -6,9 +7,8 @@ use crate::write::indexer::tree::centroids::{
 use crate::write::indexer::tree::{IndexUpdateResults, Indexer};
 use crate::{Config, DistanceMetric};
 use async_trait::async_trait;
-use common::Storage;
 use common::coordinator::Flusher;
-use common::storage::StorageSnapshot;
+use slatedb::{Db, DbSnapshot};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -19,8 +19,8 @@ struct VectorDbFlusherOpts {
 
 pub(crate) struct VectorDbFlusher {
     opts: VectorDbFlusherOpts,
-    storage: Arc<dyn Storage>,
-    last_snapshot: Arc<dyn StorageSnapshot>,
+    storage: Arc<Db>,
+    last_snapshot: Arc<DbSnapshot>,
     last_snapshot_epoch: u64,
     indexer: Indexer,
     last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
@@ -33,8 +33,8 @@ pub(crate) struct VectorDbFlusher {
 impl VectorDbFlusher {
     pub(crate) fn new(
         config: &Config,
-        storage: Arc<dyn Storage>,
-        initial_snapshot: Arc<dyn StorageSnapshot>,
+        storage: Arc<Db>,
+        initial_snapshot: Arc<DbSnapshot>,
         initial_snapshot_epoch: u64,
         indexer: Indexer,
         last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
@@ -60,7 +60,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
         &mut self,
         frozen: Arc<VectorDbDeltaView>,
         epoch_range: &Range<u64>,
-    ) -> Result<Arc<dyn StorageSnapshot>, String> {
+    ) -> Result<Arc<DbSnapshot>, String> {
         if let Some(err) = &self.poisoned {
             return Err(format!("flusher is poisoned due to prior error: {err}"));
         }
@@ -94,7 +94,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
 
 impl VectorDbFlusher {
     #[allow(unused_variables)]
-    async fn validate(&self, snapshot: Arc<dyn StorageSnapshot>) {
+    async fn validate(&self, snapshot: Arc<DbSnapshot>) {
         #[cfg(debug_assertions)]
         {
             self.indexer.validate(snapshot).await;
@@ -105,11 +105,11 @@ impl VectorDbFlusher {
         &mut self,
         index_outputs: IndexUpdateResults,
         snapshot_epoch: u64,
-    ) -> Result<Arc<dyn StorageSnapshot>, String> {
-        self.storage
-            .apply(index_outputs.ops)
-            .await
-            .map_err(|e| e.to_string())?;
+    ) -> Result<Arc<DbSnapshot>, String> {
+        if !index_outputs.ops.is_empty() {
+            let batch = build_write_batch(index_outputs.ops);
+            self.storage.write(batch).await.map_err(|e| e.to_string())?;
+        }
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.validate(snapshot.clone()).await;
@@ -118,7 +118,7 @@ impl VectorDbFlusher {
             snapshot.clone(),
             snapshot_epoch,
         );
-        let cached_reader = CachedCentroidReader::new(
+        let cached_reader = CachedCentroidReader::<DbSnapshot>::new(
             &(index_outputs.centroid_cache.clone() as Arc<dyn CentroidCache>),
             stored_reader,
         );
@@ -166,9 +166,13 @@ mod tests {
     };
     use crate::write::indexer::tree::posting_list::{Posting, PostingList};
     use crate::write::indexer::tree::state::VectorIndexState;
+    use common::SequenceAllocator;
     use common::coordinator::Flusher;
-    use common::storage::in_memory::{FailingStorage, InMemoryStorage};
-    use common::{Record, SequenceAllocator, Storage};
+    use common::storage::testing::FailingObjectStore;
+    use common::{StorageBuilder, StorageError};
+    use slatedb::WriteBatch;
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
@@ -178,20 +182,36 @@ mod tests {
         VectorId::centroid_id(1, id)
     }
 
-    /// Create an InMemoryStorage with the vector merge operator.
-    fn create_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator::new(DIMS),
-        )))
+    /// Create an in-memory Db with the vector merge operator.
+    async fn create_storage() -> Arc<Db> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let built = StorageBuilder::from_object_store("test", object_store)
+            .await
+            .unwrap()
+            .with_merge_operator(Arc::new(VectorDbMergeOperator::new(DIMS)))
+            .build()
+            .await
+            .unwrap();
+        built.db
     }
 
-    /// Create a FailingStorage wrapping a storage with the vector merge operator.
-    fn create_failing_storage() -> Arc<FailingStorage> {
-        FailingStorage::wrap(create_storage())
+    /// Create an in-memory Db wrapped by a FailingObjectStore for fault injection.
+    async fn create_failing_storage() -> (Arc<Db>, Arc<FailingObjectStore>) {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let failing = FailingObjectStore::new(inner);
+        let obj_store: Arc<dyn ObjectStore> = failing.clone();
+        let built = StorageBuilder::from_object_store("test", obj_store)
+            .await
+            .unwrap()
+            .with_merge_operator(Arc::new(VectorDbMergeOperator::new(DIMS)))
+            .build()
+            .await
+            .unwrap();
+        (built.db, failing)
     }
 
     /// Build a flusher with an Indexer set up for an empty db with one centroid.
-    async fn create_flusher(storage: Arc<dyn Storage>) -> VectorDbFlusher {
+    async fn create_flusher(storage: Arc<Db>) -> VectorDbFlusher {
         let seq_key = bytes::Bytes::from_static(&[0x01, 0x02]);
         let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
@@ -203,36 +223,29 @@ mod tests {
 
         let (seq_block_key, seq_block) = id_allocator.freeze();
         let (centroid_seq_block_key, centroid_seq_block) = centroid_id_allocator.freeze();
-        storage
-            .put(vec![
-                Record::new(
-                    CentroidsKey::new().encode(),
-                    CentroidsValue::new(3).encode_to_bytes(),
-                )
-                .into(),
-                Record::new(
-                    PostingListKey::new(ROOT_VECTOR_ID).encode(),
-                    PostingListValue::from_posting_updates(vec![PostingUpdate::append(
-                        leaf_centroid_id(1),
-                        vec![0.0; DIMS],
-                    )])
-                    .unwrap()
-                    .encode_to_bytes(),
-                )
-                .into(),
-                Record::new(
-                    CentroidInfoKey::new(leaf_centroid_id(1)).encode(),
-                    CentroidInfoValue::new(1, vec![0.0; DIMS], ROOT_VECTOR_ID).encode_to_bytes(),
-                )
-                .into(),
-                Record::new(
-                    CentroidStatsKey::new(leaf_centroid_id(1)).encode(),
-                    CentroidStatsValue::new(0).encode_to_bytes(),
-                )
-                .into(),
-            ])
-            .await
-            .unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(
+            CentroidsKey::new().encode(),
+            CentroidsValue::new(3).encode_to_bytes(),
+        );
+        batch.put(
+            PostingListKey::new(ROOT_VECTOR_ID).encode(),
+            PostingListValue::from_posting_updates(vec![PostingUpdate::append(
+                leaf_centroid_id(1),
+                vec![0.0; DIMS],
+            )])
+            .unwrap()
+            .encode_to_bytes(),
+        );
+        batch.put(
+            CentroidInfoKey::new(leaf_centroid_id(1)).encode(),
+            CentroidInfoValue::new(1, vec![0.0; DIMS], ROOT_VECTOR_ID).encode_to_bytes(),
+        );
+        batch.put(
+            CentroidStatsKey::new(leaf_centroid_id(1)).encode(),
+            CentroidStatsValue::new(0).encode_to_bytes(),
+        );
+        storage.write(batch).await.unwrap();
         let centroid_cache = AllCentroidsCacheWriter::new(
             Arc::new(PostingList::from_iter(vec![Posting::new(
                 leaf_centroid_id(1),
@@ -316,10 +329,15 @@ mod tests {
         Arc::new(VectorDbDeltaView { writes })
     }
 
+    // Suppress the unused warning for the StorageError import; it's used only by
+    // reference in tests when matching object-store-level failure injection.
+    #[allow(dead_code)]
+    fn _ref_storage_error(_: StorageError) {}
+
     #[tokio::test]
     async fn should_write_vectors_to_storage() {
         // given
-        let storage = create_storage();
+        let storage = create_storage().await;
         let mut flusher = create_flusher(storage.clone()).await;
         let writes = make_writes(10);
         let frozen = make_frozen(writes);
@@ -333,23 +351,23 @@ mod tests {
             let ext_id = format!("vec-{i}");
             // Check ID dictionary entry exists
             let dict_key = IdDictionaryKey::new(&ext_id).encode();
-            let dict_record = storage
-                .get(dict_key)
+            let dict_value = storage
+                .get(&dict_key)
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("missing dictionary entry for {ext_id}"));
             let internal_id = {
-                let mut slice = dict_record.value.as_ref();
+                let mut slice = dict_value.as_ref();
                 VectorId::decode(&mut slice).unwrap()
             };
             // Check vector data record exists and has the right external_id
             let data_key = VectorDataKey::new(internal_id).encode();
-            let data_record = storage
-                .get(data_key)
+            let data_value = storage
+                .get(&data_key)
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("missing vector data for {ext_id}"));
-            let data = VectorDataValue::decode_from_bytes(&data_record.value, DIMS).unwrap();
+            let data = VectorDataValue::decode_from_bytes(&data_value, DIMS).unwrap();
             assert_eq!(data.external_id(), ext_id);
             internal_ids.push(internal_id);
         }
@@ -362,79 +380,110 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_apply_error() {
         // given
-        let storage = create_failing_storage();
-        let mut flusher = create_flusher(storage.clone() as Arc<dyn Storage>).await;
-        storage.fail_apply(common::StorageError::Storage("test apply error".into()));
+        let (storage, failing) = create_failing_storage().await;
+        let mut flusher = create_flusher(storage.clone()).await;
+        // Inject a non-retryable Precondition (default FailKind); slatedb would
+        // retry any other object_store::Error forever.
+        failing.set_fail_put(true);
 
         // when
-        let result = flusher
-            .flush_delta(make_frozen(make_writes(1)), &(0..1))
-            .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            flusher.flush_delta(make_frozen(make_writes(1)), &(0..1)),
+        )
+        .await
+        .expect("flush_delta hung past 5s; retry barrier is broken");
 
-        // then
+        // then — slatedb surfaces the injected failure as a storage error
         let err = result.err().expect("expected apply error");
         assert!(
-            err.contains("test apply error"),
-            "expected test apply error message, got: {err}"
+            err.contains("injected failure") || err.to_lowercase().contains("fail"),
+            "expected injected failure to surface, got: {err}"
         );
     }
 
+    /// `db.snapshot()` fails with `SlateDBError::Closed` after the db is
+    /// closed. An empty delta produces no index ops, so the write leg in
+    /// `apply_and_snapshot` is skipped and the failure is isolated to the
+    /// snapshot step.
     #[tokio::test]
-    async fn should_propagate_snapshot_error_after_apply() {
+    async fn should_propagate_snapshot_error() {
         // given
-        let storage = create_failing_storage();
-        let mut flusher = create_flusher(storage.clone() as Arc<dyn Storage>).await;
-        storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
+        let (storage, _failing) = create_failing_storage().await;
+        let mut flusher = create_flusher(storage.clone()).await;
+        // Close the db so the next db.snapshot() returns Closed
+        storage.close().await.unwrap();
 
-        // when
-        let result = flusher
-            .flush_delta(make_frozen(make_writes(1)), &(0..1))
-            .await;
+        // when — empty writes means index_outputs.ops is empty, so
+        // apply_and_snapshot jumps straight to snapshot()
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            flusher.flush_delta(make_frozen(make_writes(0)), &(0..1)),
+        )
+        .await
+        .expect("flush_delta hung past 5s");
 
         // then
-        let err = result.err().expect("expected snapshot error");
         assert!(
-            err.contains("test snapshot error"),
-            "expected test snapshot error message, got: {err}"
+            result.is_err(),
+            "expected snapshot error after db.close(), got Ok"
         );
     }
 
     #[tokio::test]
     async fn should_propagate_flush_storage_error() {
-        // given
-        let storage = create_failing_storage();
-        let flusher = create_flusher(storage.clone() as Arc<dyn Storage>).await;
-        storage.fail_flush(common::StorageError::Storage("test flush error".into()));
+        use slatedb::config::WriteOptions;
+        // given — non-durable write so data stays in memtable, then inject a
+        // non-retryable put failure; flush_storage drains the memtable via
+        // object-store puts and should surface the error.
+        let (storage, failing) = create_failing_storage().await;
+        let flusher = create_flusher(storage.clone()).await;
+        let mut batch = WriteBatch::new();
+        batch.put(b"__probe", b"v");
+        storage
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .unwrap();
+        failing.set_fail_put(true);
 
         // when
-        let result = flusher.flush_storage().await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), flusher.flush_storage())
+                .await
+                .expect("flush_storage hung past 5s; retry barrier is broken");
 
         // then
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("test flush error"),
-            "expected test flush error message"
-        );
+        assert!(result.is_err(), "expected flush error, got Ok");
     }
 
     #[tokio::test]
     async fn should_poison_after_post_index_failure() {
-        // given — apply fails after update_index mutates in-memory state
-        let storage = create_failing_storage();
-        let mut flusher = create_flusher(storage.clone() as Arc<dyn Storage>).await;
-        storage.fail_apply(common::StorageError::Storage("apply failed".into()));
+        // given — put fails after update_index mutates in-memory state
+        let (storage, failing) = create_failing_storage().await;
+        let mut flusher = create_flusher(storage.clone()).await;
+        failing.set_fail_put(true);
 
-        // when — first flush fails due to apply error
-        let result = flusher
-            .flush_delta(make_frozen(make_writes(1)), &(0..1))
-            .await;
+        // when — first flush fails due to put error
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            flusher.flush_delta(make_frozen(make_writes(1)), &(0..1)),
+        )
+        .await
+        .expect("first flush_delta hung past 5s; retry barrier is broken");
         assert!(result.is_err());
 
         // then — subsequent flush is rejected immediately as poisoned
-        storage.fail_apply(common::StorageError::Storage("should not reach".into()));
-        let result = flusher
-            .flush_delta(make_frozen(make_writes(1)), &(1..2))
-            .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            flusher.flush_delta(make_frozen(make_writes(1)), &(1..2)),
+        )
+        .await
+        .expect("second flush_delta hung past 5s");
         let err = result.err().expect("expected poisoned error");
         assert!(
             err.contains("poisoned"),

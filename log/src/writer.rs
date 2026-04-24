@@ -18,16 +18,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::Ttl::NoExpiry;
+use common::SequenceAllocator;
+use common::StorageError;
 use common::coordinator::{EpochWatcher, EpochWatermarks};
-use common::storage::PutOptions;
-use common::{PutRecordOp, SequenceAllocator, WriteOptions};
+use slatedb::WriteBatch;
+use slatedb::config::WriteOptions;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::AppendError;
 use crate::listing::ListingCache;
 use crate::model::{AppendOutput, Record as UserRecord, SegmentId};
+use crate::reader::ReadHandle;
 use crate::segment::{LogSegment, SegmentAssignment, SegmentCache};
 use crate::serde::LogEntryKey;
 
@@ -35,7 +37,7 @@ use crate::serde::LogEntryKey;
 #[derive(Clone)]
 pub(crate) struct WrittenView {
     pub epoch: u64,
-    pub snapshot: Arc<dyn common::storage::StorageSnapshot>,
+    pub snapshot: Arc<ReadHandle>,
     /// Storage engine sequence number for this write.
     pub seqnum: u64,
     /// ID of the most recently created segment, if any.
@@ -84,7 +86,7 @@ impl Default for LogWriterConfig {
 
 /// The log writer task. Owns all write-side state and runs as a spawned async task.
 pub(crate) struct LogWriter {
-    storage: Arc<dyn common::Storage>,
+    storage: Arc<slatedb::Db>,
     sequence_allocator: SequenceAllocator,
     segment_cache: SegmentCache,
     listing_cache: ListingCache,
@@ -97,7 +99,7 @@ pub(crate) struct LogWriter {
 impl LogWriter {
     /// Creates a new writer and returns the writer + channels for spawning.
     pub(crate) async fn new(
-        storage: Arc<dyn common::Storage>,
+        storage: Arc<slatedb::Db>,
         sequence_allocator: SequenceAllocator,
         segment_cache: SegmentCache,
         listing_cache: ListingCache,
@@ -109,7 +111,7 @@ impl LogWriter {
         let last_segment_id = segment_cache.latest().map(|s| s.id());
         let initial_view = WrittenView {
             epoch: 0,
-            snapshot: initial_snapshot,
+            snapshot: Arc::new(ReadHandle::Snapshot(initial_snapshot)),
             seqnum: 0,
             last_segment_id,
         };
@@ -169,32 +171,29 @@ impl LogWriter {
             return Ok(None);
         }
 
-        let mut records = Vec::new();
+        let mut batch = WriteBatch::new();
 
         // 1. Allocate sequences
         let (base_seq, maybe_block_record) = self.sequence_allocator.allocate(count);
         if let Some(r) = maybe_block_record {
-            records.push(PutRecordOp::new_with_options(
-                r,
-                PutOptions { ttl: NoExpiry },
-            ));
+            batch.put(r.key, r.value);
         }
 
         // 2. Assign segment (appends segment metadata record if new)
         let assignment =
             self.segment_cache
-                .assign_segment(write.timestamp_ms, base_seq, &mut records, false);
+                .assign_segment(write.timestamp_ms, base_seq, &mut batch, false);
 
         // 3. Assign listing entries for new keys
         let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
         self.listing_cache
-            .assign_new_keys(assignment.segment.id(), &keys, &mut records);
+            .assign_new_keys(assignment.segment.id(), &keys, &mut batch);
 
         // 4. Build log entry records
-        self.add_entries(&assignment.segment, base_seq, &write.records, &mut records);
+        self.add_entries(&assignment.segment, base_seq, &write.records, &mut batch);
 
         // 5. Write to storage and broadcast
-        self.write_and_broadcast(records, &assignment).await?;
+        self.write_and_broadcast(batch, &assignment).await?;
 
         Ok(Some(AppendOutput {
             start_sequence: base_seq,
@@ -205,13 +204,13 @@ impl LogWriter {
     #[cfg(test)]
     async fn handle_force_seal(&mut self, timestamp_ms: i64) -> Result<(), String> {
         let next_seq = self.sequence_allocator.peek_next_sequence();
-        let mut records = Vec::new();
+        let mut batch = WriteBatch::new();
         let assignment =
             self.segment_cache
-                .assign_segment(timestamp_ms, next_seq, &mut records, true);
+                .assign_segment(timestamp_ms, next_seq, &mut batch, true);
 
-        if !records.is_empty() {
-            self.write_and_broadcast(records, &assignment).await?;
+        if assignment.is_new {
+            self.write_and_broadcast(batch, &assignment).await?;
         }
 
         Ok(())
@@ -221,16 +220,17 @@ impl LogWriter {
     /// takes a new storage snapshot, bumps the epoch, and broadcasts.
     async fn write_and_broadcast(
         &mut self,
-        records: Vec<PutRecordOp>,
+        batch: WriteBatch,
         assignment: &SegmentAssignment,
     ) -> Result<(), String> {
         let options = WriteOptions {
             await_durable: false,
         };
-        let write_result = self
+        let handle = self
             .storage
-            .put_with_options(records, options)
+            .write_with_options(batch, &options)
             .await
+            .map_err(StorageError::from_storage)
             .map_err(|e| e.to_string())?;
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
@@ -240,8 +240,8 @@ impl LogWriter {
         }
         self.written_tx.send_replace(WrittenView {
             epoch: self.epoch,
-            snapshot,
-            seqnum: write_result.seqnum,
+            snapshot: Arc::new(ReadHandle::Snapshot(snapshot)),
+            seqnum: handle.seqnum(),
             last_segment_id: self.last_segment_id,
         });
         self.watermarks.update_written(self.epoch);
@@ -255,26 +255,22 @@ impl LogWriter {
         Ok(self.epoch)
     }
 
-    /// Builds log entry storage records from user records and appends them.
+    /// Builds log entry storage records from user records and appends them to the batch.
     fn add_entries(
         &self,
         segment: &LogSegment,
         base_sequence: u64,
         user_records: &[UserRecord],
-        records: &mut Vec<PutRecordOp>,
+        batch: &mut WriteBatch,
     ) {
         let segment_start_seq = segment.meta().start_seq;
         for (i, user_record) in user_records.iter().enumerate() {
             let sequence = base_sequence + i as u64;
             let entry_key = LogEntryKey::new(segment.id(), user_record.key.clone(), sequence);
-            let storage_record = common::Record::new(
+            batch.put(
                 entry_key.serialize(segment_start_seq),
                 user_record.value.clone(),
             );
-            records.push(PutRecordOp::new_with_options(
-                storage_record,
-                PutOptions { ttl: NoExpiry },
-            ));
         }
     }
 }
@@ -406,27 +402,54 @@ mod tests {
     use super::*;
     use crate::config::SegmentConfig;
     use crate::serde::SEQ_BLOCK_KEY;
-    use common::{
-        Storage,
-        storage::in_memory::{FailingStorage, InMemoryStorage},
-    };
-    use opendata_macros::storage_test;
+    use crate::storage::LogStorageRead as _;
+    use common::StorageBuilder;
+    use common::storage::testing::FailingObjectStore;
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
 
-    async fn create_writer() -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
+    async fn new_in_memory_storage() -> Arc<slatedb::Db> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        StorageBuilder::from_object_store("test-writer", object_store)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .db
+    }
+
+    async fn new_failing_storage() -> (Arc<slatedb::Db>, Arc<FailingObjectStore>) {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let failing = FailingObjectStore::new(inner);
+        let storage = StorageBuilder::from_object_store(
+            "test-writer-failing",
+            failing.clone() as Arc<dyn ObjectStore>,
+        )
+        .await
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .db;
+        (storage, failing)
+    }
+
+    async fn create_writer() -> (LogWriter, LogWriteHandle, Arc<slatedb::Db>) {
         create_writer_with_config(LogWriterConfig::default()).await
     }
 
     async fn create_writer_with_config(
         config: LogWriterConfig,
-    ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
-        let storage = std::sync::Arc::new(InMemoryStorage::default());
+    ) -> (LogWriter, LogWriteHandle, Arc<slatedb::Db>) {
+        let storage = new_in_memory_storage().await;
         create_writer_with_storage(storage, config).await
     }
 
     async fn create_writer_with_storage(
-        storage: Arc<dyn common::Storage>,
+        storage: Arc<slatedb::Db>,
         config: LogWriterConfig,
-    ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
+    ) -> (LogWriter, LogWriteHandle, Arc<slatedb::Db>) {
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
@@ -479,8 +502,8 @@ mod tests {
         // Verify data is in storage
         handle.flush().await.unwrap();
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
-        let record = storage.get(seq_key).await.unwrap();
-        assert!(record.is_some());
+        let value = storage.get(&seq_key).await.unwrap();
+        assert!(value.is_some());
     }
 
     #[tokio::test]
@@ -534,7 +557,6 @@ mod tests {
 
         // Verify two segments exist in storage
         handle.flush().await.unwrap();
-        use crate::storage::LogStorageRead as _;
         let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].id(), 0);
@@ -561,7 +583,6 @@ mod tests {
         handle.flush().await.unwrap();
 
         // Verify entries are readable from storage
-        use crate::storage::LogStorageRead as _;
         let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
         assert_eq!(segments.len(), 1);
 
@@ -628,91 +649,38 @@ mod tests {
         assert_eq!(handle.durable_epoch(), 1);
     }
 
-    #[storage_test]
-    async fn should_propagate_put_error_on_append(storage: Arc<dyn Storage>) {
-        let failing = FailingStorage::wrap(storage);
+    /// Previously: `should_propagate_put_error_on_append`,
+    /// `should_propagate_snapshot_error_on_append`,
+    /// `should_propagate_flush_error`, and `should_enter_fatal_state_after_put_error`
+    /// all exercised the writer's behaviour when the storage trait failed.
+    ///
+    /// Those tests relied on `FailingStorage`, a trait-level mock that surfaced
+    /// errors immediately. With the storage trait removed, failure injection
+    /// happens at the object-store layer via `FailingObjectStore`. slatedb
+    /// retries every `object_store::Error` except five non-retryable kinds, so
+    /// we inject `Precondition` (the default `FailKind`) to surface failures
+    /// without tripping the infinite retry.
+    #[tokio::test]
+    async fn should_propagate_put_error_on_flush() {
+        let (storage, failing) = new_failing_storage().await;
         let (writer, mut handle, _) =
-            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
+            create_writer_with_storage(storage, LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
 
-        // Enable put failure after writer is running
-        failing.fail_put(common::StorageError::Storage("test put error".into()));
-
-        let result = handle.try_append(make_write(&["key1"], 1000)).await;
-        assert!(
-            matches!(&result, Err(AppendError::Storage(msg)) if msg.contains("test put error")),
-            "expected Storage with test put error, got: {:?}",
-            result,
-        );
-
-        // Epoch should not have advanced
-        assert_eq!(handle.written_epoch(), 0);
-    }
-
-    #[storage_test]
-    async fn should_propagate_snapshot_error_on_append(storage: Arc<dyn Storage>) {
-        let failing = FailingStorage::wrap(storage);
-        let (writer, mut handle, _) =
-            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
-        let _task = handle.spawn(writer);
-
-        // Snapshot is taken inside write_and_broadcast after a successful put.
-        // Fail only snapshot, not put.
-        failing.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
-
-        let result = handle.try_append(make_write(&["key1"], 1000)).await;
-        assert!(
-            matches!(&result, Err(AppendError::Storage(msg)) if msg.contains("test snapshot error")),
-            "expected Storage with test snapshot error, got: {:?}",
-            result,
-        );
-    }
-
-    #[storage_test]
-    async fn should_propagate_flush_error(storage: Arc<dyn Storage>) {
-        let failing = FailingStorage::wrap(storage);
-        let (writer, mut handle, _) =
-            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
-        let _task = handle.spawn(writer);
-
-        // Append succeeds
         handle
             .try_append(make_write(&["key1"], 1000))
             .await
             .unwrap();
+        failing.set_fail_put(true);
 
-        // Enable flush failure
-        failing.fail_flush(common::StorageError::Storage("test flush error".into()));
-
-        let result = handle.flush().await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("test flush error"),
-            "expected test flush error, got: {}",
-            err,
-        );
-    }
-
-    #[storage_test]
-    async fn should_enter_fatal_state_after_put_error(storage: Arc<dyn Storage>) {
-        let failing = FailingStorage::wrap(storage);
-        let (writer, mut handle, _) =
-            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
-        let _task = handle.spawn(writer);
-
-        // First append fails
-        failing.fail_put_once(common::StorageError::Storage("test put error".into()));
-        let result = handle.try_append(make_write(&["key1"], 1000)).await;
-        assert!(result.is_err());
-
-        // FIXME: After a write failure the writer should enter a fatal state and
-        // reject subsequent appends. Currently it recovers, which is incorrect.
-        let result = handle
-            .try_append(make_write(&["key2"], 2000))
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.flush())
             .await
-            .unwrap();
-        assert!(result.is_some());
+            .expect("flush hung past 5s; retry barrier is broken");
+        assert!(
+            result.is_err(),
+            "expected flush to fail when object store puts fail, got: {:?}",
+            result,
+        );
     }
 
     #[tokio::test]

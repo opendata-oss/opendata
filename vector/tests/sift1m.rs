@@ -1,3 +1,5 @@
+use common::StorageConfig;
+use common::storage::config::ObjectStoreConfig;
 use log::info;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -5,6 +7,15 @@ use std::path::Path;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
 use vector::{Config, DistanceMetric, Query, SearchOptions, Vector, VectorDb, VectorDbRead};
+
+fn in_memory_storage_config() -> StorageConfig {
+    StorageConfig {
+        path: "test".into(),
+        object_store: ObjectStoreConfig::InMemory,
+        settings_path: None,
+        block_cache: None,
+    }
+}
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -93,6 +104,7 @@ async fn sift1m_recall() {
     let data_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sift");
 
     let config = Config {
+        storage: in_memory_storage_config(),
         dimensions: 128,
         distance_metric: DistanceMetric::L2,
         split_search_neighbourhood: 16,
@@ -188,6 +200,7 @@ async fn sift100k_recall() {
     ensure_extracted(&data_dir, "sift100k.tgz", "base.fvecs");
 
     let config = Config {
+        storage: in_memory_storage_config(),
         dimensions: 128,
         distance_metric: DistanceMetric::L2,
         split_search_neighbourhood: 0,

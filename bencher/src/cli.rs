@@ -56,10 +56,14 @@ impl Config {
     /// Default configuration for development/testing.
     fn default() -> Self {
         use common::StorageConfig;
+        use common::storage::config::ObjectStoreConfig;
 
         Self {
             data: DataConfig {
-                storage: StorageConfig::InMemory,
+                storage: StorageConfig {
+                    object_store: ObjectStoreConfig::InMemory,
+                    ..StorageConfig::default()
+                },
             },
             reporter: None,
             params: Default::default(),

@@ -48,7 +48,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64.workspace = true
-common = { workspace = true, features = ["test-utils"] }
+common = { workspace = true, features = ["test-utils", "testing"] }
 metrics-exporter-prometheus.workspace = true
 proptest.workspace = true
 reqwest.workspace = true

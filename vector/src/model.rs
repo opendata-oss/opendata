@@ -250,7 +250,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            storage: StorageConfig::InMemory,
+            storage: StorageConfig::default(),
             dimensions: 0, // Must be set explicitly
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),

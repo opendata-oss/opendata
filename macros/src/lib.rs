@@ -13,7 +13,7 @@ use proc_macro::TokenStream;
 ///
 /// ```ignore
 /// #[opendata_macros::storage_test]
-/// async fn my_test(storage: Arc<dyn Storage>) {
+/// async fn my_test(db: Arc<slatedb::Db>) {
 ///     // test body
 /// }
 /// ```
@@ -21,8 +21,8 @@ use proc_macro::TokenStream;
 /// # With merge operator
 ///
 /// ```ignore
-/// #[opendata_macros::storage_test(merge_operator = VectorDbMergeOperator::new(3))]
-/// async fn my_test(storage: Arc<dyn Storage>) {
+/// #[opendata_macros::storage_test(merge_operator = MyMergeOp::new())]
+/// async fn my_test(db: Arc<slatedb::Db>) {
 ///     // test body
 /// }
 /// ```

@@ -19,12 +19,12 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```no_run
 //! # use timeseries::{TimeSeriesDb, Config, Series};
 //! # use common::StorageConfig;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+//! let config = Config { storage: StorageConfig::default(), ..Default::default() };
 //! let ts = TimeSeriesDb::open(config).await?;
 //!
 //! let series = Series::builder("http_requests_total")

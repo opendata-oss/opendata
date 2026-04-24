@@ -2,20 +2,20 @@ use crate::Result;
 use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::centroids::SearchResult;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use common::StorageRead;
+use slatedb::DbSnapshot;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) struct SplitRoot {
     opts: Arc<IndexerOpts>,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<DbSnapshot>,
     snapshot_epoch: u64,
 }
 
 impl SplitRoot {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
     ) -> Self {
         Self {

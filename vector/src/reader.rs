@@ -16,8 +16,8 @@ use crate::write::indexer::tree::centroids::{
     LeveledCentroidIndex, StoredCentroidReader, TreeDepth,
 };
 use async_trait::async_trait;
-use common::StorageSemantics;
 use common::storage::factory::{StorageReaderRuntime, create_storage_read};
+use slatedb::DbReader;
 use std::sync::Arc;
 
 /// Read-only client for querying a vector database.
@@ -28,7 +28,7 @@ use std::sync::Arc;
 ///       a later improvement. In the interim we'll first add support for creating
 ///       a reader from a checkpoint.
 pub struct VectorDbReader {
-    query_engine: QueryEngine,
+    query_engine: QueryEngine<DbReader>,
 }
 
 impl VectorDbReader {
@@ -46,27 +46,28 @@ impl VectorDbReader {
         runtime: StorageReaderRuntime,
     ) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = create_storage_read(
+        let runtime = runtime.with_merge_operator(Arc::new(merge_op));
+        let built = create_storage_read(
             &config.storage,
             runtime,
-            StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
             slatedb::config::DbReaderOptions::default(),
         )
         .await?;
+        let reader = built.reader;
 
         let dimensions = config.dimensions as usize;
-        let centroids_meta = storage.get_centroids_meta().await?;
+        let centroids_meta = reader.get_centroids_meta().await?;
         if centroids_meta.is_none() {
             return Err(Error::Storage(
                 "No centroid tree found in storage. Database must be initialized by VectorDb first."
                     .to_string(),
             ));
         }
-        let reader = Arc::new(StoredCentroidReader::new(dimensions, storage.clone(), 0));
+        let centroid_reader = Arc::new(StoredCentroidReader::new(dimensions, reader.clone(), 0));
         let centroid_index = Arc::new(LeveledCentroidIndex::new(
             TreeDepth::of(centroids_meta.expect("checked above").depth),
             config.distance_metric,
-            reader,
+            centroid_reader,
         ));
 
         let options = QueryEngineOptions {
@@ -75,11 +76,16 @@ impl VectorDbReader {
             query_pruning_factor: config.query_pruning_factor,
         };
 
-        let query_engine = QueryEngine::new(options, centroid_index, storage);
+        let query_engine = QueryEngine::new(options, centroid_index, reader);
+        // NOTE: the `managed_cache` returned by create_storage_read is dropped here;
+        // the reader holds the cache alive via its DbCache dyn handle, and we don't
+        // currently expose an explicit close on VectorDbReader. If/when we do,
+        // we'll need to thread managed_cache through.
+        drop(built.managed_cache);
         Ok(Self::new(query_engine))
     }
 
-    pub(crate) fn new(query_engine: QueryEngine) -> Self {
+    pub(crate) fn new(query_engine: QueryEngine<DbReader>) -> Self {
         Self { query_engine }
     }
 }
@@ -107,21 +113,19 @@ mod tests {
     use crate::reader::VectorDbReader;
     use crate::serde::collection_meta::DistanceMetric;
     use common::StorageConfig;
-    use common::storage::config::{
-        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-    };
+    use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
     use std::time::Duration;
     use tempfile::TempDir;
 
     fn local_storage_config(dir: &TempDir) -> StorageConfig {
-        StorageConfig::SlateDb(SlateDbStorageConfig {
+        StorageConfig {
             path: "vector-data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: dir.path().to_string_lossy().to_string(),
             }),
             settings_path: None,
             block_cache: None,
-        })
+        }
     }
 
     #[tokio::test]
@@ -147,6 +151,7 @@ mod tests {
         ];
         db.write(vectors).await.unwrap();
         db.flush().await.unwrap();
+        db.close().await.unwrap();
 
         // when - open a reader and search
         let reader_config = ReaderConfig {

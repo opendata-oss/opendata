@@ -8,15 +8,14 @@ use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::tree::centroids::{CentroidCache, TreeDepth, TreeLevel};
 use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::state::VectorIndexState;
-use common::StorageRead;
-use common::storage::StorageSnapshot;
+use slatedb::{DbRead, DbSnapshot};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
 pub(crate) async fn validate(
-    snapshot: Arc<dyn StorageSnapshot>,
+    snapshot: Arc<DbSnapshot>,
     state: &VectorIndexState,
     dimensions: usize,
 ) -> Result<()> {
@@ -494,7 +493,9 @@ fn validate_exact_posting_list_match(
     Ok(())
 }
 
-async fn load_centroid_counts(snapshot: &dyn StorageRead) -> Result<HashMap<(u8, VectorId), u64>> {
+async fn load_centroid_counts<R: DbRead + Send + Sync>(
+    snapshot: &R,
+) -> Result<HashMap<(u8, VectorId), u64>> {
     let mut counts = HashMap::new();
     for (centroid_id, value) in snapshot.scan_all_centroid_stats().await? {
         if value.num_vectors < 0 {
@@ -508,8 +509,8 @@ async fn load_centroid_counts(snapshot: &dyn StorageRead) -> Result<HashMap<(u8,
     Ok(counts)
 }
 
-async fn load_centroid_postings(
-    snapshot: &dyn StorageRead,
+async fn load_centroid_postings<R: DbRead + Send + Sync>(
+    snapshot: &R,
     dimensions: usize,
 ) -> Result<HashMap<VectorId, PostingList>> {
     Ok(snapshot
@@ -550,8 +551,8 @@ mod tests {
     };
     use crate::write::indexer::tree::posting_list::Posting;
     use bytes::Bytes;
-    use common::storage::in_memory::InMemoryStorage;
-    use common::{Record, SequenceAllocator, Storage};
+    use common::SequenceAllocator;
+    use slatedb::{Db, DbBuilder, WriteBatch};
 
     const DIMS: usize = 2;
 
@@ -565,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_validate_consistent_root_only_tree() {
-        let storage = create_storage();
+        let storage = create_storage().await;
         let root = vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])];
         write_tree(
             &storage,
@@ -589,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_reject_stale_centroid_info_entries() {
-        let storage = create_storage();
+        let storage = create_storage().await;
         let root = vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])];
         write_tree(
             &storage,
@@ -619,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_validate_cached_root_and_internal_centroids_against_storage() {
-        let storage = create_storage();
+        let storage = create_storage().await;
         let root = vec![(10, vec![1.0, 0.0]), (11, vec![0.0, 1.0])];
         write_tree(
             &storage,
@@ -680,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_reject_when_cached_internal_posting_differs_from_storage() {
-        let storage = create_storage();
+        let storage = create_storage().await;
         let root = vec![(10, vec![1.0, 0.0])];
         write_tree(
             &storage,
@@ -720,16 +721,21 @@ mod tests {
         );
     }
 
-    fn create_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator::new(DIMS),
-        )))
+    async fn create_storage() -> Arc<Db> {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = DbBuilder::new("test", object_store)
+            .with_merge_operator(Arc::new(VectorDbMergeOperator::new(DIMS)))
+            .build()
+            .await
+            .unwrap();
+        Arc::new(db)
     }
 
     #[allow(clippy::type_complexity)]
     async fn create_state(
-        storage: Arc<dyn Storage>,
-        snapshot: Arc<dyn StorageSnapshot>,
+        storage: Arc<Db>,
+        snapshot: Arc<DbSnapshot>,
         depth: u8,
         root: Vec<(u64, Vec<f32>)>,
         centroid_postings: Vec<(u64, Vec<(u64, Vec<f32>)>)>,
@@ -809,8 +815,8 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     async fn build_last_applied_snapshot(
-        _storage: Arc<dyn Storage>,
-        snapshot: Arc<dyn StorageSnapshot>,
+        _storage: Arc<Db>,
+        snapshot: Arc<DbSnapshot>,
         depth: u8,
         root: Vec<(u64, Vec<f32>)>,
         centroid_postings: Vec<(u64, Vec<(u64, Vec<f32>)>)>,
@@ -858,56 +864,41 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     async fn write_tree(
-        storage: &Arc<dyn Storage>,
+        storage: &Arc<Db>,
         depth: u8,
         root: Vec<(u64, Vec<f32>)>,
         centroid_info: Vec<(u64, CentroidInfoValue)>,
         centroid_stats: Vec<((u8, u64), i32)>,
         centroid_postings: Vec<(u64, Vec<(u64, Vec<f32>)>)>,
     ) {
-        let mut ops = Vec::new();
-        ops.push(
-            Record::new(
-                CentroidsKey::new().encode(),
-                CentroidsValue::new(depth).encode_to_bytes(),
-            )
-            .into(),
+        let mut batch = WriteBatch::new();
+        batch.put(
+            CentroidsKey::new().encode(),
+            CentroidsValue::new(depth).encode_to_bytes(),
         );
-        ops.push(
-            Record::new(
-                PostingListKey::new(ROOT_VECTOR_ID).encode(),
-                posting_list_value(TreeDepth::of(depth).max_inner_level(), root).encode_to_bytes(),
-            )
-            .into(),
+        batch.put(
+            PostingListKey::new(ROOT_VECTOR_ID).encode(),
+            posting_list_value(TreeDepth::of(depth).max_inner_level(), root).encode_to_bytes(),
         );
         for (centroid_num, value) in centroid_info {
-            ops.push(
-                Record::new(
-                    CentroidInfoKey::new(centroid_id(value.level, centroid_num)).encode(),
-                    value.encode_to_bytes(),
-                )
-                .into(),
+            batch.put(
+                CentroidInfoKey::new(centroid_id(value.level, centroid_num)).encode(),
+                value.encode_to_bytes(),
             );
         }
         for ((level, centroid_num), count) in centroid_stats {
-            ops.push(
-                Record::new(
-                    CentroidStatsKey::new(centroid_id(level, centroid_num)).encode(),
-                    CentroidStatsValue::new(count).encode_to_bytes(),
-                )
-                .into(),
+            batch.put(
+                CentroidStatsKey::new(centroid_id(level, centroid_num)).encode(),
+                CentroidStatsValue::new(count).encode_to_bytes(),
             );
         }
         for (centroid_id, postings) in centroid_postings {
-            ops.push(
-                Record::new(
-                    PostingListKey::new(root_posting_id(depth, centroid_id)).encode(),
-                    posting_list_value(1, postings).encode_to_bytes(),
-                )
-                .into(),
+            batch.put(
+                PostingListKey::new(root_posting_id(depth, centroid_id)).encode(),
+                posting_list_value(1, postings).encode_to_bytes(),
             );
         }
-        storage.put(ops).await.unwrap();
+        storage.write(batch).await.unwrap();
     }
 
     fn posting_list_value(level: u8, postings: Vec<(u64, Vec<f32>)>) -> PostingListValue {

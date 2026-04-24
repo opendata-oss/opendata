@@ -1,7 +1,5 @@
-use crate::StorageRead;
-use crate::coordinator::WriteCommand;
-use crate::storage::StorageSnapshot;
 use async_trait::async_trait;
+use slatedb::DbSnapshot;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -101,7 +99,7 @@ pub trait Flusher<D: Delta>: Send + Sync + 'static {
         &mut self,
         frozen: D::Frozen,
         epoch_range: &Range<u64>,
-    ) -> Result<Arc<dyn StorageSnapshot>, String>;
+    ) -> Result<Arc<DbSnapshot>, String>;
 
     /// Ensure storage durability (e.g. call storage.flush()).
     async fn flush_storage(&self) -> Result<(), String>;

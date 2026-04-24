@@ -2,7 +2,7 @@
 //!
 //! This module provides [`LogStorageRead`], an extension trait that adds
 //! log-specific read operations (segment scanning, entry scanning, key
-//! listing) to any [`StorageRead`] implementation, and test helpers for
+//! listing) to any [`slatedb::DbRead`] implementation, and test helpers for
 //! writing log domain types to storage.
 
 use async_trait::async_trait;
@@ -14,16 +14,16 @@ use crate::model::{LogEntry, SegmentId};
 use crate::segment::LogSegment;
 use crate::serde::{ListingEntryKey, LogEntryKey, SegmentMeta, SegmentMetaKey};
 use bytes::Bytes;
-#[cfg(test)]
-use common::Storage;
-use common::{StorageIterator, StorageRead};
+use common::StorageError;
+use common::default_scan_options;
+use slatedb::DbRead;
 
-/// Extension trait adding log-specific read operations to any [`StorageRead`].
+/// Extension trait adding log-specific read operations to any [`slatedb::DbRead`].
 ///
 /// Provides default implementations for scanning segments, entries, and listing keys.
-/// Automatically available on all `StorageRead` types via a blanket impl.
+/// Automatically available on all `DbRead` types via a blanket impl.
 #[async_trait]
-pub(crate) trait LogStorageRead: StorageRead {
+pub(crate) trait LogStorageRead: DbRead + Send + Sync {
     /// Returns keys present in the given segment range.
     ///
     /// Keys are deduplicated and returned in a sorted `BTreeSet`.
@@ -35,7 +35,7 @@ pub(crate) trait LogStorageRead: StorageRead {
 
         let scan_range = ListingEntryKey::scan_range(segment_range);
         let mut iter = self
-            .scan_iter(scan_range)
+            .scan_with_options(scan_range, &default_scan_options())
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
@@ -57,10 +57,13 @@ pub(crate) trait LogStorageRead: StorageRead {
     /// Returns segments ordered by segment ID.
     async fn scan_segments(&self, range: Range<SegmentId>) -> Result<Vec<LogSegment>> {
         let scan_range = SegmentMetaKey::scan_range(range);
-        let mut iter = self.scan_iter(scan_range).await?;
+        let mut iter = self
+            .scan_with_options(scan_range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
 
         let mut segments = Vec::new();
-        while let Some(record) = iter.next().await? {
+        while let Some(record) = iter.next().await.map_err(StorageError::from_storage)? {
             let key = SegmentMetaKey::deserialize(&record.key)?;
             let meta = SegmentMeta::deserialize(&record.value)?;
             segments.push(LogSegment::new(key.segment_id, meta));
@@ -79,7 +82,10 @@ pub(crate) trait LogStorageRead: StorageRead {
         seq_range: Range<u64>,
     ) -> Result<SegmentIterator> {
         let scan_range = LogEntryKey::scan_range(segment, key, seq_range.clone());
-        let inner = self.scan_iter(scan_range).await?;
+        let inner = self
+            .scan_with_options(scan_range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
         Ok(SegmentIterator::new(
             inner,
             seq_range,
@@ -88,24 +94,20 @@ pub(crate) trait LogStorageRead: StorageRead {
     }
 }
 
-impl<T: StorageRead + ?Sized> LogStorageRead for T {}
+impl<T: DbRead + Send + Sync + ?Sized> LogStorageRead for T {}
 
 /// Iterator over log entries within a single segment.
 ///
-/// Wraps a `StorageIterator` and handles range validation and `LogEntry`
+/// Wraps a `slatedb::DbIterator` and handles range validation and `LogEntry`
 /// deserialization.
 pub(crate) struct SegmentIterator {
-    inner: Box<dyn StorageIterator + Send>,
+    inner: slatedb::DbIterator,
     seq_range: Range<u64>,
     segment_start_seq: u64,
 }
 
 impl SegmentIterator {
-    fn new(
-        inner: Box<dyn StorageIterator + Send>,
-        seq_range: Range<u64>,
-        segment_start_seq: u64,
-    ) -> Self {
+    fn new(inner: slatedb::DbIterator, seq_range: Range<u64>, segment_start_seq: u64) -> Self {
         Self {
             inner,
             seq_range,
@@ -144,50 +146,53 @@ impl SegmentIterator {
     }
 }
 
-/// Extension trait adding log-specific test write helpers to any [`Storage`].
+/// Extension trait adding log-specific test write helpers to any [`slatedb::Db`].
 ///
 /// These helpers construct storage records from log domain types (segments,
 /// entries, sequence blocks) and are used by tests to set up storage state
 /// without going through the full write coordinator.
 #[cfg(test)]
-#[async_trait]
-pub(crate) trait LogStorageWrite: Storage {
-    /// Writes a segment metadata record to storage.
-    async fn write_segment(&self, segment: &LogSegment) -> Result<()> {
-        let key = SegmentMetaKey::new(segment.id()).serialize();
-        let value = segment.meta().serialize();
-        self.put(vec![common::Record::new(key, value).into()])
-            .await?;
-        Ok(())
-    }
-
-    /// Writes a log entry record to storage.
-    ///
-    /// This is a low-level API primarily for testing. Production code should
-    /// use the higher-level `LogDb::append` method.
-    async fn write_entry(&self, segment: &LogSegment, entry: &LogEntry) -> Result<()> {
-        let entry_key = LogEntryKey::new(segment.id(), entry.key.clone(), entry.sequence);
-        let record = common::Record {
-            key: entry_key.serialize(segment.meta().start_seq),
-            value: entry.value.clone(),
-        };
-        self.put(vec![record.into()]).await?;
-        Ok(())
-    }
-
-    /// Writes a SeqBlock record to storage.
-    async fn write_seq_block(&self, block: &common::SeqBlock) -> Result<()> {
-        use crate::serde::{KEY_VERSION, RecordType};
-        let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
-        let value = block.serialize();
-        self.put(vec![common::Record::new(key, value).into()])
-            .await?;
-        Ok(())
-    }
+pub(crate) async fn write_segment(storage: &slatedb::Db, segment: &LogSegment) -> Result<()> {
+    let key = SegmentMetaKey::new(segment.id()).serialize();
+    let value = segment.meta().serialize();
+    storage
+        .put(&key, &value)
+        .await
+        .map_err(StorageError::from_storage)?;
+    Ok(())
 }
 
+/// Writes a log entry record to storage.
+///
+/// This is a low-level API primarily for testing. Production code should
+/// use the higher-level `LogDb::append` method.
 #[cfg(test)]
-impl<T: Storage + ?Sized> LogStorageWrite for T {}
+pub(crate) async fn write_entry(
+    storage: &slatedb::Db,
+    segment: &LogSegment,
+    entry: &LogEntry,
+) -> Result<()> {
+    let entry_key = LogEntryKey::new(segment.id(), entry.key.clone(), entry.sequence);
+    let key = entry_key.serialize(segment.meta().start_seq);
+    storage
+        .put(&key, &entry.value)
+        .await
+        .map_err(StorageError::from_storage)?;
+    Ok(())
+}
+
+/// Writes a SeqBlock record to storage.
+#[cfg(test)]
+pub(crate) async fn write_seq_block(storage: &slatedb::Db, block: &common::SeqBlock) -> Result<()> {
+    use crate::serde::{KEY_VERSION, RecordType};
+    let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
+    let value = block.serialize();
+    storage
+        .put(&key, &value)
+        .await
+        .map_err(StorageError::from_storage)?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -196,41 +201,38 @@ mod tests {
     use opendata_macros::storage_test;
 
     #[storage_test]
-    async fn should_get_record_when_present(storage: Arc<dyn Storage>) {
+    async fn should_get_record_when_present(storage: Arc<slatedb::Db>) {
         // given
         let key = Bytes::from("test-key");
         let value = Bytes::from("test-value");
-        storage
-            .put(vec![common::Record::new(key.clone(), value.clone()).into()])
-            .await
-            .unwrap();
+        storage.put(&key, &value).await.unwrap();
 
         // when
-        let result = storage.get(key).await.unwrap();
+        let result = storage.get(&key).await.unwrap();
 
         // then
         assert!(result.is_some());
-        assert_eq!(result.unwrap().value, value);
+        assert_eq!(result.unwrap(), value);
     }
 
     #[storage_test]
-    async fn should_return_none_when_record_absent(storage: Arc<dyn Storage>) {
+    async fn should_return_none_when_record_absent(storage: Arc<slatedb::Db>) {
         // when
-        let result = storage.get(Bytes::from("missing")).await.unwrap();
+        let result = storage.get(&Bytes::from("missing")).await.unwrap();
 
         // then
         assert!(result.is_none());
     }
 
     #[storage_test]
-    async fn should_scan_segments_in_order(storage: Arc<dyn Storage>) {
+    async fn should_scan_segments_in_order(storage: Arc<slatedb::Db>) {
         // given
         let seg0 = LogSegment::new(0, SegmentMeta::new(0, 100));
         let seg1 = LogSegment::new(1, SegmentMeta::new(100, 200));
         let seg2 = LogSegment::new(2, SegmentMeta::new(200, 300));
-        storage.write_segment(&seg0).await.unwrap();
-        storage.write_segment(&seg2).await.unwrap(); // write out of order
-        storage.write_segment(&seg1).await.unwrap();
+        write_segment(&storage, &seg0).await.unwrap();
+        write_segment(&storage, &seg2).await.unwrap(); // write out of order
+        write_segment(&storage, &seg1).await.unwrap();
 
         // when
         let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
@@ -243,11 +245,11 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_scan_segments_with_range(storage: Arc<dyn Storage>) {
+    async fn should_scan_segments_with_range(storage: Arc<slatedb::Db>) {
         // given
         for i in 0u32..5 {
             let seg = LogSegment::new(i, SegmentMeta::new(i as u64 * 100, i as i64 * 100));
-            storage.write_segment(&seg).await.unwrap();
+            write_segment(&storage, &seg).await.unwrap();
         }
 
         // when
@@ -261,10 +263,10 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_scan_entries_for_key(storage: Arc<dyn Storage>) {
+    async fn should_scan_entries_for_key(storage: Arc<slatedb::Db>) {
         // given
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
-        storage.write_segment(&segment).await.unwrap();
+        write_segment(&storage, &segment).await.unwrap();
 
         let key = Bytes::from("key1");
         for seq in 0..5 {
@@ -273,7 +275,7 @@ mod tests {
                 sequence: seq,
                 value: Bytes::from(format!("value-{}", seq)),
             };
-            storage.write_entry(&segment, &entry).await.unwrap();
+            write_entry(&storage, &segment, &entry).await.unwrap();
         }
 
         // when
@@ -294,10 +296,10 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_filter_entries_by_sequence_range(storage: Arc<dyn Storage>) {
+    async fn should_filter_entries_by_sequence_range(storage: Arc<slatedb::Db>) {
         // given
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
-        storage.write_segment(&segment).await.unwrap();
+        write_segment(&storage, &segment).await.unwrap();
 
         let key = Bytes::from("key1");
         for seq in 0..10 {
@@ -306,7 +308,7 @@ mod tests {
                 sequence: seq,
                 value: Bytes::from(format!("value-{}", seq)),
             };
-            storage.write_entry(&segment, &entry).await.unwrap();
+            write_entry(&storage, &segment, &entry).await.unwrap();
         }
 
         // when - scan only sequences 3..7
@@ -323,10 +325,10 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_return_empty_iterator_for_unknown_key(storage: Arc<dyn Storage>) {
+    async fn should_return_empty_iterator_for_unknown_key(storage: Arc<slatedb::Db>) {
         // given
         let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
-        storage.write_segment(&segment).await.unwrap();
+        write_segment(&storage, &segment).await.unwrap();
 
         // when
         let mut iter = storage
@@ -339,40 +341,36 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_write_and_read_seq_block(storage: Arc<dyn Storage>) {
+    async fn should_write_and_read_seq_block(storage: Arc<slatedb::Db>) {
         // given
         let block = common::SeqBlock::new(1000, 500);
 
         // when
-        storage.write_seq_block(&block).await.unwrap();
+        write_seq_block(&storage, &block).await.unwrap();
 
         // then
         use crate::serde::{KEY_VERSION, RecordType};
         let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
-        let record = storage.get(key).await.unwrap().unwrap();
-        let read_block = common::SeqBlock::deserialize(&record.value).unwrap();
+        let value = storage.get(&key).await.unwrap().unwrap();
+        let read_block = common::SeqBlock::deserialize(&value).unwrap();
         assert_eq!(read_block.base_sequence, 1000);
         assert_eq!(read_block.block_size, 500);
     }
 
     #[storage_test]
-    async fn should_put_with_options(storage: Arc<dyn Storage>) {
+    async fn should_put_batch_via_write(storage: Arc<slatedb::Db>) {
         // given
-        let records = vec![
-            common::Record::new(Bytes::from("k1"), Bytes::from("v1")).into(),
-            common::Record::new(Bytes::from("k2"), Bytes::from("v2")).into(),
-        ];
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(Bytes::from("k1"), Bytes::from("v1"));
+        batch.put(Bytes::from("k2"), Bytes::from("v2"));
 
         // when
-        storage
-            .put_with_options(records, common::WriteOptions::default())
-            .await
-            .unwrap();
+        storage.write(batch).await.unwrap();
 
         // then
-        let r1 = storage.get(Bytes::from("k1")).await.unwrap();
-        let r2 = storage.get(Bytes::from("k2")).await.unwrap();
-        assert_eq!(r1.unwrap().value, Bytes::from("v1"));
-        assert_eq!(r2.unwrap().value, Bytes::from("v2"));
+        let r1 = storage.get(&Bytes::from("k1")).await.unwrap();
+        let r2 = storage.get(&Bytes::from("k2")).await.unwrap();
+        assert_eq!(r1.unwrap(), Bytes::from("v1"));
+        assert_eq!(r2.unwrap(), Bytes::from("v2"));
     }
 }

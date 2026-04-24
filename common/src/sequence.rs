@@ -6,11 +6,11 @@
 //! **[`SequenceAllocator`]**: Allocates individual sequence numbers from sequence
 //!  blocks stored in storage. Tracks the current reserved block, and allocates new
 //!  sequence numbers from it. When the block is out of sequence numbers, the
-//!  allocator allocates a new block, and returns the corresponding Record in the
-//!  return from `SequenceAllocator#allocate`. It is up to the caller to ensure
-//!  that the record is persisted in storage. This allows the allocator to be used
-//!  from implementations of `Delta` by including the sequence block writes in
-//!  persisted deltas.
+//!  allocator allocates a new block, and returns the corresponding `(key, value)`
+//!  pair in the return from `SequenceAllocator#allocate`. It is up to the caller
+//!  to ensure that the record is persisted in storage. This allows the allocator
+//!  to be used from implementations of `Delta` by including the sequence block
+//!  writes in persisted deltas.
 //!
 //! # Design
 //!
@@ -30,25 +30,26 @@
 //!
 //! ```ignore
 //! use bytes::Bytes;
-//! use common::sequence::{SeqBlockStore, SequenceAllocator};
+//! use common::SequenceAllocator;
 //!
 //! // Domain-specific key (e.g., Log uses [0x01, 0x02])
 //! const MY_SEQ_BLOCK_KEY: &[u8] = &[0x01, 0x02];
 //!
 //! let key = Bytes::from_static(MY_SEQ_BLOCK_KEY);
-//! let allocator = SequenceAllocator::load(storage.clone(), key);
+//! let allocator = SequenceAllocator::load(&db, key).await?;
 //!
-//! let (seq, put) = allocator.allocate_one().await?;
-//! if let Some(put) = put {
-//!     storage.put(vec![put]).await.unwrap();
+//! let (seq, put) = allocator.allocate_one();
+//! if let Some((k, v)) = put {
+//!     db.put(&k, &v).await?;
 //! }
 //! ```
 
 use bytes::Bytes;
+use slatedb::DbRead;
 
+use crate::StorageError;
 use crate::serde::DeserializeError;
 use crate::serde::seq_block::SeqBlock;
-use crate::{Record, Storage, StorageError};
 
 /// Default block size for sequence allocation.
 pub const DEFAULT_BLOCK_SIZE: u64 = 4096;
@@ -88,6 +89,17 @@ impl From<DeserializeError> for SequenceError {
 /// Result type alias for sequence allocation operations.
 pub type SequenceResult<T> = std::result::Result<T, SequenceError>;
 
+/// A key/value pair identifying the persisted form of a new sequence block.
+///
+/// Callers receive this from [`SequenceAllocator::allocate`] when a new block
+/// is reserved, and are responsible for writing it to storage before
+/// publishing any of the allocated sequence numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeqBlockPut {
+    pub key: Bytes,
+    pub value: Bytes,
+}
+
 #[derive(Clone, Debug)]
 pub struct AllocatedSeqBlock {
     current_block: Option<SeqBlock>,
@@ -102,9 +114,16 @@ impl AllocatedSeqBlock {
         }
     }
 
-    async fn load(storage: &dyn Storage, key: &Bytes) -> SequenceResult<Self> {
-        let current_block = match storage.get(key.clone()).await? {
-            Some(record) => Some(SeqBlock::deserialize(&record.value)?),
+    async fn load<R>(db: &R, key: &Bytes) -> SequenceResult<Self>
+    where
+        R: DbRead + Send + Sync,
+    {
+        let current_block = match db
+            .get(key.as_ref())
+            .await
+            .map_err(StorageError::from_storage)?
+        {
+            Some(value) => Some(SeqBlock::deserialize(&value)?),
             None => None,
         };
         let next_sequence = current_block
@@ -137,9 +156,13 @@ pub struct SequenceAllocator {
 }
 
 impl SequenceAllocator {
-    /// Creates a new allocator using the given storage and key.
-    pub async fn load(storage: &dyn Storage, key: Bytes) -> SequenceResult<Self> {
-        let block = AllocatedSeqBlock::load(storage, &key).await?;
+    /// Creates a new allocator by loading any existing sequence block from the
+    /// given reader under `key`.
+    pub async fn load<R>(db: &R, key: Bytes) -> SequenceResult<Self>
+    where
+        R: DbRead + Send + Sync,
+    {
+        let block = AllocatedSeqBlock::load(db, &key).await?;
         Ok(Self { key, block })
     }
 
@@ -157,7 +180,7 @@ impl SequenceAllocator {
     /// Allocates a single sequence number.
     ///
     /// Convenience method equivalent to `allocate(1)`.
-    pub fn allocate_one(&mut self) -> (u64, Option<Record>) {
+    pub fn allocate_one(&mut self) -> (u64, Option<SeqBlockPut>) {
         self.allocate(1)
     }
 
@@ -165,14 +188,14 @@ impl SequenceAllocator {
     ///
     /// Returns a pair where the first element is the first sequence number in
     /// the allocated range. The caller can use sequences `base..base+count`.
-    /// The second element is an `Option<Record>`. If the current block doesn't
+    /// The second element is an `Option<SeqBlockPut>`. If the current block doesn't
     /// have enough sequences remaining, the remaining sequences are used and a
-    /// new block is allocated for the rest. The returned record, if present,
-    /// must be put to storage to reserve the full sequence range. Note that since
+    /// new block is allocated for the rest. The returned put, if present,
+    /// must be written to storage to reserve the full sequence range. Note that since
     /// blocks are contiguous (each starts where the previous ends), the returned
     /// sequence range is always contiguous.
     ///
-    pub fn allocate(&mut self, count: u64) -> (u64, Option<Record>) {
+    pub fn allocate(&mut self, count: u64) -> (u64, Option<SeqBlockPut>) {
         let remaining = self.block.remaining();
 
         // If current block can satisfy the request, use it
@@ -184,7 +207,7 @@ impl SequenceAllocator {
 
         // Need a new block. Use remaining sequences from current block first.
         let from_new_block = count - remaining;
-        let (new_block, record) = self.init_next_block(from_new_block);
+        let (new_block, put) = self.init_next_block(from_new_block);
 
         // Base sequence is either from current block (if any remaining) or new block
         let base_sequence = if remaining > 0 {
@@ -196,10 +219,10 @@ impl SequenceAllocator {
         self.block.next_sequence = new_block.base_sequence + from_new_block;
         self.block.current_block = Some(new_block);
 
-        (base_sequence, Some(record))
+        (base_sequence, Some(put))
     }
 
-    fn init_next_block(&self, min_count: u64) -> (SeqBlock, Record) {
+    fn init_next_block(&self, min_count: u64) -> (SeqBlock, SeqBlockPut) {
         let base_sequence = match &self.block.current_block {
             Some(block) => block.next_base(),
             None => 0,
@@ -209,8 +232,11 @@ impl SequenceAllocator {
         let new_block = SeqBlock::new(base_sequence, block_size);
 
         let value: Bytes = new_block.serialize();
-        let record = Record::new(self.key.clone(), value);
-        (new_block, record)
+        let put = SeqBlockPut {
+            key: self.key.clone(),
+            value,
+        };
+        (new_block, put)
     }
 
     pub fn freeze(self) -> (Bytes, AllocatedSeqBlock) {
@@ -221,15 +247,19 @@ impl SequenceAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
     use opendata_macros::storage_test;
 
     fn test_key() -> Bytes {
         Bytes::from_static(&[0x01, 0x02])
     }
 
+    async fn write_put(storage: &slatedb::Db, put: SeqBlockPut) {
+        storage.put(&put.key, &put.value).await.unwrap();
+        storage.flush().await.unwrap();
+    }
+
     #[storage_test]
-    async fn should_load_none_when_no_block_allocated(storage: Arc<dyn Storage>) {
+    async fn should_load_none_when_no_block_allocated(storage: Arc<slatedb::Db>) {
         // when
         let block = AllocatedSeqBlock::load(storage.as_ref(), &test_key())
             .await
@@ -241,7 +271,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_load_first_block(storage: Arc<dyn Storage>) {
+    async fn should_load_first_block(storage: Arc<slatedb::Db>) {
         // given:
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -260,7 +290,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_allocate_larger_block_when_requested(storage: Arc<dyn Storage>) {
+    async fn should_allocate_larger_block_when_requested(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -282,7 +312,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_allocate_sequential_blocks(storage: Arc<dyn Storage>) {
+    async fn should_allocate_sequential_blocks(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -307,14 +337,14 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_recover_from_storage_on_initialize(storage: Arc<dyn Storage>) {
+    async fn should_recover_from_storage_on_initialize(storage: Arc<slatedb::Db>) {
         // First instance allocates some blocks
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
             .unwrap();
         allocator.allocate(DEFAULT_BLOCK_SIZE);
         let (_, put) = allocator.allocate(DEFAULT_BLOCK_SIZE);
-        storage.put(vec![put.unwrap().into()]).await.unwrap();
+        write_put(&storage, put.unwrap()).await;
 
         // when: Second instance should recover
         let mut allocator2 = SequenceAllocator::load(storage.as_ref(), test_key())
@@ -334,13 +364,13 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_resume_from_next_block_on_initialize(storage: Arc<dyn Storage>) {
+    async fn should_resume_from_next_block_on_initialize(storage: Arc<slatedb::Db>) {
         // First instance allocates some blocks
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
             .unwrap();
         let (_, put) = allocator.allocate(DEFAULT_BLOCK_SIZE / 2);
-        storage.put(vec![put.unwrap().into()]).await.unwrap();
+        write_put(&storage, put.unwrap()).await;
 
         // when: Second instance should recover
         let mut allocator2 = SequenceAllocator::load(storage.as_ref(), test_key())
@@ -360,7 +390,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_allocate_sequential_sequence_numbers(storage: Arc<dyn Storage>) {
+    async fn should_allocate_sequential_sequence_numbers(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -378,7 +408,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_allocate_batch_of_sequences(storage: Arc<dyn Storage>) {
+    async fn should_allocate_batch_of_sequences(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -394,7 +424,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_span_blocks_when_batch_exceeds_remaining(storage: Arc<dyn Storage>) {
+    async fn should_span_blocks_when_batch_exceeds_remaining(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -414,7 +444,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_allocate_new_block_when_exhausted(storage: Arc<dyn Storage>) {
+    async fn should_allocate_new_block_when_exhausted(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -430,7 +460,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_allocate_exactly_remaining(storage: Arc<dyn Storage>) {
+    async fn should_allocate_exactly_remaining(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -454,7 +484,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_handle_large_batch_spanning_from_partial_block(storage: Arc<dyn Storage>) {
+    async fn should_handle_large_batch_spanning_from_partial_block(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await
@@ -476,7 +506,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_peek_next_sequence_without_consuming(storage: Arc<dyn Storage>) {
+    async fn should_peek_next_sequence_without_consuming(storage: Arc<slatedb::Db>) {
         // given
         let mut allocator = SequenceAllocator::load(storage.as_ref(), test_key())
             .await

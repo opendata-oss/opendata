@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::storage::in_memory::InMemoryStorage;
+use slatedb::DbBuilder;
+use slatedb::object_store::memory::InMemory;
 
 use crate::model::{
     InstantSample, Label, Labels, MetricType, QueryOptions, RangeSample, Sample, Series,
@@ -199,9 +200,13 @@ pub(crate) fn build_oracle(scenario: &Scenario) -> Oracle {
 }
 
 pub(crate) async fn create_tsdb_for_scenario(scenario: &Scenario) -> Tsdb {
-    let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-        OpenTsdbMergeOperator,
-    ))));
+    let object_store = Arc::new(InMemory::new());
+    let db = DbBuilder::new("test", object_store)
+        .with_merge_operator(Arc::new(OpenTsdbMergeOperator))
+        .build()
+        .await
+        .unwrap();
+    let tsdb = Tsdb::new(Arc::new(db));
 
     for bucket_idx in 0..scenario.config.bucket_count {
         let bucket_series = build_bucket_series(scenario, bucket_idx);

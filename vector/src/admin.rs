@@ -3,10 +3,11 @@ use crate::error::{Error, Result};
 use crate::model::Config;
 use crate::serde::vector_id::VectorId;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::storage::record::build_write_batch;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::validator::validate as validate_tree_index;
-use common::Storage;
-use common::{StorageBuilder, StorageSemantics};
+use common::{StorageBuilder, StorageError};
+use slatedb::{Db, DbSnapshot};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -16,21 +17,29 @@ use std::sync::Arc;
 /// and keeps the tree indexer itself internal.
 pub struct VectorDbAdmin {
     config: Config,
-    storage: Arc<dyn Storage>,
+    storage: Arc<Db>,
+    /// Handle to the managed foyer hybrid cache, if one was created from the
+    /// [`Config::storage::block_cache`]. Held so we can close it explicitly on shutdown
+    /// after closing the db.
+    managed_cache: Option<common::storage::factory::OwnedHybridCache>,
 }
 
 impl VectorDbAdmin {
     /// Open a vector database for administrative operations.
     pub async fn open(config: Config) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = StorageBuilder::new(&config.storage)
+        let built = StorageBuilder::new(&config.storage)
             .await
             .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?
-            .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
+            .with_merge_operator(Arc::new(merge_op))
             .build()
             .await
             .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
-        Ok(Self { config, storage })
+        Ok(Self {
+            config,
+            storage: built.db,
+            managed_cache: built.managed_cache,
+        })
     }
 
     /// Run one index-maintenance round with no new vector writes.
@@ -39,8 +48,9 @@ impl VectorDbAdmin {
         let mut indexer = self.load_indexer(snapshot.clone()).await?;
         let result = indexer.update_index(vec![], 1, snapshot, 0).await?;
         if !result.ops.is_empty() {
+            let batch = build_write_batch(result.ops);
             self.storage
-                .apply(result.ops)
+                .write(batch)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
             self.storage
@@ -94,17 +104,27 @@ impl VectorDbAdmin {
         Ok(out)
     }
 
-    async fn snapshot(&self) -> Result<Arc<dyn common::storage::StorageSnapshot>> {
+    /// Close the underlying storage, flushing any pending data and releasing
+    /// resources. Consumes the admin handle.
+    pub async fn close(self) -> Result<()> {
+        self.storage
+            .close()
+            .await
+            .map_err(StorageError::from_storage)?;
+        if let Some(cache) = self.managed_cache {
+            let _ = cache.close().await;
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> Result<Arc<DbSnapshot>> {
         self.storage
             .snapshot()
             .await
             .map_err(|e| Error::Storage(format!("Failed to create snapshot: {e}")))
     }
 
-    async fn load_indexer(
-        &self,
-        snapshot: Arc<dyn common::storage::StorageSnapshot>,
-    ) -> Result<Indexer> {
+    async fn load_indexer(&self, snapshot: Arc<DbSnapshot>) -> Result<Indexer> {
         let state =
             VectorDb::load_indexer_state(self.storage.clone(), snapshot, &self.config, 0).await?;
         Ok(Indexer::new(VectorDb::indexer_opts(&self.config), state))

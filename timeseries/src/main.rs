@@ -31,7 +31,8 @@ mod util;
 use std::sync::Arc;
 
 use clap::Parser;
-use common::{StorageBuilder, StorageSemantics};
+use common::StorageBuilder;
+use common::storage::factory::BuiltDb;
 
 use promql::config::{CliArgs, PrometheusConfig, load_config};
 use reader::TimeSeriesDbReader;
@@ -104,13 +105,18 @@ async fn main() {
     } else {
         // Read-write mode: open full storage + Tsdb
         let merge_operator = Arc::new(OpenTsdbMergeOperator);
-        let storage = StorageBuilder::new(&prometheus_config.storage)
+        let BuiltDb {
+            db,
+            managed_cache: _managed_cache,
+            object_store: _,
+            path: _,
+        } = StorageBuilder::new(&prometheus_config.storage)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!("Failed to create storage: {}", e);
                 std::process::exit(1);
             })
-            .with_semantics(StorageSemantics::new().with_merge_operator(merge_operator))
+            .with_merge_operator(merge_operator)
             .build()
             .await
             .unwrap_or_else(|e| {
@@ -118,7 +124,11 @@ async fn main() {
                 std::process::exit(1);
             });
         tracing::info!("Storage created successfully");
-        Arc::new(Arc::new(Tsdb::new(storage)).into())
+        // NOTE: The managed_cache handle is dropped here. The server's close()
+        // path will close the slatedb Db, but the block cache will close via
+        // foyer's Drop impl. A future refactor can thread the handle through
+        // the TsdbEngine for deterministic shutdown.
+        Arc::new(Arc::new(Tsdb::new(db)).into())
     };
 
     // Create server configuration

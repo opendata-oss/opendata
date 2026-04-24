@@ -13,7 +13,7 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::serde::vector_index_data::VectorIndexDataValue;
-use crate::storage::record::put_vector_index_data;
+use crate::storage::record::{StorageOp, put_vector_index_data};
 use crate::storage::{VectorDbStorageReadExt, record};
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
@@ -21,11 +21,11 @@ use crate::write::indexer::tree::centroids::{
 };
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use bytes::Bytes;
+use common::SequenceAllocator;
 use common::sequence::AllocatedSeqBlock;
-use common::storage::RecordOp;
-use common::{Record, SequenceAllocator, StorageRead};
 use futures::future::BoxFuture;
 use log::info;
+use slatedb::DbSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
@@ -105,7 +105,7 @@ pub(crate) struct ForwardIndexDelta {
     vector_index_updates: HashMap<VectorId, VectorIndexDataValue>,
     vector_deletes: HashSet<VectorId>,
     id_allocator: SequenceAllocator,
-    ops: Vec<RecordOp>,
+    ops: Vec<StorageOp>,
 }
 
 impl ForwardIndexDelta {
@@ -130,7 +130,8 @@ impl ForwardIndexDelta {
     ) -> VectorId {
         let (vector_id, seq_alloc_put) = self.id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
-            self.ops.push(RecordOp::Put(seq_alloc_put.into()));
+            self.ops
+                .push(StorageOp::put(seq_alloc_put.key, seq_alloc_put.value));
         }
         let vector_id = VectorId::data_vector_id(vector_id);
         let fields: Vec<Field> = attributes
@@ -162,7 +163,7 @@ impl ForwardIndexDelta {
         self.vector_index_updates.remove(&vector_id);
     }
 
-    pub(crate) fn freeze(self, state: &mut VectorIndexState, output_ops: &mut Vec<RecordOp>) {
+    pub(crate) fn freeze(self, state: &mut VectorIndexState, output_ops: &mut Vec<StorageOp>) {
         let ForwardIndexDelta {
             dictionary_updates,
             vector_updates,
@@ -192,7 +193,7 @@ impl ForwardIndexDelta {
         for (vector_id, value) in vector_updates {
             let key = VectorDataKey::new(vector_id).encode();
             let encoded = value.encode_to_bytes();
-            output_ops.push(RecordOp::Put(Record::new(key, encoded).into()));
+            output_ops.push(StorageOp::put(key, encoded));
         }
 
         for (vector_id, value) in vector_index_updates {
@@ -221,7 +222,7 @@ pub(crate) struct SearchIndexDelta {
     inverted_index_updates: HashMap<Bytes, MetadataIndexValue>,
     id_allocator: SequenceAllocator,
     current_posting: HashMap<VectorId, VectorId>,
-    ops: Vec<RecordOp>,
+    ops: Vec<StorageOp>,
 }
 
 impl SearchIndexDelta {
@@ -336,7 +337,8 @@ impl SearchIndexDelta {
         assert!(id.is_centroid());
         assert_eq!(level.level(), id.level());
         if let Some(seq_alloc_put) = seq_alloc_put {
-            self.ops.push(RecordOp::Put(seq_alloc_put.into()));
+            self.ops
+                .push(StorageOp::put(seq_alloc_put.key, seq_alloc_put.value));
         }
         let centroid = CentroidInfoValue::new(level.level(), vector, parent);
         let deltas = self.centroid_count_deltas.entry(id.level()).or_default();
@@ -428,7 +430,7 @@ impl SearchIndexDelta {
         self,
         epoch: u64,
         state: &mut VectorIndexState,
-        output_ops: &mut Vec<RecordOp>,
+        output_ops: &mut Vec<StorageOp>,
     ) {
         let SearchIndexDelta {
             centroids_meta,
@@ -498,16 +500,14 @@ impl SearchIndexDelta {
         output_ops.extend(ops);
 
         let key = CentroidsKey::new().encode();
-        output_ops.push(RecordOp::Put(
-            Record::new(key, centroids_meta.encode_to_bytes()).into(),
-        ));
+        output_ops.push(StorageOp::put(key, centroids_meta.encode_to_bytes()));
 
         if let Some(root) = root {
             let key = PostingListKey::new(ROOT_VECTOR_ID).encode();
             let value = PostingListValue::from_posting_updates(root)
                 .expect("root postings should always encode")
                 .encode_to_bytes();
-            output_ops.push(RecordOp::Put(Record::new(key, value).into()));
+            output_ops.push(StorageOp::put(key, value));
         }
         if !root_updates.is_empty() {
             let op = record::merge_posting_list(ROOT_VECTOR_ID, root_updates)
@@ -517,9 +517,7 @@ impl SearchIndexDelta {
 
         for (centroid_id, centroid) in upserted_centroids {
             let key = CentroidInfoKey::new(centroid_id).encode();
-            output_ops.push(RecordOp::Put(
-                Record::new(key, centroid.encode_to_bytes()).into(),
-            ));
+            output_ops.push(StorageOp::put(key, centroid.encode_to_bytes()));
         }
 
         for (centroid_id, updates) in posting_updates {
@@ -543,7 +541,7 @@ impl SearchIndexDelta {
                         i32::try_from(count).expect("centroid count should fit in i32"),
                     )
                     .encode_to_bytes();
-                    output_ops.push(RecordOp::Put(Record::new(key, value).into()));
+                    output_ops.push(StorageOp::put(key, value));
                 }
             }
         }
@@ -557,11 +555,13 @@ impl SearchIndexDelta {
         }
 
         for centroid_id in &deleted_centroids {
-            output_ops.push(RecordOp::Delete(
+            output_ops.push(StorageOp::delete(
                 CentroidInfoKey::new(*centroid_id).encode(),
             ));
-            output_ops.push(RecordOp::Delete(PostingListKey::new(*centroid_id).encode()));
-            output_ops.push(RecordOp::Delete(
+            output_ops.push(StorageOp::delete(
+                PostingListKey::new(*centroid_id).encode(),
+            ));
+            output_ops.push(StorageOp::delete(
                 CentroidStatsKey::new(*centroid_id).encode(),
             ));
         }
@@ -583,7 +583,7 @@ impl VectorIndexDelta {
         }
     }
 
-    pub(crate) fn freeze(self, epoch: u64, state: &mut VectorIndexState) -> Vec<RecordOp> {
+    pub(crate) fn freeze(self, epoch: u64, state: &mut VectorIndexState) -> Vec<StorageOp> {
         let mut ops = vec![];
         self.forward_index.freeze(state, &mut ops);
         self.search_index.freeze(epoch, state, &mut ops);
@@ -592,7 +592,7 @@ impl VectorIndexDelta {
 }
 
 struct DirtyCentroidReader<'a> {
-    reader: CachedCentroidReader,
+    reader: CachedCentroidReader<DbSnapshot>,
     delta: &'a SearchIndexDelta,
 }
 
@@ -649,7 +649,7 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
 pub(crate) struct VectorIndexView<'a> {
     delta: &'a VectorIndexDelta,
     state: &'a VectorIndexState,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<DbSnapshot>,
     snapshot_epoch: u64,
 }
 
@@ -657,7 +657,7 @@ impl<'a> VectorIndexView<'a> {
     pub(crate) fn new(
         delta: &'a VectorIndexDelta,
         state: &'a VectorIndexState,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
     ) -> Self {
         Self {
@@ -818,38 +818,45 @@ mod tests {
     use crate::serde::key::{CentroidSeqBlockKey, SeqBlockKey};
     use crate::storage::VectorDbStorageReadExt;
     use crate::storage::merge_operator::VectorDbMergeOperator;
+    use crate::storage::record::build_write_batch;
     use crate::write::indexer::tree::centroids::{CentroidCache, TreeDepth, TreeLevel};
-    use common::Storage;
     use common::sequence::DEFAULT_BLOCK_SIZE;
     use common::serde::seq_block::SeqBlock;
-    use common::storage::in_memory::InMemoryStorage;
+    use slatedb::{Db, DbBuilder, WriteBatch};
 
     const DIMS: usize = 2;
     const EPOCH: u64 = 1;
 
-    async fn setup() -> (Arc<dyn Storage>, VectorIndexState) {
+    async fn apply_storage_ops(db: &Db, ops: Vec<StorageOp>) {
+        let batch = build_write_batch(ops);
+        db.write(batch).await.unwrap();
+    }
+
+    async fn setup() -> (Arc<Db>, VectorIndexState) {
         setup_with_prefill(0, 1).await
     }
 
-    async fn setup_with_vector_allocator_prefill(
-        prefill: u64,
-    ) -> (Arc<dyn Storage>, VectorIndexState) {
+    async fn setup_with_vector_allocator_prefill(prefill: u64) -> (Arc<Db>, VectorIndexState) {
         setup_with_prefill(prefill, 1).await
     }
 
-    async fn setup_with_centroid_allocator_prefill(
-        prefill: u64,
-    ) -> (Arc<dyn Storage>, VectorIndexState) {
+    async fn setup_with_centroid_allocator_prefill(prefill: u64) -> (Arc<Db>, VectorIndexState) {
         setup_with_prefill(0, prefill).await
     }
 
     async fn setup_with_prefill(
         vector_prefill: u64,
         centroid_prefill: u64,
-    ) -> (Arc<dyn Storage>, VectorIndexState) {
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator::new(DIMS),
-        )));
+    ) -> (Arc<Db>, VectorIndexState) {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let storage = Arc::new(
+            DbBuilder::new("test", object_store)
+                .with_merge_operator(Arc::new(VectorDbMergeOperator::new(DIMS)))
+                .build()
+                .await
+                .unwrap(),
+        );
 
         let seq_key = SeqBlockKey.encode();
         let mut vector_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
@@ -858,7 +865,9 @@ mod tests {
         if vector_prefill > 0 {
             let (_, put) = vector_allocator.allocate(vector_prefill);
             if let Some(put) = put {
-                storage.put(vec![put.into()]).await.unwrap();
+                let mut batch = WriteBatch::new();
+                batch.put(put.key, put.value);
+                storage.write(batch).await.unwrap();
             }
         }
 
@@ -869,7 +878,9 @@ mod tests {
         if centroid_prefill > 0 {
             let (_, put) = centroid_allocator.allocate(centroid_prefill);
             if let Some(put) = put {
-                storage.put(vec![put.into()]).await.unwrap();
+                let mut batch = WriteBatch::new();
+                batch.put(put.key, put.value);
+                storage.write(batch).await.unwrap();
             }
         }
 
@@ -938,13 +949,13 @@ mod tests {
     }
 
     async fn apply_search_delta(
-        storage: &Arc<dyn Storage>,
+        storage: &Arc<Db>,
         state: &mut VectorIndexState,
         delta: SearchIndexDelta,
     ) {
         let mut ops = vec![];
         delta.freeze(EPOCH, state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(storage, ops).await;
     }
 
     fn leaf_centroid(id: u64) -> VectorId {
@@ -956,7 +967,7 @@ mod tests {
     }
 
     async fn assert_root_posting(
-        storage: &Arc<dyn Storage>,
+        storage: &Arc<Db>,
         state: &VectorIndexState,
         expected: Vec<(VectorId, Vec<f32>)>,
     ) {
@@ -976,7 +987,7 @@ mod tests {
     }
 
     async fn seed_root_centroid(
-        storage: &Arc<dyn Storage>,
+        storage: &Arc<Db>,
         state: &mut VectorIndexState,
         vector: Vec<f32>,
     ) -> VectorId {
@@ -990,7 +1001,7 @@ mod tests {
     }
 
     async fn seed_promoted_root(
-        storage: &Arc<dyn Storage>,
+        storage: &Arc<Db>,
         state: &mut VectorIndexState,
         vectors: Vec<Vec<f32>>,
     ) -> Vec<VectorId> {
@@ -1014,7 +1025,7 @@ mod tests {
     fn dirty_reader<'a>(
         delta: &'a SearchIndexDelta,
         state: &'a VectorIndexState,
-        snapshot: Arc<dyn StorageRead>,
+        snapshot: Arc<DbSnapshot>,
     ) -> DirtyCentroidReader<'a> {
         let stored = StoredCentroidReader::new(DIMS, snapshot, EPOCH);
         let cache: Arc<dyn CentroidCache> = Arc::new(state.centroid_cache());
@@ -1028,7 +1039,7 @@ mod tests {
     fn vector_index_view<'a>(
         delta: &'a VectorIndexDelta,
         state: &'a VectorIndexState,
-        snapshot: &'a Arc<dyn StorageRead>,
+        snapshot: &'a Arc<DbSnapshot>,
     ) -> VectorIndexView<'a> {
         VectorIndexView::new(delta, state, snapshot, EPOCH)
     }
@@ -1044,7 +1055,7 @@ mod tests {
         delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
 
         // then:
         assert_eq!(state.dictionary()["v1"], id);
@@ -1067,14 +1078,14 @@ mod tests {
         delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
 
         // when:
         let mut delta = ForwardIndexDelta::new(&state);
         delta.delete_vector(id);
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
 
         // then:
         assert!(storage.get_vector_data(id, DIMS).await.unwrap().is_none());
@@ -1093,7 +1104,7 @@ mod tests {
         let id2 = delta.add_vector("v2", &make_attributes(vec![1.0, 1.0]));
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
 
         // then:
         assert_eq!(id0, VectorId::data_vector_id(0));
@@ -1119,17 +1130,17 @@ mod tests {
         let id1 = delta.add_vector("v1", &make_attributes(vec![0.0, 1.0]));
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
 
         // then:
         assert_eq!(id0, VectorId::data_vector_id(DEFAULT_BLOCK_SIZE - 1));
         assert_eq!(id1, VectorId::data_vector_id(DEFAULT_BLOCK_SIZE));
-        let record = storage
-            .get(SeqBlockKey.encode())
+        let value = storage
+            .get(&SeqBlockKey.encode())
             .await
             .unwrap()
             .expect("seq block should be written");
-        let block = SeqBlock::deserialize(&record.value).unwrap();
+        let block = SeqBlock::deserialize(&value).unwrap();
         assert_eq!(block.base_sequence, DEFAULT_BLOCK_SIZE);
         assert_eq!(block.block_size, DEFAULT_BLOCK_SIZE);
     }
@@ -1144,7 +1155,7 @@ mod tests {
         let new_level = delta.promote_root(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
         let mut ops = vec![];
         delta.freeze(EPOCH, &mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
 
         // then:
         assert_eq!(new_level.level(), 2);
@@ -1316,12 +1327,12 @@ mod tests {
 
         // then:
         assert_eq!(id, leaf_centroid(DEFAULT_BLOCK_SIZE));
-        let record = storage
-            .get(CentroidSeqBlockKey.encode())
+        let value = storage
+            .get(&CentroidSeqBlockKey.encode())
             .await
             .unwrap()
             .expect("centroid seq block should be written");
-        let block = SeqBlock::deserialize(&record.value).unwrap();
+        let block = SeqBlock::deserialize(&value).unwrap();
         assert_eq!(block.base_sequence, DEFAULT_BLOCK_SIZE);
         assert_eq!(block.block_size, DEFAULT_BLOCK_SIZE);
     }
@@ -1654,7 +1665,7 @@ mod tests {
         seed.update_vector_index_data(stored_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let delta_id = VectorId::data_vector_id(99);
         let mut delta = VectorIndexDelta::new(&state);
         delta
@@ -1662,7 +1673,7 @@ mod tests {
             .dictionary_updates
             .insert("v1".to_string(), delta_id);
 
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1679,9 +1690,9 @@ mod tests {
         seed.update_vector_index_data(stored_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let delta = VectorIndexDelta::new(&state);
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1697,10 +1708,10 @@ mod tests {
         seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let mut delta = VectorIndexDelta::new(&state);
         delta.forward_index.delete_vector(vector_id);
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1716,13 +1727,13 @@ mod tests {
         seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let mut delta = VectorIndexDelta::new(&state);
         delta
             .forward_index
             .vector_updates
             .insert(vector_id, make_value(vec![5.0, 6.0], "green", 11));
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1741,9 +1752,9 @@ mod tests {
         seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let delta = VectorIndexDelta::new(&state);
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1762,10 +1773,10 @@ mod tests {
         seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let mut delta = VectorIndexDelta::new(&state);
         delta.forward_index.delete_vector(vector_id);
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1781,14 +1792,14 @@ mod tests {
         seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let mut delta = VectorIndexDelta::new(&state);
         delta.forward_index.update_vector_index_data(
             vector_id,
             vec![leaf_centroid(2), leaf_centroid(3)],
             make_indexed_fields(),
         );
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1807,9 +1818,9 @@ mod tests {
         seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
-        storage.apply(ops).await.unwrap();
+        apply_storage_ops(&storage, ops).await;
         let delta = VectorIndexDelta::new(&state);
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1837,7 +1848,7 @@ mod tests {
             .centroid_count_deltas
             .insert(level.level(), HashMap::from([(existing, -2), (added, 4)]));
         delta.search_index.deleted_centroids.insert(deleted);
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:
@@ -1858,7 +1869,7 @@ mod tests {
             .search_index
             .current_posting
             .insert(vector_id, centroid_id);
-        let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
+        let snapshot: Arc<DbSnapshot> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
         // when/then:

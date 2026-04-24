@@ -12,8 +12,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::StorageBuilder;
+#[cfg(feature = "http-server")]
+use common::StorageError;
 use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
+use common::storage::factory::OwnedHybridCache;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -24,7 +27,7 @@ use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
 use crate::model::{AppendOutput, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
-use crate::reader::{LogIterator, LogRead, LogReadView};
+use crate::reader::{LogIterator, LogRead, LogReadView, ReadHandle};
 use crate::segment::SegmentCache;
 use crate::serde::SEQ_BLOCK_KEY;
 use crate::view_tracker::{ViewEntry, ViewTracker};
@@ -73,9 +76,17 @@ use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, Writte
 /// # use log::{LogDb, LogRead, Config, Record};
 /// # use bytes::Bytes;
 /// # use common::StorageConfig;
+/// # use common::storage::config::ObjectStoreConfig;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// let config = Config {
+///     storage: StorageConfig {
+///         path: "demo".to_string(),
+///         object_store: ObjectStoreConfig::InMemory,
+///         ..Default::default()
+///     },
+///     ..Default::default()
+/// };
 /// let log = LogDb::open(config).await?;
 ///
 /// // Append records
@@ -97,12 +108,21 @@ use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, Writte
 pub struct LogDb {
     handle: LogWriteHandle,
     writer_task: JoinHandle<()>,
-    storage: Arc<dyn common::Storage>,
+    storage: Arc<slatedb::Db>,
+    managed_cache: Option<OwnedHybridCache>,
     clock: Arc<dyn Clock>,
     read_view: Arc<RwLock<LogReadView>>,
     epoch_watcher: EpochWatcher,
     read_subscriber_task: JoinHandle<()>,
     read_visibility: ReadVisibility,
+    /// Object store handle used by [`LogDb::check_storage`] as a direct
+    /// infrastructure probe. None when [`LogDb::new`] / [`LogDb::new_durable`]
+    /// are used from tests that don't care about the readiness path.
+    #[cfg(feature = "http-server")]
+    object_store: Option<Arc<dyn slatedb::object_store::ObjectStore>>,
+    /// Data path prefix in `object_store`. Pairs with the field above.
+    #[cfg(feature = "http-server")]
+    object_store_path: String,
 }
 
 impl LogDb {
@@ -251,11 +271,34 @@ impl LogDb {
     /// Returns `Ok(())` if storage is accessible, or an error if the check fails.
     #[cfg(feature = "http-server")]
     pub(crate) async fn check_storage(&self) -> Result<()> {
-        // Read the sequence block - this is a single key lookup that verifies
-        // storage is accessible without scanning or listing data.
-        let seq_key = Bytes::from_static(&crate::serde::SEQ_BLOCK_KEY);
-        let _ = self.storage.get(seq_key).await?;
-        Ok(())
+        // Probe the object store directly — slatedb's get/scan paths have
+        // several layers of memtable/block-cache shortcuts that can make a
+        // broken object store look healthy. A single `list_with_delimiter`
+        // on the data prefix is cheap, always round-trips, and fails loudly
+        // when the object store is unreachable.
+        match &self.object_store {
+            Some(object_store) => {
+                use slatedb::object_store::path::Path;
+                let prefix = Path::from(self.object_store_path.as_str());
+                object_store
+                    .list_with_delimiter(Some(&prefix))
+                    .await
+                    .map_err(|e| StorageError::Storage(e.to_string()))?;
+                Ok(())
+            }
+            None => {
+                // Fallback for LogDb instances constructed without an
+                // object-store handle (in-process tests). Keep the old
+                // single-key `get` — it's imperfect but better than nothing.
+                let seq_key = Bytes::from_static(&crate::serde::SEQ_BLOCK_KEY);
+                let _ = self
+                    .storage
+                    .get(&seq_key)
+                    .await
+                    .map_err(StorageError::from_storage)?;
+                Ok(())
+            }
+        }
     }
 
     /// Forces creation of a new segment, sealing the current one.
@@ -308,24 +351,73 @@ impl LogDb {
             .close()
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
+        if let Some(cache) = self.managed_cache {
+            // Best-effort cache close — only cache warmth at stake.
+            let _ = cache.close().await;
+        }
         Ok(())
     }
 
-    /// Creates a LogDb from an existing storage implementation.
+    /// Creates a LogDb from an existing slatedb handle (for tests).
     #[cfg(test)]
-    pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Memory).await
+    pub(crate) async fn new(storage: Arc<slatedb::Db>) -> Result<Self> {
+        Self::from_storage(
+            storage,
+            None,
+            #[cfg(feature = "http-server")]
+            None,
+            #[cfg(feature = "http-server")]
+            String::new(),
+            SegmentConfig::default(),
+            ReadVisibility::Memory,
+        )
+        .await
     }
 
-    /// Creates a LogDb with `ReadVisibility::Remote` from an existing storage implementation.
+    /// Creates a LogDb with `ReadVisibility::Remote` from an existing slatedb handle.
     #[cfg(test)]
-    pub(crate) async fn new_durable(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Remote).await
+    pub(crate) async fn new_durable(storage: Arc<slatedb::Db>) -> Result<Self> {
+        Self::from_storage(
+            storage,
+            None,
+            #[cfg(feature = "http-server")]
+            None,
+            #[cfg(feature = "http-server")]
+            String::new(),
+            SegmentConfig::default(),
+            ReadVisibility::Remote,
+        )
+        .await
+    }
+
+    /// Creates a LogDb with an object-store handle for health-probing. Used
+    /// by [`LogDbBuilder`] in production; tests can use it when they need
+    /// `check_storage` to actually hit a (potentially failing) object store.
+    #[cfg(feature = "http-server")]
+    pub(crate) async fn new_with_object_store(
+        storage: Arc<slatedb::Db>,
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        path: String,
+    ) -> Result<Self> {
+        Self::from_storage(
+            storage,
+            None,
+            Some(object_store),
+            path,
+            SegmentConfig::default(),
+            ReadVisibility::Memory,
+        )
+        .await
     }
 
     /// Shared construction logic used by both `LogDb::new` and `LogDbBuilder::build`.
     async fn from_storage(
-        storage: Arc<dyn common::Storage>,
+        storage: Arc<slatedb::Db>,
+        managed_cache: Option<OwnedHybridCache>,
+        #[cfg(feature = "http-server")] object_store: Option<
+            Arc<dyn slatedb::object_store::ObjectStore>,
+        >,
+        #[cfg(feature = "http-server")] object_store_path: String,
         segment_config: SegmentConfig,
         read_visibility: ReadVisibility,
     ) -> Result<Self> {
@@ -356,10 +448,8 @@ impl LogDb {
         let writer_task = handle.spawn(writer);
 
         let initial_segment_id = segment_cache.latest().map(|s| s.id());
-        let read_view = Arc::new(RwLock::new(LogReadView::new(
-            snapshot as Arc<dyn common::StorageRead>,
-            segment_cache,
-        )));
+        let read_handle = Arc::new(ReadHandle::Snapshot(snapshot));
+        let read_view = Arc::new(RwLock::new(LogReadView::new(read_handle, segment_cache)));
 
         let (epoch_watcher, read_subscriber_task) = if read_visibility.is_remote() {
             spawn_durable_subscriber(
@@ -376,11 +466,16 @@ impl LogDb {
             handle,
             writer_task,
             storage,
+            managed_cache,
             clock,
             read_view,
             epoch_watcher,
             read_subscriber_task,
             read_visibility,
+            #[cfg(feature = "http-server")]
+            object_store,
+            #[cfg(feature = "http-server")]
+            object_store_path,
         })
     }
 }
@@ -493,13 +588,18 @@ impl LogDbBuilder {
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?,
         };
-        let storage = sb
+        let built = sb
             .build()
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         LogDb::from_storage(
-            storage,
+            built.db,
+            built.managed_cache,
+            #[cfg(feature = "http-server")]
+            Some(built.object_store),
+            #[cfg(feature = "http-server")]
+            built.path,
             self.config.segmentation,
             self.config.read_visibility,
         )
@@ -519,7 +619,8 @@ async fn try_advance_read_view(
 ) {
     if let Some(advanced) = tracker.advance(through_seq) {
         let mut rv = read_view.write().await;
-        rv.update_snapshot(advanced.snapshot as Arc<dyn common::StorageRead>);
+        // `advanced.snapshot` is already wrapped as an Arc<ReadHandle> at broadcast time.
+        rv.update_snapshot(advanced.snapshot);
 
         // Refresh segments from the snapshot when the writer reports a new segment.
         if advanced.last_segment_id != *known_segment_id {
@@ -583,11 +684,12 @@ fn spawn_written_subscriber(
 fn spawn_durable_subscriber(
     mut written_rx: watch::Receiver<WrittenView>,
     read_view: Arc<RwLock<LogReadView>>,
-    storage: &Arc<dyn common::Storage>,
+    storage: &Arc<slatedb::Db>,
     initial_segment_id: Option<SegmentId>,
 ) -> (EpochWatcher, JoinHandle<()>) {
     let (watermarks, watcher) = EpochWatermarks::new();
-    let mut durable_rx = storage.subscribe_durable();
+    // Bridge slatedb's DbStatus to a u64 durable_seq watcher.
+    let mut status_rx = storage.subscribe();
     let mut tracker = ViewTracker::new();
     let mut known_segment_id = initial_segment_id;
 
@@ -595,7 +697,7 @@ fn spawn_durable_subscriber(
         // Track the latest known durable_seq so we can re-check after new
         // writes arrive (the durable notification may arrive before the
         // WrittenView is pushed).
-        let mut last_durable_seq: u64 = *durable_rx.borrow();
+        let mut last_durable_seq: u64 = status_rx.borrow().durable_seq;
 
         loop {
             tokio::select! {
@@ -619,11 +721,11 @@ fn spawn_durable_subscriber(
                     )
                     .await;
                 }
-                result = durable_rx.changed() => {
+                result = status_rx.changed() => {
                     if result.is_err() {
                         break;
                     }
-                    last_durable_seq = *durable_rx.borrow_and_update();
+                    last_durable_seq = status_rx.borrow_and_update().durable_seq;
                     try_advance_read_view(
                         &mut tracker, &read_view, &watermarks, &mut known_segment_id,
                         Durability::Durable, last_durable_seq,
@@ -641,16 +743,35 @@ fn spawn_durable_subscriber(
 mod tests {
     use common::StorageBuilder;
     use common::StorageConfig;
+    use common::storage::config::ObjectStoreConfig;
 
     use super::*;
     use crate::config::Config;
     use crate::reader::LogDbReader;
 
-    fn test_config() -> Config {
-        Config {
-            storage: StorageConfig::InMemory,
+    fn test_storage_config() -> StorageConfig {
+        StorageConfig {
+            path: "test-log".to_string(),
+            object_store: ObjectStoreConfig::InMemory,
             ..Default::default()
         }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            storage: test_storage_config(),
+            ..Default::default()
+        }
+    }
+
+    async fn new_test_storage() -> Arc<slatedb::Db> {
+        StorageBuilder::new(&test_storage_config())
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .db
     }
 
     #[tokio::test]
@@ -1053,12 +1174,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_entries_via_log_reader() {
         // given - create shared storage
-        let storage = StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
+        let storage = new_test_storage().await;
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.try_append(vec![
             Record {
@@ -1291,12 +1407,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_keys_via_log_reader() {
         // given - create shared storage
-        let storage = StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
+        let storage = new_test_storage().await;
         let log = LogDb::new(storage.clone()).await.unwrap();
         log.try_append(vec![
             Record {
@@ -1703,12 +1814,7 @@ mod tests {
     #[tokio::test]
     async fn should_list_segments_via_log_reader() {
         // given
-        let storage = StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
+        let storage = new_test_storage().await;
         let log = LogDb::new(storage.clone()).await.unwrap();
 
         log.try_append(vec![Record {
@@ -1897,11 +2003,10 @@ mod tests {
         assert_eq!(segments[0].start_seq, 0);
     }
 
-    /// Helper: creates a SlateDB-backed storage using an in-memory object store.
+    /// Helper: creates a SlateDB-backed db using an in-memory object store.
     /// With `start_paused = true`, SlateDB's WAL flush timer is frozen so writes
     /// remain non-durable until an explicit `flush()` call.
-    async fn slate_storage() -> Arc<dyn common::Storage> {
-        use common::storage::slate::SlateDbStorage;
+    async fn slate_storage() -> Arc<slatedb::Db> {
         use slatedb::DbBuilder;
         use slatedb::object_store::memory::InMemory;
 
@@ -1910,7 +2015,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        Arc::new(SlateDbStorage::new(Arc::new(db)))
+        Arc::new(db)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1989,39 +2094,12 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn should_not_see_unflushed_writes_in_read_durable_mode_in_memory() {
-        let storage =
-            Arc::new(common::storage::in_memory::InMemoryStorage::new().with_deferred_durability());
-        let log = LogDb::new_durable(Arc::clone(&storage) as Arc<dyn common::Storage>)
-            .await
-            .unwrap();
-
-        // Append records — written but not durable
-        log.try_append(vec![Record {
-            key: Bytes::from("key1"),
-            value: Bytes::from("value1"),
-        }])
-        .await
-        .unwrap();
-
-        // Scan returns empty — data is not yet durable
-        let mut iter = log.scan(Bytes::from("key1"), ..).await.unwrap();
-        assert!(
-            iter.next().await.unwrap().is_none(),
-            "should not see non-durable writes"
-        );
-
-        // Flush makes data durable
-        common::Storage::flush(storage.as_ref()).await.unwrap();
-        // This bypasses LogDb::flush barrier tracking, so allow subscriber propagation.
-        tokio::task::yield_now().await;
-
-        let mut iter = log.scan(Bytes::from("key1"), ..).await.unwrap();
-        let entry = iter.next().await.unwrap().unwrap();
-        assert_eq!(entry.value, Bytes::from("value1"));
-        assert!(iter.next().await.unwrap().is_none());
-    }
+    // The `*_in_memory` variant of the durable-mode test used
+    // `InMemoryStorage::with_deferred_durability()`, a flag on the deleted
+    // InMemoryStorage shim. The SlateDB-backed `slate_storage()` fixture with
+    // `start_paused = true` above exercises the same "written but not durable"
+    // state for LogDb::new_durable; the distinct in-memory variant is no
+    // longer expressible and is intentionally omitted.
 
     #[tokio::test(start_paused = true)]
     async fn should_see_writes_immediately_in_flushed_mode() {

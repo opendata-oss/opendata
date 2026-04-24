@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use common::StorageConfig;
-use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
+use common::storage::config::ObjectStoreConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::params::Params;
@@ -54,11 +54,10 @@ fn default_interval() -> Duration {
 impl ReporterConfig {
     /// Convert to a StorageConfig for TimeSeries.
     pub fn to_storage_config(&self) -> StorageConfig {
-        StorageConfig::SlateDb(SlateDbStorageConfig {
+        StorageConfig {
             path: "bench-results".to_string(),
             object_store: self.object_store.clone(),
-            settings_path: None,
-            block_cache: None,
-        })
+            ..StorageConfig::default()
+        }
     }
 }

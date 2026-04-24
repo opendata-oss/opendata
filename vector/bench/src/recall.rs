@@ -19,7 +19,6 @@ use std::thread;
 
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::StorageConfig;
-use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
 use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
 use tokio::sync::mpsc;
@@ -395,18 +394,15 @@ impl Dataset {
             return Ok(writer_storage.clone());
         };
 
-        let override_storage = load_storage_config(path);
-        match (writer_storage, override_storage) {
-            (StorageConfig::SlateDb(writer), StorageConfig::SlateDb(reader)) => {
-                Ok(StorageConfig::SlateDb(SlateDbStorageConfig {
-                    path: writer.path.clone(),
-                    object_store: writer.object_store.clone(),
-                    settings_path: reader.settings_path,
-                    block_cache: reader.block_cache,
-                }))
-            }
-            (_, storage) => Ok(storage),
-        }
+        let reader = load_storage_config(path);
+        // Reader reads from the same path / object store as the writer, but gets its own
+        // settings/block cache knobs from the override config.
+        Ok(StorageConfig {
+            path: writer_storage.path.clone(),
+            object_store: writer_storage.object_store.clone(),
+            settings_path: reader.settings_path,
+            block_cache: reader.block_cache,
+        })
     }
 
     /// Load query vectors, respecting `format`.
@@ -907,17 +903,9 @@ impl Benchmark for RecallBenchmark {
         println!("start cold reader phase");
         let cold_query_latency = bench.histogram("cold_query_latency_us");
         let mut cold_latencies_us = Vec::with_capacity(queries.len());
-        let object_store = match &reader_config.storage {
-            StorageConfig::SlateDb(slate_config) => {
-                println!("CREATE STATIC OBJECT STORE");
-                Some(create_object_store(&slate_config.object_store)?)
-            }
-            _ => None,
-        };
-        let mut runtime = StorageReaderRuntime::default();
-        if let Some(object_store) = object_store {
-            runtime = runtime.with_object_store(object_store);
-        }
+        println!("CREATE STATIC OBJECT STORE");
+        let object_store = create_object_store(&reader_config.storage.object_store)?;
+        let runtime = StorageReaderRuntime::default().with_object_store(object_store);
         for query in queries.iter().take(10) {
             let reader =
                 VectorDbReader::open_with_runtime(reader_config.clone(), runtime.clone()).await?;

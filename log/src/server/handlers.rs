@@ -254,11 +254,20 @@ mod tests {
     use super::*;
     use crate::Config;
     use axum::http::StatusCode;
-    use common::{MergeRecordOp, PutRecordOp, StorageConfig};
+    use common::StorageConfig;
+    use common::storage::config::ObjectStoreConfig;
+    use common::storage::testing::FailingObjectStore;
+    use common::{StorageBuilder, storage::factory::BuiltDb};
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
 
     fn test_config() -> Config {
         Config {
-            storage: StorageConfig::InMemory,
+            storage: StorageConfig {
+                path: "test-handlers".to_string(),
+                object_store: ObjectStoreConfig::InMemory,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -288,123 +297,43 @@ mod tests {
         assert_eq!(body, "OK");
     }
 
+    /// `check_storage` lists the data prefix on the object store directly —
+    /// a small, unconditional I/O probe that bypasses slatedb's caches.
+    /// Toggling `fail_list` on the FailingObjectStore should surface as a
+    /// 503 from the ready endpoint.
     #[tokio::test]
     async fn should_return_503_for_ready_when_storage_fails() {
-        use async_trait::async_trait;
-        use bytes::Bytes;
-        use common::storage::{RecordOp, StorageSnapshot};
-        use common::{BytesRange, Record, Storage, StorageIterator, StorageRead};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let failing = FailingObjectStore::new(inner);
+        let obj_store: Arc<dyn ObjectStore> = failing.clone();
+        let BuiltDb {
+            db,
+            object_store,
+            path,
+            managed_cache: _,
+        } = StorageBuilder::from_object_store("test-ready", obj_store)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
 
-        // A mock storage that can be configured to fail after initialization
-        struct ToggleFailStorage {
-            should_fail: AtomicBool,
-        }
-
-        impl ToggleFailStorage {
-            fn new() -> Self {
-                Self {
-                    should_fail: AtomicBool::new(false),
-                }
-            }
-
-            fn set_failing(&self, fail: bool) {
-                self.should_fail.store(fail, Ordering::SeqCst);
-            }
-
-            fn check_failure(&self) -> common::StorageResult<()> {
-                if self.should_fail.load(Ordering::SeqCst) {
-                    Err(common::StorageError::Storage("storage unavailable".into()))
-                } else {
-                    Ok(())
-                }
-            }
-        }
-
-        struct EmptyIterator;
-
-        #[async_trait]
-        impl StorageIterator for EmptyIterator {
-            async fn next(&mut self) -> common::StorageResult<Option<Record>> {
-                Ok(None)
-            }
-        }
-
-        #[async_trait]
-        impl StorageRead for ToggleFailStorage {
-            async fn get(&self, _key: Bytes) -> common::StorageResult<Option<Record>> {
-                self.check_failure()?;
-                Ok(None)
-            }
-
-            async fn scan_iter(
-                &self,
-                _range: BytesRange,
-            ) -> common::StorageResult<Box<dyn StorageIterator + Send + 'static>> {
-                self.check_failure()?;
-                Ok(Box::new(EmptyIterator))
-            }
-        }
-
-        impl StorageSnapshot for ToggleFailStorage {}
-
-        #[async_trait]
-        impl Storage for ToggleFailStorage {
-            async fn apply_with_options(
-                &self,
-                _ops: Vec<RecordOp>,
-                _options: common::WriteOptions,
-            ) -> common::StorageResult<common::storage::WriteResult> {
-                self.check_failure()?;
-                Ok(common::storage::WriteResult { seqnum: 0 })
-            }
-
-            async fn put_with_options(
-                &self,
-                _records: Vec<PutRecordOp>,
-                _options: common::WriteOptions,
-            ) -> common::StorageResult<common::storage::WriteResult> {
-                self.check_failure()?;
-                Ok(common::storage::WriteResult { seqnum: 0 })
-            }
-
-            async fn merge_with_options(
-                &self,
-                _records: Vec<MergeRecordOp>,
-                _options: common::WriteOptions,
-            ) -> common::StorageResult<common::storage::WriteResult> {
-                self.check_failure()?;
-                Ok(common::storage::WriteResult { seqnum: 0 })
-            }
-
-            async fn snapshot(&self) -> common::StorageResult<Arc<dyn StorageSnapshot>> {
-                self.check_failure()?;
-                Ok(Arc::new(ToggleFailStorage::new()))
-            }
-
-            fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64> {
-                let (_, rx) = tokio::sync::watch::channel(0);
-                rx
-            }
-
-            async fn flush(&self) -> common::StorageResult<()> {
-                self.check_failure()
-            }
-        }
-
-        // given - a log backed by configurable storage
-        let storage = Arc::new(ToggleFailStorage::new());
-        let log = Arc::new(LogDb::new(storage.clone()).await.unwrap());
+        let log = Arc::new(
+            LogDb::new_with_object_store(db, object_store, path)
+                .await
+                .unwrap(),
+        );
         let metrics = Arc::new(Metrics::new());
         let state = AppState { log, metrics };
 
-        // Configure storage to fail after initialization
-        storage.set_failing(true);
+        failing.set_fail_list(true);
 
-        // when
-        let (status, body) = handle_ready(State(state)).await;
-
-        // then
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_ready(State(state)),
+        )
+        .await
+        .expect("handle_ready hung past 5s; retry barrier is broken");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "Not Ready");
     }

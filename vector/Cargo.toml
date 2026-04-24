@@ -70,7 +70,7 @@ path = "src/bin/embedded_reader.rs"
 required-features = ["embedded-reader"]
 
 [dev-dependencies]
-common = { workspace = true, features = ["test-utils"] }
+common = { workspace = true, features = ["test-utils", "testing"] }
 criterion.workspace = true
 opendata-macros.workspace = true
 reqwest.workspace = true

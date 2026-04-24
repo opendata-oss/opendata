@@ -7,8 +7,8 @@ use crate::write::indexer::tree::centroids::TreeLevel;
 use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::split::ReassignVector;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use common::StorageRead;
 use futures::future::BoxFuture;
+use slatedb::DbSnapshot;
 use std::sync::Arc;
 
 struct MergeCentroid {
@@ -20,7 +20,7 @@ struct MergeCentroid {
 pub(crate) struct MergeCentroids {
     opts: Arc<IndexerOpts>,
     level: TreeLevel,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<DbSnapshot>,
     snapshot_epoch: u64,
 }
 
@@ -28,7 +28,7 @@ impl MergeCentroids {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
         level: TreeLevel,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
     ) -> Self {
         Self {

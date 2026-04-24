@@ -9,7 +9,7 @@ use crate::serde::posting_list::merge_batch_posting_list;
 use crate::serde::{EncodingError, KEY_VERSION, RecordType, SUBSYSTEM};
 use bytes::Bytes;
 use common::serde::key_prefix::KeyPrefix;
-use common::storage::default_merge_batch;
+use slatedb::MergeOperatorError;
 
 /// Merge operator for vector database that handles merging of different record types.
 ///
@@ -27,24 +27,56 @@ impl VectorDbMergeOperator {
     }
 }
 
-impl common::storage::MergeOperator for VectorDbMergeOperator {
-    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        let prefix = KeyPrefix::from_bytes_with_validation(key, SUBSYSTEM, KEY_VERSION)
-            .expect("Failed to decode key prefix");
+impl slatedb::MergeOperator for VectorDbMergeOperator {
+    fn merge(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        value: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        // Delegate to merge_batch with a single-element slice.
+        self.merge_batch(key, existing_value, std::slice::from_ref(&value))
+    }
+
+    fn merge_batch(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let prefix =
+            KeyPrefix::from_bytes_with_validation(key, SUBSYSTEM, KEY_VERSION).map_err(|e| {
+                MergeOperatorError::Callback {
+                    message: e.to_string(),
+                }
+            })?;
         let record_type =
-            RecordType::from_prefix(prefix).expect("Failed to get record type from record tag");
+            RecordType::from_prefix(prefix).map_err(|e| MergeOperatorError::Callback {
+                message: e.to_string(),
+            })?;
 
         match record_type {
             RecordType::MetadataIndex => merge_batch_metadata_index(existing_value, operands)
-                .expect("Failed to batch merge MetadataIndexValue"),
-            RecordType::PostingList => {
-                merge_batch_posting_list(existing_value, operands, self.dimensions)
-            }
-            RecordType::CentroidStats => merge_batch_centroid_stats(existing_value, operands),
+                .map_err(|e| MergeOperatorError::Callback {
+                    message: e.to_string(),
+                }),
+            RecordType::PostingList => Ok(merge_batch_posting_list(
+                existing_value,
+                operands,
+                self.dimensions,
+            )),
+            RecordType::CentroidStats => Ok(merge_batch_centroid_stats(existing_value, operands)),
             _ => {
-                // For other record types (IdDictionary, VectorData, VectorMeta, etc.), just use new value
-                // for each pairwise merge. These should use Put, not Merge, but handle gracefully
-                default_merge_batch(key, existing_value, operands, |_k, _e, v| v)
+                // For other record types (IdDictionary, VectorData, VectorMeta, etc.),
+                // just take the last operand. These should use Put, not Merge, but handle
+                // gracefully.
+                if let Some(last) = operands.last() {
+                    Ok(last.clone())
+                } else if let Some(existing) = existing_value {
+                    Ok(existing)
+                } else {
+                    Ok(Bytes::new())
+                }
             }
         }
     }
@@ -114,9 +146,9 @@ mod tests {
     use crate::serde::metadata_index::MetadataIndexValue;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
     use crate::serde::vector_id::VectorId;
-    use common::storage::MergeOperator;
     use roaring::RoaringTreemap;
     use rstest::rstest;
+    use slatedb::MergeOperator;
 
     /// Helper to create a test key for PostingList
     fn create_posting_list_key() -> Bytes {
@@ -207,7 +239,9 @@ mod tests {
             .unwrap();
 
         // when
-        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
+        let merged = operator
+            .merge_batch(&key, Some(existing_value), &[new_value])
+            .unwrap();
 
         // then - verify the merge actually happened (union)
         let decoded = MetadataIndexValue::decode_from_bytes(&merged).unwrap();
@@ -237,7 +271,9 @@ mod tests {
             .encode_to_bytes();
 
         // when
-        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
+        let merged = operator
+            .merge_batch(&key, Some(existing_value), &[new_value])
+            .unwrap();
 
         // then - verify the merge produced deduplicated result
         let decoded = PostingListValue::decode_from_bytes(&merged, 2).unwrap();
@@ -252,7 +288,9 @@ mod tests {
         let new_value = Bytes::from(b"new_value".to_vec());
 
         // when
-        let result = operator.merge_batch(&key, None, std::slice::from_ref(&new_value));
+        let result = operator
+            .merge_batch(&key, None, std::slice::from_ref(&new_value))
+            .unwrap();
 
         // then
         assert_eq!(result, new_value);
@@ -278,7 +316,9 @@ mod tests {
         let new_value = CentroidStatsValue::new(new_count).encode_to_bytes();
 
         // when
-        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
+        let merged = operator
+            .merge_batch(&key, Some(existing_value), &[new_value])
+            .unwrap();
 
         // then
         let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
@@ -329,7 +369,9 @@ mod tests {
         let op1 = CentroidStatsValue::new(-3).encode_to_bytes();
 
         // when
-        let merged = operator.merge_batch(&key, Some(existing), &[op0, op1]);
+        let merged = operator
+            .merge_batch(&key, Some(existing), &[op0, op1])
+            .unwrap();
 
         // then
         let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
@@ -345,8 +387,9 @@ mod tests {
         let new_value = Bytes::from(b"new_value".to_vec());
 
         // when
-        let result =
-            operator.merge_batch(&key, Some(existing_value), std::slice::from_ref(&new_value));
+        let result = operator
+            .merge_batch(&key, Some(existing_value), std::slice::from_ref(&new_value))
+            .unwrap();
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);
@@ -381,7 +424,9 @@ mod tests {
         .unwrap();
 
         // when
-        let merged = operator.merge_batch(&key, Some(existing), &[op0, op1]);
+        let merged = operator
+            .merge_batch(&key, Some(existing), &[op0, op1])
+            .unwrap();
 
         // then
         let mut expected = RoaringTreemap::new();

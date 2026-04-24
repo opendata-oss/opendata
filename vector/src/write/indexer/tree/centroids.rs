@@ -50,7 +50,6 @@ use crate::serde::vector_id::{LEAF_LEVEL, ROOT_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::drivers::AsyncBatchDriver;
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
-use common::StorageRead;
 use futures::future::BoxFuture;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
@@ -677,15 +676,24 @@ impl<'a> Ord for RankedPosting<'a> {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct StoredCentroidReader {
+pub(crate) struct StoredCentroidReader<R: slatedb::DbRead + Send + Sync + 'static> {
     dimensions: usize,
     epoch: u64,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<R>,
 }
 
-impl StoredCentroidReader {
-    pub(crate) fn new(dimensions: usize, snapshot: Arc<dyn StorageRead>, epoch: u64) -> Self {
+impl<R: slatedb::DbRead + Send + Sync + 'static> Clone for StoredCentroidReader<R> {
+    fn clone(&self) -> Self {
+        Self {
+            dimensions: self.dimensions,
+            epoch: self.epoch,
+            snapshot: self.snapshot.clone(),
+        }
+    }
+}
+
+impl<R: slatedb::DbRead + Send + Sync + 'static> StoredCentroidReader<R> {
+    pub(crate) fn new(dimensions: usize, snapshot: Arc<R>, epoch: u64) -> Self {
         Self {
             dimensions,
             epoch,
@@ -694,7 +702,7 @@ impl StoredCentroidReader {
     }
 }
 
-impl CentroidReader for StoredCentroidReader {
+impl<R: slatedb::DbRead + Send + Sync + 'static> CentroidReader for StoredCentroidReader<R> {
     fn read_root(&self) -> MaybeCached<Arc<PostingList>> {
         self.read_postings(ROOT_VECTOR_ID)
     }
@@ -710,14 +718,22 @@ impl CentroidReader for StoredCentroidReader {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct CachedCentroidReader {
+pub(crate) struct CachedCentroidReader<R: slatedb::DbRead + Send + Sync + 'static> {
     cache: Arc<dyn CentroidCache>,
-    inner: StoredCentroidReader,
+    inner: StoredCentroidReader<R>,
 }
 
-impl CachedCentroidReader {
-    pub(crate) fn new(cache: &Arc<dyn CentroidCache>, inner: StoredCentroidReader) -> Self {
+impl<R: slatedb::DbRead + Send + Sync + 'static> Clone for CachedCentroidReader<R> {
+    fn clone(&self) -> Self {
+        Self {
+            cache: self.cache.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<R: slatedb::DbRead + Send + Sync + 'static> CachedCentroidReader<R> {
+    pub(crate) fn new(cache: &Arc<dyn CentroidCache>, inner: StoredCentroidReader<R>) -> Self {
         Self {
             cache: cache.clone(),
             inner,
@@ -725,7 +741,7 @@ impl CachedCentroidReader {
     }
 }
 
-impl CentroidReader for CachedCentroidReader {
+impl<R: slatedb::DbRead + Send + Sync + 'static> CentroidReader for CachedCentroidReader<R> {
     fn read_root(&self) -> MaybeCached<Arc<PostingList>> {
         if let Some(root) = self.cache.root(self.inner.epoch) {
             MaybeCached::Value(root)
@@ -1047,8 +1063,7 @@ mod tests {
     use super::*;
     use crate::serde::key::PostingListKey;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-    use common::storage::in_memory::InMemoryStorage;
-    use common::{Record, Storage, StorageRead};
+    use slatedb::{Db, DbBuilder, WriteBatch};
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -1220,24 +1235,30 @@ mod tests {
         HashSet::new()
     }
 
+    async fn new_db() -> Arc<Db> {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = DbBuilder::new("test", object_store).build().await.unwrap();
+        Arc::new(db)
+    }
+
     async fn put_posting_list(
-        storage: &Arc<dyn Storage>,
+        storage: &Arc<Db>,
         centroid_id: VectorId,
         postings: Vec<(u8, u64, Vec<f32>)>,
     ) -> Arc<PostingList> {
         let key = PostingListKey::new(centroid_id).encode();
         let value = posting_list_value(postings);
         let posting_list = Arc::new(PostingList::from_value(value.clone()));
-        storage
-            .put(vec![Record::new(key, value.encode_to_bytes()).into()])
-            .await
-            .unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(key, value.encode_to_bytes());
+        storage.write(batch).await.unwrap();
         posting_list
     }
 
     fn cached_index(
         depth: TreeDepth,
-        storage: Arc<dyn Storage>,
+        storage: Arc<Db>,
         root: Arc<PostingList>,
         postings: HashMap<VectorId, Arc<PostingList>>,
         distance_metric: DistanceMetric,
@@ -1259,14 +1280,14 @@ mod tests {
                     .collect(),
             ))),
         });
-        let stored = StoredCentroidReader::new(DIMS, storage as Arc<dyn StorageRead>, 0);
+        let stored = StoredCentroidReader::new(DIMS, storage, 0);
         let reader = CachedCentroidReader::new(&cache, stored);
         LeveledCentroidIndex::new(depth, distance_metric, Arc::new(reader))
     }
 
     struct TestTree {
         depth: TreeDepth,
-        storage: Arc<dyn Storage>,
+        storage: Arc<Db>,
         root: Arc<PostingList>,
         postings_by_level: HashMap<u8, HashMap<VectorId, Arc<PostingList>>>,
     }
@@ -1367,7 +1388,7 @@ mod tests {
         root: Vec<(u8, u64, Vec<f32>)>,
         postings_by_level: Vec<(u8, Vec<((u8, u64), Vec<(u8, u64, Vec<f32>)>)>)>,
     ) -> TestTree {
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let storage = new_db().await;
         let root = put_posting_list(&storage, ROOT_VECTOR_ID, root).await;
         let mut tree_postings = HashMap::new();
         for (level, postings) in postings_by_level {

@@ -8,8 +8,8 @@ use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::{Attribute, Vector};
-use common::storage::StorageRead;
 use roaring::RoaringTreemap;
+use slatedb::DbRead;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
@@ -32,17 +32,17 @@ pub(crate) struct QueryEngineOptions {
 ///
 /// Each query on `VectorDb` creates a short-lived `QueryEngine` from the current
 /// snapshot. `QueryEngine` is also used by `VectorDbReader` for read-only access.
-pub(crate) struct QueryEngine {
+pub(crate) struct QueryEngine<R: DbRead + Send + Sync + 'static = slatedb::DbSnapshot> {
     options: QueryEngineOptions,
     centroid_index: Arc<LeveledCentroidIndex<'static>>,
-    storage: Arc<dyn StorageRead>,
+    storage: Arc<R>,
 }
 
-impl QueryEngine {
+impl<R: DbRead + Send + Sync + 'static> QueryEngine<R> {
     pub(crate) fn new(
         options: QueryEngineOptions,
         centroid_index: Arc<LeveledCentroidIndex<'static>>,
-        storage: Arc<dyn StorageRead>,
+        storage: Arc<R>,
     ) -> Self {
         Self {
             options,
@@ -415,10 +415,10 @@ impl QueryEngine {
     ///
     /// Collects all candidate IDs into a bitmap, evaluates the filter against
     /// the inverted index, then retains only candidates that pass the filter.
-    async fn apply_filter(
+    async fn apply_filter<S: DbRead + Send + Sync>(
         sorted_lists: &mut [Vec<ScoredCandidate>],
         filter: &Filter,
-        storage: &dyn StorageRead,
+        storage: &S,
     ) -> Result<()> {
         // Collect all candidate internal IDs
         let mut candidates = RoaringTreemap::new();
@@ -443,10 +443,10 @@ impl QueryEngine {
     ///
     /// Returns a bitmap of vector IDs that match the filter.
     /// For Neq, the `candidates` bitmap is used as the universe for complement.
-    fn evaluate_filter<'a>(
+    fn evaluate_filter<'a, S: DbRead + Send + Sync>(
         filter: &'a Filter,
         candidates: &'a RoaringTreemap,
-        storage: &'a dyn StorageRead,
+        storage: &'a S,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringTreemap>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -533,7 +533,17 @@ mod tests {
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::vector_id::VectorId;
     use crate::write::indexer::tree::posting_list::Posting;
+    use common::storage::config::ObjectStoreConfig;
     use common::{StorageBuilder, StorageConfig};
+
+    fn in_memory_storage_config() -> StorageConfig {
+        StorageConfig {
+            path: "test".into(),
+            object_store: ObjectStoreConfig::InMemory,
+            settings_path: None,
+            block_cache: None,
+        }
+    }
 
     fn data_id(id: u64) -> VectorId {
         VectorId::data_vector_id(id)
@@ -541,7 +551,7 @@ mod tests {
 
     fn create_config(dimensions: u16, metric: DistanceMetric) -> Config {
         Config {
-            storage: StorageConfig::InMemory,
+            storage: in_memory_storage_config(),
             dimensions,
             distance_metric: metric,
             metadata_fields: vec![],
@@ -858,7 +868,7 @@ mod tests {
 
     fn create_filterable_config() -> Config {
         Config {
-            storage: StorageConfig::InMemory,
+            storage: in_memory_storage_config(),
             dimensions: 3,
             distance_metric: DistanceMetric::L2,
             metadata_fields: vec![

@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::storage::config::StorageConfig;
 use log::{LogDbBuilder, LogRead};
 
 use crate::ffi::*;
@@ -55,18 +54,16 @@ pub unsafe extern "C" fn opendata_log_open(
                 )));
             }
         };
+        let storage_path = rust_config.storage.path.clone();
+        let object_store_config = rust_config.storage.object_store.clone();
         let sb = sb.map_slatedb(|db| {
-            // Re-extract SlateDB config fields for the CompactorBuilder.
-            // Called inside block_on because CompactorBuilder::new requires a Tokio runtime.
-            if let StorageConfig::SlateDb(ref slate_config) = rust_config.storage {
-                let obj_store = common::create_object_store(&slate_config.object_store).unwrap();
-                db.with_compactor_builder(
-                    common::CompactorBuilder::new(slate_config.path.clone(), obj_store)
-                        .with_runtime(compaction_runtime.handle().clone()),
-                )
-            } else {
-                db
-            }
+            // CompactorBuilder::new requires a Tokio runtime, so this closure
+            // is called inside block_on.
+            let obj_store = common::create_object_store(&object_store_config).unwrap();
+            db.with_compactor_builder(
+                common::CompactorBuilder::new(storage_path.clone(), obj_store)
+                    .with_runtime(compaction_runtime.handle().clone()),
+            )
         });
         LogDbBuilder::new(rust_config)
             .with_storage_builder(sb)

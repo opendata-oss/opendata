@@ -1,5 +1,4 @@
-use proc_macro_crate::{FoundCrate, crate_name};
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 use syn::{
     Attribute, Error, Expr, Ident, ItemFn, Token,
@@ -61,23 +60,12 @@ impl Parse for TestMacroArgs {
     }
 }
 
-fn macro_crate_path() -> TokenStream {
-    match crate_name("opendata-common") {
-        Ok(FoundCrate::Itself) => {
-            // macro is expanded inside the defining crate
-            quote!(crate)
-        }
-        Ok(FoundCrate::Name(name)) => {
-            let ident = syn::Ident::new(&name, Span::call_site());
-            quote!(::#ident)
-        }
-        Err(err) => {
-            let msg = format!("failed to resolve macro crate `opendata-common`: {}", err);
-            quote! {
-                compile_error!(#msg);
-            }
-        }
-    }
+/// Accept `Arc<slatedb::Db>` with or without the `slatedb::` prefix.
+///
+/// The tokenstream `to_string()` representation pads operators with spaces, so the
+/// canonical forms we compare against are `Arc < slatedb :: Db >` and `Arc < Db >`.
+fn is_accepted_db_arc(ty_str: &str) -> bool {
+    matches!(ty_str, "Arc < slatedb :: Db >" | "Arc < Db >")
 }
 
 pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -110,11 +98,11 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     // construct inner function name
     let fn_name_inner = Ident::new(&format!("{}_inner", fn_name), item_fn.sig.ident.span());
 
-    // validate that the function only has a single parameter of type Arc<dyn Storage>
+    // validate that the function only has a single parameter of type Arc<slatedb::Db>
     if item_fn.sig.inputs.len() != 1 {
         return Error::new(
             item_fn.span(),
-            "expected single parameter of type Arc<dyn Storage>",
+            "expected single parameter of type Arc<slatedb::Db>",
         )
         .to_compile_error();
     }
@@ -122,11 +110,12 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     // validate type of parameter
     let input_name = match &item_fn.sig.inputs[0] {
         syn::FnArg::Typed(pat_type) => {
-            if &*pat_type.ty.to_token_stream().to_string() != "Arc < dyn Storage >" {
+            let ty_str = pat_type.ty.to_token_stream().to_string();
+            if !is_accepted_db_arc(&ty_str) {
                 return Error::new(
                     item_fn.span(),
                     format!(
-                        "parameter '{}' must be of type Arc<dyn Storage>",
+                        "parameter '{}' must be of type Arc<slatedb::Db> (or Arc<Db>)",
                         pat_type.pat.to_token_stream()
                     ),
                 )
@@ -137,7 +126,7 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
         _ => {
             return Error::new(
                 item_fn.span(),
-                "first parameter must be of type Arc<dyn Storage>",
+                "first parameter must be of type Arc<slatedb::Db>",
             )
             .to_compile_error();
         }
@@ -146,22 +135,33 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     // get statements from function body
     let body = item_fn.block.stmts.clone();
 
-    // determine crate path based on call site
-    let crate_path = macro_crate_path();
-
     // generate storage creation based on whether merge_operator was provided
-    let storage_creation = if let Some(merge_op) = args_parsed.merge_operator {
+    let db_creation = if let Some(merge_op) = args_parsed.merge_operator {
         quote! {
-            let #input_name: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
-                #crate_path::storage::in_memory::InMemoryStorage::with_merge_operator(
-                    std::sync::Arc::new(#merge_op)
-                )
+            let __object_store = std::sync::Arc::new(
+                ::slatedb::object_store::memory::InMemory::new()
+            );
+            let __merge_op: std::sync::Arc<
+                dyn ::slatedb::MergeOperator + Send + Sync
+            > = std::sync::Arc::new(#merge_op);
+            let #input_name: std::sync::Arc<::slatedb::Db> = std::sync::Arc::new(
+                ::slatedb::DbBuilder::new("test", __object_store)
+                    .with_merge_operator(__merge_op)
+                    .build()
+                    .await
+                    .expect("failed to build in-memory slatedb")
             );
         }
     } else {
         quote! {
-            let #input_name: std::sync::Arc<dyn Storage> = std::sync::Arc::new(
-                #crate_path::storage::in_memory::InMemoryStorage::default()
+            let __object_store = std::sync::Arc::new(
+                ::slatedb::object_store::memory::InMemory::new()
+            );
+            let #input_name: std::sync::Arc<::slatedb::Db> = std::sync::Arc::new(
+                ::slatedb::DbBuilder::new("test", __object_store)
+                    .build()
+                    .await
+                    .expect("failed to build in-memory slatedb")
             );
         }
     };
@@ -170,12 +170,12 @@ pub fn test_impl(args: TokenStream, input: TokenStream) -> TokenStream {
         #tokio_macro
         #[allow(unused_must_use)]
         async fn #fn_name() {
-            #storage_creation
+            #db_creation
             #fn_name_inner(#input_name.clone()).await;
             let _ = #input_name.close().await;
         }
 
-        async fn #fn_name_inner(#input_name: std::sync::Arc<dyn Storage>) {
+        async fn #fn_name_inner(#input_name: std::sync::Arc<::slatedb::Db>) {
             #(#body)*
         }
     }
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn test_simple_function() {
         let input = quote! {
-            async fn my_test(storage_test: Arc<dyn Storage>) {
+            async fn my_test(db: Arc<slatedb::Db>) {
                 assert_eq!(1, 1);
             }
         };
@@ -254,13 +254,19 @@ mod tests {
             wrapper.sig.asyncness.is_some(),
             "Wrapper function should be async"
         );
+
+        let wrapper_code = wrapper.block.to_token_stream().to_string();
         assert!(
-            wrapper
-                .block
-                .to_token_stream()
-                .to_string()
-                .contains("storage_test . close ()"),
-            "Wrapper should call storage_test.close()"
+            wrapper_code.contains("DbBuilder :: new"),
+            "Wrapper should build the db via DbBuilder::new"
+        );
+        assert!(
+            wrapper_code.contains("InMemory :: new"),
+            "Wrapper should use an in-memory object store"
+        );
+        assert!(
+            wrapper_code.contains("db . close ()"),
+            "Wrapper should call db.close()"
         );
 
         // verify inner function exists with correct name
@@ -283,8 +289,8 @@ mod tests {
                 .unwrap()
                 .to_token_stream()
                 .to_string(),
-            "storage_test : std :: sync :: Arc < dyn Storage >",
-            "Inner function first parameter should be dynamic storage Arc"
+            "db : std :: sync :: Arc < :: slatedb :: Db >",
+            "Inner function first parameter should be Arc<slatedb::Db>"
         );
 
         // verify inner function has the original body
@@ -296,10 +302,29 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_function_with_db_alias() {
+        // Users may have imported `slatedb::Db` as `Db` — accept the short form too.
+        let input = quote! {
+            async fn my_test(db: Arc<Db>) {
+                assert_eq!(1, 1);
+            }
+        };
+
+        let output = test_impl(TokenStream::new(), input);
+        let file = parse_output(&output);
+        let functions = extract_functions(&file);
+        assert_eq!(
+            functions.len(),
+            2,
+            "Should generate exactly 2 functions even with the `Arc<Db>` short form"
+        );
+    }
+
+    #[test]
     fn test_with_merge_operator() {
         let args = quote! { merge_operator = MyMergeOp };
         let input = quote! {
-            async fn my_test(storage_test: Arc<dyn Storage>) {
+            async fn my_test(db: Arc<slatedb::Db>) {
                 assert_eq!(1, 1);
             }
         };
@@ -320,23 +345,27 @@ mod tests {
             "Should have #[tokio::test] attribute"
         );
 
-        // verify wrapper body contains storage creation with merge operator
+        // verify wrapper body wires the merge operator into the DbBuilder
         let wrapper_code = wrapper.block.to_token_stream().to_string();
         assert!(
-            wrapper_code.contains("InMemoryStorage :: with_merge_operator"),
-            "Storage creation should use with_merge_operator when merge_operator is specified"
+            wrapper_code.contains("with_merge_operator"),
+            "Generated code should call DbBuilder::with_merge_operator when merge_operator is specified"
         );
         assert!(
             wrapper_code.contains("MyMergeOp"),
             "Generated code should reference the merge operator"
         );
         assert!(
+            wrapper_code.contains("DbBuilder :: new"),
+            "Generated code should build the db via DbBuilder::new"
+        );
+        assert!(
             wrapper_code.contains("my_test_inner"),
             "Wrapper should call the inner function"
         );
         assert!(
-            wrapper_code.contains("storage_test . close ()"),
-            "Wrapper should call storage_test.close()"
+            wrapper_code.contains("db . close ()"),
+            "Wrapper should call db.close()"
         );
 
         // Verify inner function exists
@@ -349,7 +378,7 @@ mod tests {
     fn test_tokio_macro_args() {
         let input = quote! {
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-            async fn my_test(storage_test: Arc<dyn Storage>) {
+            async fn my_test(db: Arc<slatedb::Db>) {
                 assert_eq!(1, 1);
             }
         };
@@ -370,11 +399,33 @@ mod tests {
             "Should have #[tokio::test] attribute"
         );
 
-        // verify wrapper body contains storage creation with merge operator
+        // verify the tokio::test args were preserved
         assert!(wrapper.attrs.iter().any(|attr| {
             attr.to_token_stream().to_string()
                 == "# [tokio :: test (flavor = \"multi_thread\" , worker_threads = 2)]"
         }));
+    }
+
+    #[test]
+    fn test_rejects_non_db_arc() {
+        let input = quote! {
+            async fn my_test(storage: Arc<dyn Storage>) {
+                assert_eq!(1, 1);
+            }
+        };
+
+        let output = test_impl(TokenStream::new(), input);
+        let output_str = output.to_string();
+        assert!(
+            output_str.contains("compile_error"),
+            "Expected compile_error! for Arc<dyn Storage>, got: {}",
+            output_str
+        );
+        assert!(
+            output_str.contains("Arc<slatedb::Db>"),
+            "Expected diagnostic to mention Arc<slatedb::Db>, got: {}",
+            output_str
+        );
     }
 
     #[test]

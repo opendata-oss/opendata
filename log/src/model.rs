@@ -34,9 +34,17 @@ pub type Sequence = u64;
 /// ```no_run
 /// # use log::{LogDb, LogRead, Config};
 /// # use common::StorageConfig;
+/// # use common::storage::config::ObjectStoreConfig;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// # let config = Config {
+/// #     storage: StorageConfig {
+/// #         path: "demo".to_string(),
+/// #         object_store: ObjectStoreConfig::InMemory,
+/// #         ..Default::default()
+/// #     },
+/// #     ..Default::default()
+/// # };
 /// # let log = LogDb::open(config).await?;
 /// let segments = log.list_segments(..).await?;
 /// for segment in segments {
@@ -110,9 +118,17 @@ pub struct Record {
 /// # use log::{LogDb, Config, Record};
 /// # use bytes::Bytes;
 /// # use common::StorageConfig;
+/// # use common::storage::config::ObjectStoreConfig;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// # let config = Config {
+/// #     storage: StorageConfig {
+/// #         path: "demo".to_string(),
+/// #         object_store: ObjectStoreConfig::InMemory,
+/// #         ..Default::default()
+/// #     },
+/// #     ..Default::default()
+/// # };
 /// # let log = LogDb::open(config).await?;
 /// # let records = vec![Record { key: Bytes::from("k"), value: Bytes::from("v") }];
 /// let result = log.try_append(records).await?;
@@ -144,9 +160,17 @@ pub struct AppendOutput {
 /// # use log::{LogDb, LogRead, Config};
 /// # use bytes::Bytes;
 /// # use common::StorageConfig;
+/// # use common::storage::config::ObjectStoreConfig;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// # let config = Config {
+/// #     storage: StorageConfig {
+/// #         path: "demo".to_string(),
+/// #         object_store: ObjectStoreConfig::InMemory,
+/// #         ..Default::default()
+/// #     },
+/// #     ..Default::default()
+/// # };
 /// # let log = LogDb::open(config).await?;
 /// # let key = Bytes::from("orders");
 /// let mut iter = log.scan(key, ..).await?;

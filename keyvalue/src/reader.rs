@@ -1,17 +1,21 @@
 //! Read-only key-value access and the [`KeyValueRead`] trait.
 
 use std::ops::RangeBounds;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::storage::factory::create_storage_read;
-use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
+use common::{StorageReaderRuntime, create_storage_read};
+use slatedb::DbReader;
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::model::KeyValueEntry;
 use crate::storage::{KeyValueScanIterator, KeyValueStorageRead};
+
+#[cfg(test)]
+use slatedb::Db;
+#[cfg(test)]
+use std::sync::Arc;
 
 /// Trait for read operations on the key-value store.
 ///
@@ -29,35 +33,64 @@ pub trait KeyValueRead {
     async fn scan(&self, key_range: impl RangeBounds<Bytes> + Send) -> Result<KeyValueIterator>;
 }
 
+/// Underlying read source for [`KeyValueDbReader`].
+///
+/// `DbRead` is not object-safe, so we can't hold an `Arc<dyn DbRead>`. Instead
+/// we enumerate the concrete sources we actually support.
+enum ReaderSource {
+    Reader(KeyValueStorageRead<DbReader>),
+    #[cfg(test)]
+    Db(KeyValueStorageRead<Db>),
+}
+
+impl ReaderSource {
+    async fn get(&self, key: &Bytes) -> Result<Option<Bytes>> {
+        match self {
+            ReaderSource::Reader(r) => r.get(key).await,
+            #[cfg(test)]
+            ReaderSource::Db(r) => r.get(key).await,
+        }
+    }
+
+    async fn scan(&self, range: impl RangeBounds<Bytes>) -> Result<KeyValueScanIterator> {
+        match self {
+            ReaderSource::Reader(r) => r.scan(range).await,
+            #[cfg(test)]
+            ReaderSource::Db(r) => r.scan(range).await,
+        }
+    }
+}
+
 /// A read-only view of the key-value store.
 ///
 /// `KeyValueDbReader` provides access to all read operations via the
 /// [`KeyValueRead`] trait, but not write operations.
 pub struct KeyValueDbReader {
-    storage: KeyValueStorageRead,
+    storage: ReaderSource,
 }
 
 impl KeyValueDbReader {
     /// Opens a read-only view of the key-value store.
     pub async fn open(config: Config) -> Result<Self> {
-        let storage: Arc<dyn StorageRead> = create_storage_read(
+        let built = create_storage_read(
             &config.storage,
             StorageReaderRuntime::new(),
-            StorageSemantics::new(),
             slatedb::config::DbReaderOptions::default(),
         )
         .await?;
-        let kv_storage = KeyValueStorageRead::new(storage);
         Ok(Self {
-            storage: kv_storage,
+            storage: ReaderSource::Reader(KeyValueStorageRead::new(built.reader)),
         })
     }
 
-    /// Creates a KeyValueDbReader from an existing storage implementation.
+    /// Creates a KeyValueDbReader from an existing SlateDB instance.
+    ///
+    /// Useful in tests where a writer and reader share the same `Db` against an
+    /// in-memory object store.
     #[cfg(test)]
-    pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
+    pub(crate) fn from_db(db: Arc<Db>) -> Self {
         Self {
-            storage: KeyValueStorageRead::new(storage),
+            storage: ReaderSource::Db(KeyValueStorageRead::new(db)),
         }
     }
 }

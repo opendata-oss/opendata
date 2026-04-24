@@ -7,19 +7,19 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::StorageConfig;
-use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 use log::{Config, LogDb, LogDbReader, LogRead, ReaderConfig, Record};
 use tempfile::TempDir;
 
 fn local_storage_config(dir: &TempDir) -> StorageConfig {
-    StorageConfig::SlateDb(SlateDbStorageConfig {
+    StorageConfig {
         path: "log-data".to_string(),
         object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
             path: dir.path().to_string_lossy().to_string(),
         }),
         settings_path: None,
         block_cache: None,
-    })
+    }
 }
 
 #[tokio::test]

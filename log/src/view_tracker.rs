@@ -9,13 +9,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::model::SegmentId;
-use common::storage::StorageSnapshot;
+use crate::reader::ReadHandle;
 
 /// A write-aligned read view entry.
 pub(crate) struct ViewEntry {
     pub seqnum: u64,
     pub epoch: u64,
-    pub snapshot: Arc<dyn StorageSnapshot>,
+    pub snapshot: Arc<ReadHandle>,
     pub last_segment_id: Option<SegmentId>,
 }
 
@@ -62,12 +62,16 @@ impl ViewTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::Storage;
-    use common::storage::in_memory::InMemoryStorage;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
 
-    async fn make_snapshot() -> Arc<dyn StorageSnapshot> {
-        let storage = InMemoryStorage::new();
-        storage.snapshot().await.unwrap()
+    async fn make_snapshot() -> Arc<ReadHandle> {
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("/test/view_tracker", object_store)
+            .build()
+            .await
+            .unwrap();
+        Arc::new(ReadHandle::Snapshot(db.snapshot().await.unwrap()))
     }
 
     #[tokio::test]

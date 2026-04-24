@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::StorageError;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError};
-use common::storage::StorageSnapshot;
-use common::{Storage, StorageRead};
+use slatedb::{Db, DbRead, DbSnapshot};
 
 const WRITE_CHANNEL: &str = "write";
 
@@ -17,20 +17,125 @@ use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
 use crate::query::BucketQueryReader;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
-use crate::storage::OpenTsdbStorageReadExt;
+use crate::storage::{
+    get_forward_index, get_forward_index_one, get_forward_index_series, get_inverted_index,
+    get_inverted_index_term, get_inverted_index_terms, get_label_values, load_series_dictionary,
+};
 use crate::util::Result;
+
+/// A snapshot-like handle used by `MiniQueryReader`. We erase the
+/// concrete reader type behind an `Arc<dyn ErasedSnapshot>` (a local
+/// trait) so a MiniQueryReader can be constructed from either
+/// `Arc<DbSnapshot>` or `Arc<DbReader>` without being generic itself.
+///
+/// `slatedb::DbRead` is not object-safe (its methods are generic over
+/// key types), so we can't store `Arc<dyn DbRead>` directly — we wrap
+/// the small set of operations the timeseries extension functions use.
+#[async_trait]
+pub(crate) trait ErasedSnapshot: Send + Sync {
+    async fn get_forward_index_async(
+        &self,
+        bucket: TimeBucket,
+    ) -> Result<crate::index::ForwardIndex>;
+    async fn get_forward_index_series_async(
+        &self,
+        bucket: TimeBucket,
+        series_ids: Vec<SeriesId>,
+    ) -> Result<crate::index::ForwardIndex>;
+    async fn get_inverted_index_async(
+        &self,
+        bucket: TimeBucket,
+    ) -> Result<crate::index::InvertedIndex>;
+    async fn get_inverted_index_terms_async(
+        &self,
+        bucket: TimeBucket,
+        terms: Vec<Label>,
+    ) -> Result<crate::index::InvertedIndex>;
+    async fn get_label_values_async(
+        &self,
+        bucket: TimeBucket,
+        label_name: String,
+    ) -> Result<Vec<String>>;
+    async fn get_forward_index_one_async(
+        &self,
+        bucket: TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<crate::index::SeriesSpec>>;
+    async fn get_inverted_index_term_async(
+        &self,
+        bucket: TimeBucket,
+        term: Label,
+    ) -> Result<Option<roaring::RoaringBitmap>>;
+    async fn get_async(&self, key: bytes::Bytes) -> Result<Option<bytes::Bytes>>;
+}
+
+#[async_trait]
+impl<R> ErasedSnapshot for R
+where
+    R: DbRead + Send + Sync,
+{
+    async fn get_forward_index_async(
+        &self,
+        bucket: TimeBucket,
+    ) -> Result<crate::index::ForwardIndex> {
+        get_forward_index(self, bucket).await
+    }
+    async fn get_forward_index_series_async(
+        &self,
+        bucket: TimeBucket,
+        series_ids: Vec<SeriesId>,
+    ) -> Result<crate::index::ForwardIndex> {
+        get_forward_index_series(self, &bucket, &series_ids).await
+    }
+    async fn get_inverted_index_async(
+        &self,
+        bucket: TimeBucket,
+    ) -> Result<crate::index::InvertedIndex> {
+        get_inverted_index(self, bucket).await
+    }
+    async fn get_inverted_index_terms_async(
+        &self,
+        bucket: TimeBucket,
+        terms: Vec<Label>,
+    ) -> Result<crate::index::InvertedIndex> {
+        get_inverted_index_terms(self, &bucket, &terms).await
+    }
+    async fn get_label_values_async(
+        &self,
+        bucket: TimeBucket,
+        label_name: String,
+    ) -> Result<Vec<String>> {
+        get_label_values(self, &bucket, &label_name).await
+    }
+    async fn get_forward_index_one_async(
+        &self,
+        bucket: TimeBucket,
+        series_id: SeriesId,
+    ) -> Result<Option<crate::index::SeriesSpec>> {
+        get_forward_index_one(self, &bucket, series_id).await
+    }
+    async fn get_inverted_index_term_async(
+        &self,
+        bucket: TimeBucket,
+        term: Label,
+    ) -> Result<Option<roaring::RoaringBitmap>> {
+        get_inverted_index_term(self, &bucket, &term).await
+    }
+    async fn get_async(&self, key: bytes::Bytes) -> Result<Option<bytes::Bytes>> {
+        self.get(&key)
+            .await
+            .map_err(|e| StorageError::from_storage(e).into())
+    }
+}
 
 pub(crate) struct MiniQueryReader {
     bucket: TimeBucket,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<dyn ErasedSnapshot>,
 }
 
 impl MiniQueryReader {
-    pub(crate) fn new(bucket: TimeBucket, storage: Arc<dyn StorageRead>) -> Self {
-        Self {
-            bucket,
-            snapshot: storage,
-        }
+    pub(crate) fn new(bucket: TimeBucket, snapshot: Arc<dyn ErasedSnapshot>) -> Self {
+        Self { bucket, snapshot }
     }
 }
 
@@ -42,7 +147,7 @@ impl BucketQueryReader for MiniQueryReader {
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let forward_index = io_trace_async(IoKindLocal::ForwardIndexFetch, async {
             self.snapshot
-                .get_forward_index_series(&self.bucket, series_ids)
+                .get_forward_index_series_async(self.bucket, series_ids.to_vec())
                 .await
         })
         .await?;
@@ -54,7 +159,7 @@ impl BucketQueryReader for MiniQueryReader {
     ) -> Result<Box<dyn ForwardIndexLookup + Send + Sync + 'static>> {
         let forward_index = io_trace_async(
             IoKindLocal::ForwardIndexFetch,
-            self.snapshot.get_forward_index(self.bucket),
+            self.snapshot.get_forward_index_async(self.bucket),
         )
         .await?;
         Ok(Box::new(forward_index))
@@ -66,7 +171,7 @@ impl BucketQueryReader for MiniQueryReader {
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let inverted_index = io_trace_async(IoKindLocal::InvertedIndexFetch, async {
             self.snapshot
-                .get_inverted_index_terms(&self.bucket, terms)
+                .get_inverted_index_terms_async(self.bucket, terms.to_vec())
                 .await
         })
         .await?;
@@ -78,7 +183,7 @@ impl BucketQueryReader for MiniQueryReader {
     ) -> Result<Box<dyn InvertedIndexLookup + Send + Sync + 'static>> {
         let inverted_index = io_trace_async(
             IoKindLocal::InvertedIndexFetch,
-            self.snapshot.get_inverted_index(self.bucket),
+            self.snapshot.get_inverted_index_async(self.bucket),
         )
         .await?;
         Ok(Box::new(inverted_index))
@@ -87,7 +192,8 @@ impl BucketQueryReader for MiniQueryReader {
     async fn label_values(&self, label_name: &str) -> Result<Vec<String>> {
         io_trace_async(
             IoKindLocal::LabelValuesFetch,
-            self.snapshot.get_label_values(&self.bucket, label_name),
+            self.snapshot
+                .get_label_values_async(self.bucket, label_name.to_string()),
         )
         .await
     }
@@ -98,7 +204,8 @@ impl BucketQueryReader for MiniQueryReader {
     ) -> Result<Option<crate::index::SeriesSpec>> {
         io_trace_async(
             IoKindLocal::ForwardIndexFetch,
-            self.snapshot.get_forward_index_one(&self.bucket, series_id),
+            self.snapshot
+                .get_forward_index_one_async(self.bucket, series_id),
         )
         .await
     }
@@ -106,7 +213,8 @@ impl BucketQueryReader for MiniQueryReader {
     async fn inverted_index_term(&self, term: &Label) -> Result<Option<roaring::RoaringBitmap>> {
         io_trace_async(
             IoKindLocal::InvertedIndexFetch,
-            self.snapshot.get_inverted_index_term(&self.bucket, term),
+            self.snapshot
+                .get_inverted_index_term_async(self.bucket, term.clone()),
         )
         .await
     }
@@ -126,7 +234,7 @@ impl BucketQueryReader for MiniQueryReader {
         };
         let record = io_trace_async(
             IoKindLocal::SamplesFetch,
-            self.snapshot.get(storage_key.encode()),
+            self.snapshot.get_async(storage_key.encode()),
         )
         .await?;
 
@@ -134,11 +242,11 @@ impl BucketQueryReader for MiniQueryReader {
             Some(record) => {
                 crate::promql::trace::record_bytes(
                     crate::promql::trace::IoKind::SamplesFetch,
-                    record.value.len() as u64,
+                    record.len() as u64,
                 );
-                let raw_len = record.value.len() as u64;
+                let raw_len = record.len() as u64;
                 let samples = io_trace_sync(IoKindLocal::Deserialize, || {
-                    let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
+                    let iter = TimeSeriesIterator::new(record.as_ref()).ok_or_else(|| {
                         Error::Internal("Invalid timeseries data in storage".into())
                     })?;
                     let samples: Vec<Sample> = iter
@@ -191,16 +299,16 @@ impl MiniTsdb {
         let view = self.write_coordinator.view();
         MiniQueryReader {
             bucket: self.bucket,
-            snapshot: view.snapshot.clone(),
+            snapshot: view.snapshot.clone() as Arc<dyn ErasedSnapshot>,
         }
     }
 
-    pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn Storage>) -> Result<Self> {
-        let snapshot = storage.snapshot().await?;
+    pub(crate) async fn load(bucket: TimeBucket, db: Arc<Db>) -> Result<Self> {
+        let snapshot = db.snapshot().await.map_err(StorageError::from_storage)?;
 
         let mut series_dict = HashMap::new();
-        let next_series_id = snapshot
-            .load_series_dictionary(&bucket, |fingerprint, series_id| {
+        let next_series_id =
+            load_series_dictionary(snapshot.as_ref(), &bucket, |fingerprint, series_id| {
                 series_dict.insert(fingerprint, series_id);
             })
             .await?;
@@ -211,11 +319,9 @@ impl MiniTsdb {
             next_series_id,
         };
 
-        let flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let flusher = TsdbFlusher { db: db.clone() };
 
-        let initial_snapshot: Arc<dyn StorageSnapshot> = storage
+        let initial_snapshot: Arc<DbSnapshot> = db
             .snapshot()
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -297,7 +403,7 @@ impl MiniTsdb {
     /// Flush pending data to the storage memtable (not yet durable).
     ///
     /// After this returns, the data is visible to snapshot reads but has not
-    /// been persisted to durable storage. Call [`Storage::flush`] afterwards
+    /// been persisted to durable storage. Call `db.flush()` afterwards
     /// to make the data durable.
     pub(crate) async fn flush_written(&self) -> Result<()> {
         let handle = self.write_coordinator.handle(WRITE_CHANNEL);
@@ -339,18 +445,16 @@ fn map_write_error(e: WriteError) -> Error {
 mod tests {
     use super::*;
     use crate::model::{Label, Sample, Series};
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
 
     /// Create a MiniTsdb with a custom queue capacity.
-    async fn load_with_config(
-        bucket: TimeBucket,
-        storage: Arc<dyn Storage>,
-        queue_capacity: usize,
-    ) -> MiniTsdb {
-        let snapshot = storage.snapshot().await.unwrap();
+    async fn load_with_config(bucket: TimeBucket, db: Arc<Db>, queue_capacity: usize) -> MiniTsdb {
+        let snapshot = db.snapshot().await.unwrap();
 
         let mut series_dict = HashMap::new();
-        let next_series_id = snapshot
-            .load_series_dictionary(&bucket, |fingerprint, series_id| {
+        let next_series_id =
+            load_series_dictionary(snapshot.as_ref(), &bucket, |fingerprint, series_id| {
                 series_dict.insert(fingerprint, series_id);
             })
             .await
@@ -362,11 +466,9 @@ mod tests {
             next_series_id,
         };
 
-        let flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let flusher = TsdbFlusher { db: db.clone() };
 
-        let initial_snapshot: Arc<dyn StorageSnapshot> = storage.snapshot().await.unwrap();
+        let initial_snapshot: Arc<DbSnapshot> = db.snapshot().await.unwrap();
 
         let config = WriteCoordinatorConfig {
             queue_capacity,
@@ -396,27 +498,24 @@ mod tests {
         )
     }
 
-    async fn test_storage() -> Arc<dyn Storage> {
+    async fn test_db() -> Arc<Db> {
         use crate::storage::merge_operator::OpenTsdbMergeOperator;
-        use common::{StorageBuilder, StorageConfig, StorageSemantics};
 
-        StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .with_semantics(
-                StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-            )
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("test", object_store)
+            .with_merge_operator(Arc::new(OpenTsdbMergeOperator))
             .build()
             .await
-            .unwrap()
+            .unwrap();
+        Arc::new(db)
     }
 
     #[tokio::test]
     async fn should_succeed_ingest_batch_with_timeout_when_queue_has_space() {
         // given - queue has space (capacity=1)
         let bucket = TimeBucket::hour(60);
-        let storage = test_storage().await;
-        let mini = load_with_config(bucket, storage, 1).await;
+        let db = test_db().await;
+        let mini = load_with_config(bucket, db, 1).await;
 
         // when
         let s1 = vec![test_series("cpu", 3_700_000, 1.0)];
@@ -432,8 +531,8 @@ mod tests {
     async fn should_fail_ingest_batch_when_timeout_too_short_for_drain() {
         // given - queue_capacity=2, coordinator paused
         let bucket = TimeBucket::hour(60);
-        let storage = test_storage().await;
-        let mini = load_with_config(bucket, storage, 2).await;
+        let db = test_db().await;
+        let mini = load_with_config(bucket, db, 2).await;
 
         let pause = mini.write_coordinator.pause_handle(WRITE_CHANNEL);
         pause.pause();

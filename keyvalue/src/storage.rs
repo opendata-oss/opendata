@@ -1,43 +1,45 @@
 //! KeyValue-specific storage wrappers.
 //!
 //! This module provides [`KeyValueStorage`] and [`KeyValueStorageRead`] which wrap
-//! the underlying storage traits with key encoding/decoding.
+//! the underlying SlateDB types with key encoding/decoding.
 
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::storage::RecordOp;
-use common::{Record, Storage, StorageIterator, StorageRead};
+use common::StorageError;
+use common::default_scan_options;
+use slatedb::{Db, DbRead, WriteBatch};
 
 use crate::config::WriteOptions;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::model::KeyValueEntry;
 use crate::serde::{decode_key, encode_key, encode_key_range};
 
 /// Read-only key-value storage operations.
 ///
-/// Wraps `Arc<dyn StorageRead>` with key encoding/decoding.
+/// Wraps an `Arc<R>` where `R` implements [`slatedb::DbRead`] with key
+/// encoding/decoding.
 #[derive(Clone)]
-pub(crate) struct KeyValueStorageRead {
-    storage: Arc<dyn StorageRead>,
+pub(crate) struct KeyValueStorageRead<R: DbRead + Send + Sync> {
+    storage: Arc<R>,
 }
 
-impl KeyValueStorageRead {
+impl<R: DbRead + Send + Sync> KeyValueStorageRead<R> {
     /// Creates a new read-only storage wrapper.
-    pub(crate) fn new(storage: Arc<dyn StorageRead>) -> Self {
+    pub(crate) fn new(storage: Arc<R>) -> Self {
         Self { storage }
     }
 
     /// Gets a value by user key.
     pub(crate) async fn get(&self, key: &Bytes) -> Result<Option<Bytes>> {
         let storage_key = encode_key(key);
-        let record = self
+        let value = self
             .storage
-            .get(storage_key)
+            .get(&storage_key)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(record.map(|r| r.value))
+            .map_err(StorageError::from_storage)?;
+        Ok(value)
     }
 
     /// Scans key-value pairs within a user key range.
@@ -48,16 +50,16 @@ impl KeyValueStorageRead {
         let storage_range = encode_key_range(key_range);
         let inner = self
             .storage
-            .scan_iter(storage_range)
+            .scan_with_options(storage_range, &default_scan_options())
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(StorageError::from_storage)?;
         Ok(KeyValueScanIterator { inner })
     }
 }
 
 /// Iterator over key-value pairs from storage.
 pub(crate) struct KeyValueScanIterator {
-    inner: Box<dyn StorageIterator + Send>,
+    inner: slatedb::DbIterator,
 }
 
 impl KeyValueScanIterator {
@@ -67,7 +69,7 @@ impl KeyValueScanIterator {
             .inner
             .next()
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(StorageError::from_storage)?;
 
         match record {
             Some(r) => {
@@ -84,28 +86,34 @@ impl KeyValueScanIterator {
 
 /// Read-write key-value storage operations.
 ///
-/// Wraps `Arc<dyn Storage>` with key encoding/decoding.
+/// Wraps `Arc<slatedb::Db>` with key encoding/decoding.
 #[derive(Clone)]
 pub(crate) struct KeyValueStorage {
-    storage: Arc<dyn Storage>,
+    storage: Arc<Db>,
 }
 
 impl KeyValueStorage {
     /// Creates a new storage wrapper.
-    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
+    pub(crate) fn new(storage: Arc<Db>) -> Self {
         Self { storage }
     }
 
-    /// Creates a new storage with an in-memory backend.
+    /// Creates a new storage backed by an in-memory SlateDB instance.
     #[cfg(test)]
-    pub(crate) fn in_memory() -> Self {
-        use common::storage::in_memory::InMemoryStorage;
-        Self::new(Arc::new(InMemoryStorage::new()))
+    pub(crate) async fn in_memory() -> Self {
+        use slatedb::DbBuilder;
+        use slatedb::object_store::memory::InMemory;
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("test", object_store)
+            .build()
+            .await
+            .expect("failed to build in-memory slatedb");
+        Self::new(Arc::new(db))
     }
 
     /// Returns a read-only view of this storage.
-    pub(crate) fn as_read(&self) -> KeyValueStorageRead {
-        KeyValueStorageRead::new(Arc::clone(&self.storage) as Arc<dyn StorageRead>)
+    pub(crate) fn as_read(&self) -> KeyValueStorageRead<Db> {
+        KeyValueStorageRead::new(Arc::clone(&self.storage))
     }
 
     /// Puts a key-value pair.
@@ -122,14 +130,15 @@ impl KeyValueStorage {
         options: WriteOptions,
     ) -> Result<()> {
         let storage_key = encode_key(&key);
-        let record = Record::new(storage_key, value);
-        let storage_options = common::WriteOptions {
+        let mut batch = WriteBatch::new();
+        batch.put(storage_key, value);
+        let write_options = slatedb::config::WriteOptions {
             await_durable: options.await_durable,
         };
         self.storage
-            .put_with_options(vec![record.into()], storage_options)
+            .write_with_options(batch, &write_options)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(StorageError::from_storage)?;
         Ok(())
     }
 
@@ -145,18 +154,15 @@ impl KeyValueStorage {
         options: WriteOptions,
     ) -> Result<()> {
         let storage_key = encode_key(&key);
-        let op = RecordOp::Delete(storage_key);
-
-        // Note: common::Storage::apply doesn't have an options variant,
-        // so we flush after if await_durable is requested.
+        let mut batch = WriteBatch::new();
+        batch.delete(storage_key);
+        let write_options = slatedb::config::WriteOptions {
+            await_durable: options.await_durable,
+        };
         self.storage
-            .apply(vec![op])
+            .write_with_options(batch, &write_options)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        if options.await_durable {
-            self.flush().await?;
-        }
+            .map_err(StorageError::from_storage)?;
         Ok(())
     }
 
@@ -165,7 +171,8 @@ impl KeyValueStorage {
         self.storage
             .flush()
             .await
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(StorageError::from_storage)?;
+        Ok(())
     }
 
     /// Closes the storage, releasing resources.
@@ -173,7 +180,8 @@ impl KeyValueStorage {
         self.storage
             .close()
             .await
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(StorageError::from_storage)?;
+        Ok(())
     }
 }
 
@@ -184,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn should_put_and_get_value() {
         // given
-        let storage = KeyValueStorage::in_memory();
+        let storage = KeyValueStorage::in_memory().await;
         let key = Bytes::from("test-key");
         let value = Bytes::from("test-value");
 
@@ -199,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_for_missing_key() {
         // given
-        let storage = KeyValueStorage::in_memory();
+        let storage = KeyValueStorage::in_memory().await;
 
         // when
         let result = storage
@@ -215,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn should_delete_existing_key() {
         // given
-        let storage = KeyValueStorage::in_memory();
+        let storage = KeyValueStorage::in_memory().await;
         let key = Bytes::from("to-delete");
         storage
             .put(key.clone(), Bytes::from("value"))
@@ -233,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn should_delete_nonexistent_key_without_error() {
         // given
-        let storage = KeyValueStorage::in_memory();
+        let storage = KeyValueStorage::in_memory().await;
 
         // when
         let result = storage.delete(Bytes::from("nonexistent")).await;
@@ -245,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_all_entries() {
         // given
-        let storage = KeyValueStorage::in_memory();
+        let storage = KeyValueStorage::in_memory().await;
         storage
             .put(Bytes::from("a"), Bytes::from("1"))
             .await
@@ -276,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn should_scan_key_range() {
         // given
-        let storage = KeyValueStorage::in_memory();
+        let storage = KeyValueStorage::in_memory().await;
         storage
             .put(Bytes::from("a"), Bytes::from("1"))
             .await
@@ -314,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn should_overwrite_existing_key() {
         // given
-        let storage = KeyValueStorage::in_memory();
+        let storage = KeyValueStorage::in_memory().await;
         let key = Bytes::from("key");
         storage.put(key.clone(), Bytes::from("old")).await.unwrap();
 

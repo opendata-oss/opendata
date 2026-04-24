@@ -6,11 +6,20 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::StorageConfig;
+use common::storage::config::ObjectStoreConfig;
 use log::{Config, LogDb, LogRead, Record, SegmentConfig};
+
+fn in_memory_storage_config() -> StorageConfig {
+    StorageConfig {
+        path: "test-http-server".to_string(),
+        object_store: ObjectStoreConfig::InMemory,
+        ..Default::default()
+    }
+}
 
 async fn setup_test_log() -> Arc<LogDb> {
     let config = Config {
-        storage: StorageConfig::InMemory,
+        storage: in_memory_storage_config(),
         ..Default::default()
     };
     Arc::new(LogDb::open(config).await.expect("Failed to open log"))
@@ -276,7 +285,7 @@ async fn test_list_segments_then_list_keys_workflow() {
 
 async fn setup_test_log_with_segment_interval(interval: Duration) -> Arc<LogDb> {
     let config = Config {
-        storage: StorageConfig::InMemory,
+        storage: in_memory_storage_config(),
         segmentation: SegmentConfig {
             seal_interval: Some(interval),
         },

@@ -4,7 +4,7 @@ use crate::serde::timeseries::merge_batch_time_series;
 use crate::serde::{EncodingError, RecordType};
 use bytes::Bytes;
 use common::serde::key_prefix::KeyPrefix;
-use common::storage::default_merge_batch;
+use slatedb::MergeOperatorError;
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
 ///
@@ -12,25 +12,63 @@ use common::storage::default_merge_batch;
 /// record type encoded in the key.
 pub(crate) struct OpenTsdbMergeOperator;
 
-impl common::storage::MergeOperator for OpenTsdbMergeOperator {
-    fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
+impl slatedb::MergeOperator for OpenTsdbMergeOperator {
+    fn merge(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        value: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        // Delegate to merge_batch with a single-element slice.
+        self.merge_batch(key, existing_value, std::slice::from_ref(&value))
+    }
+
+    fn merge_batch(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
         // Decode record type from key
-        let key_prefix = KeyPrefix::from_bytes(key.as_ref()).unwrap();
+        let key_prefix =
+            KeyPrefix::from_bytes(key.as_ref()).map_err(|e| MergeOperatorError::Callback {
+                message: e.to_string(),
+            })?;
 
         let record_type =
-            RecordType::from_prefix(key_prefix).expect("Failed to get record type from record tag");
+            RecordType::from_prefix(key_prefix).map_err(|e| MergeOperatorError::Callback {
+                message: e.to_string(),
+            })?;
 
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)
-                .expect("Failed to batch merge inverted index"),
-            RecordType::TimeSeries => merge_batch_time_series(existing_value, operands)
-                .expect("Failed to batch merge time series"),
-            RecordType::BucketList => merge_batch_bucket_list(existing_value, operands)
-                .expect("Failed to batch merge bucket list"),
+                .map_err(|e| MergeOperatorError::Callback {
+                    message: e.to_string(),
+                }),
+            RecordType::TimeSeries => {
+                merge_batch_time_series(existing_value, operands).map_err(|e| {
+                    MergeOperatorError::Callback {
+                        message: e.to_string(),
+                    }
+                })
+            }
+            RecordType::BucketList => {
+                merge_batch_bucket_list(existing_value, operands).map_err(|e| {
+                    MergeOperatorError::Callback {
+                        message: e.to_string(),
+                    }
+                })
+            }
             _ => {
                 // For other record types (SeriesDictionary, ForwardIndex), just use new value for each pairwise merge.
-                // These should use Put, not Merge, but handle gracefully
-                default_merge_batch(key, existing_value, operands, |_k, _e, v| v)
+                // These should use Put, not Merge, but handle gracefully — take the last operand.
+                if let Some(last) = operands.last() {
+                    Ok(last.clone())
+                } else if let Some(existing) = existing_value {
+                    Ok(existing)
+                } else {
+                    Ok(Bytes::new())
+                }
             }
         }
     }
@@ -94,9 +132,9 @@ mod tests {
     use crate::serde::key::{BucketListKey, InvertedIndexKey, TimeSeriesKey};
     use crate::serde::timeseries::TimeSeriesValue;
     use bytes::Bytes;
-    use common::storage::MergeOperator;
     use roaring::RoaringBitmap;
     use rstest::rstest;
+    use slatedb::MergeOperator;
 
     /// Helper to create a test key for InvertedIndex
     fn create_inverted_index_key() -> Bytes {
@@ -439,7 +477,9 @@ mod tests {
         };
 
         // when
-        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
+        let merged = operator
+            .merge_batch(&key, Some(existing_value), &[new_value])
+            .unwrap();
 
         // then - verify the merge actually happened (not just returning new_value)
         // For InvertedIndex, check it's a union
@@ -489,7 +529,7 @@ mod tests {
         .unwrap();
 
         // when
-        let result = operator.merge_batch(&key, None, &[new_value]);
+        let result = operator.merge_batch(&key, None, &[new_value]).unwrap();
 
         // then
         let decoded = InvertedIndexValue::decode(result.as_ref()).unwrap();
@@ -505,8 +545,9 @@ mod tests {
         let new_value = Bytes::from(b"new_value".to_vec());
 
         // when
-        let result =
-            operator.merge_batch(&key, Some(existing_value), std::slice::from_ref(&new_value));
+        let result = operator
+            .merge_batch(&key, Some(existing_value), std::slice::from_ref(&new_value))
+            .unwrap();
 
         // then - should return new_value without merging
         assert_eq!(result, new_value);
@@ -857,7 +898,9 @@ mod tests {
         };
 
         // when
-        let merged = operator.merge_batch(&key, Some(existing_value), &[op0, op1]);
+        let merged = operator
+            .merge_batch(&key, Some(existing_value), &[op0, op1])
+            .unwrap();
 
         // then - verify all three sources were merged
         match record_type {
@@ -902,7 +945,9 @@ mod tests {
         let op1 = Bytes::from(b"final".to_vec());
 
         // when
-        let result = operator.merge_batch(&key, Some(existing_value), &[op0, op1.clone()]);
+        let result = operator
+            .merge_batch(&key, Some(existing_value), &[op0, op1.clone()])
+            .unwrap();
 
         // then - falls back to pairwise merge; last operand wins for non-mergeable types
         assert_eq!(result, op1);

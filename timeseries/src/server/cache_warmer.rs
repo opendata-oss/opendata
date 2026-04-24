@@ -8,7 +8,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::{BytesRange, StorageRead};
+use async_trait::async_trait;
+use bytes::Bytes;
+use common::{BytesRange, StorageError, default_scan_options};
+use slatedb::DbRead;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -17,9 +20,64 @@ use crate::serde::TimeBucketScoped;
 use crate::serde::key::{
     BucketListKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
 };
-use crate::storage::OpenTsdbStorageReadExt;
+use crate::storage::get_buckets_in_range;
 
 const LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Erased reader trait used by the cache warmer.
+///
+/// `slatedb::DbRead` is not object-safe (its methods are generic over key
+/// types), so we wrap the two operations the warmer needs (`get`, `scan_iter`)
+/// behind an object-safe trait. Implemented for the concrete `Arc<Db>` and
+/// `Arc<DbReader>` handles the TSDB holds at runtime.
+#[async_trait]
+pub(crate) trait CacheWarmerReader: Send + Sync {
+    async fn get_bytes(&self, key: Bytes) -> crate::util::Result<Option<Bytes>>;
+
+    /// Scan `range` and return the number of records touched, populating any
+    /// block cache attached to the underlying `DbRead` as a side effect.
+    async fn drain_scan(&self, range: BytesRange) -> crate::util::Result<u64>;
+
+    /// Erased version of `get_buckets_in_range` (needed because `DbRead` is not
+    /// object-safe).
+    async fn list_buckets_in_range(
+        &self,
+        start_secs: Option<i64>,
+        end_secs: Option<i64>,
+    ) -> crate::util::Result<Vec<crate::model::TimeBucket>>;
+}
+
+#[async_trait]
+impl<R> CacheWarmerReader for R
+where
+    R: DbRead + Send + Sync + 'static,
+{
+    async fn get_bytes(&self, key: Bytes) -> crate::util::Result<Option<Bytes>> {
+        self.get(&key)
+            .await
+            .map_err(|e| StorageError::from_storage(e).into())
+    }
+
+    async fn drain_scan(&self, range: BytesRange) -> crate::util::Result<u64> {
+        let mut iter = self
+            .scan_with_options(range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        let mut count = 0u64;
+        while let Some(_kv) = iter.next().await.map_err(StorageError::from_storage)? {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn list_buckets_in_range(
+        &self,
+        start_secs: Option<i64>,
+        end_secs: Option<i64>,
+    ) -> crate::util::Result<Vec<crate::model::TimeBucket>> {
+        get_buckets_in_range(self, start_secs, end_secs).await
+    }
+}
 
 pub(crate) struct CacheWarmerHandle {
     cancel: CancellationToken,
@@ -37,12 +95,15 @@ impl CacheWarmerHandle {
 
 /// Spawns a one-off cache warming task. Returns a handle that must be
 /// shut down before closing the database.
-pub(crate) fn start(storage: Arc<dyn StorageRead>, config: CacheWarmerConfig) -> CacheWarmerHandle {
+pub(crate) fn start(
+    reader: Arc<dyn CacheWarmerReader>,
+    config: CacheWarmerConfig,
+) -> CacheWarmerHandle {
     let cancel = CancellationToken::new();
     let join = tokio::spawn({
         let cancel = cancel.clone();
         async move {
-            match warm(&storage, &config, &cancel).await {
+            match warm(&reader, &config, &cancel).await {
                 Ok(stats) => tracing::info!(
                     buckets = stats.buckets,
                     records = stats.records,
@@ -63,7 +124,7 @@ struct WarmStats {
 }
 
 async fn warm(
-    storage: &Arc<dyn StorageRead>,
+    reader: &Arc<dyn CacheWarmerReader>,
     config: &CacheWarmerConfig,
     cancel: &CancellationToken,
 ) -> crate::util::Result<WarmStats> {
@@ -75,10 +136,10 @@ async fn warm(
     let range_start = now_secs - config.warm_range.as_secs() as i64;
 
     // Warm the bucket list key
-    let _ = storage.get(BucketListKey.encode()).await?;
+    let _ = reader.get_bytes(BucketListKey.encode()).await?;
 
-    let buckets = storage
-        .get_buckets_in_range(Some(range_start), Some(now_secs))
+    let buckets = reader
+        .list_buckets_in_range(Some(range_start), Some(now_secs))
         .await?;
     let total = buckets.len();
 
@@ -91,12 +152,20 @@ async fn warm(
             break;
         }
 
-        records += drain_scan(storage, ForwardIndexKey::bucket_range(bucket)).await?;
-        records += drain_scan(storage, InvertedIndexKey::bucket_range(bucket)).await?;
-        records += drain_scan(storage, SeriesDictionaryKey::bucket_range(bucket)).await?;
+        records += reader
+            .drain_scan(ForwardIndexKey::bucket_range(bucket))
+            .await?;
+        records += reader
+            .drain_scan(InvertedIndexKey::bucket_range(bucket))
+            .await?;
+        records += reader
+            .drain_scan(SeriesDictionaryKey::bucket_range(bucket))
+            .await?;
 
         if config.include_samples {
-            records += drain_scan(storage, TimeSeriesKey::bucket_range(bucket)).await?;
+            records += reader
+                .drain_scan(TimeSeriesKey::bucket_range(bucket))
+                .await?;
         }
 
         if last_log.elapsed() >= LOG_INTERVAL {
@@ -118,36 +187,30 @@ async fn warm(
     })
 }
 
-/// Scan a key range, consuming all records to populate the block cache.
-/// Returns the number of records touched.
-async fn drain_scan(storage: &Arc<dyn StorageRead>, range: BytesRange) -> crate::util::Result<u64> {
-    let mut iter = storage.scan_iter(range).await?;
-    let mut count = 0u64;
-    while iter.next().await?.is_some() {
-        count += 1;
-    }
-    Ok(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Series;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
     use crate::tsdb::Tsdb;
-    use common::storage::in_memory::InMemoryStorage;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
 
-    fn create_storage() -> Arc<InMemoryStorage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
+    async fn create_db() -> Arc<slatedb::Db> {
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("test", object_store)
+            .with_merge_operator(Arc::new(OpenTsdbMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        Arc::new(db)
     }
 
     #[tokio::test]
     async fn should_warm_with_data() {
         // given
-        let storage = create_storage();
-        let tsdb = Tsdb::new(storage.clone());
+        let db = create_db().await;
+        let tsdb = Tsdb::new(db.clone());
         let series = vec![
             Series::builder("http_requests_total")
                 .label("method", "GET")
@@ -170,9 +233,8 @@ mod tests {
 
         // when
         let cancel = CancellationToken::new();
-        let stats = warm(&(storage as Arc<dyn StorageRead>), &config, &cancel)
-            .await
-            .unwrap();
+        let reader: Arc<dyn CacheWarmerReader> = db;
+        let stats = warm(&reader, &config, &cancel).await.unwrap();
 
         // then
         assert!(stats.buckets > 0);
@@ -182,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn should_warm_empty_storage() {
         // given
-        let storage = create_storage();
+        let db = create_db().await;
         let config = CacheWarmerConfig {
             warm_range: Duration::from_secs(3600),
             include_samples: true,
@@ -190,9 +252,8 @@ mod tests {
 
         // when
         let cancel = CancellationToken::new();
-        let stats = warm(&(storage as Arc<dyn StorageRead>), &config, &cancel)
-            .await
-            .unwrap();
+        let reader: Arc<dyn CacheWarmerReader> = db;
+        let stats = warm(&reader, &config, &cancel).await.unwrap();
 
         // then
         assert_eq!(stats.buckets, 0);
@@ -202,8 +263,8 @@ mod tests {
     #[tokio::test]
     async fn should_stop_on_cancellation() {
         // given
-        let storage = create_storage();
-        let tsdb = Tsdb::new(storage.clone());
+        let db = create_db().await;
+        let tsdb = Tsdb::new(db.clone());
         let series = vec![
             Series::builder("metric_a")
                 .label("env", "test")
@@ -227,9 +288,8 @@ mod tests {
         // when — cancel before starting
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let stats = warm(&(storage as Arc<dyn StorageRead>), &config, &cancel)
-            .await
-            .unwrap();
+        let reader: Arc<dyn CacheWarmerReader> = db;
+        let stats = warm(&reader, &config, &cancel).await.unwrap();
 
         // then — should have found buckets but processed none
         assert_eq!(stats.records, 0);

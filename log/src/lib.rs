@@ -25,9 +25,17 @@
 //! # use log::{LogDb, LogRead, Config, Record};
 //! # use bytes::Bytes;
 //! # use common::StorageConfig;
+//! # use common::storage::config::ObjectStoreConfig;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+//! let config = Config {
+//!     storage: StorageConfig {
+//!         path: "demo".to_string(),
+//!         object_store: ObjectStoreConfig::InMemory,
+//!         ..Default::default()
+//!     },
+//!     ..Default::default()
+//! };
 //! let log = LogDb::open(config).await?;
 //!
 //! // Append records

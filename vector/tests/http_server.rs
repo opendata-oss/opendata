@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::StorageConfig;
+use common::storage::config::ObjectStoreConfig;
 use reqwest::Client;
 use serde_json::json;
 use tokio::task::JoinHandle;
@@ -123,7 +124,12 @@ async fn setup_server_with_vectors() -> TestServerFixture {
         MetadataFieldSpec::new("rank", FieldType::Int64, true),
     ];
     let config = Config {
-        storage: StorageConfig::InMemory,
+        storage: StorageConfig {
+            path: "test".into(),
+            object_store: ObjectStoreConfig::InMemory,
+            settings_path: None,
+            block_cache: None,
+        },
         dimensions: 2,
         distance_metric: DistanceMetric::L2,
         metadata_fields: metadata_fields.clone(),

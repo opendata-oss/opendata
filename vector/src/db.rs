@@ -11,7 +11,6 @@
 //! - Delta handles dictionary lookup, centroid assignment, and builds RecordOps
 //! - Flusher applies ops atomically to storage
 
-use crate::VectorDbReader;
 use crate::error::{Error, Result};
 use crate::model::{
     AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
@@ -29,6 +28,7 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::storage::record::{StorageOp, build_write_batch};
 use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
@@ -40,12 +40,13 @@ use crate::write::indexer::tree::centroids::{
 use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
-use common::Record;
 use common::SequenceAllocator;
+use common::StorageBuilder;
+use common::StorageError;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
-use common::storage::{Storage, StorageRead, StorageSnapshot};
-use common::{StorageBuilder, StorageSemantics};
+use common::storage::factory::OwnedHybridCache;
 use rayon::prelude::*;
+use slatedb::{Db, DbRead, DbSnapshot};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -116,7 +117,7 @@ pub trait VectorDbRead {
 ///       and then construct the centroid index directly from that plus the snapshot
 #[derive(Clone)]
 pub(crate) struct LastAppliedSnapshot {
-    pub(crate) snapshot: Arc<dyn StorageSnapshot>,
+    pub(crate) snapshot: Arc<DbSnapshot>,
     pub(crate) centroid_index: Arc<LeveledCentroidIndex<'static>>,
     pub(crate) centroid_cache: Arc<AllCentroidsCache>,
     pub(crate) centroid_count: usize,
@@ -129,13 +130,18 @@ pub(crate) struct LastAppliedSnapshot {
 /// and metadata index maintenance automatically.
 pub struct VectorDb {
     config: Config,
-    storage: Arc<dyn Storage>,
+    storage: Arc<Db>,
 
     /// The WriteCoordinator itself (stored to keep it alive).
     write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
 
     /// snapshot state for queries
     last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
+
+    /// Handle to the managed foyer hybrid cache, if one was built from
+    /// [`Config::storage::block_cache`]. Held so we can close the cache
+    /// explicitly after the db on shutdown.
+    managed_cache: Option<OwnedHybridCache>,
 }
 
 impl VectorDb {
@@ -194,13 +200,13 @@ impl VectorDb {
         builder: StorageBuilder,
     ) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = builder
-            .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
+        let built = builder
+            .with_merge_operator(Arc::new(merge_op))
             .build()
             .await
             .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
 
-        Self::load_or_init_db(storage, config, centroids).await
+        Self::load_or_init_db(built.db, built.managed_cache, config, centroids).await
     }
 
     /// Create a vector database with the given storage, configuration, and centroids.
@@ -210,7 +216,8 @@ impl VectorDb {
     /// If centroids already exist in storage, the provided centroids are ignored.
     /// Otherwise, the provided centroids are written to storage.
     async fn load_or_init_db(
-        storage: Arc<dyn Storage>,
+        storage: Arc<Db>,
+        managed_cache: Option<OwnedHybridCache>,
         config: Config,
         centroids: Vec<Vec<f32>>,
     ) -> Result<Self> {
@@ -220,18 +227,24 @@ impl VectorDb {
         let mut centroid_id_allocator =
             SequenceAllocator::load(storage.as_ref(), centroid_seq_key).await?;
 
-        let initial_snapshot = storage.snapshot().await?;
+        let initial_snapshot = storage
+            .snapshot()
+            .await
+            .map_err(StorageError::from_storage)?;
 
         Self::bootstrap_tree_index_if_needed(
             &storage,
-            initial_snapshot.as_ref(),
+            &initial_snapshot,
             &config,
             centroids,
             &mut centroid_id_allocator,
         )
         .await?;
 
-        let snapshot = storage.snapshot().await?;
+        let snapshot = storage
+            .snapshot()
+            .await
+            .map_err(StorageError::from_storage)?;
         let loaded_tree = Self::load_tree_index(
             snapshot.clone(),
             0,
@@ -281,12 +294,13 @@ impl VectorDb {
             storage,
             write_coordinator,
             last_applied_snapshot,
+            managed_cache,
         })
     }
 
     async fn bootstrap_tree_index_if_needed(
-        storage: &Arc<dyn Storage>,
-        snapshot: &dyn StorageSnapshot,
+        storage: &Arc<Db>,
+        snapshot: &DbSnapshot,
         config: &Config,
         centroids: Vec<Vec<f32>>,
         centroid_id_allocator: &mut SequenceAllocator,
@@ -314,7 +328,7 @@ impl VectorDb {
         let mut ops = Vec::new();
         let (root_id, seq_alloc_put) = centroid_id_allocator.allocate_one();
         if let Some(seq_alloc_put) = seq_alloc_put {
-            ops.push(common::storage::RecordOp::Put(seq_alloc_put.into()));
+            ops.push(StorageOp::put(seq_alloc_put.key, seq_alloc_put.value));
         }
         assert_eq!(root_id, 0, "root centroid must be id 0");
 
@@ -322,51 +336,46 @@ impl VectorDb {
         for vector in centroids {
             let (centroid_id, seq_alloc_put) = centroid_id_allocator.allocate_one();
             if let Some(seq_alloc_put) = seq_alloc_put {
-                ops.push(common::storage::RecordOp::Put(seq_alloc_put.into()));
+                ops.push(StorageOp::put(seq_alloc_put.key, seq_alloc_put.value));
             }
             let centroid_id = VectorId::centroid_id(1, centroid_id);
             let centroid_info = CentroidInfoValue::new(1, vector.clone(), ROOT_VECTOR_ID);
-            ops.push(common::storage::RecordOp::Put(
-                Record::new(
-                    CentroidInfoKey::new(centroid_id).encode(),
-                    centroid_info.encode_to_bytes(),
-                )
-                .into(),
+            ops.push(StorageOp::put(
+                CentroidInfoKey::new(centroid_id).encode(),
+                centroid_info.encode_to_bytes(),
             ));
-            ops.push(common::storage::RecordOp::Put(
-                Record::new(
-                    CentroidStatsKey::new(centroid_id).encode(),
-                    CentroidStatsValue::new(0).encode_to_bytes(),
-                )
-                .into(),
+            ops.push(StorageOp::put(
+                CentroidStatsKey::new(centroid_id).encode(),
+                CentroidStatsValue::new(0).encode_to_bytes(),
             ));
             root_postings.push(PostingUpdate::append(centroid_id, vector));
         }
 
-        ops.push(common::storage::RecordOp::Put(
-            Record::new(
-                CentroidsKey::new().encode(),
-                CentroidsValue::new(3).encode_to_bytes(),
-            )
-            .into(),
+        ops.push(StorageOp::put(
+            CentroidsKey::new().encode(),
+            CentroidsValue::new(3).encode_to_bytes(),
         ));
-        ops.push(common::storage::RecordOp::Put(
-            Record::new(
-                PostingListKey::new(ROOT_VECTOR_ID).encode(),
-                PostingListValue::from_posting_updates(root_postings)?.encode_to_bytes(),
-            )
-            .into(),
+        ops.push(StorageOp::put(
+            PostingListKey::new(ROOT_VECTOR_ID).encode(),
+            PostingListValue::from_posting_updates(root_postings)?.encode_to_bytes(),
         ));
-        storage.apply(ops).await?;
+        let batch = build_write_batch(ops);
+        storage
+            .write(batch)
+            .await
+            .map_err(StorageError::from_storage)?;
         Ok(())
     }
 
-    pub(crate) async fn load_tree_index(
-        snapshot: Arc<dyn StorageSnapshot>,
+    pub(crate) async fn load_tree_index<R>(
+        snapshot: Arc<R>,
         snapshot_epoch: u64,
         dimensions: usize,
         distance_metric: crate::DistanceMetric,
-    ) -> Result<LoadedTreeIndex> {
+    ) -> Result<LoadedTreeIndex>
+    where
+        R: DbRead + Send + Sync + 'static,
+    {
         let centroids_meta = snapshot
             .get_centroids_meta()
             .await?
@@ -422,8 +431,8 @@ impl VectorDb {
     }
 
     pub(crate) async fn load_indexer_state(
-        storage: Arc<dyn Storage>,
-        snapshot: Arc<dyn StorageSnapshot>,
+        storage: Arc<Db>,
+        snapshot: Arc<DbSnapshot>,
         config: &Config,
         snapshot_epoch: u64,
     ) -> Result<VectorIndexState> {
@@ -458,9 +467,12 @@ impl VectorDb {
     }
 
     /// Load ID dictionary entries from storage into a HashMap.
-    pub(crate) async fn load_dictionary_from_storage(
-        snapshot: &dyn StorageRead,
-    ) -> Result<HashMap<String, VectorId>> {
+    pub(crate) async fn load_dictionary_from_storage<R>(
+        snapshot: &R,
+    ) -> Result<HashMap<String, VectorId>>
+    where
+        R: DbRead + Send + Sync,
+    {
         // Create prefix for all IdDictionary records
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
         crate::serde::RecordType::IdDictionary
@@ -470,15 +482,22 @@ impl VectorDb {
 
         // Scan all IdDictionary records
         let range = common::BytesRange::prefix(prefix);
-        let records = snapshot.scan(range).await?;
+        let mut iter = snapshot
+            .scan_with_options(range, &common::default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+
+        let mut records = Vec::new();
+        while let Some(kv) = iter.next().await.map_err(StorageError::from_storage)? {
+            records.push(kv);
+        }
 
         records
             .into_par_iter()
-            .map(|record| {
-                let key = crate::serde::key::IdDictionaryKey::decode(&record.key)?;
-                let value = crate::serde::id_dictionary::IdDictionaryValue::decode_from_bytes(
-                    &record.value,
-                )?;
+            .map(|kv| {
+                let key = crate::serde::key::IdDictionaryKey::decode(&kv.key)?;
+                let value =
+                    crate::serde::id_dictionary::IdDictionaryValue::decode_from_bytes(&kv.value)?;
                 let internal_id = value.vector_id;
                 Ok((key.external_id, internal_id))
             })
@@ -489,9 +508,12 @@ impl VectorDb {
     ///
     /// Scans all CentroidStats records and extracts the accumulated num_vectors
     /// for each centroid.
-    pub(crate) async fn load_centroid_counts_from_storage(
-        snapshot: &dyn StorageRead,
-    ) -> Result<HashMap<u8, HashMap<VectorId, u64>>> {
+    pub(crate) async fn load_centroid_counts_from_storage<R>(
+        snapshot: &R,
+    ) -> Result<HashMap<u8, HashMap<VectorId, u64>>>
+    where
+        R: DbRead + Send + Sync,
+    {
         let stats = snapshot.scan_all_centroid_stats().await?;
         let mut counts = HashMap::new();
         for (centroid_id, value) in stats {
@@ -749,7 +771,13 @@ impl VectorDb {
             .stop()
             .await
             .map_err(Error::Internal)?;
-        self.storage.close().await?;
+        self.storage
+            .close()
+            .await
+            .map_err(StorageError::from_storage)?;
+        if let Some(cache) = self.managed_cache {
+            let _ = cache.close().await;
+        }
         Ok(())
     }
 
@@ -798,7 +826,30 @@ impl VectorDb {
     }
 
     pub async fn snapshot(&self) -> Box<dyn VectorDbRead> {
-        Box::new(VectorDbReader::new(self.query_engine())) as Box<dyn VectorDbRead>
+        Box::new(VectorDbSnapshotReader {
+            engine: self.query_engine(),
+        }) as Box<dyn VectorDbRead>
+    }
+}
+
+/// Snapshot-bound [`VectorDbRead`] adapter backed by a
+/// [`QueryEngine<DbSnapshot>`]. Created by [`VectorDb::snapshot`].
+struct VectorDbSnapshotReader {
+    engine: QueryEngine<DbSnapshot>,
+}
+
+#[async_trait]
+impl VectorDbRead for VectorDbSnapshotReader {
+    async fn search_with_options(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        self.engine.search_with_options(query, options).await
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<Vector>> {
+        self.engine.get(id).await
     }
 }
 
@@ -829,8 +880,18 @@ mod tests {
     use crate::serde::vector_data::VectorDataValue;
     use crate::serde::vector_id::VectorId;
     use common::StorageConfig;
+    use common::storage::config::ObjectStoreConfig;
     use opendata_macros::storage_test;
     use std::time::Duration;
+
+    fn in_memory_storage_config() -> StorageConfig {
+        StorageConfig {
+            path: "test".into(),
+            object_store: ObjectStoreConfig::InMemory,
+            settings_path: None,
+            block_cache: None,
+        }
+    }
 
     fn create_test_config() -> Config {
         create_test_config_with_metric(DistanceMetric::L2)
@@ -838,7 +899,7 @@ mod tests {
 
     fn create_test_config_with_metric(metric: DistanceMetric) -> Config {
         Config {
-            storage: StorageConfig::InMemory,
+            storage: in_memory_storage_config(),
             dimensions: 3,
             distance_metric: metric,
             flush_interval: Duration::from_secs(60),
@@ -875,11 +936,11 @@ mod tests {
     }
 
     #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
-    async fn should_write_and_flush_vectors(storage: Arc<dyn Storage>) {
+    async fn should_write_and_flush_vectors(storage: Arc<Db>) {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), None, config, centroids)
             .await
             .unwrap();
 
@@ -902,25 +963,25 @@ mod tests {
         // Check VectorData records (now contain external_id, vector, and metadata)
         // Vector IDs are allocated independently from centroid IDs.
         let vec1_data_key = VectorDataKey::new(data_id(0)).encode();
-        let vec1_data = storage.get(vec1_data_key).await.unwrap();
+        let vec1_data = storage.get(&vec1_data_key).await.unwrap();
         assert!(vec1_data.is_some());
 
         let vec2_data_key = VectorDataKey::new(data_id(1)).encode();
-        let vec2_data = storage.get(vec2_data_key).await.unwrap();
+        let vec2_data = storage.get(&vec2_data_key).await.unwrap();
         assert!(vec2_data.is_some());
 
         // Check IdDictionary
         let dict_key1 = IdDictionaryKey::new("vec-1").encode();
-        let dict_entry1 = storage.get(dict_key1).await.unwrap();
+        let dict_entry1 = storage.get(&dict_key1).await.unwrap();
         assert!(dict_entry1.is_some());
     }
 
     #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
-    async fn should_upsert_existing_vector(storage: Arc<dyn Storage>) {
+    async fn should_upsert_existing_vector(storage: Arc<Db>) {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), None, config, centroids)
             .await
             .unwrap();
 
@@ -944,14 +1005,14 @@ mod tests {
         // Vector IDs are allocated independently from centroid IDs, so the first write
         // gets ID 0 and the upsert gets ID 1.
         let vec_data_key = VectorDataKey::new(data_id(1)).encode(); // New internal ID
-        let vec_data = storage.get(vec_data_key).await.unwrap();
+        let vec_data = storage.get(&vec_data_key).await.unwrap();
         assert!(vec_data.is_some());
-        let decoded = VectorDataValue::decode_from_bytes(&vec_data.unwrap().value, 3).unwrap();
+        let decoded = VectorDataValue::decode_from_bytes(&vec_data.unwrap(), 3).unwrap();
         assert_eq!(decoded.vector_field(), &[2.0, 3.0, 4.0]);
 
         // Verify only one IdDictionary entry
         let dict_key = IdDictionaryKey::new("vec-1").encode();
-        let dict_entry = storage.get(dict_key).await.unwrap();
+        let dict_entry = storage.get(&dict_key).await.unwrap();
         assert!(dict_entry.is_some());
     }
 
@@ -990,16 +1051,20 @@ mod tests {
     }
 
     #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
-    async fn should_load_dictionary_on_reopen(storage: Arc<dyn Storage>) {
+    async fn should_load_dictionary_on_reopen(storage: Arc<Db>) {
         // given - create database and write vectors
         let config = create_test_config();
         let centroids = create_test_centroids(3);
 
         {
-            let db =
-                VectorDb::load_or_init_db(Arc::clone(&storage), config.clone(), centroids.clone())
-                    .await
-                    .unwrap();
+            let db = VectorDb::load_or_init_db(
+                Arc::clone(&storage),
+                None,
+                config.clone(),
+                centroids.clone(),
+            )
+            .await
+            .unwrap();
             let vectors = vec![
                 Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
                     .attribute("category", "shoes")
@@ -1015,7 +1080,7 @@ mod tests {
         }
 
         // when - reopen database (centroids should be loaded from storage)
-        let db2 = VectorDb::load_or_init_db(Arc::clone(&storage), config, vec![])
+        let db2 = VectorDb::load_or_init_db(Arc::clone(&storage), None, config, vec![])
             .await
             .unwrap();
 
@@ -1029,19 +1094,17 @@ mod tests {
 
     #[tokio::test]
     async fn flush_should_be_durable_across_reopen() {
-        use common::storage::config::{
-            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-        };
+        use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage_config = StorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
             block_cache: None,
-        });
+        };
 
         let config = Config {
             storage: storage_config.clone(),
@@ -1076,19 +1139,17 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::needless_return)]
     async fn close_without_explicit_flush_guarantees_durability() {
-        use common::storage::config::{
-            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-        };
+        use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage_config = StorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
             block_cache: None,
-        });
+        };
 
         let config = Config {
             storage: storage_config.clone(),

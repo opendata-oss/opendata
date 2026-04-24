@@ -2,11 +2,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use common::StorageError;
 use common::coordinator::Flusher;
-use common::storage::{Storage, StorageSnapshot};
+use slatedb::{Db, DbSnapshot, WriteBatch};
 
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
-use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
+use crate::storage::{
+    bucket_list_contains, insert_forward_index_kv, insert_series_id_kv, merge_bucket_list_kv,
+    merge_inverted_index_kv, merge_samples_kv,
+};
 use crate::tsdb_metrics;
 
 /// Flusher implementation for the timeseries write coordinator.
@@ -14,7 +18,7 @@ use crate::tsdb_metrics;
 /// Converts a `FrozenTsdbDelta` into storage operations and applies them
 /// atomically, then returns a new snapshot for readers.
 pub(crate) struct TsdbFlusher {
-    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) db: Arc<Db>,
 }
 
 #[async_trait]
@@ -23,71 +27,64 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         &mut self,
         frozen: FrozenTsdbDelta,
         _epoch_range: &Range<u64>,
-    ) -> Result<Arc<dyn StorageSnapshot>, String> {
+    ) -> Result<Arc<DbSnapshot>, String> {
         if frozen.is_empty() {
-            return self.storage.snapshot().await.map_err(|e| e.to_string());
+            return self.db.snapshot().await.map_err(|e| e.to_string());
         }
 
         let new_series_count = frozen.series_dict_delta.len() as u64;
         let start = std::time::Instant::now();
 
-        let mut ops = Vec::new();
+        let mut batch = WriteBatch::new();
         // Suppress the BucketList merge when this bucket is already listed.
         // Without this check, every flush emits an identical single-element
         // merge operand on a singleton hot key that only coalesces at major
         // compaction. `merge_batch_bucket_list` still dedupes, so concurrent
         // first-sightings from two flushers are safe.
-        let bucket_announced = self
-            .storage
-            .bucket_list_contains(frozen.bucket)
+        let bucket_announced = bucket_list_contains(self.db.as_ref(), frozen.bucket)
             .await
             .map_err(|e| e.to_string())?;
         if !bucket_announced {
-            ops.push(
-                self.storage
-                    .merge_bucket_list(frozen.bucket)
-                    .map_err(|e| e.to_string())?,
-            );
+            let kv = merge_bucket_list_kv(frozen.bucket).map_err(|e| e.to_string())?;
+            batch.merge(kv.key, kv.value);
         }
 
         for (fingerprint, series_id) in &frozen.series_dict_delta {
-            ops.push(
-                self.storage
-                    .insert_series_id(frozen.bucket, *fingerprint, *series_id)
-                    .map_err(|e| e.to_string())?,
-            );
+            let kv = insert_series_id_kv(frozen.bucket, *fingerprint, *series_id)
+                .map_err(|e| e.to_string())?;
+            batch.put(kv.key, kv.value);
         }
 
         for entry in frozen.forward_index.series.iter() {
-            ops.push(
-                self.storage
-                    .insert_forward_index(frozen.bucket, *entry.key(), entry.value().clone())
-                    .map_err(|e| e.to_string())?,
-            );
+            let kv = insert_forward_index_kv(frozen.bucket, *entry.key(), entry.value().clone())
+                .map_err(|e| e.to_string())?;
+            batch.put(kv.key, kv.value);
         }
 
         for entry in frozen.inverted_index.postings.iter() {
-            ops.push(
-                self.storage
-                    .merge_inverted_index(frozen.bucket, entry.key().clone(), entry.value().clone())
-                    .map_err(|e| e.to_string())?,
-            );
+            let kv =
+                merge_inverted_index_kv(frozen.bucket, entry.key().clone(), entry.value().clone())
+                    .map_err(|e| e.to_string())?;
+            batch.merge(kv.key, kv.value);
         }
 
         for (series_id, series_samples) in frozen.samples {
-            ops.push(
-                self.storage
-                    .merge_samples(
-                        frozen.bucket,
-                        series_id,
-                        &series_samples.metric_name,
-                        series_samples.points,
-                    )
-                    .map_err(|e| e.to_string())?,
-            );
+            let kv = merge_samples_kv(
+                frozen.bucket,
+                series_id,
+                &series_samples.metric_name,
+                series_samples.points,
+            )
+            .map_err(|e| e.to_string())?;
+            batch.merge(kv.key, kv.value);
         }
 
-        let result = self.storage.apply(ops).await.map_err(|e| e.to_string());
+        let result = self
+            .db
+            .write(batch)
+            .await
+            .map_err(StorageError::from_storage)
+            .map_err(|e| e.to_string());
         let elapsed = start.elapsed().as_secs_f64();
 
         match &result {
@@ -104,11 +101,11 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_DURATION_SECONDS).record(elapsed);
 
         result?;
-        self.storage.snapshot().await.map_err(|e| e.to_string())
+        self.db.snapshot().await.map_err(|e| e.to_string())
     }
 
     async fn flush_storage(&self) -> Result<(), String> {
-        self.storage.flush().await.map_err(|e| e.to_string())
+        self.db.flush().await.map_err(|e| e.to_string())
     }
 }
 
@@ -119,17 +116,23 @@ mod tests {
     use crate::model::{Label, MetricType, Sample, Series, TimeBucket};
     use crate::serde::bucket_list::BucketListValue;
     use crate::serde::key::BucketListKey;
-    use crate::storage::OpenTsdbStorageReadExt;
+    use crate::storage::get_buckets_in_range;
+    use crate::storage::load_series_dictionary;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use common::Record;
     use common::coordinator::Delta;
-    use common::storage::in_memory::InMemoryStorage;
+    use common::storage::testing::FailingObjectStore;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
     use std::collections::HashMap;
 
-    fn create_test_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
+    async fn create_test_db() -> Arc<Db> {
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("test", object_store)
+            .with_merge_operator(Arc::new(OpenTsdbMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        Arc::new(db)
     }
 
     fn create_test_bucket() -> TimeBucket {
@@ -153,10 +156,8 @@ mod tests {
     #[tokio::test]
     async fn should_flush_delta_to_storage() {
         // given
-        let storage = create_test_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let db = create_test_db().await;
+        let mut flusher = TsdbFlusher { db: db.clone() };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
@@ -172,7 +173,9 @@ mod tests {
         let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = get_buckets_in_range(snapshot.as_ref(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0], create_test_bucket());
     }
@@ -180,10 +183,8 @@ mod tests {
     #[tokio::test]
     async fn should_skip_empty_delta() {
         // given
-        let storage = create_test_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let db = create_test_db().await;
+        let mut flusher = TsdbFlusher { db: db.clone() };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
@@ -198,13 +199,23 @@ mod tests {
         // then
         assert!(result.is_ok());
         let snapshot = result.unwrap();
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = get_buckets_in_range(snapshot.as_ref(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets.len(), 0);
     }
 
-    fn create_failing_storage() -> Arc<common::storage::in_memory::FailingStorage> {
-        let inner = create_test_storage();
-        common::storage::in_memory::FailingStorage::wrap(inner)
+    async fn create_failing_db() -> (Arc<Db>, Arc<FailingObjectStore>) {
+        let inner: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let failing = FailingObjectStore::new(inner);
+        let db = common::StorageBuilder::from_object_store("test", failing.clone())
+            .await
+            .unwrap()
+            .with_merge_operator(Arc::new(OpenTsdbMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        (db.db, failing)
     }
 
     fn create_non_empty_frozen() -> FrozenTsdbDelta {
@@ -224,75 +235,93 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_apply_error() {
         // given
-        let storage = create_failing_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
-        storage.fail_apply(common::StorageError::Storage("test apply error".into()));
+        let (db, failing) = create_failing_db().await;
+        let mut flusher = TsdbFlusher { db: db.clone() };
+        // Inject a non-retryable Precondition; slatedb would retry any other
+        // object_store::Error forever.
+        failing.set_fail_put(true);
 
         // when
-        let result = flusher
-            .flush_delta(create_non_empty_frozen(), &(1..2))
-            .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            flusher.flush_delta(create_non_empty_frozen(), &(1..2)),
+        )
+        .await
+        .expect("flush_delta hung past 5s; retry barrier is broken");
 
         // then
-        let err = result.err().expect("expected apply error");
-        assert!(
-            err.contains("test apply error"),
-            "expected test apply error message, got: {err}"
-        );
+        assert!(result.is_err(), "expected flush to fail with fail_put set");
     }
 
+    /// `db.snapshot()` fails with `SlateDBError::Closed` after the db is
+    /// closed. `flush_delta` with an empty frozen delta takes the
+    /// snapshot-only shortcut, so closing the db before the call isolates
+    /// the failure to the snapshot step.
     #[tokio::test]
-    async fn should_propagate_snapshot_error_after_apply() {
+    async fn should_propagate_snapshot_error() {
         // given
-        let storage = create_failing_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
-        // Apply succeeds, but snapshot after apply fails
-        storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
+        let db = create_test_db().await;
+        let mut flusher = TsdbFlusher { db: db.clone() };
+        // Close the db so the next db.snapshot() returns Closed
+        db.close().await.unwrap();
 
-        // when
-        let result = flusher
-            .flush_delta(create_non_empty_frozen(), &(1..2))
-            .await;
+        // when — empty delta means flush_delta jumps straight to snapshot()
+        let ctx = TsdbContext {
+            bucket: create_test_bucket(),
+            series_dict: Arc::new(HashMap::new()),
+            next_series_id: 0,
+        };
+        let delta = TsdbWriteDelta::init(ctx);
+        let (frozen, _, _) = delta.freeze();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            flusher.flush_delta(frozen, &(1..2)),
+        )
+        .await
+        .expect("flush_delta hung past 5s");
 
         // then
-        let err = result.err().expect("expected snapshot error");
         assert!(
-            err.contains("test snapshot error"),
-            "expected test snapshot error message, got: {err}"
+            result.is_err(),
+            "expected snapshot error after db.close(), got Ok"
         );
     }
 
     #[tokio::test]
     async fn should_propagate_flush_storage_error() {
-        // given
-        let storage = create_failing_storage();
-        let flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
-        storage.fail_flush(common::StorageError::Storage("test flush error".into()));
+        use slatedb::config::WriteOptions;
+        // given — write something non-durably so it stays in memtable; then
+        // enable put failures so the subsequent flush_storage (which drains the
+        // memtable through object-store puts) actually surfaces an error.
+        let (db, failing) = create_failing_db().await;
+        let flusher = TsdbFlusher { db: db.clone() };
+        let mut batch = WriteBatch::new();
+        batch.put(b"__probe", b"v");
+        db.write_with_options(
+            batch,
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+        failing.set_fail_put(true);
 
         // when
-        let result = flusher.flush_storage().await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), flusher.flush_storage())
+                .await
+                .expect("flush_storage hung past 5s; retry barrier is broken");
 
         // then
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("test flush error"),
-            "expected test flush error message"
-        );
+        assert!(result.is_err(), "expected flush_storage to fail");
     }
 
     #[tokio::test]
     async fn should_register_bucket_on_first_flush() {
         // given
-        let storage = create_test_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let db = create_test_db().await;
+        let mut flusher = TsdbFlusher { db: db.clone() };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
@@ -312,17 +341,17 @@ mod tests {
         let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = get_buckets_in_range(snapshot.as_ref(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets, vec![create_test_bucket()]);
     }
 
     #[tokio::test]
     async fn should_not_duplicate_bucket_across_multiple_flushes() {
         // given: two back-to-back flushes for the same bucket
-        let storage = create_test_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let db = create_test_db().await;
+        let mut flusher = TsdbFlusher { db: db.clone() };
         let bucket = create_test_bucket();
 
         for (i, name) in ["metric_a", "metric_b"].iter().enumerate() {
@@ -349,31 +378,27 @@ mod tests {
         }
 
         // then: bucket appears exactly once
-        let snapshot = storage.snapshot().await.unwrap();
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let snapshot = db.snapshot().await.unwrap();
+        let buckets = get_buckets_in_range(snapshot.as_ref(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets, vec![bucket]);
     }
 
     #[tokio::test]
     async fn should_skip_bucket_list_merge_when_bucket_already_present() {
         // given: storage pre-populated with the bucket in the BucketList
-        let storage = create_test_storage();
+        let db = create_test_db().await;
         let bucket = create_test_bucket();
         let pre_existing = BucketListValue {
             buckets: vec![(bucket.size, bucket.start)],
         }
         .encode();
-        storage
-            .put(vec![common::storage::PutRecordOp::new(Record {
-                key: BucketListKey.encode(),
-                value: pre_existing,
-            })])
+        db.put(&BucketListKey.encode(), &pre_existing)
             .await
             .unwrap();
 
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let mut flusher = TsdbFlusher { db: db.clone() };
         let ctx = TsdbContext {
             bucket,
             series_dict: Arc::new(HashMap::new()),
@@ -393,17 +418,17 @@ mod tests {
         let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
 
         // then: list still has exactly one entry for this bucket
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
+        let buckets = get_buckets_in_range(snapshot.as_ref(), None, None)
+            .await
+            .unwrap();
         assert_eq!(buckets, vec![bucket]);
     }
 
     #[tokio::test]
     async fn should_persist_series_dict_entries() {
         // given
-        let storage = create_test_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-        };
+        let db = create_test_db().await;
+        let mut flusher = TsdbFlusher { db: db.clone() };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
@@ -428,8 +453,8 @@ mod tests {
         // then: verify series dictionary was persisted
         let bucket = create_test_bucket();
         let mut count = 0;
-        let _max_id = snapshot
-            .load_series_dictionary(&bucket, |_fingerprint, _series_id| {
+        let _max_id =
+            load_series_dictionary(snapshot.as_ref(), &bucket, |_fingerprint, _series_id| {
                 count += 1;
             })
             .await

@@ -40,7 +40,7 @@ impl Default for VectorServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::StorageConfig;
+    use common::storage::config::ObjectStoreConfig;
 
     #[test]
     fn should_load_vector_config_from_yaml() {
@@ -51,7 +51,9 @@ mod tests {
             &config_path,
             r#"
 storage:
-  type: InMemory
+  path: data
+  object_store:
+    type: InMemory
 dimensions: 384
 distance_metric: L2
 flush_interval: 60
@@ -71,7 +73,10 @@ metadata_fields: []
         let config = load_vector_config(config_path.to_str().unwrap());
 
         // then
-        assert!(matches!(config.storage, StorageConfig::InMemory));
+        assert!(matches!(
+            config.storage.object_store,
+            ObjectStoreConfig::InMemory
+        ));
         assert_eq!(config.dimensions, 384);
     }
 
@@ -84,7 +89,9 @@ metadata_fields: []
             &config_path,
             r#"
 storage:
-  type: InMemory
+  path: data
+  object_store:
+    type: InMemory
 dimensions: 2
 distance_metric: L2
 metadata_fields:
@@ -99,7 +106,10 @@ metadata_fields:
         let config = load_vector_config(config_path.to_str().unwrap());
 
         // then
-        assert!(matches!(config.storage, StorageConfig::InMemory));
+        assert!(matches!(
+            config.storage.object_store,
+            ObjectStoreConfig::InMemory
+        ));
         assert_eq!(config.dimensions, 2);
         assert_eq!(config.flush_interval, std::time::Duration::from_secs(60));
         assert_eq!(config.split_threshold_vectors, 2_000);
@@ -116,7 +126,9 @@ metadata_fields:
             &config_path,
             r#"
 storage:
-  type: InMemory
+  path: data
+  object_store:
+    type: InMemory
 dimensions: 384
 distance_metric: L2
 metadata_fields: []
@@ -128,7 +140,10 @@ metadata_fields: []
         let config = load_reader_config(config_path.to_str().unwrap());
 
         // then
-        assert!(matches!(config.storage, StorageConfig::InMemory));
+        assert!(matches!(
+            config.storage.object_store,
+            ObjectStoreConfig::InMemory
+        ));
         assert_eq!(config.dimensions, 384);
     }
 }

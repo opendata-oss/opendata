@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use slatedb::DbRead;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{StorageError, StorageRead, StorageResult};
+use crate::{StorageError, StorageResult};
 
 /// Trait for types that can be loaded from storage.
 ///
@@ -13,7 +14,9 @@ use crate::{StorageError, StorageRead, StorageResult};
 #[async_trait]
 pub trait Loadable<S>: Sized + Send + Sync {
     /// Load an instance from storage for the given scope.
-    async fn load(storage: &dyn StorageRead, scope: &S) -> StorageResult<Self>;
+    async fn load<R>(storage: &R, scope: &S) -> StorageResult<Self>
+    where
+        R: DbRead + Send + Sync;
 }
 
 /// Synchronization metadata for coordinating with the ingest side.
@@ -39,9 +42,9 @@ pub struct LoadResult<T> {
 /// the storage snapshot to load from and optional synchronization metadata.
 ///
 /// The generic parameter `T` specifies which type to load (e.g., IngestTsdb or QueryTsdb).
-pub struct LoadSpec<T: Loadable<S>, S> {
+pub struct LoadSpec<T: Loadable<S>, S, R: DbRead + Send + Sync> {
     /// The storage snapshot to load from (could be current storage or a point-in-time snapshot)
-    pub storage: Arc<dyn StorageRead>,
+    pub storage: Arc<R>,
     /// Optional synchronization metadata from the ingest side
     /// If present, the loader will return these values in the LoadResult
     pub metadata: Option<LoadMetadata>,
@@ -82,9 +85,9 @@ impl Loader {
     /// generated and sequence_number will be set to 0.
     ///
     /// Returns a LoadResult containing the loaded data and synchronization metadata.
-    pub async fn load<T: Loadable<S>, S>(
+    pub async fn load<T: Loadable<S>, S, R: DbRead + Send + Sync>(
         &self,
-        spec: LoadSpec<T, S>,
+        spec: LoadSpec<T, S, R>,
         scope: &S,
     ) -> StorageResult<LoadResult<T>> {
         // Acquire permit (blocks if at capacity)

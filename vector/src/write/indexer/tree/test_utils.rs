@@ -6,13 +6,14 @@ use crate::serde::key::{CentroidSeqBlockKey, SeqBlockKey};
 use crate::serde::vector_data::Field;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::storage::record::build_write_batch;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::tree::centroids::AllCentroidsCacheWriter;
 use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState};
 use crate::write::indexer::tree::{IndexerOpts, validator, vector::WriteVectors};
-use common::storage::in_memory::InMemoryStorage;
-use common::{SequenceAllocator, Storage, StorageRead};
+use common::SequenceAllocator;
+use slatedb::{Db, DbBuilder, DbSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -125,9 +126,15 @@ impl IndexerOpTestHarnessBuilder {
             }
         }
 
-        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            VectorDbMergeOperator::new(dimensions),
-        )));
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let storage: Arc<Db> = Arc::new(
+            DbBuilder::new("test", object_store)
+                .with_merge_operator(Arc::new(VectorDbMergeOperator::new(dimensions)))
+                .build()
+                .await
+                .unwrap(),
+        );
 
         let seq_key = SeqBlockKey.encode();
         let vector_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
@@ -241,7 +248,8 @@ impl IndexerOpTestHarnessBuilder {
         }
 
         let ops = delta.freeze(SNAPSHOT_EPOCH, &mut state);
-        storage.apply(ops).await.unwrap();
+        let batch = build_write_batch(ops);
+        storage.write(batch).await.unwrap();
 
         let harness = IndexerOpTestHarness {
             storage,
@@ -280,20 +288,21 @@ impl IndexerOpTestHarnessBuilder {
 }
 
 pub struct IndexerOpTestHarness {
-    pub storage: Arc<dyn Storage>,
+    pub storage: Arc<Db>,
     pub state: VectorIndexState,
     dimensions: usize,
     vector_schema: Vec<MetadataFieldSpec>,
 }
 
 impl IndexerOpTestHarness {
-    pub async fn snapshot(&self) -> Arc<dyn StorageRead> {
+    pub async fn snapshot(&self) -> Arc<DbSnapshot> {
         self.storage.snapshot().await.unwrap()
     }
 
     pub async fn apply_delta(&mut self, delta: VectorIndexDelta) {
         let ops = delta.freeze(SNAPSHOT_EPOCH, &mut self.state);
-        self.storage.apply(ops).await.unwrap();
+        let batch = build_write_batch(ops);
+        self.storage.write(batch).await.unwrap();
         self.validate().await;
     }
 

@@ -36,7 +36,6 @@ scrape_configs:
 
 # Storage configuration
 storage:
-  type: SlateDb
   path: data
   object_store:
     type: Local

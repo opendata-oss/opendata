@@ -14,11 +14,8 @@ pub use storage::config::{
     BlockCacheConfig, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
 };
 pub use storage::factory::{
-    CompactorBuilder, DbBuilder, StorageBuilder, StorageReaderRuntime, StorageSemantics,
-    create_object_store, create_storage_read,
+    BuiltDb, BuiltDbReader, CompactorBuilder, DbBuilder, StorageBuilder, StorageReaderRuntime,
+    create_object_store, create_storage_read, default_scan_options,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
-pub use storage::{
-    MergeRecordOp, PutRecordOp, Record, Storage, StorageError, StorageIterator, StorageRead,
-    StorageResult, Ttl, WriteOptions, WriteResult,
-};
+pub use storage::{StorageError, StorageResult};

@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [features]
 default = []
 test-utils = ["dep:arc-swap"]
+testing = []
 
 [dependencies]
 slatedb.workspace = true

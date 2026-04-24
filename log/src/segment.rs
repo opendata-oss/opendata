@@ -16,8 +16,8 @@ use crate::model::Segment;
 use crate::model::SegmentId;
 use crate::serde::{SegmentMeta, SegmentMetaKey};
 use crate::storage::LogStorageRead as _;
-use common::storage::PutOptions;
-use common::{PutRecordOp, Record, StorageRead, Ttl};
+use slatedb::DbRead;
+use slatedb::WriteBatch;
 
 /// A logical segment of the log.
 ///
@@ -83,7 +83,10 @@ pub(crate) struct SegmentCache {
 
 impl SegmentCache {
     /// Creates a new cache by loading all segments from storage.
-    pub(crate) async fn open(storage: &dyn StorageRead, config: SegmentConfig) -> Result<Self> {
+    pub(crate) async fn open<R: DbRead + Send + Sync + ?Sized>(
+        storage: &R,
+        config: SegmentConfig,
+    ) -> Result<Self> {
         let loaded = storage.scan_segments(0..u32::MAX).await?;
 
         let mut segments = BTreeMap::new();
@@ -148,9 +151,9 @@ impl SegmentCache {
     ///
     /// If `after_segment_id` is `Some(id)`, only loads segments with id > `id` and appends them.
     /// If `after_segment_id` is `None`, reloads all segments.
-    pub(crate) async fn refresh(
+    pub(crate) async fn refresh<R: DbRead + Send + Sync + ?Sized>(
         &mut self,
-        storage: &dyn StorageRead,
+        storage: &R,
         after_segment_id: Option<SegmentId>,
     ) -> Result<()> {
         let loaded = match after_segment_id {
@@ -177,12 +180,12 @@ impl SegmentCache {
     ///
     /// Determines whether to use an existing segment or create a new one based on
     /// the seal interval and `force_seal`. If a new segment is created, its metadata
-    /// record is appended to `records` and the cache is updated.
+    /// record is appended to the `batch` and the cache is updated.
     pub(crate) fn assign_segment(
         &mut self,
         current_time_ms: i64,
         start_seq: u64,
-        records: &mut Vec<PutRecordOp>,
+        batch: &mut WriteBatch,
         force_seal: bool,
     ) -> SegmentAssignment {
         let latest = self.latest();
@@ -194,10 +197,7 @@ impl SegmentCache {
             let meta = SegmentMeta::new(start_seq, current_time_ms);
             let key = SegmentMetaKey::new(segment_id).serialize();
             let value = meta.serialize();
-            records.push(PutRecordOp::new_with_options(
-                Record::new(key, value),
-                PutOptions { ttl: Ttl::NoExpiry },
-            ));
+            batch.put(key, value);
 
             let segment = LogSegment::new(segment_id, meta);
             self.insert(segment.clone());
@@ -239,13 +239,12 @@ impl SegmentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::LogStorageWrite;
-    use common::Storage;
+    use crate::storage::write_segment as storage_write_segment;
     use opendata_macros::storage_test;
 
     // Helper to create a segment and write it to storage + cache
     async fn write_segment(
-        storage: &dyn common::Storage,
+        storage: &slatedb::Db,
         cache: &mut SegmentCache,
         meta: SegmentMeta,
     ) -> LogSegment {
@@ -254,13 +253,13 @@ mod tests {
             None => 0,
         };
         let segment = LogSegment::new(segment_id, meta);
-        storage.write_segment(&segment).await.unwrap();
+        storage_write_segment(storage, &segment).await.unwrap();
         cache.insert(segment.clone());
         segment
     }
 
     #[storage_test]
-    async fn should_return_none_when_no_segments_exist(storage: Arc<dyn Storage>) {
+    async fn should_return_none_when_no_segments_exist(storage: Arc<slatedb::Db>) {
         // given
         let cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -274,7 +273,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_write_first_segment_with_id_zero(storage: Arc<dyn Storage>) {
+    async fn should_write_first_segment_with_id_zero(storage: Arc<slatedb::Db>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -290,7 +289,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_increment_segment_id_on_subsequent_writes(storage: Arc<dyn Storage>) {
+    async fn should_increment_segment_id_on_subsequent_writes(storage: Arc<slatedb::Db>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -308,7 +307,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_return_latest_segment(storage: Arc<dyn Storage>) {
+    async fn should_return_latest_segment(storage: Arc<slatedb::Db>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -324,7 +323,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_scan_all_segments(storage: Arc<dyn Storage>) {
+    async fn should_scan_all_segments(storage: Arc<slatedb::Db>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -344,7 +343,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_persist_segments_to_storage(storage: Arc<dyn Storage>) {
+    async fn should_persist_segments_to_storage(storage: Arc<slatedb::Db>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -367,7 +366,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_segments_by_seq_range_all(storage: Arc<dyn Storage>) {
+    async fn should_find_segments_by_seq_range_all(storage: Arc<slatedb::Db>) {
         // given: segments at seq 0, 100, 200
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -384,7 +383,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_segments_by_seq_range_single(storage: Arc<dyn Storage>) {
+    async fn should_find_segments_by_seq_range_single(storage: Arc<slatedb::Db>) {
         // given: segments at seq 0, 100, 200
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -402,7 +401,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_segments_by_seq_range_spanning(storage: Arc<dyn Storage>) {
+    async fn should_find_segments_by_seq_range_spanning(storage: Arc<slatedb::Db>) {
         // given: segments at seq 0, 100, 200
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -421,7 +420,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_segments_by_seq_range_unbounded_end(storage: Arc<dyn Storage>) {
+    async fn should_find_segments_by_seq_range_unbounded_end(storage: Arc<slatedb::Db>) {
         // given: segments at seq 0, 100, 200
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -440,7 +439,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_no_segments_when_range_before_all(storage: Arc<dyn Storage>) {
+    async fn should_find_no_segments_when_range_before_all(storage: Arc<slatedb::Db>) {
         // given: segments starting at seq 100
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -455,7 +454,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_no_segments_when_storage_empty(storage: Arc<dyn Storage>) {
+    async fn should_find_no_segments_when_storage_empty(storage: Arc<slatedb::Db>) {
         // given: no segments
         let cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -469,7 +468,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_last_segment_when_range_after_all(storage: Arc<dyn Storage>) {
+    async fn should_find_last_segment_when_range_after_all(storage: Arc<slatedb::Db>) {
         // given: segments at seq 0, 100, 200
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -487,7 +486,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_segment_when_query_starts_at_boundary(storage: Arc<dyn Storage>) {
+    async fn should_find_segment_when_query_starts_at_boundary(storage: Arc<slatedb::Db>) {
         // given: segments at seq 0, 100, 200
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -505,7 +504,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_find_segments_with_unbounded_start(storage: Arc<dyn Storage>) {
+    async fn should_find_segments_with_unbounded_start(storage: Arc<slatedb::Db>) {
         // given: segments at seq 0, 100, 200
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -599,29 +598,34 @@ mod tests {
     }
 
     #[storage_test]
-    async fn assign_segment_creates_first_segment_when_none_exist(storage: Arc<dyn Storage>) {
+    async fn assign_segment_creates_first_segment_when_none_exist(storage: Arc<slatedb::Db>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        let mut records = Vec::new();
+        let mut batch = WriteBatch::new();
 
         // when
-        let assignment = cache.assign_segment(1000, 0, &mut records, false);
+        let assignment = cache.assign_segment(1000, 0, &mut batch, false);
 
         // then
         assert!(assignment.is_new);
         assert_eq!(assignment.segment.id(), 0);
         assert_eq!(assignment.segment.meta().start_seq, 0);
         assert_eq!(assignment.segment.meta().start_time_ms, 1000);
-        assert_eq!(records.len(), 1); // segment meta record added
         // cache is updated
         assert_eq!(cache.latest().unwrap().id(), 0);
+
+        // persist batch and verify storage has the segment
+        storage.write(batch).await.unwrap();
+        let stored = storage.scan_segments(0..u32::MAX).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id(), 0);
     }
 
     #[storage_test]
     async fn assign_segment_returns_existing_segment_when_within_interval(
-        storage: Arc<dyn Storage>,
+        storage: Arc<slatedb::Db>,
     ) {
         // given: segment exists, within seal interval
         let config = SegmentConfig {
@@ -629,55 +633,58 @@ mod tests {
         };
         let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
-        let mut records = Vec::new();
+        let mut batch = WriteBatch::new();
 
         // when: request 30 minutes later
         let current_time_ms = 1000 + 30 * 60 * 1000;
-        let assignment = cache.assign_segment(current_time_ms, 100, &mut records, false);
+        let assignment = cache.assign_segment(current_time_ms, 100, &mut batch, false);
 
-        // then: returns existing segment, no new record
+        // then: returns existing segment, cache unchanged
         assert!(!assignment.is_new);
         assert_eq!(assignment.segment.id(), 0);
-        assert_eq!(records.len(), 0);
         // still only one segment in cache
         assert_eq!(cache.all().len(), 1);
     }
 
     #[storage_test]
-    async fn assign_segment_creates_new_segment_when_interval_exceeded(storage: Arc<dyn Storage>) {
+    async fn assign_segment_creates_new_segment_when_interval_exceeded(storage: Arc<slatedb::Db>) {
         // given: segment at time 1000, seal interval 1 hour
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
         };
         let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
-        let mut records = Vec::new();
+        let mut batch = WriteBatch::new();
 
         // when: request 2 hours later
         let current_time_ms = 1000 + 2 * 60 * 60 * 1000;
-        let assignment = cache.assign_segment(current_time_ms, 100, &mut records, false);
+        let assignment = cache.assign_segment(current_time_ms, 100, &mut batch, false);
 
         // then: creates new segment and updates cache
         assert!(assignment.is_new);
         assert_eq!(assignment.segment.id(), 1);
         assert_eq!(assignment.segment.meta().start_seq, 100);
-        assert_eq!(records.len(), 1);
         assert_eq!(cache.all().len(), 2);
+
+        // persist batch and verify storage has the new segment
+        storage.write(batch).await.unwrap();
+        let stored = storage.scan_segments(0..u32::MAX).await.unwrap();
+        assert_eq!(stored.len(), 2);
     }
 
     #[storage_test]
-    async fn assign_segment_force_seal_creates_new_segment(storage: Arc<dyn Storage>) {
+    async fn assign_segment_force_seal_creates_new_segment(storage: Arc<slatedb::Db>) {
         // given: segment exists, within seal interval
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
         };
         let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
-        let mut records = Vec::new();
+        let mut batch = WriteBatch::new();
 
         // when: force_seal overrides interval check
         let current_time_ms = 1000 + 30 * 60 * 1000;
-        let assignment = cache.assign_segment(current_time_ms, 100, &mut records, true);
+        let assignment = cache.assign_segment(current_time_ms, 100, &mut batch, true);
 
         // then: new segment created despite being within interval
         assert!(assignment.is_new);
@@ -686,28 +693,27 @@ mod tests {
     }
 
     #[storage_test]
-    async fn assign_segment_creates_correct_segment_meta_record(storage: Arc<dyn Storage>) {
+    async fn assign_segment_creates_correct_segment_meta_record(storage: Arc<slatedb::Db>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        let mut records = Vec::new();
+        let mut batch = WriteBatch::new();
 
         // when
-        let assignment = cache.assign_segment(5000, 42, &mut records, false);
+        let assignment = cache.assign_segment(5000, 42, &mut batch, false);
 
-        // then: verify the record can be deserialized
-        assert_eq!(records.len(), 1);
-        let key = SegmentMetaKey::deserialize(&records[0].record.key).unwrap();
-        let meta = SegmentMeta::deserialize(&records[0].record.value).unwrap();
-        assert_eq!(key.segment_id, assignment.segment.id());
-        assert_eq!(meta.start_seq, 42);
-        assert_eq!(meta.start_time_ms, 5000);
-        assert_eq!(records[0].options, PutOptions { ttl: Ttl::NoExpiry })
+        // persist batch and verify records
+        storage.write(batch).await.unwrap();
+        let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].id(), assignment.segment.id());
+        assert_eq!(segments[0].meta().start_seq, 42);
+        assert_eq!(segments[0].meta().start_time_ms, 5000);
     }
 
     #[storage_test]
-    async fn refresh_with_none_reloads_all_segments(storage: Arc<dyn Storage>) {
+    async fn refresh_with_none_reloads_all_segments(storage: Arc<slatedb::Db>) {
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -729,7 +735,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn refresh_with_after_id_loads_only_newer_segments(storage: Arc<dyn Storage>) {
+    async fn refresh_with_after_id_loads_only_newer_segments(storage: Arc<slatedb::Db>) {
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -755,7 +761,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn refresh_with_after_id_is_noop_when_no_newer_segments(storage: Arc<dyn Storage>) {
+    async fn refresh_with_after_id_is_noop_when_no_newer_segments(storage: Arc<slatedb::Db>) {
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -768,7 +774,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn refresh_with_none_replaces_stale_entries(storage: Arc<dyn Storage>) {
+    async fn refresh_with_none_replaces_stale_entries(storage: Arc<slatedb::Db>) {
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -785,7 +791,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn refresh_with_after_id_preserves_existing_entries(storage: Arc<dyn Storage>) {
+    async fn refresh_with_after_id_preserves_existing_entries(storage: Arc<slatedb::Db>) {
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();

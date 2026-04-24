@@ -7,6 +7,7 @@
 use crate::DistanceMetric;
 use crate::Result;
 use crate::serde::vector_id::{LEAF_LEVEL, VectorId};
+use crate::storage::record::StorageOp;
 use crate::write::delta::VectorWrite;
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, CentroidCache, TreeDepth, TreeLevel,
@@ -16,10 +17,7 @@ use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
-use common::StorageRead;
-use common::storage::RecordOp;
-#[cfg(debug_assertions)]
-use common::storage::StorageSnapshot;
+use slatedb::DbSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -59,7 +57,7 @@ pub(crate) struct IndexerOpts {
 }
 
 pub(crate) struct IndexUpdateResults {
-    pub(crate) ops: Vec<RecordOp>,
+    pub(crate) ops: Vec<StorageOp>,
     pub(crate) centroid_cache: Arc<AllCentroidsCache>,
     pub(crate) leaf_centroids: usize,
     pub(crate) centroid_tree_depth: TreeDepth,
@@ -137,7 +135,7 @@ impl Indexer {
         &mut self,
         updates: Vec<VectorWrite>,
         update_epoch: u64,
-        snapshot: Arc<dyn StorageRead>,
+        snapshot: Arc<DbSnapshot>,
         snapshot_epoch: u64,
     ) -> Result<IndexUpdateResults> {
         let update_span = debug_span!(
@@ -315,7 +313,7 @@ impl Indexer {
     }
 
     #[cfg(debug_assertions)]
-    pub(crate) async fn validate(&self, snapshot: Arc<dyn StorageSnapshot>) {
+    pub(crate) async fn validate(&self, snapshot: Arc<DbSnapshot>) {
         validator::validate(snapshot, &self.state, self.opts.dimensions)
             .await
             .expect("validation failed");
@@ -323,7 +321,7 @@ impl Indexer {
 
     async fn reassign_vectors(
         &self,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
         delta: &mut VectorIndexDelta,
         reassigns: Vec<ReassignVector>,

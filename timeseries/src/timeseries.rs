@@ -8,7 +8,9 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use common::{StorageBuilder, StorageSemantics};
+use common::StorageBuilder;
+use common::storage::factory::{BuiltDb, OwnedHybridCache};
+use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::error::{QueryError, Result};
@@ -27,12 +29,12 @@ use crate::tsdb::{
 ///
 /// # Example
 ///
-/// ```
+/// ```no_run
 /// # use timeseries::{TimeSeriesDb, Config, Series};
 /// # use common::StorageConfig;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// let config = Config { storage: StorageConfig::default(), ..Default::default() };
 /// let ts = TimeSeriesDb::open(config).await?;
 ///
 /// let series = Series::builder("http_requests_total")
@@ -48,6 +50,10 @@ use crate::tsdb::{
 pub struct TimeSeriesDb {
     // Internal Tsdb - not exposed
     tsdb: Tsdb,
+    /// Managed block cache handle, retained for deterministic close after
+    /// the underlying `slatedb::Db` is closed. See [`BuiltDb`] for the
+    /// shutdown contract.
+    managed_cache: Mutex<Option<OwnedHybridCache>>,
 }
 
 impl TimeSeriesDb {
@@ -66,30 +72,38 @@ impl TimeSeriesDb {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```no_run
     /// # use timeseries::{TimeSeriesDb, Config};
     /// # use common::StorageConfig;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// let config = Config { storage: StorageConfig::default(), ..Default::default() };
     /// let ts = TimeSeriesDb::open(config).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = StorageBuilder::new(&config.storage)
-            .await?
-            .with_semantics(
-                StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-            )
+        let BuiltDb {
+            db,
+            managed_cache,
+            object_store: _,
+            path: _,
+        } = StorageBuilder::new(&config.storage)
+            .await
+            .map_err(|e| crate::error::Error::Storage(e.to_string()))?
+            .with_merge_operator(Arc::new(OpenTsdbMergeOperator))
             .build()
-            .await?;
+            .await
+            .map_err(|e| crate::error::Error::Storage(e.to_string()))?;
         // Flatten accumulated BucketList merge operands into a single Put so
         // later reads don't have to replay them across SSTs. Runs before any
         // writer is started, so no concurrent merges can race the Put.
-        coalesce_bucket_list(storage.as_ref()).await?;
-        let tsdb = Tsdb::new(storage);
-        Ok(Self { tsdb })
+        coalesce_bucket_list(&db).await?;
+        let tsdb = Tsdb::new(db);
+        Ok(Self {
+            tsdb,
+            managed_cache: Mutex::new(managed_cache),
+        })
     }
 
     /// Writes one or more time series.
@@ -122,7 +136,7 @@ impl TimeSeriesDb {
     /// # use common::StorageConfig;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let config = Config { storage: StorageConfig::default(), ..Default::default() };
     /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
@@ -160,7 +174,7 @@ impl TimeSeriesDb {
     /// # use std::time::Duration;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let config = Config { storage: StorageConfig::default(), ..Default::default() };
     /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
@@ -264,7 +278,13 @@ impl TimeSeriesDb {
     /// closed. For SlateDB-backed storage, this also releases the database
     /// fence.
     pub async fn close(self) -> Result<()> {
-        self.tsdb.close().await
+        self.tsdb.close().await?;
+        // Best-effort close of the managed block cache, ordered *after*
+        // the db close so no inserts race the flusher shutdown.
+        if let Some(cache) = self.managed_cache.lock().await.take() {
+            let _ = cache.close().await;
+        }
+        Ok(())
     }
 }
 
@@ -273,21 +293,19 @@ mod tests {
     use super::*;
     use crate::model::{Label, Sample, Series};
     use common::StorageConfig;
-    use common::storage::config::{
-        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-    };
+    use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
     #[tokio::test]
     async fn close_without_explicit_flush_guarantees_durability() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage = StorageConfig {
             path: "ts-data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
             block_cache: None,
-        });
+        };
 
         // Write a series and close without calling flush()
         {

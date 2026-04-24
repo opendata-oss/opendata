@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use slatedb::DbRead;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -22,8 +23,62 @@ use crate::model::{LogEntry, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::storage::{LogStorageRead as _, SegmentIterator};
+use common::StorageReaderRuntime;
 use common::storage::factory::create_storage_read;
-use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
+
+/// Internal wrapper over readable SlateDB handles.
+///
+/// `slatedb::DbRead` is not object-safe (its methods are generic over the
+/// key type). Log read code needs to operate polymorphically over
+/// `DbSnapshot` (written-view snapshots from `LogDb`) and `DbReader`
+/// (used by `LogDbReader`), so we introduce this enum and implement
+/// `DbRead` on it by delegation. This keeps `LogIterator`,
+/// `LogReadView`, etc. free of type parameters.
+#[derive(Clone)]
+pub(crate) enum ReadHandle {
+    Snapshot(Arc<slatedb::DbSnapshot>),
+    Reader(Arc<slatedb::DbReader>),
+}
+
+#[async_trait]
+impl DbRead for ReadHandle {
+    async fn get_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &slatedb::config::ReadOptions,
+    ) -> std::result::Result<Option<Bytes>, slatedb::Error> {
+        match self {
+            ReadHandle::Snapshot(s) => s.get_with_options(key, options).await,
+            ReadHandle::Reader(r) => r.get_with_options(key, options).await,
+        }
+    }
+
+    async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &slatedb::config::ReadOptions,
+    ) -> std::result::Result<Option<slatedb::KeyValue>, slatedb::Error> {
+        match self {
+            ReadHandle::Snapshot(s) => s.get_key_value_with_options(key, options).await,
+            ReadHandle::Reader(r) => r.get_key_value_with_options(key, options).await,
+        }
+    }
+
+    async fn scan_with_options<K, T>(
+        &self,
+        range: T,
+        options: &slatedb::config::ScanOptions,
+    ) -> std::result::Result<slatedb::DbIterator, slatedb::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        T: std::ops::RangeBounds<K> + Send,
+    {
+        match self {
+            ReadHandle::Snapshot(s) => s.scan_with_options(range, options).await,
+            ReadHandle::Reader(r) => r.scan_with_options(range, options).await,
+        }
+    }
+}
 
 /// Trait for read operations on the log.
 ///
@@ -168,9 +223,17 @@ pub trait LogRead {
     /// ```no_run
     /// # use log::{LogDb, LogRead, Config};
     /// # use common::StorageConfig;
+    /// # use common::storage::config::ObjectStoreConfig;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let config = Config {
+    /// #     storage: StorageConfig {
+    /// #         path: "demo".to_string(),
+    /// #         object_store: ObjectStoreConfig::InMemory,
+    /// #         ..Default::default()
+    /// #     },
+    /// #     ..Default::default()
+    /// # };
     /// # let log = LogDb::open(config).await?;
     /// // List all keys
     /// let mut iter = log.list_keys(..).await?;
@@ -209,9 +272,17 @@ pub trait LogRead {
     /// ```no_run
     /// # use log::{LogDb, LogRead, Config};
     /// # use common::StorageConfig;
+    /// # use common::storage::config::ObjectStoreConfig;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let config = Config {
+    /// #     storage: StorageConfig {
+    /// #         path: "demo".to_string(),
+    /// #         object_store: ObjectStoreConfig::InMemory,
+    /// #         ..Default::default()
+    /// #     },
+    /// #     ..Default::default()
+    /// # };
     /// # let log = LogDb::open(config).await?;
     /// // List all segments
     /// let segments = log.list_segments(..).await?;
@@ -229,21 +300,21 @@ pub trait LogRead {
 
 /// Shared read component used by both `LogDb` and `LogDbReader`.
 ///
-/// Contains the storage and segment cache needed for read operations.
+/// Contains the storage handle and segment cache needed for read operations.
 /// Wrapped in `Arc<RwLock<_>>` by both consumers.
 pub(crate) struct LogReadView {
-    pub(crate) storage: Arc<dyn StorageRead>,
+    pub(crate) storage: Arc<ReadHandle>,
     pub(crate) segments: SegmentCache,
 }
 
 impl LogReadView {
     /// Creates a new `LogReadView`.
-    pub(crate) fn new(storage: Arc<dyn StorageRead>, segments: SegmentCache) -> Self {
+    pub(crate) fn new(storage: Arc<ReadHandle>, segments: SegmentCache) -> Self {
         Self { storage, segments }
     }
 
     /// Replaces the underlying storage snapshot with a new one.
-    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<dyn StorageRead>) {
+    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<ReadHandle>) {
         self.storage = snapshot;
     }
 
@@ -395,18 +466,30 @@ impl LogDbReader {
     /// # }
     /// ```
     pub async fn open(config: ReaderConfig) -> Result<Self> {
+        Self::open_with_runtime(config, StorageReaderRuntime::new()).await
+    }
+
+    /// Opens a reader using a caller-supplied [`StorageReaderRuntime`].
+    ///
+    /// Lets callers override the object store (e.g. to share one with a writer
+    /// in tests) or plug in a block cache without going through the serde
+    /// config. Production code should prefer [`LogDbReader::open`].
+    pub async fn open_with_runtime(
+        config: ReaderConfig,
+        runtime: StorageReaderRuntime,
+    ) -> Result<Self> {
         let reader_options = slatedb::config::DbReaderOptions {
             manifest_poll_interval: config.refresh_interval,
             ..Default::default()
         };
-        let storage: Arc<dyn StorageRead> = create_storage_read(
-            &config.storage,
-            StorageReaderRuntime::new(),
-            StorageSemantics::new(),
-            reader_options,
-        )
-        .await
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        let built = create_storage_read(&config.storage, runtime, reader_options)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        // The managed_cache returned from create_storage_read should ideally
+        // be held and closed on shutdown; for now we drop it, matching the
+        // previous LogDbReader lifecycle (no explicit cache close).
+        let _managed_cache = built.managed_cache;
+        let storage = Arc::new(ReadHandle::Reader(built.reader));
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
         let read_view = Arc::new(RwLock::new(LogReadView::new(storage, segments)));
 
@@ -459,11 +542,16 @@ impl LogDbReader {
         (shutdown_tx, task)
     }
 
-    /// Creates a LogDbReader from an existing storage implementation.
+    /// Creates a LogDbReader from an existing slatedb snapshot handle (for tests).
     #[cfg(test)]
-    pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
-        let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, segments)));
+    pub(crate) async fn new(storage: Arc<slatedb::Db>) -> Result<Self> {
+        let snapshot = storage
+            .snapshot()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let handle = Arc::new(ReadHandle::Snapshot(snapshot));
+        let segments = SegmentCache::open(handle.as_ref(), SegmentConfig::default()).await?;
+        let read_view = Arc::new(RwLock::new(LogReadView::new(handle, segments)));
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             read_view,
@@ -537,7 +625,7 @@ impl LogRead for LogDbReader {
 /// within the sequence range. Instantiates a `SegmentIterator` for each
 /// segment as needed.
 pub struct LogIterator {
-    storage: Arc<dyn StorageRead>,
+    storage: Arc<ReadHandle>,
     segments: Vec<LogSegment>,
     key: Bytes,
     seq_range: Range<Sequence>,
@@ -548,7 +636,7 @@ pub struct LogIterator {
 impl LogIterator {
     /// Opens a new iterator by looking up segments covering the sequence range.
     pub(crate) fn open(
-        storage: Arc<dyn StorageRead>,
+        storage: Arc<ReadHandle>,
         segment_cache: &SegmentCache,
         key: Bytes,
         seq_range: Range<Sequence>,
@@ -567,7 +655,7 @@ impl LogIterator {
     /// Creates a new iterator over the given segments.
     #[cfg(test)]
     pub(crate) fn new(
-        storage: Arc<dyn StorageRead>,
+        storage: Arc<ReadHandle>,
         segments: Vec<LogSegment>,
         key: Bytes,
         seq_range: Range<Sequence>,
@@ -624,8 +712,7 @@ impl LogIterator {
 mod tests {
     use super::*;
     use crate::serde::SegmentMeta;
-    use crate::storage::LogStorageWrite;
-    use common::Storage;
+    use crate::storage::write_entry as storage_write_entry;
     use opendata_macros::storage_test;
 
     fn entry(key: &[u8], seq: u64, value: &[u8]) -> LogEntry {
@@ -636,42 +723,39 @@ mod tests {
         }
     }
 
+    async fn read_handle(storage: &Arc<slatedb::Db>) -> Arc<ReadHandle> {
+        // Use a live snapshot so scans see writes made through `storage` before the
+        // snapshot was taken. Take the snapshot AFTER writes in each test by
+        // passing `storage` around; but for the new() helper below we snapshot now.
+        let snap = storage.snapshot().await.unwrap();
+        Arc::new(ReadHandle::Snapshot(snap))
+    }
+
     #[storage_test]
-    async fn should_return_none_when_no_segments(storage: Arc<dyn Storage>) {
+    async fn should_return_none_when_no_segments(storage: Arc<slatedb::Db>) {
         let segments = vec![];
 
-        let mut iter = LogIterator::new(
-            storage.clone() as Arc<dyn StorageRead>,
-            segments,
-            Bytes::from("key"),
-            0..u64::MAX,
-        );
+        let handle = read_handle(&storage).await;
+        let mut iter = LogIterator::new(handle, segments, Bytes::from("key"), 0..u64::MAX);
 
         assert!(iter.next().await.unwrap().is_none());
     }
 
     #[storage_test]
-    async fn should_iterate_entries_in_single_segment(storage: Arc<dyn Storage>) {
+    async fn should_iterate_entries_in_single_segment(storage: Arc<slatedb::Db>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
-        storage
-            .write_entry(&segment, &entry(b"key", 0, b"value0"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 0, b"value0"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key", 1, b"value1"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 1, b"value1"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key", 2, b"value2"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 2, b"value2"))
             .await
             .unwrap();
 
-        let mut iter = LogIterator::new(
-            storage.clone() as Arc<dyn StorageRead>,
-            vec![segment],
-            Bytes::from("key"),
-            0..u64::MAX,
-        );
+        let handle = read_handle(&storage).await;
+        let mut iter = LogIterator::new(handle, vec![segment], Bytes::from("key"), 0..u64::MAX);
 
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.sequence, 0);
@@ -689,30 +773,27 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_iterate_entries_across_multiple_segments(storage: Arc<dyn Storage>) {
+    async fn should_iterate_entries_across_multiple_segments(storage: Arc<slatedb::Db>) {
         let segment0 = LogSegment::new(0, SegmentMeta::new(0, 1000));
         let segment1 = LogSegment::new(1, SegmentMeta::new(100, 2000));
         // Entries in segment 0 (start_seq = 0)
-        storage
-            .write_entry(&segment0, &entry(b"key", 0, b"value0"))
+        storage_write_entry(&storage, &segment0, &entry(b"key", 0, b"value0"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment0, &entry(b"key", 1, b"value1"))
+        storage_write_entry(&storage, &segment0, &entry(b"key", 1, b"value1"))
             .await
             .unwrap();
         // Entries in segment 1 (start_seq = 100)
-        storage
-            .write_entry(&segment1, &entry(b"key", 100, b"value100"))
+        storage_write_entry(&storage, &segment1, &entry(b"key", 100, b"value100"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment1, &entry(b"key", 101, b"value101"))
+        storage_write_entry(&storage, &segment1, &entry(b"key", 101, b"value101"))
             .await
             .unwrap();
 
+        let handle = read_handle(&storage).await;
         let mut iter = LogIterator::new(
-            storage.clone() as Arc<dyn StorageRead>,
+            handle,
             vec![segment0, segment1],
             Bytes::from("key"),
             0..u64::MAX,
@@ -740,31 +821,23 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_filter_by_sequence_range(storage: Arc<dyn Storage>) {
+    async fn should_filter_by_sequence_range(storage: Arc<slatedb::Db>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
-        storage
-            .write_entry(&segment, &entry(b"key", 0, b"value0"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 0, b"value0"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key", 1, b"value1"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 1, b"value1"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key", 2, b"value2"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 2, b"value2"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key", 3, b"value3"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 3, b"value3"))
             .await
             .unwrap();
 
-        let mut iter = LogIterator::new(
-            storage.clone() as Arc<dyn StorageRead>,
-            vec![segment],
-            Bytes::from("key"),
-            1..3,
-        );
+        let handle = read_handle(&storage).await;
+        let mut iter = LogIterator::new(handle, vec![segment], Bytes::from("key"), 1..3);
 
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.sequence, 1);
@@ -776,31 +849,23 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_filter_entries_for_specified_key(storage: Arc<dyn Storage>) {
+    async fn should_filter_entries_for_specified_key(storage: Arc<slatedb::Db>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
-        storage
-            .write_entry(&segment, &entry(b"key1", 0, b"k1v0"))
+        storage_write_entry(&storage, &segment, &entry(b"key1", 0, b"k1v0"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key2", 0, b"k2v0"))
+        storage_write_entry(&storage, &segment, &entry(b"key2", 0, b"k2v0"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key1", 1, b"k1v1"))
+        storage_write_entry(&storage, &segment, &entry(b"key1", 1, b"k1v1"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key2", 1, b"k2v1"))
+        storage_write_entry(&storage, &segment, &entry(b"key2", 1, b"k2v1"))
             .await
             .unwrap();
 
-        let mut iter = LogIterator::new(
-            storage.clone() as Arc<dyn StorageRead>,
-            vec![segment],
-            Bytes::from("key1"),
-            0..u64::MAX,
-        );
+        let handle = read_handle(&storage).await;
+        let mut iter = LogIterator::new(handle, vec![segment], Bytes::from("key1"), 0..u64::MAX);
 
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.key.as_ref(), b"key1");
@@ -814,37 +879,70 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_return_none_when_no_entries_in_range(storage: Arc<dyn Storage>) {
+    async fn should_return_none_when_no_entries_in_range(storage: Arc<slatedb::Db>) {
         let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
-        storage
-            .write_entry(&segment, &entry(b"key", 0, b"value0"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 0, b"value0"))
             .await
             .unwrap();
-        storage
-            .write_entry(&segment, &entry(b"key", 1, b"value1"))
+        storage_write_entry(&storage, &segment, &entry(b"key", 1, b"value1"))
             .await
             .unwrap();
 
-        let mut iter = LogIterator::new(
-            storage.clone() as Arc<dyn StorageRead>,
-            vec![segment],
-            Bytes::from("key"),
-            10..20,
-        );
+        let handle = read_handle(&storage).await;
+        let mut iter = LogIterator::new(handle, vec![segment], Bytes::from("key"), 10..20);
 
         assert!(iter.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn open_spawns_refresh_task() {
+    fn runtime_with_store(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+    ) -> StorageReaderRuntime {
+        StorageReaderRuntime::new().with_object_store(object_store)
+    }
+
+    /// Returns a (reader config, shared object_store) pair. The shared store
+    /// already has a manifest written by a short-lived writer, so
+    /// `LogDbReader::open_with_runtime` can attach to it.
+    async fn prepare_reader_fixture(
+        refresh_interval: Duration,
+    ) -> (ReaderConfig, Arc<dyn slatedb::object_store::ObjectStore>) {
+        use common::StorageBuilder;
         use common::StorageConfig;
+        use common::storage::config::ObjectStoreConfig;
+        use slatedb::object_store::ObjectStore;
+        use slatedb::object_store::memory::InMemory;
+
+        // SlateDB's DbReader requires a manifest to exist in the object store.
+        // Share one object_store between a short-lived writer (to create the
+        // manifest) and the reader.
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let built = StorageBuilder::from_object_store("reader-test", object_store.clone())
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        built.db.close().await.unwrap();
 
         let config = ReaderConfig {
-            storage: StorageConfig::InMemory,
-            refresh_interval: Duration::from_millis(100),
+            storage: StorageConfig {
+                path: "reader-test".to_string(),
+                object_store: ObjectStoreConfig::InMemory, // ignored — runtime override wins
+                ..Default::default()
+            },
+            refresh_interval,
         };
+        (config, object_store)
+    }
 
-        let reader = LogDbReader::open(config).await.unwrap();
+    #[tokio::test]
+    async fn open_spawns_refresh_task() {
+        let (config, object_store) = prepare_reader_fixture(Duration::from_millis(100)).await;
+
+        let reader =
+            LogDbReader::open_with_runtime(config, runtime_with_store(object_store.clone()))
+                .await
+                .unwrap();
 
         // Verify background task is running
         assert!(reader.refresh_task.is_some());
@@ -855,14 +953,12 @@ mod tests {
 
     #[tokio::test]
     async fn close_stops_refresh_task_gracefully() {
-        use common::StorageConfig;
+        let (config, object_store) = prepare_reader_fixture(Duration::from_millis(50)).await;
 
-        let config = ReaderConfig {
-            storage: StorageConfig::InMemory,
-            refresh_interval: Duration::from_millis(50),
-        };
-
-        let reader = LogDbReader::open(config).await.unwrap();
+        let reader =
+            LogDbReader::open_with_runtime(config, runtime_with_store(object_store.clone()))
+                .await
+                .unwrap();
         assert!(reader.refresh_task.is_some());
 
         // Close should complete without timeout

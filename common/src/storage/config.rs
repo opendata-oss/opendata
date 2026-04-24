@@ -1,41 +1,23 @@
 //! Storage configuration types.
 //!
-//! This module provides configuration structures for different storage backends,
-//! allowing services to configure storage type (InMemory or SlateDB) via config files
-//! or environment variables.
+//! This module provides configuration structures for the SlateDB-backed
+//! storage used by OpenData databases. Configuration can be provided via
+//! config files or environment variables.
 
 use serde::{Deserialize, Serialize};
 
 /// Top-level storage configuration.
 ///
-/// Defaults to `SlateDb` with a local `/tmp/opendata-storage` directory.
+/// Defaults to a SlateDB database rooted at `data` with a local `.data`
+/// directory object store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub enum StorageConfig {
-    InMemory,
-    SlateDb(SlateDbStorageConfig),
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        StorageConfig::SlateDb(SlateDbStorageConfig {
-            path: "data".to_string(),
-            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                path: ".data".to_string(),
-            }),
-            settings_path: None,
-            block_cache: None,
-        })
-    }
-}
-
-/// SlateDB-specific configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SlateDbStorageConfig {
+pub struct StorageConfig {
     /// Path prefix for SlateDB data in the object store.
+    #[serde(default = "default_path")]
     pub path: String,
 
     /// Object store provider configuration.
+    #[serde(default)]
     pub object_store: ObjectStoreConfig,
 
     /// Optional path to SlateDB settings file (TOML/YAML/JSON).
@@ -43,7 +25,7 @@ pub struct SlateDbStorageConfig {
     /// If not provided, uses SlateDB's `Settings::load()` which checks for
     /// `SlateDb.toml`, `SlateDb.json`, `SlateDb.yaml` in the working directory
     /// and merges any `SLATEDB_` prefixed environment variables.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_path: Option<String>,
 
     /// Optional block cache for SST block lookups.
@@ -52,6 +34,37 @@ pub struct SlateDbStorageConfig {
     /// in memory and/or on local disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_cache: Option<BlockCacheConfig>,
+}
+
+fn default_path() -> String {
+    "data".to_string()
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            path: default_path(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: ".data".to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Returns a new config with the path modified by appending a suffix.
+    ///
+    /// Appends the suffix to the path (e.g., "data" -> "data/0").
+    pub fn with_path_suffix(&self, suffix: &str) -> Self {
+        Self {
+            path: format!("{}/{}", self.path, suffix),
+            object_store: self.object_store.clone(),
+            settings_path: self.settings_path.clone(),
+            block_cache: self.block_cache.clone(),
+        }
+    }
 }
 
 /// Block cache configuration for SlateDB.
@@ -118,35 +131,6 @@ impl FoyerHybridCacheConfig {
     }
 }
 
-impl Default for SlateDbStorageConfig {
-    fn default() -> Self {
-        Self {
-            path: "data".to_string(),
-            object_store: ObjectStoreConfig::default(),
-            settings_path: None,
-            block_cache: None,
-        }
-    }
-}
-
-impl StorageConfig {
-    /// Returns a new config with the path modified by appending a suffix.
-    ///
-    /// For SlateDB storage, appends the suffix to the path (e.g., "data" -> "data/0").
-    /// For InMemory storage, returns a clone unchanged.
-    pub fn with_path_suffix(&self, suffix: &str) -> Self {
-        match self {
-            StorageConfig::InMemory => StorageConfig::InMemory,
-            StorageConfig::SlateDb(config) => StorageConfig::SlateDb(SlateDbStorageConfig {
-                path: format!("{}/{}", config.path, suffix),
-                object_store: config.object_store.clone(),
-                settings_path: config.settings_path.clone(),
-                block_cache: config.block_cache.clone(),
-            }),
-        }
-    }
-}
-
 /// Object store provider configuration for SlateDB.
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -184,42 +168,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_default_to_slatedb_with_local_data_dir() {
+    fn should_default_to_local_data_dir() {
         // given/when
         let config = StorageConfig::default();
 
         // then
-        match config {
-            StorageConfig::SlateDb(slate_config) => {
-                assert_eq!(slate_config.path, "data");
-                assert_eq!(
-                    slate_config.object_store,
-                    ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                        path: ".data".to_string()
-                    })
-                );
-            }
-            _ => panic!("Expected SlateDb config as default"),
-        }
+        assert_eq!(config.path, "data");
+        assert_eq!(
+            config.object_store,
+            ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: ".data".to_string()
+            })
+        );
     }
 
     #[test]
-    fn should_deserialize_in_memory_config() {
-        // given
-        let yaml = r#"type: InMemory"#;
-
-        // when
-        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
-
-        // then
-        assert_eq!(config, StorageConfig::InMemory);
-    }
-
-    #[test]
-    fn should_deserialize_slatedb_config_with_local_object_store() {
+    fn should_deserialize_config_with_local_object_store() {
         // given
         let yaml = r#"
-type: SlateDb
 path: my-data
 object_store:
   type: Local
@@ -230,26 +196,20 @@ object_store:
         let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
 
         // then
-        match config {
-            StorageConfig::SlateDb(slate_config) => {
-                assert_eq!(slate_config.path, "my-data");
-                assert_eq!(
-                    slate_config.object_store,
-                    ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                        path: "/tmp/slatedb".to_string()
-                    })
-                );
-                assert!(slate_config.settings_path.is_none());
-            }
-            _ => panic!("Expected SlateDb config"),
-        }
+        assert_eq!(config.path, "my-data");
+        assert_eq!(
+            config.object_store,
+            ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: "/tmp/slatedb".to_string()
+            })
+        );
+        assert!(config.settings_path.is_none());
     }
 
     #[test]
-    fn should_deserialize_slatedb_config_with_aws_object_store() {
+    fn should_deserialize_config_with_aws_object_store() {
         // given
         let yaml = r#"
-type: SlateDb
 path: my-data
 object_store:
   type: Aws
@@ -262,27 +222,21 @@ settings_path: slatedb.toml
         let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
 
         // then
-        match config {
-            StorageConfig::SlateDb(slate_config) => {
-                assert_eq!(slate_config.path, "my-data");
-                assert_eq!(
-                    slate_config.object_store,
-                    ObjectStoreConfig::Aws(AwsObjectStoreConfig {
-                        region: "us-west-2".to_string(),
-                        bucket: "my-bucket".to_string()
-                    })
-                );
-                assert_eq!(slate_config.settings_path, Some("slatedb.toml".to_string()));
-            }
-            _ => panic!("Expected SlateDb config"),
-        }
+        assert_eq!(config.path, "my-data");
+        assert_eq!(
+            config.object_store,
+            ObjectStoreConfig::Aws(AwsObjectStoreConfig {
+                region: "us-west-2".to_string(),
+                bucket: "my-bucket".to_string()
+            })
+        );
+        assert_eq!(config.settings_path, Some("slatedb.toml".to_string()));
     }
 
     #[test]
-    fn should_deserialize_slatedb_config_with_in_memory_object_store() {
+    fn should_deserialize_config_with_in_memory_object_store() {
         // given
         let yaml = r#"
-type: SlateDb
 path: test-data
 object_store:
   type: InMemory
@@ -292,32 +246,26 @@ object_store:
         let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
 
         // then
-        match config {
-            StorageConfig::SlateDb(slate_config) => {
-                assert_eq!(slate_config.path, "test-data");
-                assert_eq!(slate_config.object_store, ObjectStoreConfig::InMemory);
-            }
-            _ => panic!("Expected SlateDb config"),
-        }
+        assert_eq!(config.path, "test-data");
+        assert_eq!(config.object_store, ObjectStoreConfig::InMemory);
     }
 
     #[test]
-    fn should_serialize_slatedb_config() {
+    fn should_serialize_config() {
         // given
-        let config = StorageConfig::SlateDb(SlateDbStorageConfig {
+        let config = StorageConfig {
             path: "my-data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: "/tmp/slatedb".to_string(),
             }),
             settings_path: None,
             block_cache: None,
-        });
+        };
 
         // when
         let yaml = serde_yaml::to_string(&config).unwrap();
 
         // then
-        assert!(yaml.contains("type: SlateDb"));
         assert!(yaml.contains("path: my-data"));
         assert!(yaml.contains("type: Local"));
         // settings_path and block_cache should be omitted when None
@@ -328,7 +276,6 @@ object_store:
     #[test]
     fn should_deserialize_block_cache_config() {
         let yaml = r#"
-type: SlateDb
 path: data
 object_store:
   type: InMemory
@@ -339,25 +286,20 @@ block_cache:
   disk_path: /mnt/nvme/block-cache
 "#;
         let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
-        match config {
-            StorageConfig::SlateDb(slate_config) => {
-                let cache = slate_config.block_cache.expect("block_cache should be set");
-                match cache {
-                    BlockCacheConfig::FoyerHybrid(foyer) => {
-                        assert_eq!(foyer.memory_capacity, 8589934592);
-                        assert_eq!(foyer.disk_capacity, 150323855360);
-                        assert_eq!(foyer.disk_path, "/mnt/nvme/block-cache");
-                        // new fields should get defaults
-                        assert_eq!(foyer.write_policy, FoyerWritePolicy::WriteOnInsertion);
-                        assert_eq!(foyer.flushers, 4);
-                        assert!(foyer.buffer_pool_size.is_none());
-                        assert_eq!(foyer.submit_queue_size_threshold, 1024 * 1024 * 1024);
-                        // effective buffer pool = memory_capacity / 32
-                        assert_eq!(foyer.effective_buffer_pool_size(), 8589934592 / 32);
-                    }
-                }
+        let cache = config.block_cache.expect("block_cache should be set");
+        match cache {
+            BlockCacheConfig::FoyerHybrid(foyer) => {
+                assert_eq!(foyer.memory_capacity, 8589934592);
+                assert_eq!(foyer.disk_capacity, 150323855360);
+                assert_eq!(foyer.disk_path, "/mnt/nvme/block-cache");
+                // new fields should get defaults
+                assert_eq!(foyer.write_policy, FoyerWritePolicy::WriteOnInsertion);
+                assert_eq!(foyer.flushers, 4);
+                assert!(foyer.buffer_pool_size.is_none());
+                assert_eq!(foyer.submit_queue_size_threshold, 1024 * 1024 * 1024);
+                // effective buffer pool = memory_capacity / 32
+                assert_eq!(foyer.effective_buffer_pool_size(), 8589934592 / 32);
             }
-            _ => panic!("Expected SlateDb config"),
         }
     }
 
@@ -365,7 +307,6 @@ block_cache:
     fn should_deserialize_block_cache_with_explicit_engine_options() {
         // given
         let yaml = r#"
-type: SlateDb
 path: data
 object_store:
   type: InMemory
@@ -384,21 +325,16 @@ block_cache:
         let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
 
         // then
-        match config {
-            StorageConfig::SlateDb(slate_config) => {
-                let cache = slate_config.block_cache.expect("block_cache should be set");
-                match cache {
-                    BlockCacheConfig::FoyerHybrid(foyer) => {
-                        assert_eq!(foyer.write_policy, FoyerWritePolicy::WriteOnEviction);
-                        assert_eq!(foyer.flushers, 2);
-                        assert_eq!(foyer.buffer_pool_size, Some(134217728));
-                        assert_eq!(foyer.submit_queue_size_threshold, 536870912);
-                        // explicit value overrides derivation
-                        assert_eq!(foyer.effective_buffer_pool_size(), 134217728);
-                    }
-                }
+        let cache = config.block_cache.expect("block_cache should be set");
+        match cache {
+            BlockCacheConfig::FoyerHybrid(foyer) => {
+                assert_eq!(foyer.write_policy, FoyerWritePolicy::WriteOnEviction);
+                assert_eq!(foyer.flushers, 2);
+                assert_eq!(foyer.buffer_pool_size, Some(134217728));
+                assert_eq!(foyer.submit_queue_size_threshold, 536870912);
+                // explicit value overrides derivation
+                assert_eq!(foyer.effective_buffer_pool_size(), 134217728);
             }
-            _ => panic!("Expected SlateDb config"),
         }
     }
 
@@ -425,17 +361,19 @@ block_cache:
     #[test]
     fn should_default_block_cache_to_none() {
         let yaml = r#"
-type: SlateDb
 path: data
 object_store:
   type: InMemory
 "#;
         let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
-        match config {
-            StorageConfig::SlateDb(slate_config) => {
-                assert!(slate_config.block_cache.is_none());
-            }
-            _ => panic!("Expected SlateDb config"),
-        }
+        assert!(config.block_cache.is_none());
+    }
+
+    #[test]
+    fn should_apply_path_suffix() {
+        let config = StorageConfig::default();
+        let suffixed = config.with_path_suffix("shard-0");
+        assert_eq!(suffixed.path, "data/shard-0");
+        assert_eq!(suffixed.object_store, config.object_store);
     }
 }

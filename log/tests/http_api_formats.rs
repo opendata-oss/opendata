@@ -14,6 +14,7 @@ use axum::routing::{get, post};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use common::StorageConfig;
+use common::storage::config::ObjectStoreConfig;
 use log::server::handlers::{
     AppState, handle_append, handle_list_keys, handle_list_segments, handle_metrics, handle_scan,
 };
@@ -25,7 +26,11 @@ use tower::ServiceExt;
 
 async fn setup_test_app() -> (Router, Arc<LogDb>) {
     let config = Config {
-        storage: StorageConfig::InMemory,
+        storage: StorageConfig {
+            path: "test-api".to_string(),
+            object_store: ObjectStoreConfig::InMemory,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
@@ -766,15 +771,13 @@ fn global_prometheus_handle() -> metrics_exporter_prometheus::PrometheusHandle {
 /// Setup a test app backed by SlateDB (in-memory object store) so that
 /// slatedb metrics are populated via the MetricsRsRecorder bridge.
 async fn setup_slatedb_test_app() -> Router {
-    use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig};
-
     let config = Config {
-        storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+        storage: StorageConfig {
             path: "test-metrics".to_string(),
             object_store: ObjectStoreConfig::InMemory,
             settings_path: None,
             block_cache: None,
-        }),
+        },
         ..Default::default()
     };
 

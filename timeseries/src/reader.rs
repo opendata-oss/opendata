@@ -12,20 +12,23 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use common::StorageConfig;
-use common::StorageRead;
-use common::storage::factory::create_storage_read;
-use common::{StorageReaderRuntime, StorageSemantics};
+use common::StorageError;
+use common::storage::factory::{BuiltDbReader, create_storage_read};
+use common::{StorageReaderRuntime, storage::factory::OwnedHybridCache};
 use futures::stream::{self, StreamExt};
 use moka::future::Cache;
+use slatedb::DbReader;
+use tokio::sync::Mutex;
 
 use crate::error::{QueryError, Result};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
-use crate::minitsdb::MiniQueryReader;
+use crate::minitsdb::{ErasedSnapshot, MiniQueryReader};
 use crate::model::{
     Label, Labels, QueryOptions, QueryValue, RangeSample, Sample, SeriesId, TimeBucket,
 };
 use crate::query::{BucketQueryReader, QueryReader};
-use crate::storage::OpenTsdbStorageReadExt;
+use crate::storage::get_buckets_for_ranges;
+use crate::storage::get_buckets_in_range;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
     TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
@@ -135,6 +138,18 @@ impl QueryReader for ReaderQueryReader {
 
 // ── TimeSeriesDbReader ───────────────────────────────────────────────
 
+/// Backing database handle for a [`TimeSeriesDbReader`].
+///
+/// Either a production `Arc<DbReader>` (from [`create_storage_read`]) or a
+/// bare `Arc<slatedb::Db>` used in tests to share state with a writer.
+enum ReaderBackend {
+    Reader {
+        reader: Arc<DbReader>,
+        managed_cache: Mutex<Option<OwnedHybridCache>>,
+    },
+    Db(Arc<slatedb::Db>),
+}
+
 /// A read-only view of a time series database.
 ///
 /// `TimeSeriesDbReader` provides the same read API as [`TimeSeriesDb`](crate::timeseries::TimeSeriesDb)
@@ -165,7 +180,7 @@ impl QueryReader for ReaderQueryReader {
 /// let result = reader.query("rate(http_requests_total[5m])", None).await?;
 /// ```
 pub struct TimeSeriesDbReader {
-    storage: Arc<dyn StorageRead>,
+    backend: ReaderBackend,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
 }
@@ -184,41 +199,73 @@ impl TimeSeriesDbReader {
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
-        let storage = create_storage_read(
+        let BuiltDbReader {
+            reader,
+            managed_cache,
+            object_store: _,
+            path: _,
+        } = create_storage_read(
             &storage_config,
-            StorageReaderRuntime::new(),
-            StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
+            StorageReaderRuntime::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
             reader_options,
         )
-        .await?;
-        Ok(Self::from_storage_with_capacity(storage, cache_capacity))
+        .await
+        .map_err(|e| crate::error::Error::Storage(e.to_string()))?;
+        let query_cache = Cache::builder().max_capacity(cache_capacity).build();
+        Ok(Self {
+            backend: ReaderBackend::Reader {
+                reader,
+                managed_cache: Mutex::new(managed_cache),
+            },
+            query_cache,
+        })
     }
 
-    /// Creates a TimeSeriesDbReader from an existing storage implementation.
-    pub(crate) fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
-        Self::from_storage_with_capacity(storage, DEFAULT_CACHE_CAPACITY)
+    /// Creates a TimeSeriesDbReader from an existing `Arc<slatedb::Db>`.
+    ///
+    /// Useful for tests that want to share state with a writer. Production code
+    /// should use [`open`](Self::open), which uses a `DbReader` to avoid fencing.
+    pub(crate) fn from_db(db: Arc<slatedb::Db>) -> Self {
+        Self::from_db_with_capacity(db, DEFAULT_CACHE_CAPACITY)
     }
 
-    fn from_storage_with_capacity(storage: Arc<dyn StorageRead>, cache_capacity: u64) -> Self {
+    fn from_db_with_capacity(db: Arc<slatedb::Db>, cache_capacity: u64) -> Self {
         let query_cache = Cache::builder().max_capacity(cache_capacity).build();
         Self {
-            storage,
+            backend: ReaderBackend::Db(db),
             query_cache,
         }
     }
 
-    /// Returns a read handle to the underlying storage, for background tasks
-    /// like the cache warmer.
-    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
-        self.storage.clone()
+    /// Returns an erased snapshot handle used by [`MiniQueryReader`].
+    fn snapshot_handle(&self) -> Arc<dyn ErasedSnapshot> {
+        match &self.backend {
+            ReaderBackend::Reader { reader, .. } => reader.clone() as Arc<dyn ErasedSnapshot>,
+            ReaderBackend::Db(db) => db.clone() as Arc<dyn ErasedSnapshot>,
+        }
+    }
+
+    /// Returns a handle suitable for the cache warmer.
+    #[cfg(feature = "http-server")]
+    pub(crate) fn cache_warmer_reader(
+        &self,
+    ) -> Arc<dyn crate::server::cache_warmer::CacheWarmerReader> {
+        match &self.backend {
+            ReaderBackend::Reader { reader, .. } => {
+                reader.clone() as Arc<dyn crate::server::cache_warmer::CacheWarmerReader>
+            }
+            ReaderBackend::Db(db) => {
+                db.clone() as Arc<dyn crate::server::cache_warmer::CacheWarmerReader>
+            }
+        }
     }
 
     /// Get a cached bucket reader, loading from storage if needed.
     async fn get_or_load_bucket(&self, bucket: TimeBucket) -> Arc<MiniQueryReader> {
-        let storage = self.storage.clone();
+        let handle = self.snapshot_handle();
         self.query_cache
             .get_with(bucket, async move {
-                Arc::new(MiniQueryReader::new(bucket, storage))
+                Arc::new(MiniQueryReader::new(bucket, handle))
             })
             .await
     }
@@ -273,7 +320,27 @@ impl TimeSeriesDbReader {
 
     /// Closes the underlying storage reader, flushing any caches to disk.
     pub async fn close(&self) -> Result<()> {
-        self.storage.close().await?;
+        match &self.backend {
+            ReaderBackend::Reader {
+                reader,
+                managed_cache,
+            } => {
+                reader
+                    .close()
+                    .await
+                    .map_err(StorageError::from_storage)
+                    .map_err(crate::error::Error::from)?;
+                if let Some(cache) = managed_cache.lock().await.take() {
+                    let _ = cache.close().await;
+                }
+            }
+            ReaderBackend::Db(db) => {
+                db.close()
+                    .await
+                    .map_err(StorageError::from_storage)
+                    .map_err(crate::error::Error::from)?;
+            }
+        }
         Ok(())
     }
 
@@ -298,10 +365,14 @@ impl TsdbReadEngine for TimeSeriesDbReader {
     type QR = ReaderQueryReader;
 
     async fn make_query_reader(&self, start: i64, end: i64) -> Result<ReaderQueryReader> {
-        let buckets = self
-            .storage
-            .get_buckets_in_range(Some(start), Some(end))
-            .await?;
+        let buckets = match &self.backend {
+            ReaderBackend::Reader { reader, .. } => {
+                get_buckets_in_range(reader.as_ref(), Some(start), Some(end)).await?
+            }
+            ReaderBackend::Db(db) => {
+                get_buckets_in_range(db.as_ref(), Some(start), Some(end)).await?
+            }
+        };
 
         let readers: Vec<_> = stream::iter(buckets)
             .map(|bucket| async move {
@@ -321,7 +392,12 @@ impl TsdbReadEngine for TimeSeriesDbReader {
     ) -> Result<ReaderQueryReader> {
         let buckets = {
             let _g = crate::promql::trace::Scope::enter("list_buckets");
-            self.storage.get_buckets_for_ranges(ranges).await?
+            match &self.backend {
+                ReaderBackend::Reader { reader, .. } => {
+                    get_buckets_for_ranges(reader.as_ref(), ranges).await?
+                }
+                ReaderBackend::Db(db) => get_buckets_for_ranges(db.as_ref(), ranges).await?,
+            }
         };
 
         let readers: Vec<_> = stream::iter(buckets)
@@ -343,20 +419,25 @@ mod tests {
     use super::*;
     use crate::model::Series;
     use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use common::storage::in_memory::InMemoryStorage;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
 
-    fn create_shared_storage() -> Arc<InMemoryStorage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
+    async fn create_shared_db() -> Arc<slatedb::Db> {
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("test", object_store)
+            .with_merge_operator(Arc::new(OpenTsdbMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        Arc::new(db)
     }
 
     #[tokio::test]
     async fn reader_sees_written_data() {
         // Write data through internal Tsdb, then verify reader sees it.
-        let storage = create_shared_storage();
+        let db = create_shared_db().await;
 
-        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
+        let tsdb = crate::tsdb::Tsdb::new(db.clone());
         let series = vec![
             Series::builder("http_requests_total")
                 .label("method", "GET")
@@ -368,8 +449,8 @@ mod tests {
         tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
-        // Open reader on the same storage
-        let reader = TimeSeriesDbReader::from_storage(storage);
+        // Open reader on the same db
+        let reader = TimeSeriesDbReader::from_db(db);
 
         // Query should find the data
         let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000);
@@ -389,9 +470,9 @@ mod tests {
 
     #[tokio::test]
     async fn reader_series_discovery() {
-        let storage = create_shared_storage();
+        let db = create_shared_db().await;
 
-        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
+        let tsdb = crate::tsdb::Tsdb::new(db.clone());
         let series = vec![
             Series::builder("http_requests_total")
                 .label("method", "GET")
@@ -409,7 +490,7 @@ mod tests {
         tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
-        let reader = TimeSeriesDbReader::from_storage(storage);
+        let reader = TimeSeriesDbReader::from_db(db);
 
         // Series discovery
         let series = reader
@@ -450,12 +531,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_and_reader_coexist_on_shared_storage() {
+    async fn writer_and_reader_coexist_on_shared_db() {
         // Verify that a writer and reader can both operate on the same
-        // InMemoryStorage without interfering with each other.
-        let storage = create_shared_storage();
+        // in-memory Db without interfering with each other.
+        let db = create_shared_db().await;
 
-        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
+        let tsdb = crate::tsdb::Tsdb::new(db.clone());
 
         // Write initial data
         let series = vec![
@@ -468,7 +549,7 @@ mod tests {
         tsdb.flush().await.unwrap();
 
         // Open reader
-        let reader = TimeSeriesDbReader::from_storage(storage.clone());
+        let reader = TimeSeriesDbReader::from_db(db.clone());
 
         // Reader sees initial data
         let query_time = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000000000);
@@ -488,7 +569,7 @@ mod tests {
         tsdb.ingest_samples(more_series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
-        // Reader sees newly written data (InMemory storage shares state)
+        // Reader sees newly written data (shared state)
         let query_time2 = SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000);
         let result2 = reader.query("metric_a", Some(query_time2)).await.unwrap();
         match &result2 {
@@ -502,9 +583,9 @@ mod tests {
 
     #[tokio::test]
     async fn reader_query_range() {
-        let storage = create_shared_storage();
+        let db = create_shared_db().await;
 
-        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
+        let tsdb = crate::tsdb::Tsdb::new(db.clone());
         let series = vec![
             Series::builder("counter")
                 .label("job", "test")
@@ -518,7 +599,7 @@ mod tests {
         tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
-        let reader = TimeSeriesDbReader::from_storage(storage);
+        let reader = TimeSeriesDbReader::from_db(db);
 
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000);
         let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
@@ -544,19 +625,17 @@ mod tests {
     async fn slatedb_writer_and_reader_coexist_no_fencing() {
         use crate::config::Config;
         use crate::timeseries::TimeSeriesDb;
-        use common::storage::config::{
-            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-        };
+        use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage_config = common::StorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
             block_cache: None,
-        });
+        };
 
         // 1. Open writer and write data
         let writer = TimeSeriesDb::open(Config {
@@ -657,20 +736,18 @@ mod tests {
     async fn should_persist_data_after_flush_and_writer_reopen() {
         use crate::config::Config;
         use crate::timeseries::TimeSeriesDb;
-        use common::storage::config::{
-            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-        };
+        use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig};
 
         // given
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage_config = common::StorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
             }),
             settings_path: None,
             block_cache: None,
-        });
+        };
 
         let writer = TimeSeriesDb::open(Config {
             storage: storage_config.clone(),
@@ -690,7 +767,7 @@ mod tests {
 
         // when
         writer.flush().await.unwrap();
-        drop(writer);
+        writer.close().await.unwrap();
 
         let reopened = TimeSeriesDb::open(Config {
             storage: storage_config,
@@ -723,8 +800,8 @@ mod tests {
     async fn writer_and_reader_query_range_parity_at_boundary() {
         use crate::model::QueryOptions;
 
-        let storage = create_shared_storage();
-        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
+        let db = create_shared_db().await;
+        let tsdb = crate::tsdb::Tsdb::new(db.clone());
 
         // 5 samples at 15s intervals: t+0, t+15, t+30, t+45, t+60
         let series = vec![
@@ -740,10 +817,10 @@ mod tests {
         tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
-        let reader = TimeSeriesDbReader::from_storage(storage.clone());
+        let reader = TimeSeriesDbReader::from_db(db.clone());
 
-        // Use Tsdb directly for the writer side (same data, same storage)
-        let writer_tsdb = crate::tsdb::Tsdb::new(storage);
+        // Use Tsdb directly for the writer side (same data, same db)
+        let writer_tsdb = crate::tsdb::Tsdb::new(db);
 
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000);
         let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
@@ -789,9 +866,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_range_rejects_zero_step() {
-        let storage = create_shared_storage();
+        let db = create_shared_db().await;
 
-        let tsdb = crate::tsdb::Tsdb::new(storage.clone());
+        let tsdb = crate::tsdb::Tsdb::new(db.clone());
         let series = vec![
             Series::builder("counter")
                 .label("job", "test")
@@ -801,7 +878,7 @@ mod tests {
         tsdb.ingest_samples(series, None).await.unwrap();
         tsdb.flush().await.unwrap();
 
-        let reader = TimeSeriesDbReader::from_storage(storage);
+        let reader = TimeSeriesDbReader::from_db(db);
 
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000);
         let end = SystemTime::UNIX_EPOCH + Duration::from_secs(1700000060);
@@ -819,20 +896,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_storage_uses_default_cache_capacity() {
-        let storage = create_shared_storage();
-        let reader = TimeSeriesDbReader::from_storage(storage);
+    #[tokio::test]
+    async fn from_db_uses_default_cache_capacity() {
+        let db = create_shared_db().await;
+        let reader = TimeSeriesDbReader::from_db(db);
         assert_eq!(
             reader.query_cache.policy().max_capacity(),
             Some(DEFAULT_CACHE_CAPACITY)
         );
     }
 
-    #[test]
-    fn from_storage_with_capacity_honors_custom_value() {
-        let storage = create_shared_storage();
-        let reader = TimeSeriesDbReader::from_storage_with_capacity(storage, 123);
+    #[tokio::test]
+    async fn from_db_with_capacity_honors_custom_value() {
+        let db = create_shared_db().await;
+        let reader = TimeSeriesDbReader::from_db_with_capacity(db, 123);
         assert_eq!(reader.query_cache.policy().max_capacity(), Some(123));
     }
 }

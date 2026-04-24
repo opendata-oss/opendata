@@ -24,10 +24,9 @@ enum FlushEvent<D: Delta> {
 }
 
 // Internal use only
-use crate::StorageRead;
-use crate::storage::StorageSnapshot;
 use async_trait::async_trait;
 pub use handle::EpochWatcher;
+use slatedb::DbSnapshot;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -84,7 +83,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         config: WriteCoordinatorConfig,
         channels: Vec<impl ToString>,
         initial_context: D::Context,
-        initial_snapshot: Arc<dyn StorageSnapshot>,
+        initial_snapshot: Arc<DbSnapshot>,
         flusher: F,
     ) -> WriteCoordinator<D, F> {
         let (watermarks, watcher) = EpochWatermarks::new();
@@ -215,7 +214,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     pub fn new(
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
-        initial_snapshot: Arc<dyn StorageSnapshot>,
+        initial_snapshot: Arc<DbSnapshot>,
         write_rxs: Vec<PausableReceiver<D>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         watermarks: Arc<EpochWatermarks>,
@@ -550,7 +549,7 @@ impl<D: Delta> BroadcastedView<D> {
         }
     }
 
-    fn update_flush_finished(&self, snapshot: Arc<dyn StorageSnapshot>, epoch_range: Range<u64>) {
+    fn update_flush_finished(&self, snapshot: Arc<DbSnapshot>, epoch_range: Range<u64>) {
         self.inner
             .lock()
             .expect("lock poisoned")
@@ -579,11 +578,7 @@ struct BroadcastedViewInner<D: Delta> {
 }
 
 impl<D: Delta> BroadcastedViewInner<D> {
-    fn update_flush_finished(
-        &mut self,
-        snapshot: Arc<dyn StorageSnapshot>,
-        epoch_range: Range<u64>,
-    ) {
+    fn update_flush_finished(&mut self, snapshot: Arc<DbSnapshot>, epoch_range: Range<u64>) {
         let mut new_frozen = self.view.frozen.clone();
         let last = new_frozen
             .pop()
@@ -674,14 +669,21 @@ mod tests {
     use super::*;
     use crate::BytesRange;
     use crate::coordinator::Durability;
-    use crate::storage::in_memory::{InMemoryStorage, InMemoryStorageSnapshot};
-    use crate::storage::{PutRecordOp, Record, StorageSnapshot};
-    use crate::{Storage, StorageRead};
     use async_trait::async_trait;
     use bytes::Bytes;
+    use slatedb::object_store::ObjectStore;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::config::WriteOptions;
+    use slatedb::{Db, DbBuilder, DbRead, WriteBatch};
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::sync::Mutex;
+
+    async fn new_test_db() -> Arc<Db> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = DbBuilder::new("/test", object_store).build().await.unwrap();
+        Arc::new(db)
+    }
     // ============================================================================
     // Test Infrastructure
     // ============================================================================
@@ -799,22 +801,20 @@ mod tests {
     #[derive(Clone)]
     struct TestFlusher {
         state: Arc<Mutex<TestFlusherState>>,
-        storage: Arc<InMemoryStorage>,
-    }
-
-    impl Default for TestFlusher {
-        fn default() -> Self {
-            Self {
-                state: Arc::new(Mutex::new(TestFlusherState::default())),
-                storage: Arc::new(InMemoryStorage::new()),
-            }
-        }
+        db: Arc<Db>,
     }
 
     impl TestFlusher {
+        async fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(TestFlusherState::default())),
+                db: new_test_db().await,
+            }
+        }
+
         /// Create a flusher that blocks until signaled, with a notification when flush starts.
         /// Returns (flusher, flush_started_rx, unblock_tx).
-        fn with_flush_control() -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
+        async fn with_flush_control() -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
             let (started_tx, started_rx) = oneshot::channel();
             let (unblock_tx, unblock_rx) = mpsc::channel(1);
             let flusher = Self {
@@ -823,7 +823,7 @@ mod tests {
                     flush_started_tx: Some(started_tx),
                     unblock_rx: Some(unblock_rx),
                 })),
-                storage: Arc::new(InMemoryStorage::new()),
+                db: new_test_db().await,
             };
             (flusher, started_rx, unblock_tx)
         }
@@ -832,8 +832,8 @@ mod tests {
             self.state.lock().unwrap().flushed_events.clone()
         }
 
-        async fn initial_snapshot(&self) -> Arc<dyn StorageSnapshot> {
-            self.storage.snapshot().await.unwrap()
+        async fn initial_snapshot(&self) -> Arc<DbSnapshot> {
+            self.db.snapshot().await.unwrap()
         }
     }
 
@@ -843,7 +843,7 @@ mod tests {
             &mut self,
             frozen: FrozenTestDelta,
             epoch_range: &Range<u64>,
-        ) -> Result<Arc<dyn StorageSnapshot>, String> {
+        ) -> Result<Arc<DbSnapshot>, String> {
             // Signal that flush has started
             let flush_started_tx = {
                 let mut state = self.state.lock().unwrap();
@@ -862,19 +862,24 @@ mod tests {
                 rx.recv().await;
             }
 
-            // Write records to storage
-            let records: Vec<PutRecordOp> = frozen
-                .writes
-                .iter()
-                .map(|(key, (seq, value))| {
-                    let mut buf = Vec::with_capacity(16);
-                    buf.extend_from_slice(&seq.to_le_bytes());
-                    buf.extend_from_slice(&value.to_le_bytes());
-                    Record::new(Bytes::from(key.clone()), Bytes::from(buf)).into()
-                })
-                .collect();
-            self.storage
-                .put(records)
+            // Write records to storage via non-durable writes: the data lands
+            // in slatedb's memtable (which snapshots see) without waiting on
+            // WAL / flush background workers. This keeps the flusher usable
+            // from tests that pause tokio time.
+            let mut batch = WriteBatch::new();
+            for (key, (seq, value)) in frozen.writes.iter() {
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(&seq.to_le_bytes());
+                buf.extend_from_slice(&value.to_le_bytes());
+                batch.put(Bytes::from(key.clone()), Bytes::from(buf));
+            }
+            self.db
+                .write_with_options(
+                    batch,
+                    &WriteOptions {
+                        await_durable: false,
+                    },
+                )
                 .await
                 .map_err(|e| format!("{}", e))?;
 
@@ -886,7 +891,7 @@ mod tests {
                     .push(Arc::new(EpochStamped::new(frozen, epoch_range.clone())));
             }
 
-            self.storage.snapshot().await.map_err(|e| format!("{}", e))
+            self.db.snapshot().await.map_err(|e| format!("{}", e))
         }
 
         async fn flush_storage(&self) -> Result<(), String> {
@@ -920,11 +925,20 @@ mod tests {
         }
     }
 
-    async fn assert_snapshot_has_rows(
-        snapshot: &Arc<dyn StorageSnapshot>,
-        expected: &[(&str, u64, u64)],
-    ) {
-        let records = snapshot.scan(BytesRange::unbounded()).await.unwrap();
+    async fn collect_snapshot(snapshot: &Arc<DbSnapshot>) -> Vec<(Bytes, Bytes)> {
+        let mut iter = snapshot
+            .scan_with_options(BytesRange::unbounded(), &crate::default_scan_options())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(kv) = iter.next().await.unwrap() {
+            out.push((kv.key, kv.value));
+        }
+        out
+    }
+
+    async fn assert_snapshot_has_rows(snapshot: &Arc<DbSnapshot>, expected: &[(&str, u64, u64)]) {
+        let records = collect_snapshot(snapshot).await;
         assert_eq!(
             records.len(),
             expected.len(),
@@ -934,10 +948,10 @@ mod tests {
         );
         let mut actual: Vec<(String, u64, u64)> = records
             .iter()
-            .map(|r| {
-                let key = String::from_utf8(r.key.to_vec()).unwrap();
-                let seq = u64::from_le_bytes(r.value[0..8].try_into().unwrap());
-                let value = u64::from_le_bytes(r.value[8..16].try_into().unwrap());
+            .map(|(key, value)| {
+                let key = String::from_utf8(key.to_vec()).unwrap();
+                let seq = u64::from_le_bytes(value[0..8].try_into().unwrap());
+                let value = u64::from_le_bytes(value[8..16].try_into().unwrap());
                 (key, seq, value)
             })
             .collect();
@@ -970,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn should_assign_monotonic_epochs() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1022,7 +1036,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_apply_writes_in_order() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1080,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn should_update_applied_watermark_after_each_write() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1112,7 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn should_propagate_apply_error_to_handle() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let context = TestContext {
             error: Some("apply error".to_string()),
             ..Default::default()
@@ -1155,7 +1169,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_flush_on_command() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1188,7 +1202,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_wait_on_flush_handle() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1221,7 +1235,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_return_correct_epoch_from_flush_handle() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1263,7 +1277,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_include_all_pending_writes_in_flush() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1308,7 +1322,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let frozen_delta = &events[0];
         assert_eq!(frozen_delta.val.writes.len(), 3);
-        let snapshot = flusher.storage.snapshot().await.unwrap();
+        let snapshot = flusher.db.snapshot().await.unwrap();
         assert_snapshot_has_rows(&snapshot, &[("a", 0, 1), ("b", 1, 2), ("c", 2, 3)]).await;
 
         // cleanup
@@ -1318,7 +1332,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_skip_flush_when_no_new_writes() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1366,7 +1380,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_update_written_watermark_after_flush() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1404,7 +1418,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn should_flush_on_flush_interval() {
         // given - create coordinator with short flush interval
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 100,
             flush_interval: Duration::from_millis(100),
@@ -1441,7 +1455,7 @@ mod tests {
 
         // then - flush should have happened
         assert_eq!(flusher.flushed_events().len(), 1);
-        let snapshot = flusher.storage.snapshot().await.unwrap();
+        let snapshot = flusher.db.snapshot().await.unwrap();
         assert_snapshot_has_rows(&snapshot, &[("a", 0, 1)]).await;
 
         // cleanup
@@ -1455,7 +1469,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_flush_when_size_threshold_exceeded() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 100,
             flush_interval: Duration::from_secs(3600),
@@ -1492,7 +1506,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_accumulate_until_threshold() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 100,
             flush_interval: Duration::from_secs(3600),
@@ -1549,7 +1563,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_accept_writes_during_flush() {
         // given
-        let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
+        let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1591,7 +1605,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_assign_new_epochs_during_flush() {
         // given
-        let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control();
+        let (flusher, flush_started_rx, unblock_tx) = TestFlusher::with_flush_control().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1649,7 +1663,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_backpressure_when_queue_full() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 2,
             flush_interval: Duration::from_secs(3600),
@@ -1697,7 +1711,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_accept_writes_after_queue_drains() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 2,
             flush_interval: Duration::from_secs(3600),
@@ -1754,7 +1768,7 @@ mod tests {
     #[tokio::test]
     async fn should_shutdown_cleanly_when_stop_called() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1775,7 +1789,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_flush_pending_writes_on_shutdown() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 100,
             flush_interval: Duration::from_secs(3600), // Long interval - won't trigger
@@ -1815,7 +1829,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_shutdown_error_after_coordinator_stops() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1849,7 +1863,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_track_epoch_range_in_flush_event() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1903,7 +1917,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_have_contiguous_epoch_ranges() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -1965,7 +1979,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_include_exact_epochs_in_range() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2024,7 +2038,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_preserve_context_across_flushes() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2082,7 +2096,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_receive_view_on_subscribe() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2117,7 +2131,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_include_snapshot_in_view_after_flush() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2156,7 +2170,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_include_delta_in_view_after_flush() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2196,7 +2210,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_include_epoch_range_in_view_after_flush() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2249,7 +2263,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_broadcast_frozen_delta_on_freeze() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2285,7 +2299,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_remove_frozen_delta_after_flush_complete() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2325,7 +2339,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_recover_from_message_lost_subscriber() {
         // given - a coordinator with a small broadcast buffer (16)
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2376,7 +2390,7 @@ mod tests {
 
         // then - the fresh view should reflect the current state
         // (all 20 writes should be in the snapshot after all the flushes)
-        let records = view.snapshot.scan(BytesRange::unbounded()).await.unwrap();
+        let records = collect_snapshot(&view.snapshot).await;
         assert!(
             records.len() >= 20,
             "expected at least 20 rows, got {}",
@@ -2408,9 +2422,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_flush_even_when_no_writes_if_flush_storage() {
         // given
-        let flusher = TestFlusher::default();
-        let storage = Arc::new(InMemoryStorage::new());
-        let snapshot = storage.snapshot().await.unwrap();
+        let flusher = TestFlusher::new().await;
+        let snapshot = flusher.initial_snapshot().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2436,9 +2449,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_advance_durable_watermark() {
         // given
-        let flusher = TestFlusher::default();
-        let storage = Arc::new(InMemoryStorage::new());
-        let snapshot = storage.snapshot().await.unwrap();
+        let flusher = TestFlusher::new().await;
+        let snapshot = flusher.initial_snapshot().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2472,7 +2484,7 @@ mod tests {
     #[tokio::test]
     async fn should_see_applied_write_via_view() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2509,7 +2521,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_flush_writes_from_multiple_channels() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["ch1".to_string(), "ch2".to_string()],
@@ -2557,7 +2569,7 @@ mod tests {
         w3.wait(Durability::Written).await.unwrap();
 
         // then - snapshot should contain writes from both channels
-        let snapshot = flusher.storage.snapshot().await.unwrap();
+        let snapshot = flusher.db.snapshot().await.unwrap();
         assert_snapshot_has_rows(&snapshot, &[("a", 0, 10), ("b", 1, 20), ("c", 2, 30)]).await;
 
         // cleanup
@@ -2567,7 +2579,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_succeed_with_write_timeout_when_queue_has_space() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2602,7 +2614,7 @@ mod tests {
     #[tokio::test]
     async fn should_timeout_when_queue_full() {
         // given - queue_capacity=2, coordinator NOT started so nothing drains
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 2,
             flush_interval: Duration::from_secs(3600),
@@ -2652,7 +2664,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_write_in_timeout_error() {
         // given - queue_capacity=1, coordinator NOT started
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 1,
             flush_interval: Duration::from_secs(3600),
@@ -2700,7 +2712,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_write_in_backpressure_error() {
         // given - queue_capacity=1, coordinator NOT started
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 1,
             flush_interval: Duration::from_secs(3600),
@@ -2745,7 +2757,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_succeed_when_queue_drains_within_timeout() {
         // given - queue_capacity=2, coordinator started so it drains
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let config = WriteCoordinatorConfig {
             queue_capacity: 2,
             flush_interval: Duration::from_secs(3600),
@@ -2799,7 +2811,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_shutdown_on_write_timeout_after_coordinator_stops() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut coordinator = WriteCoordinator::new(
             test_config(),
             vec!["default".to_string()],
@@ -2830,7 +2842,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_pause_and_resume_write_channel() {
         // given
-        let flusher = TestFlusher::default();
+        let flusher = TestFlusher::new().await;
         let mut config = test_config();
         config.flush_size_threshold = usize::MAX;
         config.flush_interval = Duration::from_hours(24);

@@ -198,13 +198,13 @@ impl TimeSeriesHttpServer {
                 .cache_warmer
                 .as_ref()
                 .map(|warmer_config| {
-                    let storage = self.tsdb.storage_read();
+                    let reader = self.tsdb.cache_warmer_reader();
                     tracing::info!(
                         warm_range = ?warmer_config.warm_range,
                         include_samples = warmer_config.include_samples,
                         "Starting cache warmer"
                     );
-                    super::cache_warmer::start(storage, warmer_config.clone())
+                    super::cache_warmer::start(reader, warmer_config.clone())
                 });
 
         // Build router with metrics middleware

@@ -67,7 +67,7 @@ impl KeyValueDb {
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let kv_storage = KeyValueStorage::new(storage);
+        let kv_storage = KeyValueStorage::new(storage.db);
         Ok(Self {
             storage: kv_storage,
         })
@@ -160,11 +160,11 @@ impl KeyValueDb {
         self.storage.close().await
     }
 
-    /// Creates a KeyValueDb from an existing storage implementation.
+    /// Creates a KeyValueDb from an existing SlateDB instance.
     #[cfg(test)]
-    pub(crate) fn new(storage: std::sync::Arc<dyn common::Storage>) -> Self {
+    pub(crate) fn new(db: std::sync::Arc<slatedb::Db>) -> Self {
         Self {
-            storage: KeyValueStorage::new(storage),
+            storage: KeyValueStorage::new(db),
         }
     }
 }
@@ -185,16 +185,30 @@ impl KeyValueRead for KeyValueDb {
 mod tests {
     use std::sync::Arc;
 
-    use common::StorageBuilder;
     use common::StorageConfig;
+    use common::storage::config::ObjectStoreConfig;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
 
     use super::*;
     use crate::reader::KeyValueDbReader;
 
     fn test_config() -> Config {
         Config {
-            storage: StorageConfig::InMemory,
+            storage: StorageConfig {
+                object_store: ObjectStoreConfig::InMemory,
+                ..StorageConfig::default()
+            },
         }
+    }
+
+    async fn in_memory_db() -> Arc<slatedb::Db> {
+        let object_store = Arc::new(InMemory::new());
+        let db = DbBuilder::new("test", object_store)
+            .build()
+            .await
+            .expect("failed to build in-memory slatedb");
+        Arc::new(db)
     }
 
     #[tokio::test]
@@ -418,14 +432,9 @@ mod tests {
 
     #[tokio::test]
     async fn should_read_via_keyvalue_reader() {
-        // given - create shared storage
-        let storage = StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
-        let kv = KeyValueDb::new(storage.clone());
+        // given - create a shared SlateDB instance
+        let db = in_memory_db().await;
+        let kv = KeyValueDb::new(db.clone());
         kv.put(Bytes::from("key1"), Bytes::from("value1"))
             .await
             .unwrap();
@@ -433,8 +442,8 @@ mod tests {
             .await
             .unwrap();
 
-        // when - create KeyValueDbReader sharing the same storage
-        let reader = KeyValueDbReader::new(storage as Arc<dyn common::StorageRead>);
+        // when - create KeyValueDbReader sharing the same db
+        let reader = KeyValueDbReader::from_db(db);
         let result1 = reader.get(Bytes::from("key1")).await.unwrap();
         let result2 = reader.get(Bytes::from("key2")).await.unwrap();
 
@@ -445,20 +454,15 @@ mod tests {
 
     #[tokio::test]
     async fn should_scan_via_keyvalue_reader() {
-        // given - create shared storage
-        let storage = StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
-        let kv = KeyValueDb::new(storage.clone());
+        // given - create a shared SlateDB instance
+        let db = in_memory_db().await;
+        let kv = KeyValueDb::new(db.clone());
         kv.put(Bytes::from("a"), Bytes::from("1")).await.unwrap();
         kv.put(Bytes::from("b"), Bytes::from("2")).await.unwrap();
         kv.put(Bytes::from("c"), Bytes::from("3")).await.unwrap();
 
-        // when - create KeyValueDbReader sharing the same storage
-        let reader = KeyValueDbReader::new(storage as Arc<dyn common::StorageRead>);
+        // when - create KeyValueDbReader sharing the same db
+        let reader = KeyValueDbReader::from_db(db);
         let mut iter = reader.scan(..).await.unwrap();
         let mut entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {

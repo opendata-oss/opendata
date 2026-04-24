@@ -17,8 +17,8 @@ use crate::write::indexer::tree::centroids::{
 };
 use crate::write::indexer::tree::split::ReassignVector;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use common::StorageRead;
 use futures::future::BoxFuture;
+use slatedb::DbSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::trace;
@@ -31,7 +31,7 @@ struct ResolvedUpsert {
 
 pub(crate) struct WriteVectors {
     opts: Arc<IndexerOpts>,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<DbSnapshot>,
     snapshot_epoch: u64,
     writes: Vec<VectorWrite>,
 }
@@ -39,7 +39,7 @@ pub(crate) struct WriteVectors {
 impl WriteVectors {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
         writes: Vec<VectorWrite>,
     ) -> Self {
@@ -256,7 +256,7 @@ struct ResolvedCentroidReassignment {
 
 pub(crate) struct ReassignVectors {
     opts: Arc<IndexerOpts>,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<DbSnapshot>,
     snapshot_epoch: u64,
     reassignments: Vec<ReassignVector>,
     level: TreeLevel,
@@ -265,7 +265,7 @@ pub(crate) struct ReassignVectors {
 impl ReassignVectors {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
         reassignments: Vec<ReassignVector>,
         level: TreeLevel,
@@ -365,7 +365,7 @@ impl ReassignVectors {
     }
 
     async fn execute_centroid_reassignments(
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
@@ -405,7 +405,7 @@ impl ReassignVectors {
 
     async fn execute_vector_reassignments(
         _opts: &IndexerOpts,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
@@ -801,7 +801,7 @@ mod tests {
         // then
         let posting_ops: Vec<_> = ops
             .iter()
-            .filter(|op| matches!(op, common::storage::RecordOp::Merge(_)))
+            .filter(|op| matches!(op, crate::storage::record::StorageOp::Merge { .. }))
             .collect();
         assert!(posting_ops.is_empty());
     }

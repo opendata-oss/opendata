@@ -3,7 +3,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+use common::storage::config::{ObjectStoreConfig, StorageConfig};
 use log::{Config, ReadVisibility, ReaderConfig, SegmentConfig};
 use tokio::runtime::Runtime;
 
@@ -260,7 +260,12 @@ pub(crate) unsafe fn build_storage_config(
     settings_path: *const c_char,
 ) -> Result<StorageConfig, opendata_log_result_t> {
     match storage_type {
-        OPENDATA_LOG_STORAGE_IN_MEMORY => Ok(StorageConfig::InMemory),
+        OPENDATA_LOG_STORAGE_IN_MEMORY => Ok(StorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::InMemory,
+            settings_path: None,
+            block_cache: None,
+        }),
         OPENDATA_LOG_STORAGE_SLATEDB => {
             let path = cstr_to_string(slatedb_path, "slatedb_path")?;
             require_handle(object_store, "object_store")?;
@@ -270,12 +275,12 @@ pub(crate) unsafe fn build_storage_config(
             } else {
                 Some(cstr_to_string(settings_path, "settings_path")?)
             };
-            Ok(StorageConfig::SlateDb(SlateDbStorageConfig {
+            Ok(StorageConfig {
                 path,
                 object_store: os_config,
                 settings_path: settings,
                 block_cache: None,
-            }))
+            })
         }
         _ => Err(error_result(
             opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,

@@ -2,9 +2,7 @@
 
 use clap::Parser;
 use common::StorageConfig;
-use common::storage::config::{
-    AwsObjectStoreConfig, LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
-};
+use common::storage::config::{AwsObjectStoreConfig, LocalObjectStoreConfig, ObjectStoreConfig};
 
 use crate::Config;
 
@@ -37,29 +35,24 @@ pub struct CliArgs {
 impl CliArgs {
     /// Convert CLI args to log configuration.
     pub fn to_log_config(&self) -> Config {
-        let storage = if self.in_memory {
-            StorageConfig::InMemory
+        let object_store = if self.in_memory {
+            ObjectStoreConfig::InMemory
         } else if let Some(bucket) = &self.s3_bucket {
-            // S3 storage
-            StorageConfig::SlateDb(SlateDbStorageConfig {
-                path: "data".to_string(),
-                object_store: ObjectStoreConfig::Aws(AwsObjectStoreConfig {
-                    region: self.s3_region.clone(),
-                    bucket: bucket.clone(),
-                }),
-                settings_path: None,
-                block_cache: None,
+            ObjectStoreConfig::Aws(AwsObjectStoreConfig {
+                region: self.s3_region.clone(),
+                bucket: bucket.clone(),
             })
         } else {
-            // Local filesystem storage
-            StorageConfig::SlateDb(SlateDbStorageConfig {
-                path: "data".to_string(),
-                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
-                    path: self.data_dir.clone(),
-                }),
-                settings_path: None,
-                block_cache: None,
+            ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: self.data_dir.clone(),
             })
+        };
+
+        let storage = StorageConfig {
+            path: "data".to_string(),
+            object_store,
+            settings_path: None,
+            block_cache: None,
         };
 
         Config {
@@ -107,7 +100,7 @@ mod tests {
         let config = args.to_log_config();
 
         // then
-        assert!(matches!(config.storage, StorageConfig::InMemory));
+        assert_eq!(config.storage.object_store, ObjectStoreConfig::InMemory);
     }
 
     #[test]
@@ -125,14 +118,11 @@ mod tests {
         let config = args.to_log_config();
 
         // then
-        match config.storage {
-            StorageConfig::SlateDb(slate_config) => match slate_config.object_store {
-                ObjectStoreConfig::Local(local_config) => {
-                    assert_eq!(local_config.path, "/tmp/log-data");
-                }
-                _ => panic!("Expected Local object store"),
-            },
-            _ => panic!("Expected SlateDb config"),
+        match config.storage.object_store {
+            ObjectStoreConfig::Local(local_config) => {
+                assert_eq!(local_config.path, "/tmp/log-data");
+            }
+            other => panic!("Expected Local object store, got {:?}", other),
         }
     }
 
@@ -151,15 +141,12 @@ mod tests {
         let config = args.to_log_config();
 
         // then
-        match config.storage {
-            StorageConfig::SlateDb(slate_config) => match slate_config.object_store {
-                ObjectStoreConfig::Aws(aws_config) => {
-                    assert_eq!(aws_config.bucket, "my-bucket");
-                    assert_eq!(aws_config.region, "us-west-2");
-                }
-                _ => panic!("Expected Aws object store"),
-            },
-            _ => panic!("Expected SlateDb config"),
+        match config.storage.object_store {
+            ObjectStoreConfig::Aws(aws_config) => {
+                assert_eq!(aws_config.bucket, "my-bucket");
+                assert_eq!(aws_config.region, "us-west-2");
+            }
+            other => panic!("Expected Aws object store, got {:?}", other),
         }
     }
 

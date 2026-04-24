@@ -8,11 +8,11 @@ use crate::write::indexer::tree::centroids::{TreeLevel, batch_search_centroids_i
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
 use crate::{DistanceMetric, Result};
-use common::StorageRead;
 use futures::future::BoxFuture;
 use log::debug;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
+use slatedb::DbSnapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
@@ -102,7 +102,7 @@ pub(crate) struct SplitCentroidsResult {
 
 pub(crate) struct SplitCentroids {
     opts: Arc<IndexerOpts>,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<DbSnapshot>,
     snapshot_epoch: u64,
     level: TreeLevel,
     max_splits: usize,
@@ -113,7 +113,7 @@ impl SplitCentroids {
     pub(crate) fn new(
         opts: &Arc<IndexerOpts>,
         level: TreeLevel,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
     ) -> Self {
         Self::new_with_max_splits_and_clustering(
@@ -129,7 +129,7 @@ impl SplitCentroids {
     fn new_with_max_splits_and_clustering(
         opts: &Arc<IndexerOpts>,
         level: TreeLevel,
-        snapshot: &Arc<dyn StorageRead>,
+        snapshot: &Arc<DbSnapshot>,
         snapshot_epoch: u64,
         max_splits: usize,
         clustering: fn(distance_metric: DistanceMetric) -> Box<dyn Clustering + Send>,
