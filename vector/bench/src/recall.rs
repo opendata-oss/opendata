@@ -21,7 +21,7 @@ use bencher::{Bench, Benchmark, Params, Summary};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{FoyerCache, FoyerCacheOptions};
 use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
-use common::{StorageConfig, tracing};
+use common::{StorageConfig};
 use tokio::sync::mpsc;
 use vector::{
     Config, DistanceMetric, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorDb,
