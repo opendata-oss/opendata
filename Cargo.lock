@@ -4921,6 +4921,7 @@ dependencies = [
  "serde_yaml",
  "tikv-jemallocator",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

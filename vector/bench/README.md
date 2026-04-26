@@ -505,6 +505,74 @@ mkdir -p vector/bench/data/cohere
 #   cohere_groundtruth.ivecs — ground truth nearest neighbors
 ```
 
+### Cohere Wikipedia 10M
+
+10M vectors, 1024 dimensions, cosine distance. Uses Cohere's `embed-multilingual-v3` embeddings from
+the [Cohere Wikipedia dataset](https://huggingface.co/datasets/Cohere/wikipedia-2023-11-embed-multilingual-v3).
+This dataset mirrors the [turbopuffer vector-10m-hot benchmark](https://github.com/turbopuffer/tpuf-benchmark/blob/main/benchmarks/website/vector-10m-hot.toml).
+
+Expected local layout:
+
+```text
+vector/bench/data/cohere-wiki/
+├── base.fvecs         (10M x 1024 float32, ~41 GB)
+├── query.fvecs        (1K x 1024 float32, ~4 MB)
+└── groundtruth.ivecs  (1K x 100 int32)
+```
+
+#### Step 1: Download and convert
+
+The download script streams the English split from HuggingFace, writes the first 10M embeddings
+as base vectors and the next 1K as query vectors.
+
+```bash
+python3 -m venv .venv-cohere-wiki
+source .venv-cohere-wiki/bin/activate
+pip install -U pip
+pip install datasets numpy
+
+python3 vector/bench/data/cohere-wiki/download.py
+```
+
+By default, output is written next to the script (`vector/bench/data/cohere-wiki/`). Pass
+`--output-dir` to write somewhere else (useful for the ~41 GB base file):
+
+```bash
+python3 vector/bench/data/cohere-wiki/download.py --output-dir /mnt/data/cohere-wiki
+```
+
+When using a non-default directory, point the benchmark at it via the `data_dir` parameter
+(which should be the parent of `cohere-wiki/`, see Step 3).
+
+This takes a while (the base file is ~41 GB). Progress is printed every 1M vectors.
+
+#### Step 2: Generate ground truth
+
+Run the `gen_groundtruth` tool to compute exact nearest neighbors via brute-force search.
+This streams the base vectors in chunks and uses all available cores.
+
+```bash
+cargo run -p opendata-vector --release --bin gen_groundtruth -- \
+  --base-fvecs vector/bench/data/cohere-wiki/base.fvecs \
+  --query-fvecs vector/bench/data/cohere-wiki/query.fvecs \
+  --output-ivecs vector/bench/data/cohere-wiki/groundtruth.ivecs \
+  --top-k 100 \
+  --distance-metric cosine
+```
+
+#### Step 3: Run the benchmark
+
+```bash
+cargo run -p vector-bench --release -- --config bench.toml
+```
+
+with:
+
+```toml
+[[params.recall]]
+dataset = "cohere_wiki_10m"
+```
+
 ### BigANN / SIFT1B
 
 128 dimensions, L2 distance, bvecs format. From the [BigANN Benchmark](http://big-ann-benchmarks.com/). Several subsets
@@ -549,7 +617,7 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 
 | Parameter           | Type   | Description                                                        |
 |---------------------|--------|--------------------------------------------------------------------|
-| `dataset`           | string | Dataset name (`sift1m`, `cohere1m`, `deep10m`, `deep1b`, `wikipedia_bge_m3_en`, `sift10m`, etc.) |
+| `dataset`           | string | Dataset name (`sift1m`, `cohere1m`, `cohere_wiki_10m`, `deep10m`, `deep1b`, `wikipedia_bge_m3_en`, `sift10m`, etc.) |
 | `dimensions`        | u16    | Vector dimensions (default: from dataset)                          |
 | `distance_metric`   | string | `l2`, `cosine`, or `dot_product` (default: from dataset)           |
 | `root_threshold`    | usize  | Root posting list split threshold (default: from dataset)          |
