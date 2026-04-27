@@ -114,6 +114,31 @@ async fn test_ready() {
 }
 
 #[tokio::test]
+async fn should_create_checkpoint_via_http() {
+    // given — a tsdb with at least one ingested sample, so the checkpoint
+    // covers a non-trivial state.
+    let (app, _) = setup_with_data().await;
+
+    // when
+    let req = Request::post("/-/checkpoint").body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    // then
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = parsed
+        .get("checkpoint_id")
+        .and_then(|v| v.as_str())
+        .expect("checkpoint_id should be a string");
+    uuid::Uuid::parse_str(id).expect("checkpoint_id must be a valid UUID");
+    assert!(
+        parsed.get("manifest_id").and_then(|v| v.as_u64()).is_some(),
+        "expected numeric manifest_id, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_metrics() {
     let (app, _) = setup().await;
 

@@ -9,7 +9,10 @@ use super::{
     MergeOperator, MergeRecordOp, PutRecordOp, Storage, StorageSnapshot, WriteOptions, WriteResult,
 };
 use crate::storage::RecordOp;
-use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl};
+use crate::{
+    BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
+    Ttl,
+};
 
 /// Trait for providing the current time.
 pub trait Clock: Send + Sync {
@@ -442,6 +445,12 @@ impl Storage for InMemoryStorage {
         }
         Ok(())
     }
+
+    async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo> {
+        Err(StorageError::Storage(
+            "checkpoints are not supported for in-memory storage".to_string(),
+        ))
+    }
 }
 
 /// Injected failure that fires either once or on every call.
@@ -629,6 +638,10 @@ impl super::Storage for FailingStorage {
     async fn flush(&self) -> super::StorageResult<()> {
         check_failure(&self.fail_flush)?;
         self.inner.flush().await
+    }
+
+    async fn create_checkpoint(&self) -> super::StorageResult<CheckpointInfo> {
+        self.inner.create_checkpoint().await
     }
 }
 

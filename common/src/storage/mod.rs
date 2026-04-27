@@ -10,8 +10,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use uuid::Uuid;
 
 use crate::BytesRange;
+
+/// Identifies a checkpoint of a storage backend at a point in time.
+///
+/// Checkpoints capture a manifest snapshot that a reader can later open
+/// against to get a consistent view of the database at the time the
+/// checkpoint was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointInfo {
+    pub id: Uuid,
+    pub manifest_id: u64,
+}
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub enum Ttl {
@@ -368,4 +380,18 @@ pub trait Storage: StorageRead {
     /// `DbStatus::durable_seq`. For in-memory storage, writes are immediately
     /// "durable" so the watermark matches the latest written seqnum.
     fn subscribe_durable(&self) -> tokio::sync::watch::Receiver<u64>;
+
+    /// Creates a durable checkpoint of the current state.
+    ///
+    /// The returned [`CheckpointInfo::id`] can later be passed to a
+    /// `StorageReaderRuntime` to open a reader pinned to this exact view of
+    /// the database. For SlateDB, this maps to `Db::create_checkpoint` with
+    /// `CheckpointScope::All` (flushes WALs and freezes the memtable so the
+    /// checkpoint includes recent writes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying backend does not support
+    /// checkpoints, or if the checkpoint cannot be persisted.
+    async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo>;
 }

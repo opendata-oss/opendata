@@ -95,7 +95,8 @@ pub(crate) fn build_router(
         .route("/metrics", get(handle_metrics))
         .route("/-/healthy", get(handle_healthy))
         .route("/-/ready", get(handle_ready))
-        .route("/-/flush", post(handle_flush));
+        .route("/-/flush", post(handle_flush))
+        .route("/-/checkpoint", post(handle_checkpoint));
 
     #[cfg(feature = "remote-write")]
     let app = app.route(
@@ -670,6 +671,26 @@ async fn handle_flush(
 ) -> Result<(StatusCode, &'static str), ApiError> {
     state.tsdb.flush().await?;
     Ok((StatusCode::OK, "OK"))
+}
+
+/// Handle /-/checkpoint endpoint - flushes pending data and creates a
+/// durable SlateDB checkpoint. Returns the checkpoint id and the manifest
+/// id it references; pass `checkpoint_id` to a read-only instance to open
+/// it pinned to this exact view.
+async fn handle_checkpoint(
+    State(state): State<AppState>,
+) -> Result<Json<CheckpointResponse>, ApiError> {
+    let info = state.tsdb.create_checkpoint().await?;
+    Ok(Json(CheckpointResponse {
+        checkpoint_id: info.id.to_string(),
+        manifest_id: info.manifest_id,
+    }))
+}
+
+#[derive(serde::Serialize)]
+struct CheckpointResponse {
+    checkpoint_id: String,
+    manifest_id: u64,
 }
 
 /// Redirect `/` to `/query`.

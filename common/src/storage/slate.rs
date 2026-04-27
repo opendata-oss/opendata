@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::storage::factory::OwnedHybridCache;
 use crate::storage::{MergeOptions, PutOptions};
 use crate::{
-    BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl,
+    BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
+    Ttl,
     storage::{
         MergeOperator, MergeRecordOp, PutRecordOp, RecordOp, Storage, StorageSnapshot,
         WriteOptions, WriteResult,
@@ -12,7 +13,7 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::IterationOrder;
-use slatedb::config::ScanOptions;
+use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
     MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
@@ -342,6 +343,18 @@ impl Storage for SlateDbStorage {
     async fn flush(&self) -> StorageResult<()> {
         self.db.flush().await.map_err(StorageError::from_storage)?;
         Ok(())
+    }
+
+    async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo> {
+        let result = self
+            .db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(CheckpointInfo {
+            id: result.id,
+            manifest_id: result.manifest_id,
+        })
     }
 }
 

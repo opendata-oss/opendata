@@ -1093,6 +1093,17 @@ impl Tsdb {
         Ok(())
     }
 
+    /// Flushes pending writes and creates a durable checkpoint.
+    ///
+    /// The returned [`CheckpointInfo::id`] can be passed to
+    /// [`crate::reader::TimeSeriesDbReader::open`] (via
+    /// [`common::StorageReaderRuntime::with_checkpoint_id`]) to open a
+    /// reader pinned to this exact view of the database.
+    pub(crate) async fn create_checkpoint(&self) -> Result<common::CheckpointInfo> {
+        self.flush().await?;
+        Ok(self.storage.create_checkpoint().await?)
+    }
+
     pub(crate) async fn close(&self) -> Result<()> {
         self.flush().await?;
         self.storage.close().await?;
@@ -1481,6 +1492,15 @@ impl TsdbEngine {
         match self {
             Self::ReadWrite(tsdb) => tsdb.flush().await,
             Self::ReadOnly(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn create_checkpoint(&self) -> Result<common::CheckpointInfo> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.create_checkpoint().await,
+            Self::ReadOnly(_) => Err(crate::error::Error::InvalidInput(
+                "checkpoint creation is not supported in read-only mode".to_string(),
+            )),
         }
     }
 

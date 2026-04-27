@@ -10,6 +10,7 @@ use common::ObjectStoreConfig;
 use common::storage::config::StorageConfig;
 use serde::{Deserialize, Deserializer};
 use slatedb::config::DbReaderOptions;
+use uuid::Uuid;
 
 #[cfg(feature = "http-server")]
 use clap::Parser;
@@ -56,6 +57,11 @@ pub struct PrometheusConfig {
         deserialize_with = "deserialize_reader_options"
     )]
     pub reader: DbReaderOptions,
+    /// Pin a read-only instance to a specific SlateDB checkpoint. Only
+    /// honored when `read_only` is true. When unset, the reader follows the
+    /// latest manifest as governed by `reader.manifest_poll_interval`.
+    #[serde(default)]
+    pub checkpoint_id: Option<Uuid>,
     /// Maximum number of bucket readers to cache in memory.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
@@ -135,6 +141,7 @@ impl Default for PrometheusConfig {
             flush_interval_secs: default_flush_interval_secs(),
             read_only: false,
             reader: default_reader_options(),
+            checkpoint_id: None,
             cache_capacity: default_cache_capacity(),
             cache_warmer: default_cache_warmer(),
             tracing: TracingConfig::default(),

@@ -257,6 +257,18 @@ impl TimeSeriesDb {
         self.tsdb.flush().await
     }
 
+    /// Flushes pending data and creates a durable checkpoint.
+    ///
+    /// The returned [`common::CheckpointInfo::id`] can be passed to
+    /// [`crate::TimeSeriesDbReader::open_at_checkpoint`] (or to the
+    /// `checkpoint_id` field on `PrometheusConfig`) to open a reader pinned
+    /// to this exact view of the database.
+    ///
+    /// Only supported by SlateDB-backed storage.
+    pub async fn create_checkpoint(&self) -> Result<common::CheckpointInfo> {
+        self.tsdb.create_checkpoint().await
+    }
+
     /// Closes the time series database, flushing any pending data and releasing
     /// resources.
     ///
