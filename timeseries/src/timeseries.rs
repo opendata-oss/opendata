@@ -88,7 +88,7 @@ impl TimeSeriesDb {
         // later reads don't have to replay them across SSTs. Runs before any
         // writer is started, so no concurrent merges can race the Put.
         coalesce_bucket_list(storage.as_ref()).await?;
-        let tsdb = Tsdb::new(storage);
+        let tsdb = Tsdb::with_retention(storage, config.retention);
         Ok(Self { tsdb })
     }
 

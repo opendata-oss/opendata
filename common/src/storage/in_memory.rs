@@ -48,12 +48,12 @@ impl StoredValue {
 
 /// Computes the absolute expiration timestamp from TTL options.
 fn compute_expire_ts(now: i64, ttl: Ttl, default_ttl: Option<u64>) -> Option<i64> {
-    let duration = match ttl {
-        Ttl::Default => default_ttl,
+    match ttl {
+        Ttl::Default => default_ttl.map(|ms| now + ms as i64),
         Ttl::NoExpiry => None,
-        Ttl::ExpireAfter(ms) => Some(ms),
-    };
-    duration.map(|ms| now + ms as i64)
+        Ttl::ExpireAfter(ms) => Some(now + ms as i64),
+        Ttl::ExpireAt(ts) => Some(ts),
+    }
 }
 
 /// In-memory implementation of the Storage trait using a BTreeMap.

@@ -974,12 +974,21 @@ pub(crate) struct Tsdb {
     /// Also used during queries so that unflushed data is visible.
     ingest_cache: Cache<TimeBucket, Arc<MiniTsdb>>,
 
+    /// Retention duration plumbed into each `MiniTsdb` so the flusher can
+    /// stamp records with a bucket-aligned `Ttl::ExpireAt`. `None` disables
+    /// per-record expiration.
+    retention: Option<Duration>,
+
     // Metadata catalog (keyed by metric name)
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 }
 
 impl Tsdb {
     pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
+        Self::with_retention(storage, None)
+    }
+
+    pub(crate) fn with_retention(storage: Arc<dyn Storage>, retention: Option<Duration>) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
             .time_to_idle(Duration::from_secs(15 * 60))
@@ -988,6 +997,7 @@ impl Tsdb {
         Self {
             storage,
             ingest_cache,
+            retention,
             metadata_catalog: RwLock::new(HashMap::new()),
         }
     }
@@ -1010,7 +1020,7 @@ impl Tsdb {
         }
 
         // Load from storage and put in ingest cache
-        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone()).await?);
+        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone(), self.retention).await?);
         self.ingest_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
     }

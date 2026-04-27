@@ -31,6 +31,7 @@ pub enum Ttl {
     Default,
     NoExpiry,
     ExpireAfter(u64),
+    ExpireAt(i64),
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
