@@ -193,7 +193,7 @@ impl TimeSeriesDbReader {
     /// Unlike [`open`](Self::open), the returned reader serves a frozen view
     /// of the database as of the checkpoint and does not advance with newer
     /// writes. The checkpoint must already exist (typically created via
-    /// [`crate::TimeSeriesDb::create_checkpoint`]).
+    /// `TimeSeriesDb::create_checkpoint`).
     pub async fn open_at_checkpoint(
         storage_config: StorageConfig,
         reader_options: slatedb::config::DbReaderOptions,

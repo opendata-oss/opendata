@@ -1095,7 +1095,7 @@ impl Tsdb {
 
     /// Flushes pending writes and creates a durable checkpoint.
     ///
-    /// The returned [`CheckpointInfo::id`] can be passed to
+    /// The returned [`common::CheckpointInfo::id`] can be passed to
     /// [`crate::reader::TimeSeriesDbReader::open`] (via
     /// [`common::StorageReaderRuntime::with_checkpoint_id`]) to open a
     /// reader pinned to this exact view of the database.

@@ -214,8 +214,8 @@ impl StorageReaderRuntime {
     /// When set, the reader serves a consistent view of the database as of
     /// the checkpoint and does not advance with newer writes. The checkpoint
     /// must already exist in storage (typically created via
-    /// [`Storage::create_checkpoint`](crate::Storage::create_checkpoint)).
-    /// Only meaningful for SlateDB storage.
+    /// [`crate::Storage::create_checkpoint`]). Only meaningful for SlateDB
+    /// storage.
     pub fn with_checkpoint_id(mut self, id: Uuid) -> Self {
         self.checkpoint_id = Some(id);
         self
