@@ -364,6 +364,7 @@ impl From<Ttl> for slatedb::config::Ttl {
             Ttl::Default => slatedb::config::Ttl::Default,
             Ttl::NoExpiry => slatedb::config::Ttl::NoExpiry,
             Ttl::ExpireAfter(ts) => slatedb::config::Ttl::ExpireAfter(ts),
+            Ttl::ExpireAt(ts) => slatedb::config::Ttl::ExpireAt(ts),
         }
     }
 }

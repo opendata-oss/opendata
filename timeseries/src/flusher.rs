@@ -1,11 +1,13 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use common::coordinator::Flusher;
-use common::storage::{Storage, StorageSnapshot};
+use common::storage::{Storage, StorageSnapshot, Ttl};
 
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
+use crate::model::TimeBucket;
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
 use crate::tsdb_metrics;
 
@@ -15,6 +17,24 @@ use crate::tsdb_metrics;
 /// atomically, then returns a new snapshot for readers.
 pub(crate) struct TsdbFlusher {
     pub(crate) storage: Arc<dyn Storage>,
+    /// Optional retention duration. When set, every record produced by a flush
+    /// is stamped with the same `Ttl::ExpireAt(bucket_start_ms + retention_ms)`
+    /// so SlateDB can collapse merge operands during compaction. Without a
+    /// shared expiration, operands written at different wall-clock times get
+    /// different TTLs and never merge — see issue #342.
+    pub(crate) retention: Option<Duration>,
+}
+
+/// Compute the absolute expire-at timestamp (ms since epoch) shared by every
+/// record in `bucket` for the given `retention`. Returns `Ttl::Default` when
+/// retention is disabled.
+fn bucket_ttl(bucket: TimeBucket, retention: Option<Duration>) -> Ttl {
+    let Some(retention) = retention else {
+        return Ttl::Default;
+    };
+    let bucket_start_ms = bucket.start as i64 * 60 * 1000;
+    let retention_ms = retention.as_millis() as i64;
+    Ttl::ExpireAt(bucket_start_ms.saturating_add(retention_ms))
 }
 
 #[async_trait]
@@ -30,6 +50,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
 
         let new_series_count = frozen.series_dict_delta.len() as u64;
         let start = std::time::Instant::now();
+        let ttl = bucket_ttl(frozen.bucket, self.retention);
 
         let mut ops = Vec::new();
         // Suppress the BucketList merge when this bucket is already listed.
@@ -45,7 +66,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         if !bucket_announced {
             ops.push(
                 self.storage
-                    .merge_bucket_list(frozen.bucket)
+                    .merge_bucket_list(frozen.bucket, ttl)
                     .map_err(|e| e.to_string())?,
             );
         }
@@ -53,7 +74,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         for (fingerprint, series_id) in &frozen.series_dict_delta {
             ops.push(
                 self.storage
-                    .insert_series_id(frozen.bucket, *fingerprint, *series_id)
+                    .insert_series_id(frozen.bucket, *fingerprint, *series_id, ttl)
                     .map_err(|e| e.to_string())?,
             );
         }
@@ -61,7 +82,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         for entry in frozen.forward_index.series.iter() {
             ops.push(
                 self.storage
-                    .insert_forward_index(frozen.bucket, *entry.key(), entry.value().clone())
+                    .insert_forward_index(frozen.bucket, *entry.key(), entry.value().clone(), ttl)
                     .map_err(|e| e.to_string())?,
             );
         }
@@ -69,7 +90,12 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         for entry in frozen.inverted_index.postings.iter() {
             ops.push(
                 self.storage
-                    .merge_inverted_index(frozen.bucket, entry.key().clone(), entry.value().clone())
+                    .merge_inverted_index(
+                        frozen.bucket,
+                        entry.key().clone(),
+                        entry.value().clone(),
+                        ttl,
+                    )
                     .map_err(|e| e.to_string())?,
             );
         }
@@ -82,6 +108,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                         series_id,
                         &series_samples.metric_name,
                         series_samples.points,
+                        ttl,
                     )
                     .map_err(|e| e.to_string())?,
             );
@@ -136,6 +163,50 @@ mod tests {
         TimeBucket::hour(1000)
     }
 
+    #[test]
+    fn should_return_default_ttl_when_retention_is_none() {
+        // given
+        let bucket = create_test_bucket();
+
+        // when
+        let ttl = bucket_ttl(bucket, None);
+
+        // then
+        assert_eq!(ttl, Ttl::Default);
+    }
+
+    #[test]
+    fn should_compute_expire_at_from_bucket_start_and_retention() {
+        // given: hour bucket starts at minute 1000, retention 7d
+        let bucket = TimeBucket::hour(1000);
+        let retention = Duration::from_secs(7 * 86_400);
+
+        // when
+        let ttl = bucket_ttl(bucket, Some(retention));
+
+        // then: bucket_start_ms = 1000 * 60 * 1000; retention_ms = 7d in ms
+        let expected = 1000_i64 * 60 * 1000 + 7 * 86_400 * 1000;
+        assert_eq!(ttl, Ttl::ExpireAt(expected));
+    }
+
+    #[test]
+    fn should_match_expire_at_for_same_bucket_across_calls() {
+        // given: same bucket, same retention, called at different wall times
+        let bucket = TimeBucket::hour(42);
+        let retention = Some(Duration::from_secs(86_400));
+
+        // when
+        let ttl_a = bucket_ttl(bucket, retention);
+        // sleep is OK because its deterministic, not required for test
+        // to succeed
+        std::thread::sleep(Duration::from_millis(2));
+        let ttl_b = bucket_ttl(bucket, retention);
+
+        // then: every record stamped with this TTL gets the same expire_at,
+        // which is the property SlateDB compaction needs to merge operands.
+        assert_eq!(ttl_a, ttl_b);
+    }
+
     fn create_test_sample() -> Sample {
         Sample {
             timestamp_ms: 60_000_001,
@@ -156,6 +227,7 @@ mod tests {
         let storage = create_test_storage();
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
@@ -183,6 +255,7 @@ mod tests {
         let storage = create_test_storage();
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
@@ -227,6 +300,7 @@ mod tests {
         let storage = create_failing_storage();
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         storage.fail_apply(common::StorageError::Storage("test apply error".into()));
 
@@ -249,6 +323,7 @@ mod tests {
         let storage = create_failing_storage();
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         // Apply succeeds, but snapshot after apply fails
         storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
@@ -272,6 +347,7 @@ mod tests {
         let storage = create_failing_storage();
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         storage.fail_flush(common::StorageError::Storage("test flush error".into()));
 
@@ -292,6 +368,7 @@ mod tests {
         let storage = create_test_storage();
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
@@ -322,6 +399,7 @@ mod tests {
         let storage = create_test_storage();
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         let bucket = create_test_bucket();
 
@@ -373,6 +451,7 @@ mod tests {
 
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         let ctx = TsdbContext {
             bucket,
@@ -403,6 +482,7 @@ mod tests {
         let storage = create_test_storage();
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
