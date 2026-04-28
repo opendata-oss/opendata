@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use buffer::{CollectedBatch, Collector, Metadata};
+use buffer::{Metadata, ReadBatch, Reader};
 use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
@@ -95,14 +95,14 @@ impl BufferConsumer {
     /// Returns a [`ConsumerHandle`] that must be used to shut down the consumer
     /// gracefully, or an error if the collector cannot be created or initialized.
     pub async fn run(self: Arc<Self>) -> Result<ConsumerHandle, buffer::Error> {
-        let collector_config = buffer::CollectorConfig {
+        let collector_config = buffer::ReaderConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
             data_path_prefix: self.config.data_path_prefix.clone(),
             gc_interval: self.config.gc_interval,
             gc_grace_period: self.config.gc_grace_period,
         };
-        let collector = Collector::new(collector_config, None).await?;
+        let collector = Reader::new(collector_config, None).await?;
         self.start(collector).await
     }
 
@@ -114,21 +114,18 @@ impl BufferConsumer {
         self: Arc<Self>,
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
     ) -> Result<ConsumerHandle, buffer::Error> {
-        let collector_config = buffer::CollectorConfig {
+        let collector_config = buffer::ReaderConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
             data_path_prefix: self.config.data_path_prefix.clone(),
             gc_interval: self.config.gc_interval,
             gc_grace_period: self.config.gc_grace_period,
         };
-        let collector = Collector::with_object_store(collector_config, object_store, None).await?;
+        let collector = Reader::with_object_store(collector_config, object_store, None).await?;
         self.start(collector).await
     }
 
-    async fn start(
-        self: &Arc<Self>,
-        collector: Collector,
-    ) -> Result<ConsumerHandle, buffer::Error> {
+    async fn start(self: &Arc<Self>, collector: Reader) -> Result<ConsumerHandle, buffer::Error> {
         tracing::info!(
             manifest_path = %self.config.manifest_path,
             poll_interval = ?self.config.poll_interval,
@@ -157,7 +154,7 @@ async fn poll_loop(
     tsdb: Arc<Tsdb>,
     converter: Arc<OtelConverter>,
     poll_interval: std::time::Duration,
-    collector: Collector,
+    collector: Reader,
     cancel: CancellationToken,
 ) {
     let (batch_tx, mut batch_rx) = mpsc::channel(PREFETCH_BATCH_BUFFER);
@@ -199,15 +196,15 @@ async fn poll_loop(
     tracing::info!("Buffer consumer shutting down, flushing pending acks...");
     drop(ack_tx);
     if let Err(e) = collector_join.await {
-        tracing::error!("Collector task panicked: {e}");
+        tracing::error!("Reader task panicked: {e}");
     }
 }
 
 async fn collector_loop(
-    mut collector: Collector,
+    mut collector: Reader,
     poll_interval: std::time::Duration,
     cancel: CancellationToken,
-    batch_tx: mpsc::Sender<CollectedBatch>,
+    batch_tx: mpsc::Sender<ReadBatch>,
     mut ack_rx: mpsc::Receiver<u64>,
 ) {
     let mut error_backoff = poll_interval;
@@ -278,9 +275,9 @@ enum WaitOutcome {
 async fn wait_for_work(
     cancel: &CancellationToken,
     ack_rx: &mut mpsc::Receiver<u64>,
-    batch_tx: &mpsc::Sender<CollectedBatch>,
+    batch_tx: &mpsc::Sender<ReadBatch>,
     delay: Option<std::time::Duration>,
-    collector: &mut Collector,
+    collector: &mut Reader,
 ) -> WaitOutcome {
     let wait_for_capacity = batch_tx.capacity() == 0;
     let mut timer = delay.map(|delay| Box::pin(sleep(delay)));
@@ -310,19 +307,19 @@ async fn wait_for_work(
     }
 }
 
-async fn drain_pending_acks(collector: &mut Collector, ack_rx: &mut mpsc::Receiver<u64>) {
+async fn drain_pending_acks(collector: &mut Reader, ack_rx: &mut mpsc::Receiver<u64>) {
     while let Ok(sequence) = ack_rx.try_recv() {
         ack_sequence(collector, sequence).await;
     }
 }
 
-async fn ack_sequence(collector: &mut Collector, sequence: u64) {
+async fn ack_sequence(collector: &mut Reader, sequence: u64) {
     if let Err(e) = collector.ack(sequence).await {
         tracing::error!(sequence, "Failed to ack batch: {e}");
     }
 }
 
-async fn process_batch(tsdb: &Tsdb, converter: &OtelConverter, batch: &CollectedBatch) {
+async fn process_batch(tsdb: &Tsdb, converter: &OtelConverter, batch: &ReadBatch) {
     for (idx, entry) in batch.entries.iter().enumerate() {
         let metadata = find_metadata_for_entry(&batch.metadata, idx as u32);
         if let Err(reason) = process_entry(tsdb, converter, entry, metadata).await {

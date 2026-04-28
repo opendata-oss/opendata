@@ -2535,7 +2535,7 @@ mod tests {
         assert!(matches!(result.unwrap_err(), QueryError::InvalidQuery(_)));
     }
 
-    /// End-to-end test: Buffer → BufferConsumer → Tsdb → query.
+    /// End-to-end test: Writer → BufferConsumer → Tsdb → query.
     ///
     /// Runs the real consumer poll loop (metadata validation, ack/flush) and
     /// shuts it down gracefully via [`ConsumerHandle`].
@@ -2556,7 +2556,7 @@ mod tests {
         use slatedb::object_store::ObjectStore;
         use slatedb::object_store::memory::InMemory;
 
-        // given — shared in-memory object store for buffer and consumer
+        // given — shared in-memory object store for writer and consumer
         let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let manifest = "ingest/manifest".to_string();
 
@@ -2608,8 +2608,8 @@ mod tests {
         // Metadata: version=1, signal_type=metrics(1), encoding=otlp_proto(1), reserved=0
         let metadata = Bytes::from_static(&[1, 1, 1, 0]);
 
-        // Produce via Buffer
-        let buffer_config = buffer::BufferConfig {
+        // Produce via Writer
+        let writer_config = buffer::WriterConfig {
             object_store: common::ObjectStoreConfig::InMemory,
             data_path_prefix: "ingest".to_string(),
             manifest_path: manifest.clone(),
@@ -2618,17 +2618,17 @@ mod tests {
             max_buffered_inputs: 1000,
             batch_compression: buffer::CompressionType::None,
         };
-        let buffer = buffer::Buffer::with_object_store(
-            buffer_config,
+        let writer = buffer::Writer::with_object_store(
+            writer_config,
             obj_store.clone(),
             Arc::new(common::clock::SystemClock),
         )
         .unwrap();
-        buffer
+        writer
             .ingest(vec![Bytes::from(proto_bytes)], metadata)
             .await
             .unwrap();
-        buffer.close().await.unwrap();
+        writer.close().await.unwrap();
 
         // Start the real BufferConsumer against the shared object store
         let tsdb = Arc::new(Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(

@@ -16,15 +16,15 @@ Callers choose the exporter by installing a `metrics::Recorder`.
 
 The buffer crate exposes only `ConflictCounter` and `queue_len`,
 both internal `AtomicU64` fields with no exporter integration.
-Operators cannot tell whether the collector is keeping up, whether
+Operators cannot tell whether the reader is keeping up, whether
 GC deletes are succeeding, or how much manifest contention exists.
 
 RFC 0001 listed observability as TBD.
 
 ## Goals
 
-- Counters, gauges, and histograms for the write path (buffer)
-  and read path (collector).
+- Counters, gauges, and histograms for the write path (writer)
+  and read path (reader).
 - No dependency on a specific exporter. The `metrics` crate uses
   a recorder facade; when no recorder is installed the macros are
   zero-cost no-ops.
@@ -85,9 +85,9 @@ Recorded in `BatchWriterTask::write_and_enqueue`.
 #### Labels
 
 `manifest_writes` and `manifest_conflicts` carry a `role` label
-(`"producer"` or `"consumer"`) to distinguish buffer-side from
-collector-side contention. All other metrics are unlabeled;
-buffers and collectors run in separate processes.
+(`"producer"` or `"consumer"`) to distinguish writer-side from
+reader-side contention. All other metrics are unlabeled;
+writers and readers run in separate processes.
 
 #### Lag calculation
 

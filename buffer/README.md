@@ -2,21 +2,21 @@
 
 A shared, stateless buffer library for [OpenData](https://github.com/opendata-oss/opendata) databases.
 
-Provides write-path infrastructure that all OpenData databases (Timeseries, Log, Vector) can reuse. Buffers accept opaque byte entries, accumulate them in memory, and periodically flush batched data files to object storage. A manifest-backed queue coordinates producers (buffers) and consumers (collectors) in a stateless, crash-safe way.
+Provides write-path infrastructure that all OpenData databases (Timeseries, Log, Vector) can reuse. Writers accept opaque byte entries, accumulate them in memory, and periodically flush batched data files to object storage. A manifest-backed queue coordinates producers (writers) and consumers (readers) in a stateless, crash-safe way.
 
 ## Why a stateless buffer?
 
-- **Fault tolerance** — buffers are stateless. If one fails, any other running buffer can take over without a rebalancing protocol.
+- **Fault tolerance** — writers are stateless. If one fails, any other running writer can take over without a rebalancing protocol.
 - **Decoupled from writes** — if the downstream database is slow or unavailable, buffered data is safely persisted in object storage rather than dropped or back-pressured.
 - **Cost savings** — data flows through object storage rather than across availability zones, avoiding cross-zonal transfer fees.
 
 ## Architecture
 
 ```text
-╔═Buffers════════════════════════════════════════════════════╗
+╔═Writers════════════════════════════════════════════════════╗
 ║                                                            ║░
 ║  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  ║░
-║  │   Buffer 1   │    │   Buffer 2   │    │   Buffer N   │  ║░
+║  │   Writer 1   │    │   Writer 2   │    │   Writer N   │  ║░
 ║  │  q-producer  │    │  q-producer  │    │  q-producer  │  ║░
 ║  └───────┬──────┘    └──────────────┘    └───────┬──────┘  ║░
 ║          │                                       │         ║░
@@ -44,10 +44,10 @@ Provides write-path infrastructure that all OpenData databases (Timeseries, Log,
                 │        ┌───────poll─────────┘
               read       │
                 │        │
-       ╔═Writer═╪════════╪═════════╗
+       ╔═Reader═╪════════╪═════════╗
        ║        │        │         ║░
        ║        │┌───────┴──────┐  ║░     ╔════════════════╗
-       ║        ││  Collector   │  ║░     ║                ║
+       ║        ││    Reader    │  ║░     ║                ║
        ║        └▶  q-consumer  ├──write──▶    Database    ║
        ║         └──────────────┘  ║░     ║                ║
        ║                           ║░     ╚════════════════╝
@@ -57,19 +57,19 @@ Provides write-path infrastructure that all OpenData databases (Timeseries, Log,
 
 ## Usage
 
-### Buffer
+### Writer
 
-The buffer accumulates entries and flushes them as compressed batches to object storage, appending their locations to the queue manifest.
+The writer accumulates entries and flushes them as compressed batches to object storage, appending their locations to the queue manifest.
 
 ```rust
-use buffer::{Buffer, BufferConfig};
+use buffer::{Writer, WriterConfig};
 use bytes::Bytes;
 use std::sync::Arc;
 
-let buffer = Buffer::new(BufferConfig::default(), clock)?;
+let writer = Writer::new(WriterConfig::default(), clock)?;
 
 // Submit entries with metadata — returns a handle to await durability
-let handle = buffer.ingest(
+let handle = writer.ingest(
     vec![Bytes::from("entry-1"), Bytes::from("entry-2")],
     Bytes::from("my-metadata"),
 ).await?;
@@ -78,7 +78,7 @@ let handle = buffer.ingest(
 handle.watcher.await_durable().await?;
 
 // Flush remaining entries and shut down
-buffer.close().await?;
+writer.close().await?;
 ```
 
 #### Configuration
@@ -92,36 +92,36 @@ buffer.close().await?;
 | `data_path_prefix` | `"ingest"` | Object storage prefix for data batches |
 | `manifest_path` | `"ingest/manifest"` | Path to the queue manifest |
 
-### Collector
+### Reader
 
-The collector reads batches from the queue in ingestion order and makes them available to a database writer.
+The reader reads batches from the queue in ingestion order and makes them available to a database writer.
 
 ```rust
-use buffer::{Collector, CollectorConfig};
+use buffer::{Reader, ReaderConfig};
 
-let collector = Collector::new(CollectorConfig::default(), clock)?;
+let reader = Reader::new(ReaderConfig::default(), clock)?;
 
-// Initialize the consumer — fences any previous collector via epoch bump
-collector.initialize(None).await?;
+// Initialize the consumer — fences any previous reader via epoch bump
+reader.initialize(None).await?;
 
 // Read batches in order
-while let Some(batch) = collector.next_batch().await? {
+while let Some(batch) = reader.next_batch().await? {
     // batch.entries: Vec<Bytes>
     // batch.sequence: u64
     // batch.metadata: Vec<Metadata>
     process(&batch);
-    collector.ack(batch.sequence).await?;
+    reader.ack(batch.sequence).await?;
 }
 
 // Force-flush acked entries from the manifest
-collector.flush().await?;
+reader.flush().await?;
 ```
 
 ## Delivery guarantees
 
-Exactly-once delivery is achievable when the caller atomically writes both the batch and its sequence number to the downstream database. After a failure, the collector resumes from the last committed sequence — no data is processed twice.
+Exactly-once delivery is achievable when the caller atomically writes both the batch and its sequence number to the downstream database. After a failure, the reader resumes from the last committed sequence — no data is processed twice.
 
-On the buffer side, callers that track progress and re-submit unacknowledged entries achieve at-least-once delivery.
+On the writer side, callers that track progress and re-submit unacknowledged entries achieve at-least-once delivery.
 
 ## CLI
 

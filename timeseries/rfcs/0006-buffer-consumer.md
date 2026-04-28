@@ -6,7 +6,7 @@
 
 This RFC defines a durable ingestion path for OTLP metrics via
 `opendata-buffer`. A Go OTel Collector exporter writes OTLP
-protobuf through the buffer `Buffer` to object storage. An
+protobuf through the buffer `Writer` to object storage. An
 embedded background task in the timeseries service consumes
 batches, converts them via `OtelConverter`, and writes to
 `TimeSeriesDb`. This complements the direct OTLP/HTTP endpoint
@@ -27,8 +27,8 @@ cross-AZ transfer fees that are acute at this scale.
 
 ## Goals
 
-- Define the contract between buffer (Go, in
-  `opendata-go`) and collector (Rust, in `opendata`) --
+- Define the contract between writer (Go, in
+  `opendata-go`) and reader (Rust, in `opendata`) --
   the 4-byte metadata protocol is the key interface since
   the two sides live in different repositories
 - Specify the Go OTel Collector exporter contract
@@ -74,7 +74,7 @@ cross-AZ transfer fees that are acute at this scale.
                                     ║ ┌────────────────────────┐ ║
                                     ║ │ BufferConsumer         │ ║
                                     ║ │                        │ ║
-                                    ║ │  Collector             │ ║
+                                    ║ │  Reader                │ ║
                                     ║ │  -> decode metadata    │ ║
                                     ║ │  -> prost decode       │ ║
                                     ║ │  -> OtelConverter      │ ║
@@ -88,7 +88,7 @@ Both this path and the direct OTLP/HTTP path converge at
 
 ### Metadata Protocol
 
-A 4-byte payload attached to each `Buffer::ingest()` call:
+A 4-byte payload attached to each `Writer::ingest()` call:
 
 | Byte | Field              | Values                          |
 |------|--------------------|-------------------------------- |
@@ -107,7 +107,7 @@ file.
 
 The expectation is that different signal types use separate
 buffer channels (distinct manifest paths), but this is not
-a hard requirement. A consumer that only handles metrics
+a hard requirement. A reader that only handles metrics
 simply discards entries with other signal types.
 
 **Go encoding:**
@@ -139,7 +139,7 @@ impl BufferMetadata {
 Component type `"opendata"`, alpha stability, metrics-only.
 Lives in `opendata-go` as a separate repository.
 
-**Configuration** maps directly to `buffer.BufferConfig`:
+**Configuration** maps directly to `buffer.WriterConfig`:
 
 ```go
 type Config struct {
@@ -156,12 +156,12 @@ type Config struct {
 
 1. `ConsumeMetrics` marshals `pmetric.Metrics` to OTLP
    protobuf
-2. Calls `buffer.Append([][]byte{proto}, metadata)`
+2. Calls `writer.Append([][]byte{proto}, metadata)`
    with metadata `[1, 1, 1, 0]`
 3. Awaits `WriteHandle.AwaitDurable(ctx)` before returning
 
-On startup, creates object store + buffer. On shutdown,
-calls `buffer.Close(ctx)`.
+On startup, creates object store + writer. On shutdown,
+calls `writer.Close(ctx)`.
 
 **Example collector config:**
 
@@ -194,7 +194,7 @@ instance as the HTTP handler.
 
 **Poll loop:**
 
-1. Initialize collector
+1. Initialize reader
 2. Poll `next_batch()`
 3. For each entry: decode metadata -> `prost::decode`
    OTLP proto -> `OtelConverter::convert()` ->
@@ -211,10 +211,10 @@ Add `buffer_consumer: Option<BufferConsumerConfig>` to
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferConsumerConfig {
-    /// Must point to same object store as the buffer(s).
+    /// Must point to same object store as the writer(s).
     pub object_store: ObjectStoreConfig,
 
-    /// Must match the buffer's manifest_path.
+    /// Must match the writer's manifest_path.
     /// Default: "ingest/manifest"
     #[serde(default = "default_manifest_path")]
     pub manifest_path: String,
@@ -242,7 +242,7 @@ buffer_consumer:
 ```
 
 The buffer object store may differ from TSDB storage -- the
-buffer queue is an intermediary store.
+buffer is an intermediary store.
 
 ### Observability
 
