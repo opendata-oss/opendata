@@ -1,7 +1,7 @@
+#[cfg(feature = "otel")]
+pub(crate) mod buffer_consumer;
 pub(crate) mod cache_warmer;
 mod http;
-#[cfg(feature = "otel")]
-pub(crate) mod ingest_consumer;
 pub(crate) mod metrics;
 mod middleware;
 #[cfg(feature = "otel")]

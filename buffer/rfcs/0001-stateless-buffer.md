@@ -1,4 +1,4 @@
-# RFC 0001: Stateless Ingest
+# RFC 0001: Stateless Buffer
 
 **Status**: Draft
 
@@ -8,16 +8,16 @@
 
 ## Summary
 
-This RFC proposes a shared, stateless ingest module for OpenData.
+This RFC proposes a shared, stateless buffer module for OpenData.
 The module provides the core write-path infrastructure that all OpenData databases
 (Timeseries, Log, Vector, and future databases) can reuse.
-Stateless ingest consists of multiple components -- called ingestors -- that accept write entries from an API layer,
+A stateless buffer consists of multiple components -- called buffers -- that accept write entries from an API layer,
 accumulate them in memory, and periodically flush batched data files to object storage.
 On the read side of the ingestion, a collector reads the batches and makes them available to a writer of a database.
-Each ingestor accepts any data, i.e., no mapping from specific ingest data partitions to specific ingestor exist.
-If an ingestor fails, any other still running ingestor can take over the work without running any rebalancing protocol.
-A manifest-backed queue coordinates producers (ingestors) and consumers (collectors) in a stateless, crash-safe way.
-Stateless ingest enables simple high availability ingest and ingest scaling in OpenData systems.
+Each buffer accepts any data, i.e., no mapping from specific ingest data partitions to specific buffer exist.
+If an buffer fails, any other still running buffer can take over the work without running any rebalancing protocol.
+A manifest-backed queue coordinates producers (buffers) and consumers (collectors) in a stateless, crash-safe way.
+A stateless buffer enables simple high availability writes and scaling in OpenData systems.
 
 
 ## Motivation
@@ -32,7 +32,7 @@ The ingestion needs to be fault-tolerant and it needs to be highly-available, th
 independently from the actual write into the OpenData system.
 A stateless ingestion allows simple fail-over and scaling.
 
-Another big motivation for stateless ingest through object storage is cost savings.
+Another big motivation for the stateless buffer through object storage is cost savings.
 The ingested data does not need to be sent to the collector that might run in a different availability zones.
 In other words, data does not need to cross zones which saves costs because reads from object storage in
 different zones do not incur cross-zonal transfer fees.
@@ -40,16 +40,16 @@ different zones do not incur cross-zonal transfer fees.
 
 ## Goals
 
-- Design ingest that is stateless, fault-tolerant, highly-available
-- Specify how the ingest makes data available to the collector that inserts the data to the OpenData system.
+- Design a buffer that is stateless, fault-tolerant, highly-available
+- Specify how the buffer makes data available to the collector that inserts the data to the OpenData system.
 - Specify how the collector can read the ingested data in the correct ingest order including the fail-over case.
 
 
 ## Non-Goals
 
 - Specify how unacknowledged entries can be re-ingested in case of a re-start.
-  Progress handling is the responsibility of the system that uses the ingestors.
-- Specify fail-over for the external system that uses the ingestors.
+  Progress handling is the responsibility of the system that uses the buffers.
+- Specify fail-over for the external system that uses the buffers.
 - Specify a service that accepts data to ingest.
 
 
@@ -57,7 +57,7 @@ different zones do not incur cross-zonal transfer fees.
 
 ```ascii
             ┌────────────┐    ┌────────────┐    ┌────────────┐
-            │ Ingestor 1 │    │ Ingestor 2 │    │ Ingestor N │
+            │ Buffer 1 │    │ Buffer 2 │    │ Buffer N │
             │ q-producer │    │ q-producer │    │ q-producer │
             └──┬──────┬──┘    └──┬──────┬──┘    └────┬────┬──┘
                │    ┌─┼──────────┘      │            │    │
@@ -87,10 +87,10 @@ different zones do not incur cross-zonal transfer fees.
 
 ### Queue
 
-The queue coordinates ingestors and collectors via a single queue manifest in object storage
+The queue coordinates buffers and collectors via a single queue manifest in object storage
 (`q-manifest` in the diagram).
 
-The queue producers (used internally by the ingestors) write the locations of the batches of ingested data
+The queue producers (used internally by the buffers) write the locations of the batches of ingested data
 to the queue manifest.
 More specifically, a queue producer reads the manifest and loads the list of locations into memory.
 It appends the location of the flushed batch to the end of the list and writes the manifest back to object storage.
@@ -169,18 +169,18 @@ If a consumer fails, the new consumer increments the epoch, fencing the old one,
 and resumes processing from the earliest unprocessed entry in the queue manifest.
 
 
-### Ingestor
+### Buffer
 
-The ingestor provides an API to ingest a vector of opaque byte entries with associated metadata.
+The buffer provides an API to ingest a vector of opaque byte entries with associated metadata.
 The entries are buffered in a batch in ingestion order.
-The ingestor flushes the batches of ingested entries to object storage and appends the locations of the
+The buffer flushes the batches of ingested entries to object storage and appends the locations of the
 flushed objects to the queue with the internally used queue producer (`q-producer` in the diagram).
 Flushes are triggered after a given time interval elapsed or if a batch of the ingested data exceeds a given size.
 
-The API of the ingestor is the following:
+The API of the buffer is the following:
 ```rust
-impl Ingestor {
-  pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
+impl Buffer {
+  pub fn new(config: BufferConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
   pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
 
@@ -188,11 +188,11 @@ impl Ingestor {
 }
 ```
 
-An ingestor is constructed by calling the method `new()` passing to it the configuration and a clock.
-The configurations for the ingestor are:
+An buffer is constructed by calling the method `new()` passing to it the configuration and a clock.
+The configurations for the buffer are:
 
 ```rust
-pub struct IngestorConfig {
+pub struct BufferConfig {
   /// Determines where and how ingest data is persisted. See [`StorageConfig`].
   pub storage: StorageConfig,
 
@@ -232,7 +232,7 @@ The config `flush_size_bytes` is a loose limit.
 The batch needs to exceed that size to trigger a flush to object storage.
 The config `max_buffered_inputs` limits the number of `ingest()` calls that can be buffered. 
 When the buffer is full, `ingest()` blocks until the background task consumes a message.
-If this backpressure becomes an issue, new ingestors can be created to better distribute the load.
+If this backpressure becomes an issue, new buffers can be created to better distribute the load.
 
 A call to `ingest()` takes a vector of opaque byte entries and a metadata payload, and returns a `WriteHandle`
 with which the caller can await the completion of the flush to object storage of the data entries.
@@ -259,11 +259,11 @@ is appended to the queue.
 More specifically, the location is appended to the end of the list of pending locations in the queue manifest
 (`q-manifest` in the diagram).
 
-Method `close()` flushes unflushed entries and terminates the ingestor.
+Method `close()` flushes unflushed entries and terminates the buffer.
 
 ### Data Batch Format
 
-A data batch is the unit of data that an ingestor flushes to object storage.
+A data batch is the unit of data that an buffer flushes to object storage.
 Each batch is a compact binary file that contains an optionally compressed block of
 length-prefixed records followed by a fixed-size footer:
 
@@ -305,18 +305,18 @@ pub enum CompressionType {
 }
 ```
 
-When compression is enabled, the ingestor first serializes all records into a contiguous buffer
+When compression is enabled, the buffer first serializes all records into a contiguous buffer
 of length-prefixed entries, then compresses that buffer as a single unit.
 The compressed bytes are written to the batch file followed by the uncompressed footer.
 
 On the read side, the collector reads the footer to determine the compression type,
 decompresses the record block if needed, and then parses the length-prefixed entries as usual.
 
-Compression is configured per-ingestor via the `batch_compression` field in `IngestorConfig`
+Compression is configured per-buffer via the `batch_compression` field in `BufferConfig`
 (see below). The default is `None` (uncompressed).
 
 The semantics of the entries are defined by the database that consumes the data.
-The ingest module does not interpret the entries; it preserves them as-is.
+The buffer module does not interpret the entries; it preserves them as-is.
 
 Each batch is stored under the configured `data_path_prefix` with a ULID filename
 (e.g., `data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch`).
@@ -369,7 +369,7 @@ The queue manifest takes the name specified in `manifest_path`.
 The collector internally creates a queue consumer and an object store client from the configuration.
 
 A `CollectedBatch` contains the deserialized entries, the sequence number, the location of the batch,
-and the per-range metadata items attached by the ingestor(s):
+and the per-range metadata items attached by the buffer(s):
 ```rust
 pub struct CollectedBatch {
     pub entries: Vec<Bytes>,
@@ -379,14 +379,14 @@ pub struct CollectedBatch {
 }
 ```
 
-The `Metadata` struct exposes the per-range metadata that ingestors attach to each batch:
+The `Metadata` struct exposes the per-range metadata that buffers attach to each batch:
 ```rust
 pub struct Metadata {
     /// Index of the first entry in the batch that this metadata range covers.
     pub start_index: u32,
     /// Wall-clock ingestion time in milliseconds since the Unix epoch.
     pub ingestion_time_ms: i64,
-    /// Opaque metadata payload supplied by the caller of `Ingestor::ingest`.
+    /// Opaque metadata payload supplied by the caller of `Buffer::ingest`.
     pub payload: Bytes,
 }
 ```
@@ -480,11 +480,11 @@ ingested data.
 
 Since the batch and the corresponding sequence number are atomically written to the
 OpenData subsystem, the sequence number always represents the last written batch.
-After a failure, the ingest can continue at the first batch that was not ingested.
+After a failure, the buffer can continue at the first batch that was not ingested.
 No data is ingested twice.
 
-The delivery guarantees of the entries on the ingestor-side that were not confirmed to be 
-durable before a failure depends on the progress tracking of the caller of the ingestor.
+The delivery guarantees of the entries on the buffer-side that were not confirmed to be 
+durable before a failure depends on the progress tracking of the caller of the buffer.
 If they track the progress and re-ingest unacknowledged entries they can achieve at-least-once guarantee.
 
 ### Observability
@@ -503,11 +503,11 @@ Some ideas:
 To avoid contention on the queue manifest files, a stateless broker can be implemented that is responsible to write
 the queue manifest files.
 This idea comes from the following turbopuffer blog post: https://turbopuffer.com/blog/object-storage-queue.
-Since we assume one ingestor per availability zone and a single collector which limits the contention, we decided
+Since we assume one buffer per availability zone and a single collector which limits the contention, we decided
 against the broker.
 One reason for deciding against the broker is that the broker would be an additional component that a user needs to
 deploy and operate.
-We want to keep the ingest as simple as possible.
+We want to keep the buffer as simple as possible.
 In the future, it might be necessary to revise this decision and implement the stateless broker approach if
 contention gets worse.
 
@@ -523,13 +523,13 @@ stale reclaim logic, and a separate consumer manifest file.
 ### Using a counter for the batch names
 
 We could use a counter for the batch names to impose an order.
-During the flushing of batches, the ingestor:
+During the flushing of batches, the buffer:
 1. lists the prefix to which the batches are written, 
 2. finds the name with the largest number, 
 3. increases it, and 
 4. conditionally tries to write the batch named with the increased number.
 
-If the write fails because a batch with that name already exists, the ingestor increases the number again, 
+If the write fails because a batch with that name already exists, the buffer increases the number again, 
 tries to write the batch again, and so forth.
 
 The collector:

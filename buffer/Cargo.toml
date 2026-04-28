@@ -1,21 +1,21 @@
 [package]
-name = "opendata-ingest"
+name = "opendata-buffer"
 version.workspace = true
 edition.workspace = true
-description = "Stateless object storage ingestion library for OpenData systems"
+description = "Stateless object storage buffer library for OpenData systems"
 license = "MIT"
 repository = "https://github.com/opendata-oss/opendata"
 readme = "README.md"
-keywords = ["database", "ingest", "batching", "streaming"]
+keywords = ["database", "buffer", "batching", "streaming"]
 categories = ["database"]
 
 [lib]
-name = "ingest"
+name = "buffer"
 path = "src/lib.rs"
 
 [[bin]]
-name = "opendata-ingest"
-path = "src/bin/opendata_ingest/main.rs"
+name = "opendata-buffer"
+path = "src/bin/opendata_buffer/main.rs"
 required-features = ["cli"]
 
 [features]

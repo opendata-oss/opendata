@@ -154,11 +154,11 @@ impl TimeSeriesHttpServer {
             tracing::info!("No scrape configs found, scraper not started");
         }
 
-        // Start the ingest consumer if configured (requires read-write mode + otel)
+        // Start the buffer consumer if configured (requires read-write mode + otel)
         #[cfg(feature = "otel")]
         let consumer_handle = {
             let mut handle = None;
-            if let Some(ingest_config) = &self.config.prometheus_config.ingest_consumer {
+            if let Some(buffer_config) = &self.config.prometheus_config.buffer_consumer {
                 if let Some(tsdb) = self.tsdb.as_tsdb() {
                     let converter =
                         Arc::new(crate::otel::OtelConverter::new(crate::otel::OtelConfig {
@@ -173,20 +173,20 @@ impl TimeSeriesHttpServer {
                                 .otel
                                 .include_scope_attrs,
                         }));
-                    let consumer = Arc::new(super::ingest_consumer::IngestConsumer::new(
+                    let consumer = Arc::new(super::buffer_consumer::BufferConsumer::new(
                         tsdb,
                         converter,
-                        ingest_config.clone(),
+                        buffer_config.clone(),
                     ));
                     match consumer.run().await {
                         Ok(h) => handle = Some(h),
                         Err(e) => {
-                            tracing::error!("Failed to start ingest consumer: {e}");
+                            tracing::error!("Failed to start buffer consumer: {e}");
                             std::process::exit(1);
                         }
                     }
                 } else {
-                    tracing::warn!("ingest_consumer config present but ignored in read-only mode");
+                    tracing::warn!("buffer_consumer config present but ignored in read-only mode");
                 }
             }
             handle
@@ -225,10 +225,10 @@ impl TimeSeriesHttpServer {
             .await
             .unwrap();
 
-        // Stop the ingest consumer and flush pending acks before flushing TSDB
+        // Stop the buffer consumer and flush pending acks before flushing TSDB
         #[cfg(feature = "otel")]
         if let Some(handle) = consumer_handle {
-            tracing::info!("Shutting down ingest consumer...");
+            tracing::info!("Shutting down buffer consumer...");
             handle.shutdown().await;
         }
 

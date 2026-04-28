@@ -1,9 +1,9 @@
-//! Background ingest consumer that reads OTLP metrics from an ingest queue.
+//! Background buffer consumer that reads OTLP metrics from a buffer queue.
 
 use std::sync::Arc;
 
+use buffer::{CollectedBatch, Collector, Metadata};
 use bytes::Bytes;
-use ingest::{CollectedBatch, Collector, Metadata};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
 use tokio::sync::mpsc;
@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::otel::OtelConverter;
-use crate::promql::config::IngestConsumerConfig;
+use crate::promql::config::BufferConsumerConfig;
 use crate::tsdb::Tsdb;
 
 // ── Metadata protocol constants ──
@@ -26,12 +26,12 @@ const ACK_SEQUENCE_BUFFER: usize = 1;
 const MAX_ERROR_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
-struct IngestMetadata {
+struct BufferMetadata {
     signal_type: u8,
     payload_encoding: u8,
 }
 
-impl IngestMetadata {
+impl BufferMetadata {
     fn decode(payload: &[u8]) -> Result<Self, String> {
         if payload.len() < METADATA_LEN {
             return Err(format!(
@@ -50,9 +50,9 @@ impl IngestMetadata {
     }
 }
 
-// ── IngestConsumer ──
+// ── BufferConsumer ──
 
-/// Handle returned by [`IngestConsumer::run`] that enables graceful shutdown.
+/// Handle returned by [`BufferConsumer::run`] that enables graceful shutdown.
 ///
 /// Dropping this handle does **not** stop the consumer — call [`shutdown`](Self::shutdown)
 /// to cancel the poll loop and flush pending acks before the collector is released.
@@ -66,22 +66,22 @@ impl ConsumerHandle {
     pub async fn shutdown(self) {
         self.cancel.cancel();
         if let Err(e) = self.join.await {
-            tracing::error!("Ingest consumer task panicked: {e}");
+            tracing::error!("Buffer consumer task panicked: {e}");
         }
     }
 }
 
-pub(crate) struct IngestConsumer {
+pub(crate) struct BufferConsumer {
     tsdb: Arc<Tsdb>,
     converter: Arc<OtelConverter>,
-    config: IngestConsumerConfig,
+    config: BufferConsumerConfig,
 }
 
-impl IngestConsumer {
+impl BufferConsumer {
     pub fn new(
         tsdb: Arc<Tsdb>,
         converter: Arc<OtelConverter>,
-        config: IngestConsumerConfig,
+        config: BufferConsumerConfig,
     ) -> Self {
         Self {
             tsdb,
@@ -94,8 +94,8 @@ impl IngestConsumer {
     ///
     /// Returns a [`ConsumerHandle`] that must be used to shut down the consumer
     /// gracefully, or an error if the collector cannot be created or initialized.
-    pub async fn run(self: Arc<Self>) -> Result<ConsumerHandle, ingest::Error> {
-        let collector_config = ingest::CollectorConfig {
+    pub async fn run(self: Arc<Self>) -> Result<ConsumerHandle, buffer::Error> {
+        let collector_config = buffer::CollectorConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
             data_path_prefix: self.config.data_path_prefix.clone(),
@@ -108,13 +108,13 @@ impl IngestConsumer {
 
     /// Like [`run`](Self::run), but uses a pre-built object store for the collector.
     ///
-    /// Useful in tests where the ingestor and collector must share an in-memory store.
+    /// Useful in tests where the buffer and collector must share an in-memory store.
     #[cfg(test)]
     pub async fn run_with_object_store(
         self: Arc<Self>,
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
-    ) -> Result<ConsumerHandle, ingest::Error> {
-        let collector_config = ingest::CollectorConfig {
+    ) -> Result<ConsumerHandle, buffer::Error> {
+        let collector_config = buffer::CollectorConfig {
             object_store: self.config.object_store.clone(),
             manifest_path: self.config.manifest_path.clone(),
             data_path_prefix: self.config.data_path_prefix.clone(),
@@ -128,11 +128,11 @@ impl IngestConsumer {
     async fn start(
         self: &Arc<Self>,
         collector: Collector,
-    ) -> Result<ConsumerHandle, ingest::Error> {
+    ) -> Result<ConsumerHandle, buffer::Error> {
         tracing::info!(
             manifest_path = %self.config.manifest_path,
             poll_interval = ?self.config.poll_interval,
-            "Ingest consumer started"
+            "Buffer consumer started"
         );
 
         let tsdb = self.tsdb.clone();
@@ -196,7 +196,7 @@ async fn poll_loop(
         }
     }
 
-    tracing::info!("Ingest consumer shutting down, flushing pending acks...");
+    tracing::info!("Buffer consumer shutting down, flushing pending acks...");
     drop(ack_tx);
     if let Err(e) = collector_join.await {
         tracing::error!("Collector task panicked: {e}");
@@ -343,7 +343,7 @@ async fn process_entry(
     metadata: Option<&Metadata>,
 ) -> Result<(), String> {
     let meta = metadata.ok_or("no metadata for entry")?;
-    let parsed = IngestMetadata::decode(&meta.payload)?;
+    let parsed = BufferMetadata::decode(&meta.payload)?;
 
     if parsed.signal_type != SIGNAL_TYPE_METRICS {
         return Err(format!("unsupported signal type: {}", parsed.signal_type));
@@ -392,7 +392,7 @@ mod tests {
         let payload = vec![1, 1, 1, 0];
 
         // when
-        let meta = IngestMetadata::decode(&payload).unwrap();
+        let meta = BufferMetadata::decode(&payload).unwrap();
 
         // then
         assert_eq!(meta.signal_type, SIGNAL_TYPE_METRICS);
@@ -405,7 +405,7 @@ mod tests {
         let payload = vec![99, 1, 1, 0];
 
         // when
-        let result = IngestMetadata::decode(&payload);
+        let result = BufferMetadata::decode(&payload);
 
         // then
         assert!(result.is_err());
@@ -418,7 +418,7 @@ mod tests {
         let payload = vec![1, 1];
 
         // when
-        let result = IngestMetadata::decode(&payload);
+        let result = BufferMetadata::decode(&payload);
 
         // then
         assert!(result.is_err());

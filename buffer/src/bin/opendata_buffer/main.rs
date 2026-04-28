@@ -1,4 +1,4 @@
-//! CLI for inspecting and debugging opendata-ingest state.
+//! CLI for inspecting and debugging opendata-buffer state.
 //!
 //! Built behind the `cli` feature flag so library consumers do not pull in
 //! clap, serde_json, or base64.
@@ -6,7 +6,7 @@
 //! # Installation
 //!
 //! ```sh
-//! cargo install opendata-ingest --features cli
+//! cargo install opendata-buffer --features cli
 //! ```
 //!
 //! # Subcommands
@@ -19,7 +19,7 @@
 //! Pair with `jq` for ad-hoc filtering:
 //!
 //! ```sh
-//! opendata-ingest manifest dump /tmp/manifest | jq '.entries | length'
+//! opendata-buffer manifest dump /tmp/manifest | jq '.entries | length'
 //! ```
 
 #[cfg(not(target_env = "msvc"))]
@@ -31,7 +31,7 @@ use clap::{Parser, Subcommand};
 mod manifest;
 
 #[derive(Parser)]
-#[command(name = "opendata-ingest", about = "CLI tools for opendata-ingest")]
+#[command(name = "opendata-buffer", about = "CLI tools for opendata-buffer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

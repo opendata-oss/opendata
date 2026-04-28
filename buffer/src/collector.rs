@@ -23,7 +23,7 @@ pub struct CollectedBatch {
     pub sequence: u64,
     /// The object storage path of the data batch.
     pub location: String,
-    /// Metadata ranges attached by the ingestor(s) that contributed to this batch.
+    /// Metadata ranges attached by the buffer(s) that contributed to this batch.
     pub metadata: Vec<Metadata>,
 }
 

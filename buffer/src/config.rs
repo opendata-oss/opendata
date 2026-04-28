@@ -6,13 +6,13 @@ use serde_with::{DurationMilliSeconds, serde_as};
 
 use crate::model::CompressionType;
 
-/// Configuration for an [`Ingestor`](crate::Ingestor).
+/// Configuration for a [`Buffer`](crate::Buffer).
 ///
 /// Controls where data batches and the queue manifest are stored, how often
 /// batches are flushed, and when backpressure is applied.
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestorConfig {
+pub struct BufferConfig {
     /// Determines where and how ingest data is persisted. See [`ObjectStoreConfig`].
     pub object_store: ObjectStoreConfig,
 
@@ -72,7 +72,7 @@ pub struct CollectorConfig {
 
     /// Path prefix for data batch objects in object storage.
     ///
-    /// Must match the ingestor's `data_path_prefix`. Defaults to `"ingest"`.
+    /// Must match the buffer's `data_path_prefix`. Defaults to `"ingest"`.
     #[serde(default = "default_data_path_prefix")]
     pub data_path_prefix: String,
 

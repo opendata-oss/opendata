@@ -2535,7 +2535,7 @@ mod tests {
         assert!(matches!(result.unwrap_err(), QueryError::InvalidQuery(_)));
     }
 
-    /// End-to-end test: Ingestor → IngestConsumer → Tsdb → query.
+    /// End-to-end test: Buffer → BufferConsumer → Tsdb → query.
     ///
     /// Runs the real consumer poll loop (metadata validation, ack/flush) and
     /// shuts it down gracefully via [`ConsumerHandle`].
@@ -2556,7 +2556,7 @@ mod tests {
         use slatedb::object_store::ObjectStore;
         use slatedb::object_store::memory::InMemory;
 
-        // given — shared in-memory object store for ingestor and consumer
+        // given — shared in-memory object store for buffer and consumer
         let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let manifest = "ingest/manifest".to_string();
 
@@ -2608,36 +2608,36 @@ mod tests {
         // Metadata: version=1, signal_type=metrics(1), encoding=otlp_proto(1), reserved=0
         let metadata = Bytes::from_static(&[1, 1, 1, 0]);
 
-        // Produce via Ingestor
-        let ingestor_config = ingest::IngestorConfig {
+        // Produce via Buffer
+        let buffer_config = buffer::BufferConfig {
             object_store: common::ObjectStoreConfig::InMemory,
             data_path_prefix: "ingest".to_string(),
             manifest_path: manifest.clone(),
             flush_interval: Duration::from_millis(10),
             flush_size_bytes: 64 * 1024 * 1024,
             max_buffered_inputs: 1000,
-            batch_compression: ingest::CompressionType::None,
+            batch_compression: buffer::CompressionType::None,
         };
-        let ingestor = ingest::Ingestor::with_object_store(
-            ingestor_config,
+        let buffer = buffer::Buffer::with_object_store(
+            buffer_config,
             obj_store.clone(),
             Arc::new(common::clock::SystemClock),
         )
         .unwrap();
-        ingestor
+        buffer
             .ingest(vec![Bytes::from(proto_bytes)], metadata)
             .await
             .unwrap();
-        ingestor.close().await.unwrap();
+        buffer.close().await.unwrap();
 
-        // Start the real IngestConsumer against the shared object store
+        // Start the real BufferConsumer against the shared object store
         let tsdb = Arc::new(Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(
             Arc::new(OpenTsdbMergeOperator),
         ))));
         let converter = Arc::new(crate::otel::OtelConverter::new(
             crate::otel::OtelConfig::default(),
         ));
-        let consumer_config = crate::promql::config::IngestConsumerConfig {
+        let consumer_config = crate::promql::config::BufferConsumerConfig {
             object_store: common::ObjectStoreConfig::InMemory,
             manifest_path: manifest,
             poll_interval: Duration::from_millis(10),
@@ -2645,7 +2645,7 @@ mod tests {
             gc_interval: Duration::from_secs(300),
             gc_grace_period: Duration::from_secs(600),
         };
-        let consumer = Arc::new(crate::server::ingest_consumer::IngestConsumer::new(
+        let consumer = Arc::new(crate::server::buffer_consumer::BufferConsumer::new(
             tsdb.clone(),
             converter,
             consumer_config,

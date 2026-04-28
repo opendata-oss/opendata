@@ -1,22 +1,22 @@
-# opendata-ingest
+# opendata-buffer
 
-A shared, stateless ingestion library for [OpenData](https://github.com/opendata-oss/opendata) databases.
+A shared, stateless buffer library for [OpenData](https://github.com/opendata-oss/opendata) databases.
 
-Provides write-path infrastructure that all OpenData databases (Timeseries, Log, Vector) can reuse. Ingestors accept opaque byte entries, buffer them in memory, and periodically flush batched data files to object storage. A manifest-backed queue coordinates producers (ingestors) and consumers (collectors) in a stateless, crash-safe way.
+Provides write-path infrastructure that all OpenData databases (Timeseries, Log, Vector) can reuse. Buffers accept opaque byte entries, accumulate them in memory, and periodically flush batched data files to object storage. A manifest-backed queue coordinates producers (buffers) and consumers (collectors) in a stateless, crash-safe way.
 
-## Why stateless ingest?
+## Why a stateless buffer?
 
-- **Fault tolerance** — ingestors are stateless. If one fails, any other running ingestor can take over without a rebalancing protocol.
-- **Decoupled from writes** — if the downstream database is slow or unavailable, ingested data is safely persisted in object storage rather than dropped or back-pressured.
+- **Fault tolerance** — buffers are stateless. If one fails, any other running buffer can take over without a rebalancing protocol.
+- **Decoupled from writes** — if the downstream database is slow or unavailable, buffered data is safely persisted in object storage rather than dropped or back-pressured.
 - **Cost savings** — data flows through object storage rather than across availability zones, avoiding cross-zonal transfer fees.
 
 ## Architecture
 
 ```text
-╔═Ingestors══════════════════════════════════════════════════╗
+╔═Buffers════════════════════════════════════════════════════╗
 ║                                                            ║░
 ║  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  ║░
-║  │  Ingestor 1  │    │  Ingestor 2  │    │  Ingestor N  │  ║░
+║  │   Buffer 1   │    │   Buffer 2   │    │   Buffer N   │  ║░
 ║  │  q-producer  │    │  q-producer  │    │  q-producer  │  ║░
 ║  └───────┬──────┘    └──────────────┘    └───────┬──────┘  ║░
 ║          │                                       │         ║░
@@ -57,19 +57,19 @@ Provides write-path infrastructure that all OpenData databases (Timeseries, Log,
 
 ## Usage
 
-### Ingestor
+### Buffer
 
-The ingestor buffers entries and flushes them as compressed batches to object storage, appending their locations to the queue manifest.
+The buffer accumulates entries and flushes them as compressed batches to object storage, appending their locations to the queue manifest.
 
 ```rust
-use ingest::{Ingestor, IngestorConfig};
+use buffer::{Buffer, BufferConfig};
 use bytes::Bytes;
 use std::sync::Arc;
 
-let ingestor = Ingestor::new(IngestorConfig::default(), clock)?;
+let buffer = Buffer::new(BufferConfig::default(), clock)?;
 
-// Ingest entries with metadata — returns a handle to await durability
-let handle = ingestor.ingest(
+// Submit entries with metadata — returns a handle to await durability
+let handle = buffer.ingest(
     vec![Bytes::from("entry-1"), Bytes::from("entry-2")],
     Bytes::from("my-metadata"),
 ).await?;
@@ -78,7 +78,7 @@ let handle = ingestor.ingest(
 handle.watcher.await_durable().await?;
 
 // Flush remaining entries and shut down
-ingestor.close().await?;
+buffer.close().await?;
 ```
 
 #### Configuration
@@ -97,7 +97,7 @@ ingestor.close().await?;
 The collector reads batches from the queue in ingestion order and makes them available to a database writer.
 
 ```rust
-use ingest::{Collector, CollectorConfig};
+use buffer::{Collector, CollectorConfig};
 
 let collector = Collector::new(CollectorConfig::default(), clock)?;
 
@@ -121,14 +121,14 @@ collector.flush().await?;
 
 Exactly-once delivery is achievable when the caller atomically writes both the batch and its sequence number to the downstream database. After a failure, the collector resumes from the last committed sequence — no data is processed twice.
 
-On the ingestor side, callers that track progress and re-ingest unacknowledged entries achieve at-least-once delivery.
+On the buffer side, callers that track progress and re-submit unacknowledged entries achieve at-least-once delivery.
 
 ## CLI
 
-A companion CLI is included for inspecting ingest state. Install with:
+A companion CLI is included for inspecting buffer state. Install with:
 
 ```bash
-cargo install opendata-ingest --features cli
+cargo install opendata-buffer --features cli
 ```
 
 ### `manifest dump`
@@ -136,7 +136,7 @@ cargo install opendata-ingest --features cli
 Deserializes a manifest file to JSON:
 
 ```bash
-opendata-ingest manifest dump /path/to/manifest
+opendata-buffer manifest dump /path/to/manifest
 ```
 
 ```json
@@ -163,7 +163,7 @@ opendata-ingest manifest dump /path/to/manifest
 Pipe through `jq` for filtering:
 
 ```bash
-opendata-ingest manifest dump /path/to/manifest | jq '.entries | length'
+opendata-buffer manifest dump /path/to/manifest | jq '.entries | length'
 ```
 
 ## Data batch format
