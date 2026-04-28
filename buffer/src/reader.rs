@@ -61,7 +61,7 @@ impl Reader {
         object_store: Arc<dyn ObjectStore>,
         last_acked_sequence: Option<u64>,
     ) -> Result<Self> {
-        crate::metric_names::describe_collector_metrics();
+        crate::metric_names::describe_reader_metrics();
         let consumer =
             QueueConsumer::with_object_store(config.manifest_path.clone(), object_store.clone());
 
@@ -116,7 +116,7 @@ impl Reader {
                         .unwrap_or_default()
                         .as_millis() as i64;
                     let lag_s = (now_ms - last_meta.ingestion_time_ms) as f64 / 1000.0;
-                    metrics::gauge!(m::COLLECTOR_LAG_SECONDS).set(lag_s.max(0.0));
+                    metrics::gauge!(m::READER_LAG_SECONDS).set(lag_s.max(0.0));
                 }
                 Ok(batch)
             }

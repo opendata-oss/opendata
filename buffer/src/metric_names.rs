@@ -12,14 +12,14 @@
 // | buffer.manifest_writes        | counter   | role   | Manifest write attempts                  |
 // | buffer.manifest_conflicts     | counter   | role   | Manifest CAS conflicts                   |
 //
-// ## Collector (read path)
+// ## Reader (read path)
 //
 // | Name                            | Type      | Labels | Description                              |
 // |---------------------------------|-----------|--------|------------------------------------------|
 // | buffer.batches_collected        | counter   |        | Batches fetched from object store        |
 // | buffer.entries_collected         | counter   |        | Entries across collected batches          |
 // | buffer.bytes_collected           | counter   |        | Bytes read from object store             |
-// | buffer.collector_lag_seconds     | gauge     |        | Wall clock - last batch ingestion time   |
+// | buffer.reader_lag_seconds        | gauge     |        | Wall clock - last batch ingestion time   |
 // | buffer.queue_length              | gauge     |        | Entries in the manifest queue             |
 // | buffer.acks                      | counter   |        | Batch acks processed                     |
 // | buffer.gc_files_deleted          | counter   |        | Batch files cleaned by GC                |
@@ -38,7 +38,7 @@ pub(crate) const FLUSH_DURATION_SECONDS: &str = "buffer.flush_duration_seconds";
 pub(crate) const BATCHES_COLLECTED: &str = "buffer.batches_collected";
 pub(crate) const ENTRIES_COLLECTED: &str = "buffer.entries_collected";
 pub(crate) const BYTES_COLLECTED: &str = "buffer.bytes_collected";
-pub(crate) const COLLECTOR_LAG_SECONDS: &str = "buffer.collector_lag_seconds";
+pub(crate) const READER_LAG_SECONDS: &str = "buffer.reader_lag_seconds";
 pub(crate) const QUEUE_LENGTH: &str = "buffer.queue_length";
 pub(crate) const ACKS: &str = "buffer.acks";
 pub(crate) const GC_FILES_DELETED: &str = "buffer.gc_files_deleted";
@@ -65,12 +65,12 @@ pub(crate) fn describe_buffer_metrics() {
     metrics::describe_counter!(MANIFEST_CONFLICTS, "Producer manifest CAS conflicts");
 }
 
-pub(crate) fn describe_collector_metrics() {
+pub(crate) fn describe_reader_metrics() {
     metrics::describe_counter!(BATCHES_COLLECTED, "Batches fetched from object store");
     metrics::describe_counter!(ENTRIES_COLLECTED, "Entries across collected batches");
     metrics::describe_counter!(BYTES_COLLECTED, "Bytes read from object store");
     metrics::describe_gauge!(
-        COLLECTOR_LAG_SECONDS,
+        READER_LAG_SECONDS,
         "Wall clock minus last batch ingestion time in seconds"
     );
     metrics::describe_gauge!(QUEUE_LENGTH, "Entries in the manifest queue");

@@ -72,7 +72,7 @@ Recorded in `BatchWriterTask::write_and_enqueue`.
 | `buffer.batches_collected` | counter | | Batches fetched |
 | `buffer.entries_collected` | counter | | Entries fetched |
 | `buffer.bytes_collected` | counter | | Bytes read from object store |
-| `buffer.collector_lag_seconds` | gauge | | Wall clock minus last batch ingestion time |
+| `buffer.reader_lag_seconds` | gauge | | Wall clock minus last batch ingestion time |
 | `buffer.queue_length` | gauge | | Entries in manifest queue |
 | `buffer.acks` | counter | | Acks processed |
 | `buffer.gc_files_deleted` | counter | | Batch files deleted by GC |
@@ -91,7 +91,7 @@ writers and readers run in separate processes.
 
 #### Lag calculation
 
-`collector_lag_seconds` is set after each `fetch_batch`:
+`reader_lag_seconds` is set after each `fetch_batch`:
 
 ```
 lag = (SystemTime::now() - last_metadata.ingestion_time_ms) / 1000
