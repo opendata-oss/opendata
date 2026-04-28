@@ -73,14 +73,14 @@ roaring = "0.7"
 rust-embed = { version = "8", features = ["mime-guess"] }
 tsz = "0.1"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { workspace = true, optional = true }
-
 # Optional dependencies for remote-write and otel features
 buffer = { workspace = true, optional = true }
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 common = { workspace = true, features = ["test-utils"] }
