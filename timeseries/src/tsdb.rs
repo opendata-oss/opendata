@@ -2608,8 +2608,8 @@ mod tests {
         // Metadata: version=1, signal_type=metrics(1), encoding=otlp_proto(1), reserved=0
         let metadata = Bytes::from_static(&[1, 1, 1, 0]);
 
-        // Produce via Writer
-        let writer_config = buffer::WriterConfig {
+        // Produce via Producer
+        let producer_config = buffer::ProducerConfig {
             object_store: common::ObjectStoreConfig::InMemory,
             data_path_prefix: "ingest".to_string(),
             manifest_path: manifest.clone(),
@@ -2618,17 +2618,17 @@ mod tests {
             max_buffered_inputs: 1000,
             batch_compression: buffer::CompressionType::None,
         };
-        let writer = buffer::Writer::with_object_store(
-            writer_config,
+        let producer = buffer::Producer::with_object_store(
+            producer_config,
             obj_store.clone(),
             Arc::new(common::clock::SystemClock),
         )
         .unwrap();
-        writer
-            .ingest(vec![Bytes::from(proto_bytes)], metadata)
+        producer
+            .produce(vec![Bytes::from(proto_bytes)], metadata)
             .await
             .unwrap();
-        writer.close().await.unwrap();
+        producer.close().await.unwrap();
 
         // Start the real BufferConsumer against the shared object store
         let tsdb = Arc::new(Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(

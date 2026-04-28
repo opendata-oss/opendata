@@ -30,7 +30,7 @@ pub struct Metadata {
     pub start_index: u32,
     /// Wall-clock ingestion time in milliseconds since the Unix epoch.
     pub ingestion_time_ms: i64,
-    /// Opaque metadata payload supplied by the caller of [`Writer::ingest`](crate::Writer::ingest).
+    /// Opaque metadata payload supplied by the caller of [`Producer::produce`](crate::Producer::produce).
     pub payload: Bytes,
 }
 

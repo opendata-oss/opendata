@@ -1,16 +1,16 @@
 mod config;
+mod consumer;
 mod error;
 mod gc;
 mod metric_names;
 mod model;
+mod producer;
 mod queue;
-mod reader;
 mod util;
-mod writer;
 
-pub use config::{ReaderConfig, WriterConfig};
+pub use config::{ConsumerConfig, ProducerConfig};
+pub use consumer::{ConsumedBatch, Consumer};
 pub use error::{Error, Result};
 pub use model::CompressionType;
+pub use producer::{DurabilityWatcher, Producer, WriteHandle};
 pub use queue::{ManifestEntry, ManifestView, Metadata, parse_manifest};
-pub use reader::{ReadBatch, Reader};
-pub use writer::{DurabilityWatcher, WriteHandle, Writer};

@@ -122,20 +122,20 @@ buffer closed, 5 batches produced
 
 ```bash
 sleep 3
-curl -s http://localhost:9099/metrics | grep ingest
+curl -s http://localhost:9099/metrics | grep buffer
 ```
 
 Sample output (values will differ):
 
 ```
-ingest_batches_collected 5
-ingest_entries_collected 10
-ingest_bytes_collected 920
-ingest_acks 5
-ingest_collector_lag_seconds 0.597
-ingest_queue_length 5
-ingest_fetch_duration_seconds_count 5
-ingest_manifest_writes{role="consumer"} 1
+buffer_batches_collected 5
+buffer_entries_collected 10
+buffer_bytes_collected 920
+buffer_acks 5
+buffer_consumer_lag_seconds 0.597
+buffer_queue_length 5
+buffer_fetch_duration_seconds_count 5
+buffer_manifest_writes{role="consumer"} 1
 ```
 
 Query the ingested data:
