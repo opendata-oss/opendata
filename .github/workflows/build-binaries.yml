@@ -44,7 +44,7 @@ jobs:
               ;;
             opendata-timeseries)
               echo "has_binary=true" >> "$GITHUB_OUTPUT"
-              echo "features=remote-write" >> "$GITHUB_OUTPUT"
+              echo "features=remote-write,otel" >> "$GITHUB_OUTPUT"
               echo "docker_image=timeseries" >> "$GITHUB_OUTPUT"
               ;;
             opendata-vector)
