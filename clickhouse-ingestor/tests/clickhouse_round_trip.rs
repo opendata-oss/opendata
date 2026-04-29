@@ -31,6 +31,19 @@ use testcontainers_modules::clickhouse::ClickHouse as ClickHouseImage;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+/// Returns a UNIX-nanosecond timestamp anchored at "now minus a few
+/// seconds" so the produced rows fall well within the alpha DDL's
+/// `TTL toDate(Timestamp) + INTERVAL 30 DAY` window. The earlier
+/// version of this test pinned timestamps to 2023-11-14 and got
+/// silently TTL-deleted on every run; the round-trip path was not
+/// broken, the test data was.
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
 fn make_logs(service: &str, record_count: usize, base_ts_ns: u64) -> Vec<u8> {
     let log_records = (0..record_count)
         .map(|i| LogRecord {
@@ -80,27 +93,18 @@ fn logs_envelope() -> Bytes {
     Bytes::from_static(&[1, 2, 1, 0])
 }
 
-/// **Currently `#[ignore]`d.** Against ClickHouse 23.3 (the
-/// testcontainers-modules 0.11 default tag), the runtime's
-/// `execute_chunk` returns HTTP 200 OK but rows do not land in the
-/// `responsive_test.logs_round_trip` table — even though the same
-/// HTTP body, replayed via `execute_statement` on the same writer,
-/// inserts correctly, and `curl --data-binary @body` against the same
-/// container also inserts correctly. The bug is reproducible with
-/// the SQL+data-in-body + URL-params-for-settings shape used by the
-/// writer today; switching to SETTINGS-in-SQL did not change it.
-/// Direct `execute_chunk` against a simple `MergeTree` table does
-/// land data, so it is something specific to the alpha logs DDL or
-/// the request shape against it.
+/// End-to-end: `Producer` + `Consumer` + `BufferConsumerRuntime` +
+/// `ClickHouseWriter` against a real ClickHouse container. Validates
+/// the runtime inserts rows that survive `FINAL`-deduplicated reads.
 ///
-/// The unit + in-memory tests (`tests/in_memory_runtime.rs`) cover
-/// the layered design including the contract guard, byte-aware
-/// chunking, manifest-aware token format, and dry-run progress. This
-/// gate stays open until the real-ClickHouse insert path is
-/// understood; it is the last thing standing between the alpha and a
-/// validated end-to-end sink.
+/// History note (2026-04-29): an earlier version of this test pinned
+/// log timestamps to 2023-11-14, which fell outside the alpha DDL's
+/// `TTL toDate(Timestamp) + INTERVAL 30 DAY` window. ClickHouse
+/// accepted the inserts (`written_rows: 5`) and then immediately
+/// TTL-evicted the rows, so a follow-up `count()` returned 0. The
+/// fix is `now_ns()` for the timestamp anchor — the ingestor itself
+/// was correct.
 #[tokio::test]
-#[ignore = "ClickHouse 23.3 silently 200s but does not insert the runtime's body; see header"]
 async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -113,7 +117,8 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
     let clickhouse = ClickHouseImage::default().start().await?;
     let host = clickhouse.get_host().await?;
     let port = clickhouse.get_host_port_ipv4(8123).await?;
-    let endpoint = format!("http://{host}:{port}");
+    eprintln!("clickhouse host as reported by testcontainers: {host} (port {port})");
+    let endpoint = format!("http://127.0.0.1:{port}");
     eprintln!("clickhouse endpoint: {endpoint}");
 
     let writer = ClickHouseWriter::new(WriterConfig {
@@ -168,23 +173,16 @@ async fn clickhouse_round_trip_with_dedup() -> Result<(), Box<dyn std::error::Er
         Arc::new(SystemClock),
     )?;
 
+    let now = now_ns();
     producer
         .produce(
-            vec![Bytes::from(make_logs(
-                "svc-a",
-                3,
-                1_700_000_000_000_000_000,
-            ))],
+            vec![Bytes::from(make_logs("svc-a", 3, now))],
             logs_envelope(),
         )
         .await?;
     producer
         .produce(
-            vec![Bytes::from(make_logs(
-                "svc-b",
-                2,
-                1_700_000_001_000_000_000,
-            ))],
+            vec![Bytes::from(make_logs("svc-b", 2, now + 1_000_000_000))],
             logs_envelope(),
         )
         .await?;
