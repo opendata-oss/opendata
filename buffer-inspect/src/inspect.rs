@@ -320,23 +320,24 @@ fn decode_logs_payload(record_index: u32, payload: &Bytes) -> RecordReport {
                     }
                 }
                 if let Some(scope_logs) = resource_logs.scope_logs.first()
-                    && let Some(rec) = scope_logs.log_records.first() {
-                        timestamp_unix_nano = rec.time_unix_nano;
-                        severity_number = rec.severity_number;
-                        severity_text = rec.severity_text.clone();
-                        body_summary = body_to_string(&rec.body);
-                        for kv in &rec.attributes {
-                            if let Some(value) = string_value(&kv.value) {
-                                log_attributes.insert(kv.key.clone(), value);
-                            }
-                        }
-                        if !rec.trace_id.is_empty() {
-                            trace_id_hex = Some(hex_encode(&rec.trace_id));
-                        }
-                        if !rec.span_id.is_empty() {
-                            span_id_hex = Some(hex_encode(&rec.span_id));
+                    && let Some(rec) = scope_logs.log_records.first()
+                {
+                    timestamp_unix_nano = rec.time_unix_nano;
+                    severity_number = rec.severity_number;
+                    severity_text = rec.severity_text.clone();
+                    body_summary = body_to_string(&rec.body);
+                    for kv in &rec.attributes {
+                        if let Some(value) = string_value(&kv.value) {
+                            log_attributes.insert(kv.key.clone(), value);
                         }
                     }
+                    if !rec.trace_id.is_empty() {
+                        trace_id_hex = Some(hex_encode(&rec.trace_id));
+                    }
+                    if !rec.span_id.is_empty() {
+                        span_id_hex = Some(hex_encode(&rec.span_id));
+                    }
+                }
             }
 
             RecordReport::Logs(LogsRecord {
@@ -371,14 +372,15 @@ fn decode_metrics_payload(record_index: u32, payload: &Bytes) -> RecordReport {
 
             for resource_metrics in &req.resource_metrics {
                 if let Some(resource) = &resource_metrics.resource
-                    && service_name.is_none() {
-                        for kv in &resource.attributes {
-                            if kv.key == "service.name" {
-                                service_name = string_value(&kv.value);
-                                break;
-                            }
+                    && service_name.is_none()
+                {
+                    for kv in &resource.attributes {
+                        if kv.key == "service.name" {
+                            service_name = string_value(&kv.value);
+                            break;
                         }
                     }
+                }
                 for scope in &resource_metrics.scope_metrics {
                     scope_metric_count += 1;
                     for metric in &scope.metrics {
