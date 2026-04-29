@@ -20,10 +20,12 @@
 
 pub mod ack;
 pub mod adapter;
+pub mod bench;
 pub mod commit_group;
 pub mod config;
 pub mod envelope;
 pub mod error;
+pub mod metrics;
 pub mod runtime;
 pub mod signal;
 pub mod source;

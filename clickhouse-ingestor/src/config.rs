@@ -166,6 +166,15 @@ pub struct AdapterSection {
     pub adapter_version: u32,
     pub max_chunk_rows: usize,
     pub max_chunk_bytes: usize,
+    /// Whether to apply `insert_deduplication_token` on inserts. True
+    /// for production replicated tables; set false for non-replicated
+    /// targets (single-node dev/test).
+    #[serde(default = "default_apply_dedup_token")]
+    pub apply_deduplication_token: bool,
+}
+
+fn default_apply_dedup_token() -> bool {
+    true
 }
 
 impl Default for AdapterSection {
@@ -174,6 +183,7 @@ impl Default for AdapterSection {
             adapter_version: 1,
             max_chunk_rows: 100_000,
             max_chunk_bytes: 32 * 1024 * 1024,
+            apply_deduplication_token: true,
         }
     }
 }
@@ -226,6 +236,7 @@ impl IngestorConfig {
             max_chunk_rows: self.adapter.max_chunk_rows,
             max_chunk_bytes: self.adapter.max_chunk_bytes,
             insert_quorum: self.clickhouse.insert_quorum.clone(),
+            apply_deduplication_token: self.adapter.apply_deduplication_token,
         }
     }
 }

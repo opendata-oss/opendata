@@ -29,6 +29,7 @@ use crate::adapter::Adapter;
 use crate::commit_group::{CommitGroup, CommitGroupBatch, CommitGroupThresholds, RecordSize};
 use crate::envelope::{ConfiguredEnvelope, decode_envelopes, validate_consistent};
 use crate::error::{IngestorError, IngestorResult};
+use crate::metrics as m;
 use crate::signal::SignalDecoder;
 use crate::source::split_into_raw_entries;
 use crate::writer::ClickHouseWriter;
@@ -141,8 +142,10 @@ where
     /// commit group and force a final flush so the durable
     /// high-watermark matches what we've seen.
     pub async fn run(mut self, shutdown: CancellationToken) -> IngestorResult<()> {
+        m::describe();
         let mut group: CommitGroup<A::Input> = CommitGroup::new(self.options.commit_group);
         let mut progress = RuntimeProgress::default();
+        let mut last_successful_ack_at: Option<std::time::Instant> = None;
         info!(
             manifest_path = %self.options.manifest_path,
             dry_run = self.options.dry_run,
@@ -168,6 +171,8 @@ where
                         Some(batch) => {
                             progress.batches_read = progress.batches_read.saturating_add(1);
                             progress.last_decoded_sequence = Some(batch.sequence);
+                            metrics::counter!(m::BUFFER_BATCHES_READ_TOTAL).increment(1);
+                            metrics::gauge!(m::LAST_DECODED_SEQUENCE).set(batch.sequence as f64);
                             self.handle_batch(batch, &mut group)?;
                         }
                         None => {
@@ -183,7 +188,13 @@ where
 
             if group.should_flush() {
                 let drained = group.drain();
-                self.flush_group(drained, &mut progress).await?;
+                self.flush_group(drained, &mut progress, &mut last_successful_ack_at)
+                    .await?;
+            }
+
+            if let Some(ack_at) = last_successful_ack_at {
+                let secs = ack_at.elapsed().as_secs_f64();
+                metrics::gauge!(m::TIME_SINCE_LAST_SUCCESSFUL_ACK_SECONDS).set(secs);
             }
 
             let _ = self.progress_tx.send(progress);
@@ -193,7 +204,8 @@ where
         // is durable.
         if !group.is_empty() {
             let drained = group.drain();
-            self.flush_group(drained, &mut progress).await?;
+            self.flush_group(drained, &mut progress, &mut last_successful_ack_at)
+                .await?;
         }
         if !self.options.dry_run {
             // Belt-and-suspenders flush in case the policy was EveryN
@@ -214,9 +226,24 @@ where
         A::Input: RecordSize,
     {
         let raw = split_into_raw_entries(batch, &self.options.manifest_path);
-        let envelopes = decode_envelopes(&raw)?;
-        validate_consistent(&envelopes, &self.options.configured_envelope)?;
-        let decoded = self.decoder.decode(&raw, &envelopes)?;
+        let envelopes = match decode_envelopes(&raw) {
+            Ok(envs) => envs,
+            Err(e) => {
+                metrics::counter!(m::DECODE_FAILURES_TOTAL, "stage" => "envelope").increment(1);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = validate_consistent(&envelopes, &self.options.configured_envelope) {
+            metrics::counter!(m::DECODE_FAILURES_TOTAL, "stage" => "envelope").increment(1);
+            return Err(e.into());
+        }
+        let decoded = match self.decoder.decode(&raw, &envelopes) {
+            Ok(d) => d,
+            Err(e) => {
+                metrics::counter!(m::DECODE_FAILURES_TOTAL, "stage" => "signal").increment(1);
+                return Err(e);
+            }
+        };
         debug!(
             sequence = raw.sequence,
             entries = raw.entries.len(),
@@ -231,39 +258,97 @@ where
         &mut self,
         drained: CommitGroupBatch<A::Input>,
         progress: &mut RuntimeProgress,
+        last_successful_ack_at: &mut Option<std::time::Instant>,
     ) -> IngestorResult<()> {
         let high = drained.high_sequence;
         let low = drained.low_sequence;
         let row_count = drained.records.len();
         progress.rows_planned = progress.rows_planned.saturating_add(row_count as u64);
+        metrics::counter!(m::ROWS_PLANNED_TOTAL).increment(row_count as u64);
+        metrics::histogram!(m::COMMIT_GROUP_SIZE_ROWS).record(row_count as f64);
 
-        let chunks = self.adapter.plan(drained).map_err(|e| match e {
-            IngestorError::Adapter(_) => e,
-            other => IngestorError::Adapter(other.to_string()),
-        })?;
+        let chunks = match self.adapter.plan(drained) {
+            Ok(chunks) => chunks,
+            Err(e) => {
+                metrics::counter!(m::DECODE_FAILURES_TOTAL, "stage" => "adapter").increment(1);
+                return Err(match e {
+                    IngestorError::Adapter(_) => e,
+                    other => IngestorError::Adapter(other.to_string()),
+                });
+            }
+        };
 
         if !self.options.dry_run {
             if let Some(writer) = &self.writer {
-                writer.execute_all(&chunks).await?;
+                let started = std::time::Instant::now();
+                let outcome = writer.execute_all(&chunks).await;
+                let elapsed = started.elapsed();
+                for chunk in &chunks {
+                    metrics::histogram!(
+                        m::INSERT_LATENCY_SECONDS,
+                        "table" => chunk.table.clone(),
+                    )
+                    .record(elapsed.as_secs_f64() / chunks.len().max(1) as f64);
+                }
+                match outcome {
+                    Ok(()) => {
+                        for chunk in &chunks {
+                            metrics::counter!(
+                                m::INSERT_CHUNKS_TOTAL,
+                                "result" => "success",
+                                "table" => chunk.table.clone(),
+                            )
+                            .increment(1);
+                        }
+                    }
+                    Err(err) => {
+                        let class = err.class();
+                        metrics::counter!(
+                            m::CLICKHOUSE_FAILURES_TOTAL,
+                            "classification" => format!("{class:?}"),
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            m::INSERT_CHUNKS_TOTAL,
+                            "result" => "failure",
+                        )
+                        .increment(chunks.len() as u64);
+                        return Err(err.into());
+                    }
+                }
                 progress.rows_inserted = progress.rows_inserted.saturating_add(row_count as u64);
+                metrics::counter!(m::ROWS_INSERTED_TOTAL).increment(row_count as u64);
+                tracing::info!(
+                    rows = row_count,
+                    low,
+                    high,
+                    "writer reported successful insert"
+                );
             } else if !chunks.is_empty() {
                 return Err(IngestorError::Config(
                     "writer is not configured but dry_run is false".into(),
                 ));
             }
 
+            let ack_started = std::time::Instant::now();
             self.ack_controller
                 .on_commit_group_success(&mut self.consumer, low, high)
                 .await?;
+            metrics::histogram!(m::ACK_FLUSH_LATENCY_SECONDS)
+                .record(ack_started.elapsed().as_secs_f64());
             progress.last_acked_sequence = Some(high);
+            metrics::gauge!(m::LAST_ACKED_SEQUENCE).set(high as f64);
+            *last_successful_ack_at = Some(std::time::Instant::now());
         } else {
             debug!(low, high, row_count, "dry-run: skipping insert and ack",);
         }
         progress.commit_groups_flushed = progress.commit_groups_flushed.saturating_add(1);
+        metrics::counter!(m::COMMIT_GROUPS_TOTAL).increment(1);
         if let Some(last) = progress.last_decoded_sequence
             && last < high
         {
             progress.last_decoded_sequence = Some(high);
+            metrics::gauge!(m::LAST_DECODED_SEQUENCE).set(high as f64);
         }
         Ok(())
     }

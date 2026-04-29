@@ -168,9 +168,17 @@ mod chrono_internal {
 #[derive(Debug, Clone, Default)]
 pub struct ClickHouseSettings {
     pub insert_quorum: Option<String>,
-    /// `insert_deduplication_token`. Always populated by the adapter;
-    /// kept here so the writer doesn't have to look it up separately.
+    /// `insert_deduplication_token`. Always populated by the adapter
+    /// for traceability; the writer applies it to the insert only when
+    /// `apply_deduplication_token` is true. ClickHouse historically
+    /// only honors the setting on `Replicated*` engines; for a plain
+    /// `ReplacingMergeTree` it can be a no-op or, in some versions,
+    /// reject the insert silently.
     pub insert_deduplication_token: String,
+    /// Whether the writer should set `insert_deduplication_token` on
+    /// the request. Default true (keeps the alpha guarantee). Set
+    /// false against non-replicated test deployments.
+    pub apply_deduplication_token: bool,
 }
 
 /// One ClickHouse insert request.

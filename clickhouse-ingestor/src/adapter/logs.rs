@@ -31,6 +31,17 @@ pub struct LogsAdapterConfig {
     /// Maximum approximate bytes per ClickHouse insert chunk.
     pub max_chunk_bytes: usize,
     pub insert_quorum: Option<String>,
+    /// Whether to apply `insert_deduplication_token` on inserts.
+    /// `true` for replicated tables (the production default), `false`
+    /// for non-replicated targets (single-node test containers, where
+    /// the setting is at best a no-op and historically can drop the
+    /// insert silently).
+    #[serde(default = "default_apply_dedup_token")]
+    pub apply_deduplication_token: bool,
+}
+
+fn default_apply_dedup_token() -> bool {
+    true
 }
 
 impl Default for LogsAdapterConfig {
@@ -42,6 +53,7 @@ impl Default for LogsAdapterConfig {
             max_chunk_rows: 100_000,
             max_chunk_bytes: 32 * 1024 * 1024,
             insert_quorum: Some("auto".to_string()),
+            apply_deduplication_token: true,
         }
     }
 }
@@ -163,6 +175,7 @@ impl Adapter for OtlpLogsClickHouseAdapter {
                 settings: ClickHouseSettings {
                     insert_quorum: self.config.insert_quorum.clone(),
                     insert_deduplication_token: token.clone(),
+                    apply_deduplication_token: self.config.apply_deduplication_token,
                 },
                 idempotency_token: token,
                 chunk_index: chunk_index as u32,
