@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::adapter::{Adapter, ClickHouseSettings, InsertChunk, RowValue};
-use crate::commit_group::CommitGroupBatch;
+use crate::commit_group::{CommitGroupBatch, RecordSize};
 use crate::error::IngestorResult;
 use crate::signal::DecodedLogRecord;
 
@@ -132,6 +132,7 @@ impl Adapter for OtlpLogsClickHouseAdapter {
             mut records,
             low_sequence,
             high_sequence,
+            bytes: _,
         } = batch;
 
         // Stable order: (entry_index, record_index) within a sequence,
@@ -157,55 +158,115 @@ impl Adapter for OtlpLogsClickHouseAdapter {
             return Ok(chunks);
         }
 
-        let max = self.config.max_chunk_rows.max(1);
-        for (chunk_index, slice) in records.chunks(max).enumerate() {
-            let rows: Vec<Vec<RowValue>> = slice.iter().map(|r| log_row(r, &self.config)).collect();
+        // Manifest path is the same across all records in a single
+        // ingestor's batch (the runtime serves one manifest), so we
+        // pull it from the first record. This becomes part of the
+        // idempotency token so two ingestors writing the same
+        // (database, table) from different manifests cannot collide.
+        let manifest_path = records[0].source.manifest_path.clone();
+
+        // Byte-aware chunking. Iterate records, accumulating row count
+        // and approx bytes; emit a chunk when either threshold trips.
+        // This is deterministic given (records, max_chunk_rows,
+        // max_chunk_bytes) — the chunking fingerprint hashes both.
+        let max_rows = self.config.max_chunk_rows.max(1);
+        let max_bytes = self.config.max_chunk_bytes.max(1);
+        let mut current: Vec<&DecodedLogRecord> = Vec::new();
+        let mut current_bytes: usize = 0;
+        let mut chunk_index: u32 = 0;
+        let emit = |slice: &[&DecodedLogRecord],
+                    chunk_index: u32,
+                    config: &LogsAdapterConfig,
+                    manifest_path: &str,
+                    fingerprint: &str|
+         -> InsertChunk {
+            let rows: Vec<Vec<RowValue>> = slice.iter().map(|r| log_row(r, config)).collect();
             let token = build_token(
-                &self.config,
-                &self.chunking_fingerprint,
+                manifest_path,
+                config,
+                fingerprint,
                 low_sequence,
                 high_sequence,
-                chunk_index as u32,
+                chunk_index,
             );
-            chunks.push(InsertChunk {
-                database: self.config.database.clone(),
-                table: self.config.table.clone(),
+            InsertChunk {
+                database: config.database.clone(),
+                table: config.table.clone(),
                 columns: COLUMNS.to_vec(),
                 rows,
                 settings: ClickHouseSettings {
-                    insert_quorum: self.config.insert_quorum.clone(),
+                    insert_quorum: config.insert_quorum.clone(),
                     insert_deduplication_token: token.clone(),
-                    apply_deduplication_token: self.config.apply_deduplication_token,
+                    apply_deduplication_token: config.apply_deduplication_token,
                 },
                 idempotency_token: token,
-                chunk_index: chunk_index as u32,
+                chunk_index,
                 observability_labels: vec![
-                    ("table", self.config.table.clone()),
+                    ("table", config.table.clone()),
                     ("signal", "logs".to_string()),
                 ],
-            });
+            }
+        };
+        for record in &records {
+            let rec_bytes = record.approx_size_bytes();
+            // If adding this record would exceed BOTH thresholds and
+            // the chunk is non-empty, flush before adding. We test
+            // either threshold separately so a row-only or bytes-only
+            // limit each correctly chunk.
+            let would_exceed_rows = current.len() + 1 > max_rows;
+            let would_exceed_bytes = current_bytes + rec_bytes > max_bytes;
+            if !current.is_empty() && (would_exceed_rows || would_exceed_bytes) {
+                chunks.push(emit(
+                    &current,
+                    chunk_index,
+                    &self.config,
+                    &manifest_path,
+                    &self.chunking_fingerprint,
+                ));
+                chunk_index += 1;
+                current.clear();
+                current_bytes = 0;
+            }
+            current.push(record);
+            current_bytes += rec_bytes;
+        }
+        if !current.is_empty() {
+            chunks.push(emit(
+                &current,
+                chunk_index,
+                &self.config,
+                &manifest_path,
+                &self.chunking_fingerprint,
+            ));
         }
         Ok(chunks)
     }
 }
 
 fn build_token(
+    manifest_path: &str,
     config: &LogsAdapterConfig,
     fingerprint: &str,
     low: u64,
     high: u64,
     chunk_index: u32,
 ) -> String {
-    // The manifest path isn't on the adapter directly; we put the table
-    // name in the token so two adapters writing different tables from
-    // the same Buffer do not collide. The runtime layers the manifest
-    // path on top via the ClickHouse setting if needed; for the alpha,
-    // the manifest segment in the spec ({manifest}:{low}-{high}:...) is
-    // covered by the configured `database.table` since the ingestor is
-    // 1:1 with a manifest.
+    // RFC 0003 token format:
+    //   {manifest_path}:{database}.{table}:{low}-{high}:{adapter_version}:{fingerprint}:{chunk_index}
+    // The manifest segment makes two ingestors writing the same
+    // (database, table) from different manifests safe. database.table
+    // is included so two adapters writing different tables from one
+    // manifest also stay distinct.
     format!(
-        "{}.{}:{}-{}:{}:{}:{}",
-        config.database, config.table, low, high, config.adapter_version, fingerprint, chunk_index
+        "{}:{}.{}:{}-{}:{}:{}:{}",
+        manifest_path,
+        config.database,
+        config.table,
+        low,
+        high,
+        config.adapter_version,
+        fingerprint,
+        chunk_index,
     )
 }
 
@@ -323,6 +384,7 @@ mod tests {
                 records: Vec::new(),
                 low_sequence: 5,
                 high_sequence: 9,
+                bytes: 0,
             })
             .expect("plan");
         assert!(chunks.is_empty());
@@ -337,6 +399,7 @@ mod tests {
                 records,
                 low_sequence: 1,
                 high_sequence: 2,
+                bytes: 0,
             })
             .expect("plan");
         assert_eq!(chunks.len(), 2);
@@ -354,14 +417,112 @@ mod tests {
                 records: vec![rec(7, 0, 0), rec(7, 0, 1), rec(8, 0, 0)],
                 low_sequence: 7,
                 high_sequence: 8,
+                bytes: 0,
             })
             .expect("plan");
         let token = &chunks[0].idempotency_token;
-        // database.table:low-high:version:fingerprint:chunk_index
-        assert!(token.starts_with("responsive.logs:7-8:1:"));
+        // {manifest}:{db}.{table}:low-high:version:fingerprint:chunk_index
+        // The test fixture's manifest_path is "ingest/test/manifest"
+        // (set in the rec() helper).
+        assert!(token.starts_with("ingest/test/manifest:responsive.logs:7-8:1:"));
         assert!(token.ends_with(":0"));
         assert!(chunks[1].idempotency_token.ends_with(":1"));
         assert_ne!(chunks[0].idempotency_token, chunks[1].idempotency_token);
+    }
+
+    #[test]
+    fn token_distinguishes_two_manifests_for_same_table() {
+        // Two ingestors writing the same (database, table) from
+        // different manifests must produce distinct tokens. Without
+        // the manifest segment, ClickHouse's
+        // insert_deduplication_token would collapse them and silently
+        // drop one stream's data.
+        let adapter = OtlpLogsClickHouseAdapter::new(cfg());
+        let mut a = rec(1, 0, 0);
+        a.source.manifest_path = "ingest/otel/logs-a/manifest".into();
+        let mut b = rec(1, 0, 0);
+        b.source.manifest_path = "ingest/otel/logs-b/manifest".into();
+        let plan_a = adapter
+            .plan(CommitGroupBatch {
+                records: vec![a],
+                low_sequence: 1,
+                high_sequence: 1,
+                bytes: 0,
+            })
+            .expect("plan a");
+        let plan_b = adapter
+            .plan(CommitGroupBatch {
+                records: vec![b],
+                low_sequence: 1,
+                high_sequence: 1,
+                bytes: 0,
+            })
+            .expect("plan b");
+        assert_ne!(
+            plan_a[0].idempotency_token, plan_b[0].idempotency_token,
+            "tokens must differ when manifest_path differs"
+        );
+    }
+
+    #[test]
+    fn byte_threshold_chunks_records() {
+        // Lower max_chunk_bytes so each row exceeds it; the adapter
+        // must split on the byte threshold even when row threshold
+        // would not trip.
+        let adapter = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig {
+            max_chunk_rows: 1_000_000,
+            max_chunk_bytes: 1, // every record's bytes will exceed this
+            ..LogsAdapterConfig::default()
+        });
+        let chunks = adapter
+            .plan(CommitGroupBatch {
+                records: vec![rec(1, 0, 0), rec(1, 0, 1), rec(1, 0, 2)],
+                low_sequence: 1,
+                high_sequence: 1,
+                bytes: 0,
+            })
+            .expect("plan");
+        assert_eq!(chunks.len(), 3, "every record should land in its own chunk");
+    }
+
+    #[test]
+    fn changing_max_chunk_bytes_shifts_chunk_boundaries() {
+        // Two configs with identical max_chunk_rows but different
+        // max_chunk_bytes must produce different chunk counts and
+        // (because the fingerprint includes max_chunk_bytes) different
+        // tokens. This pins down the property that an operator change
+        // to byte sizing cannot collide tokens with the prior
+        // chunking.
+        let records = || vec![rec(1, 0, 0), rec(1, 0, 1), rec(1, 0, 2)];
+        let adapter_loose = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig {
+            max_chunk_rows: 1_000_000,
+            max_chunk_bytes: 1_000_000,
+            ..LogsAdapterConfig::default()
+        });
+        let adapter_strict = OtlpLogsClickHouseAdapter::new(LogsAdapterConfig {
+            max_chunk_rows: 1_000_000,
+            max_chunk_bytes: 1,
+            ..LogsAdapterConfig::default()
+        });
+        let loose = adapter_loose
+            .plan(CommitGroupBatch {
+                records: records(),
+                low_sequence: 1,
+                high_sequence: 1,
+                bytes: 0,
+            })
+            .expect("plan loose");
+        let strict = adapter_strict
+            .plan(CommitGroupBatch {
+                records: records(),
+                low_sequence: 1,
+                high_sequence: 1,
+                bytes: 0,
+            })
+            .expect("plan strict");
+        assert_eq!(loose.len(), 1);
+        assert_eq!(strict.len(), 3);
+        assert_ne!(loose[0].idempotency_token, strict[0].idempotency_token);
     }
 
     #[test]
@@ -377,6 +538,7 @@ mod tests {
                 records: records(),
                 low_sequence: 7,
                 high_sequence: 8,
+                bytes: 0,
             })
             .expect("plan a");
         let plan_b = adapter
@@ -384,6 +546,7 @@ mod tests {
                 records: records(),
                 low_sequence: 7,
                 high_sequence: 8,
+                bytes: 0,
             })
             .expect("plan b");
 
@@ -425,6 +588,7 @@ mod tests {
                 records: vec![r.clone()],
                 low_sequence: 11,
                 high_sequence: 11,
+                bytes: 0,
             })
             .expect("plan");
         let row = &chunks[0].rows[0];
@@ -471,6 +635,7 @@ mod tests {
                 records,
                 low_sequence: 1,
                 high_sequence: 2,
+                bytes: 0,
             })
             .expect("plan");
         let row_seqs: Vec<u64> = chunks[0]

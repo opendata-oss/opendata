@@ -170,10 +170,18 @@ where
                     match next? {
                         Some(batch) => {
                             progress.batches_read = progress.batches_read.saturating_add(1);
-                            progress.last_decoded_sequence = Some(batch.sequence);
                             metrics::counter!(m::BUFFER_BATCHES_READ_TOTAL).increment(1);
-                            metrics::gauge!(m::LAST_DECODED_SEQUENCE).set(batch.sequence as f64);
+                            let sequence = batch.sequence;
+                            // Only advance last_decoded_sequence after the
+                            // batch has decoded successfully and been
+                            // absorbed into the commit group. A decode
+                            // failure earlier returns Err and the gauge
+                            // stays at the previous successful value,
+                            // which is what an alert reading the gauge
+                            // expects.
                             self.handle_batch(batch, &mut group)?;
+                            progress.last_decoded_sequence = Some(sequence);
+                            metrics::gauge!(m::LAST_DECODED_SEQUENCE).set(sequence as f64);
                         }
                         None => {
                             tokio::time::sleep(self.options.poll_interval).await;
@@ -263,9 +271,11 @@ where
         let high = drained.high_sequence;
         let low = drained.low_sequence;
         let row_count = drained.records.len();
+        let bytes = drained.bytes;
         progress.rows_planned = progress.rows_planned.saturating_add(row_count as u64);
         metrics::counter!(m::ROWS_PLANNED_TOTAL).increment(row_count as u64);
         metrics::histogram!(m::COMMIT_GROUP_SIZE_ROWS).record(row_count as f64);
+        metrics::histogram!(m::COMMIT_GROUP_SIZE_BYTES).record(bytes as f64);
 
         let chunks = match self.adapter.plan(drained) {
             Ok(chunks) => chunks,
@@ -277,6 +287,20 @@ where
                 });
             }
         };
+
+        // Adapter contract guard: the planned chunks must contain
+        // exactly as many rows as the commit group held. Adapters that
+        // drop or duplicate rows would otherwise advance the
+        // high-watermark (post-ack) for data that never reached the
+        // sink. Fail closed before the writer/ack runs.
+        let chunk_row_total: usize = chunks.iter().map(|c| c.rows_count()).sum();
+        if chunk_row_total != row_count {
+            metrics::counter!(m::DECODE_FAILURES_TOTAL, "stage" => "adapter").increment(1);
+            return Err(IngestorError::Adapter(format!(
+                "adapter plan covered {chunk_row_total} rows but the commit group held {row_count}; \
+                 refusing to ack a partial/dropped/duplicated chunking"
+            )));
+        }
 
         if !self.options.dry_run {
             if let Some(writer) = &self.writer {

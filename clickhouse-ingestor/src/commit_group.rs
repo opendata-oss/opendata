@@ -155,11 +155,14 @@ impl<R: RecordSize> CommitGroup<R> {
     }
 
     /// Drain the group's contents, leaving an empty group ready to absorb
-    /// the next batch.
+    /// the next batch. `bytes` on the returned batch is the sum of
+    /// `RecordSize::approx_size_bytes` at drain time so the runtime can
+    /// record the `commit_group_size_bytes` histogram without re-summing.
     pub fn drain(&mut self) -> CommitGroupBatch<R> {
         let records = std::mem::take(&mut self.records);
         let low = self.low_sequence.expect("drain called on empty group");
         let high = self.high_sequence.expect("drain called on empty group");
+        let bytes = self.bytes;
         self.low_sequence = None;
         self.high_sequence = None;
         self.bytes = 0;
@@ -168,6 +171,7 @@ impl<R: RecordSize> CommitGroup<R> {
             records,
             low_sequence: low,
             high_sequence: high,
+            bytes,
         }
     }
 }
@@ -177,6 +181,8 @@ pub struct CommitGroupBatch<R> {
     pub records: Vec<R>,
     pub low_sequence: u64,
     pub high_sequence: u64,
+    /// Sum of `RecordSize::approx_size_bytes` over the drained records.
+    pub bytes: usize,
 }
 
 impl<R> CommitGroupBatch<R> {

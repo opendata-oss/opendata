@@ -22,9 +22,14 @@ pub const ACK_FLUSH_LATENCY_SECONDS: &str = "ingestor_ack_flush_latency_seconds"
 pub const RETRY_COUNT_TOTAL: &str = "ingestor_retry_count_total";
 pub const LAST_DECODED_SEQUENCE: &str = "ingestor_last_decoded_sequence";
 pub const LAST_ACKED_SEQUENCE: &str = "ingestor_last_acked_sequence";
-pub const CURRENT_LAG_SEQUENCES: &str = "ingestor_current_lag_sequences";
 pub const TIME_SINCE_LAST_SUCCESSFUL_ACK_SECONDS: &str =
     "ingestor_time_since_last_successful_ack_seconds";
+// `current_lag_sequences` (head_sequence - last_decoded_sequence) is
+// deferred to a follow-up: the runtime does not currently observe the
+// manifest's head sequence, so the gauge would always read zero. We
+// will wire it up once the buffer crate exposes a peek API; for now
+// leave the metric off the registry rather than emit a misleading
+// value.
 pub const DECODE_FAILURES_TOTAL: &str = "ingestor_decode_failures_total";
 pub const CLICKHOUSE_FAILURES_TOTAL: &str = "ingestor_clickhouse_failures_total";
 
@@ -80,10 +85,6 @@ pub fn describe() {
     describe_gauge!(
         LAST_ACKED_SEQUENCE,
         "Highest Buffer sequence the runtime has acked; advances only when not in dry-run."
-    );
-    describe_gauge!(
-        CURRENT_LAG_SEQUENCES,
-        "Difference between the latest available manifest sequence and last_decoded_sequence."
     );
     describe_gauge!(
         TIME_SINCE_LAST_SUCCESSFUL_ACK_SECONDS,

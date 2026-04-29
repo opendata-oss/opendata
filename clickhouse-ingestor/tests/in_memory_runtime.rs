@@ -333,13 +333,125 @@ async fn adapter_chunks_carry_tokens_under_real_pipeline() {
         assert_eq!(chunk.database, "responsive");
         assert_eq!(chunk.table, "logs");
         let token = &chunk.idempotency_token;
+        // Token shape is {manifest}:{db}.{table}:{low}-{high}:{ver}:{fp}:{idx}
+        let manifest_prefix = format!("{manifest_path}:responsive.logs:");
         assert!(
-            token.starts_with("responsive.logs:"),
-            "token must start with database.table prefix: {token}"
+            token.starts_with(&manifest_prefix),
+            "token must start with {manifest_prefix}, got {token}"
         );
     }
 
     producer.close().await.expect("close");
     let _ = captured;
     let _: BTreeMap<String, String> = BTreeMap::new(); // keep BTreeMap import live for IDEs
+}
+
+/// An intentionally bad adapter that drops every record. The runtime's
+/// contract guard must reject this before acking the input range; if
+/// it didn't, the runtime would advance Buffer past records that
+/// never reached the sink.
+#[derive(Clone)]
+struct DroppingAdapter {
+    fingerprint: String,
+}
+
+impl Adapter for DroppingAdapter {
+    type Input = clickhouse_ingestor::DecodedLogRecord;
+    fn plan(&self, _batch: CommitGroupBatch<Self::Input>) -> IngestorResult<Vec<InsertChunk>> {
+        // Returns no chunks even when records are present, simulating
+        // an adapter bug that drops everything.
+        let _ = &self.fingerprint;
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn runtime_rejects_adapter_that_drops_rows() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let manifest_path = "ingest/test/contract-guard/manifest";
+    let data_prefix = "ingest/test/contract-guard/data";
+
+    let producer_config = buffer::ProducerConfig {
+        object_store: ObjectStoreConfig::InMemory,
+        data_path_prefix: data_prefix.into(),
+        manifest_path: manifest_path.into(),
+        flush_interval: Duration::from_secs(24 * 3600),
+        flush_size_bytes: 64 * 1024 * 1024,
+        max_buffered_inputs: 1000,
+        batch_compression: buffer::CompressionType::None,
+    };
+    let producer = buffer::Producer::with_object_store(
+        producer_config,
+        Arc::clone(&store),
+        Arc::new(SystemClock),
+    )
+    .expect("producer");
+
+    producer
+        .produce(vec![Bytes::from(make_logs("svc", 3))], logs_envelope())
+        .await
+        .expect("produce");
+    producer.flush().await.expect("flush");
+
+    let consumer_config = buffer::ConsumerConfig {
+        object_store: ObjectStoreConfig::InMemory,
+        manifest_path: manifest_path.into(),
+        data_path_prefix: data_prefix.into(),
+        gc_interval: Duration::from_secs(60),
+        gc_grace_period: Duration::from_secs(60),
+    };
+    let consumer = buffer::Consumer::with_object_store(consumer_config, Arc::clone(&store), None)
+        .await
+        .expect("consumer");
+
+    let options = RuntimeOptions {
+        manifest_path: manifest_path.into(),
+        data_path_prefix: data_prefix.into(),
+        configured_envelope: ConfiguredEnvelope {
+            version: 1,
+            signal_type: SignalType::Logs,
+            encoding: PayloadEncoding::OtlpProtobuf,
+        },
+        commit_group: CommitGroupThresholds {
+            max_rows: 100,
+            max_bytes: 1_000_000,
+            max_age: Duration::from_millis(50),
+        },
+        ack_flush_policy: AckFlushPolicy::EveryCommitGroup,
+        // Not dry-run: we want the contract guard to fire before the
+        // ack path runs.
+        dry_run: false,
+        poll_interval: Duration::from_millis(10),
+    };
+    // Writer is None; with dry_run=false and writer=None the runtime
+    // would error if any chunks were produced. The contract guard
+    // should fire FIRST (because the adapter dropped rows), surfacing
+    // an Adapter error.
+    let runtime = BufferConsumerRuntime::new(
+        consumer,
+        OtlpLogsDecoder::new(),
+        DroppingAdapter {
+            fingerprint: "dropper".into(),
+        },
+        None,
+        options,
+    );
+
+    let shutdown = CancellationToken::new();
+    let inner_shutdown = shutdown.clone();
+    let handle = tokio::spawn(async move { runtime.run(inner_shutdown).await });
+
+    // The runtime should error out. Give it a couple of seconds to
+    // process the batch and run the guard.
+    let _ = tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown.cancel();
+    let result = handle.await.expect("runtime task panicked");
+    let err = result.expect_err("runtime must error when adapter drops rows");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("adapter plan covered 0 rows"),
+        "unexpected error message: {msg}"
+    );
+
+    producer.close().await.expect("close");
 }

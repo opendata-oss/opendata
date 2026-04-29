@@ -129,7 +129,10 @@ impl ClickHouseWriter {
     /// are dedup-safe at the table level.
     pub async fn execute_chunk(&self, chunk: &InsertChunk) -> Result<(), WriterError> {
         let body = render_jsoneachrow(chunk)?;
-        let sql = render_insert_sql_with_settings(chunk, self.config.request_timeout);
+        // SQL is the bare INSERT (no SETTINGS clause). Settings ride
+        // as URL query params so the body shape exactly matches the
+        // simple-insert path that ClickHouse always accepts.
+        let sql = render_insert_sql_clean(chunk);
 
         let mut attempt: u32 = 0;
         let mut backoff = self.config.initial_backoff;
@@ -147,6 +150,11 @@ impl ClickHouseWriter {
                 }
                 Err(err) => match err.class() {
                     WriterErrorClass::Retryable if attempt < self.config.max_attempts => {
+                        metrics::counter!(
+                            crate::metrics::RETRY_COUNT_TOTAL,
+                            "reason" => "retryable",
+                        )
+                        .increment(1);
                         warn!(
                             attempt,
                             token = %chunk.idempotency_token,
@@ -171,36 +179,54 @@ impl ClickHouseWriter {
 
     async fn execute_once(
         &self,
-        sql_with_settings: &str,
+        sql_clean: &str,
         body: &str,
         chunk: &InsertChunk,
     ) -> Result<(), WriterError> {
-        // Combine SQL+data into a single body and POST to the endpoint
-        // root. This is the same shape `execute_statement` uses; the
-        // body-combined form is universally accepted by ClickHouse's
-        // HTTP interface, while the URL-`?query=`-plus-body split is
-        // honored on some builds and silently ignored on others.
-        let mut combined = String::with_capacity(sql_with_settings.len() + 2 + body.len());
-        combined.push_str(sql_with_settings);
+        // SQL+data combined in body (no SETTINGS clause); per-request
+        // settings ride as URL query params. This matches the curl
+        // shape ClickHouse 23.3 accepts most consistently.
+        let mut combined = String::with_capacity(sql_clean.len() + 2 + body.len());
+        combined.push_str(sql_clean);
         combined.push('\n');
         combined.push_str(body);
         if let Ok(path) = std::env::var("INGESTOR_DUMP_INSERT_BODY") {
             let _ = std::fs::write(&path, combined.as_bytes());
             tracing::debug!(path = %path, "dumped insert body");
         }
+
+        let url = build_insert_url(&self.config.endpoint, chunk, self.config.request_timeout);
+        let body_bytes = combined.into_bytes();
+        let body_len = body_bytes.len();
         tracing::debug!(
-            body_len = combined.len(),
-            body_first_bytes = %combined.chars().take(400).collect::<String>(),
+            url = %url,
+            body_len,
             "issuing clickhouse insert",
         );
-        let resp_body = self.execute_statement(&combined).await?;
-        tracing::debug!(
-            token = %chunk.idempotency_token,
-            rows = chunk.rows_count(),
-            response_bytes = resp_body.len(),
-            "insert ok"
-        );
-        Ok(())
+        let http = self.http_client()?;
+        let mut req = http
+            .post(&url)
+            .header(reqwest::header::CONTENT_LENGTH, body_len.to_string())
+            .body(body_bytes);
+        if !self.config.user.is_empty() {
+            req = req.header("X-ClickHouse-User", &self.config.user);
+        }
+        if !self.config.password.is_empty() {
+            req = req.header("X-ClickHouse-Key", &self.config.password);
+        }
+        let resp = req.send().await.map_err(|e| classify_reqwest(&e))?;
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            tracing::debug!(
+                token = %chunk.idempotency_token,
+                rows = chunk.rows_count(),
+                response_bytes = resp_body.len(),
+                "insert ok"
+            );
+            return Ok(());
+        }
+        Err(classify_status(status.as_u16(), &resp_body))
     }
 
     /// Run a SQL statement (DDL, SELECT, or INSERT-with-data-in-body).
@@ -264,35 +290,36 @@ fn classify_status(status: u16, body: &str) -> WriterError {
     }
 }
 
-fn render_insert_sql_with_settings(chunk: &InsertChunk, timeout: Duration) -> String {
+fn render_insert_sql_clean(chunk: &InsertChunk) -> String {
+    // No SETTINGS clause, no column list. JSONEachRow keys rows by
+    // field name. This is the universally-accepted INSERT shape;
+    // settings ride as URL query params.
+    format!(
+        "INSERT INTO {}.{} FORMAT JSONEachRow",
+        chunk.database, chunk.table
+    )
+}
+
+fn build_insert_url(endpoint: &str, chunk: &InsertChunk, timeout: Duration) -> String {
     use std::fmt::Write;
-    let mut clauses: Vec<String> = vec!["async_insert=0".into()];
-    clauses.push("date_time_input_format='best_effort'".into());
+    let mut url = String::new();
+    url.push_str(endpoint.trim_end_matches('/'));
+    url.push_str("/?async_insert=0");
+    url.push_str("&date_time_input_format=best_effort");
     if chunk.settings.apply_deduplication_token {
-        clauses.push(format!(
-            "insert_deduplication_token='{}'",
-            chunk
-                .settings
-                .insert_deduplication_token
-                .replace('\\', "\\\\")
-                .replace('\'', "\\'")
-        ));
+        let _ = write!(
+            &mut url,
+            "&insert_deduplication_token={}",
+            urlencoding::encode(&chunk.settings.insert_deduplication_token),
+        );
     }
     if let Some(quorum) = &chunk.settings.insert_quorum {
-        clauses.push(format!(
-            "insert_quorum='{}'",
-            quorum.replace('\\', "\\\\").replace('\'', "\\'")
-        ));
+        let _ = write!(&mut url, "&insert_quorum={}", urlencoding::encode(quorum));
     }
     if timeout > Duration::ZERO {
-        clauses.push(format!("max_execution_time={}", timeout.as_secs()));
+        let _ = write!(&mut url, "&max_execution_time={}", timeout.as_secs());
     }
-    let mut sql = format!("INSERT INTO {}.{}", chunk.database, chunk.table);
-    if !clauses.is_empty() {
-        let _ = write!(&mut sql, " SETTINGS {}", clauses.join(", "));
-    }
-    sql.push_str(" FORMAT JSONEachRow");
-    sql
+    url
 }
 
 /// Serialize the chunk's rows into ndjson for the `JSONEachRow` body.
@@ -343,9 +370,8 @@ mod tests {
     #[test]
     fn insert_sql_is_well_formed() {
         let c = chunk(vec![]);
-        let sql = render_insert_sql_with_settings(&c, Duration::ZERO);
-        assert!(sql.starts_with("INSERT INTO responsive.logs SETTINGS "));
-        assert!(sql.ends_with(" FORMAT JSONEachRow"));
+        let sql = render_insert_sql_clean(&c);
+        assert_eq!(sql, "INSERT INTO responsive.logs FORMAT JSONEachRow");
     }
 
     #[test]
@@ -395,23 +421,21 @@ mod tests {
     }
 
     #[test]
-    fn insert_sql_with_settings_renders_clauses() {
+    fn insert_url_carries_settings_as_query_params() {
         let c = chunk(vec![]);
-        let sql = render_insert_sql_with_settings(&c, Duration::from_secs(5));
-        assert!(sql.starts_with("INSERT INTO responsive.logs SETTINGS "));
-        assert!(sql.contains("async_insert=0"));
-        assert!(sql.contains("date_time_input_format='best_effort'"));
-        assert!(sql.contains("insert_deduplication_token='tok'"));
-        assert!(sql.contains("insert_quorum='auto'"));
-        assert!(sql.contains("max_execution_time=5"));
-        assert!(sql.ends_with(" FORMAT JSONEachRow"));
+        let url = build_insert_url("http://localhost:8123", &c, Duration::from_secs(5));
+        assert!(url.starts_with("http://localhost:8123/?async_insert=0"));
+        assert!(url.contains("date_time_input_format=best_effort"));
+        assert!(url.contains("insert_deduplication_token=tok"));
+        assert!(url.contains("insert_quorum=auto"));
+        assert!(url.contains("max_execution_time=5"));
     }
 
     #[test]
-    fn insert_sql_omits_token_when_disabled() {
+    fn insert_url_omits_token_when_disabled() {
         let mut c = chunk(vec![]);
         c.settings.apply_deduplication_token = false;
-        let sql = render_insert_sql_with_settings(&c, Duration::from_secs(5));
-        assert!(!sql.contains("insert_deduplication_token"));
+        let url = build_insert_url("http://localhost:8123", &c, Duration::from_secs(5));
+        assert!(!url.contains("insert_deduplication_token"));
     }
 }
