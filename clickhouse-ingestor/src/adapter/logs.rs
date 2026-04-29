@@ -160,10 +160,23 @@ impl Adapter for OtlpLogsClickHouseAdapter {
 
         // Manifest path is the same across all records in a single
         // ingestor's batch (the runtime serves one manifest), so we
-        // pull it from the first record. This becomes part of the
-        // idempotency token so two ingestors writing the same
-        // (database, table) from different manifests cannot collide.
+        // pull it from the first record and fail closed if any other
+        // record disagrees. This is defense in depth: if a future
+        // runtime change ever started multiplexing manifests through
+        // one adapter, the token would silently collide between
+        // streams and ClickHouse's insert_deduplication_token would
+        // drop one of them — better to halt explicitly.
         let manifest_path = records[0].source.manifest_path.clone();
+        if let Some(mismatch) = records
+            .iter()
+            .find(|r| r.source.manifest_path != manifest_path)
+        {
+            return Err(crate::error::IngestorError::Adapter(format!(
+                "commit group mixes manifest paths: first record has {first}, found {other}",
+                first = manifest_path,
+                other = mismatch.source.manifest_path,
+            )));
+        }
 
         // Byte-aware chunking. Iterate records, accumulating row count
         // and approx bytes; emit a chunk when either threshold trips.
@@ -428,6 +441,33 @@ mod tests {
         assert!(token.ends_with(":0"));
         assert!(chunks[1].idempotency_token.ends_with(":1"));
         assert_ne!(chunks[0].idempotency_token, chunks[1].idempotency_token);
+    }
+
+    #[test]
+    fn plan_rejects_records_from_mixed_manifests() {
+        // Defense in depth: a future runtime change could route
+        // records from two manifests through one adapter; the token
+        // would silently collide and ClickHouse's
+        // insert_deduplication_token would drop one stream's data.
+        // Fail closed before any of that.
+        let adapter = OtlpLogsClickHouseAdapter::new(cfg());
+        let mut a = rec(1, 0, 0);
+        a.source.manifest_path = "ingest/otel/logs-a/manifest".into();
+        let mut b = rec(1, 0, 1);
+        b.source.manifest_path = "ingest/otel/logs-b/manifest".into();
+        let err = adapter
+            .plan(CommitGroupBatch {
+                records: vec![a, b],
+                low_sequence: 1,
+                high_sequence: 1,
+                bytes: 0,
+            })
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("commit group mixes manifest paths"),
+            "expected manifest mismatch error, got: {msg}"
+        );
     }
 
     #[test]
