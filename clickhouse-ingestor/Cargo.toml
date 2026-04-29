@@ -1,0 +1,53 @@
+[package]
+name = "clickhouse-ingestor"
+version.workspace = true
+edition.workspace = true
+description = "Reusable Rust runtime that consumes OpenData Buffer batches and writes them into ClickHouse"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+
+[lib]
+name = "clickhouse_ingestor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clickhouse-ingestor"
+path = "src/bin/clickhouse_ingestor.rs"
+
+[features]
+default = []
+# Gates testcontainers-driven integration tests behind a feature so default
+# `cargo test` stays fast.
+integration-tests = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+[dependencies]
+anyhow.workspace = true
+buffer.workspace = true
+bytes.workspace = true
+clap = { workspace = true }
+common.workspace = true
+figment.workspace = true
+futures.workspace = true
+hex.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+opentelemetry-proto = { workspace = true }
+prost.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+slatedb.workspace = true
+testcontainers = { version = "0.23", optional = true }
+testcontainers-modules = { version = "0.11", optional = true, features = ["clickhouse", "minio"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+urlencoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

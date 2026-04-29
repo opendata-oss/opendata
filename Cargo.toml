@@ -4,6 +4,7 @@ members = [
     "bencher",
     "buffer",
     "buffer-inspect",
+    "clickhouse-ingestor",
     "common",
     "keyvalue",
     "log",
@@ -60,6 +61,9 @@ ulid = "1"
 uuid = "1.14.0"
 opentelemetry-proto = { version = "0.28", default-features = false, features = ["logs", "metrics", "gen-tonic-messages"] }
 prost = "0.13"
+sha2 = "0.10"
+hex = "0.4"
+urlencoding = "2.1"
 proptest = "1"
 dashu-float = "0.4"
 snap = "1"
