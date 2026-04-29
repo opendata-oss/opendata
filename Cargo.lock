@@ -422,6 +422,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffer-inspect"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "opendata-buffer",
+ "opendata-common",
+ "opentelemetry-proto",
+ "prost",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "slatedb",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2810,6 +2830,7 @@ dependencies = [
  "futures-util",
  "glob",
  "opentelemetry",
+ "serde_json",
  "thiserror 2.0.17",
 ]
 

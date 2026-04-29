@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "bencher",
     "buffer",
+    "buffer-inspect",
     "common",
     "keyvalue",
     "log",
@@ -57,7 +58,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 uuid = "1.14.0"
-opentelemetry-proto = { version = "0.28", default-features = false, features = ["metrics", "gen-tonic-messages"] }
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["logs", "metrics", "gen-tonic-messages"] }
 prost = "0.13"
 proptest = "1"
 dashu-float = "0.4"
