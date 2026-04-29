@@ -11,6 +11,7 @@ on:
           - timeseries
           - log
           - vector
+          - clickhouse-ingestor
       ref:
         description: 'Branch or commit SHA to build from (defaults to current branch)'
         required: false
