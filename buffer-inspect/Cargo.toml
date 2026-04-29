@@ -1,0 +1,29 @@
+[package]
+name = "buffer-inspect"
+version.workspace = true
+edition.workspace = true
+description = "Read-only inspection tool for OpenData Buffer manifests and batches"
+license = "MIT"
+repository = "https://github.com/opendata-oss/opendata"
+
+[[bin]]
+name = "buffer-inspect"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+buffer.workspace = true
+bytes.workspace = true
+clap = { workspace = true }
+common.workspace = true
+opentelemetry-proto = { workspace = true }
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+slatedb.workspace = true
+tempfile.workspace = true
