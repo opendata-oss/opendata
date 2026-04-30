@@ -4,19 +4,27 @@
 //! object store, builds a `buffer::Consumer`, wires the OTLP logs
 //! decoder + ClickHouse logs adapter + writer + ack controller into a
 //! `BufferConsumerRuntime`, and runs until `SIGINT`/`SIGTERM`.
+//!
+//! Also serves `/metrics` (Prometheus text) and `/-/healthy` on a
+//! dedicated HTTP port so the OTel collector can scrape runtime metrics.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::Router;
+use axum::http::StatusCode;
+use axum::routing::get;
 use clap::Parser;
 use clickhouse_ingestor::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
 use clickhouse_ingestor::{
     AckFlushPolicy, BufferConsumerRuntime, ClickHouseWriter, IngestorConfig,
     OtlpLogsClickHouseAdapter, OtlpLogsDecoder, RuntimeOptions,
 };
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -48,8 +56,18 @@ async fn main() -> Result<()> {
         database = %cfg.clickhouse.database,
         table = %cfg.clickhouse.table,
         dry_run = cfg.runtime.dry_run,
+        metrics_bind_addr = %cfg.metrics_server.bind_addr,
         "configuration loaded",
     );
+
+    // Install the metrics-rs recorder before any code that records or
+    // describes metrics runs. `runtime.run` calls `metrics::describe()`
+    // and the runtime emits counters/gauges from its first tick; both
+    // need the recorder in place to be observable.
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let metrics_handle = recorder.handle();
+    metrics::set_global_recorder(recorder)
+        .map_err(|e| anyhow::anyhow!("install global metrics recorder: {e}"))?;
 
     let object_store = common::create_object_store(&cfg.buffer.object_store)
         .context("constructing object store")?;
@@ -102,6 +120,57 @@ async fn main() -> Result<()> {
         signal_shutdown.cancel();
     });
 
-    runtime.run(shutdown).await?;
+    let metrics_addr: SocketAddr = cfg
+        .metrics_server
+        .bind_addr
+        .parse()
+        .with_context(|| format!("parsing metrics_server.bind_addr={}", cfg.metrics_server.bind_addr))?;
+    let metrics_shutdown = shutdown.clone();
+    let metrics_task = tokio::spawn(async move {
+        if let Err(e) = serve_metrics(metrics_handle, metrics_addr, metrics_shutdown).await {
+            error!(error = %e, "metrics server exited with error");
+        }
+    });
+
+    let runtime_result = runtime.run(shutdown.clone()).await;
+    // Cancel the metrics server on runtime exit so the process doesn't
+    // hang on shutdown.
+    shutdown.cancel();
+    if let Err(e) = metrics_task.await {
+        error!(error = %e, "metrics server task join failed");
+    }
+    runtime_result?;
+    Ok(())
+}
+
+/// Serve `/metrics` (Prometheus text format) and `/-/healthy` on the
+/// configured address until the shutdown token is cancelled.
+async fn serve_metrics(
+    handle: PrometheusHandle,
+    addr: SocketAddr,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let app = Router::new()
+        .route(
+            "/metrics",
+            get({
+                let handle = handle.clone();
+                move || {
+                    let handle = handle.clone();
+                    async move { handle.render() }
+                }
+            }),
+        )
+        .route("/-/healthy", get(|| async { (StatusCode::OK, "OK") }));
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding metrics server to {addr}"))?;
+    info!(%addr, "metrics server listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+        .context("metrics server error")?;
     Ok(())
 }

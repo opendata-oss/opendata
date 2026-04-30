@@ -679,6 +679,7 @@ name = "clickhouse-ingestor"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "clap",
  "figment",

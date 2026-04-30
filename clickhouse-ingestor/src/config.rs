@@ -62,6 +62,26 @@ pub struct IngestorConfig {
     pub commit_group: CommitGroupSection,
     pub ack: AckSection,
     pub adapter: AdapterSection,
+    #[serde(default)]
+    pub metrics_server: MetricsServerSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsServerSection {
+    #[serde(default = "default_metrics_bind_addr")]
+    pub bind_addr: String,
+}
+
+impl Default for MetricsServerSection {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_metrics_bind_addr(),
+        }
+    }
+}
+
+fn default_metrics_bind_addr() -> String {
+    "0.0.0.0:9090".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

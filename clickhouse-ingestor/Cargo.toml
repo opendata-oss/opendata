@@ -22,6 +22,7 @@ integration-tests = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 buffer.workspace = true
 bytes.workspace = true
 clap = { workspace = true }
