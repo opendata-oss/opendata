@@ -10,6 +10,7 @@ use common::ObjectStoreConfig;
 use common::storage::config::StorageConfig;
 use serde::{Deserialize, Deserializer};
 use slatedb::config::DbReaderOptions;
+use uuid::Uuid;
 
 #[cfg(feature = "http-server")]
 use clap::Parser;
@@ -40,7 +41,7 @@ pub struct PrometheusConfig {
     pub otel: OtelServerConfig,
     #[cfg(feature = "otel")]
     #[serde(default)]
-    pub ingest_consumer: Option<IngestConsumerConfig>,
+    pub buffer_consumer: Option<BufferConsumerConfig>,
     #[serde(default)]
     pub storage: StorageConfig,
     /// Flush interval in seconds for persisting data to storage.
@@ -56,6 +57,11 @@ pub struct PrometheusConfig {
         deserialize_with = "deserialize_reader_options"
     )]
     pub reader: DbReaderOptions,
+    /// Pin a read-only instance to a specific SlateDB checkpoint. Only
+    /// honored when `read_only` is true. When unset, the reader follows the
+    /// latest manifest as governed by `reader.manifest_poll_interval`.
+    #[serde(default)]
+    pub checkpoint_id: Option<Uuid>,
     /// Maximum number of bucket readers to cache in memory.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
@@ -130,11 +136,12 @@ impl Default for PrometheusConfig {
             scrape_configs: Vec::new(),
             otel: OtelServerConfig::default(),
             #[cfg(feature = "otel")]
-            ingest_consumer: None,
+            buffer_consumer: None,
             storage: StorageConfig::default(),
             flush_interval_secs: default_flush_interval_secs(),
             read_only: false,
             reader: default_reader_options(),
+            checkpoint_id: None,
             cache_capacity: default_cache_capacity(),
             cache_warmer: default_cache_warmer(),
             tracing: TracingConfig::default(),
@@ -164,15 +171,15 @@ fn default_true() -> bool {
     true
 }
 
-/// Configuration for the ingest consumer background task.
+/// Configuration for the buffer consumer background task.
 #[cfg(feature = "otel")]
 #[derive(Debug, Clone, Deserialize)]
-pub struct IngestConsumerConfig {
-    /// Object store where the ingest queue lives.
+pub struct BufferConsumerConfig {
+    /// Object store where the buffer queue lives.
     pub object_store: ObjectStoreConfig,
 
-    /// Manifest path matching the ingestor's `manifest_path`.
-    #[serde(default = "default_ingest_manifest_path")]
+    /// Manifest path matching the buffer's `manifest_path`.
+    #[serde(default = "default_buffer_manifest_path")]
     pub manifest_path: String,
 
     /// Poll interval when the queue is empty (e.g. "100ms", "1s").
@@ -202,7 +209,7 @@ pub struct IngestConsumerConfig {
 }
 
 #[cfg(feature = "otel")]
-fn default_ingest_manifest_path() -> String {
+fn default_buffer_manifest_path() -> String {
     "ingest/manifest".to_string()
 }
 
@@ -552,10 +559,10 @@ reader:
 
     #[cfg(feature = "otel")]
     #[test]
-    fn should_parse_ingest_consumer_poll_interval() {
+    fn should_parse_buffer_consumer_poll_interval() {
         // given
         let yaml = r#"
-ingest_consumer:
+buffer_consumer:
   object_store:
     type: InMemory
   manifest_path: ingest/manifest
@@ -566,17 +573,17 @@ ingest_consumer:
         let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
 
         // then
-        let consumer = config.ingest_consumer.unwrap();
+        let consumer = config.buffer_consumer.unwrap();
         assert_eq!(consumer.poll_interval, Duration::from_millis(250));
         assert_eq!(consumer.manifest_path, "ingest/manifest");
     }
 
     #[cfg(feature = "otel")]
     #[test]
-    fn should_use_default_ingest_consumer_poll_interval() {
+    fn should_use_default_buffer_consumer_poll_interval() {
         // given
         let yaml = r#"
-ingest_consumer:
+buffer_consumer:
   object_store:
     type: InMemory
 "#;
@@ -585,7 +592,7 @@ ingest_consumer:
         let config: PrometheusConfig = serde_yaml::from_str(yaml).unwrap();
 
         // then
-        let consumer = config.ingest_consumer.unwrap();
+        let consumer = config.buffer_consumer.unwrap();
         assert_eq!(consumer.poll_interval, Duration::from_secs(1));
     }
 }

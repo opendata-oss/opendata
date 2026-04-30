@@ -1,16 +1,16 @@
-mod collector;
 mod config;
+mod consumer;
 mod error;
 mod gc;
-mod ingestor;
 mod metric_names;
 mod model;
+mod producer;
 mod queue;
 mod util;
 
-pub use collector::{CollectedBatch, Collector};
-pub use config::{CollectorConfig, IngestorConfig};
+pub use config::{ConsumerConfig, ProducerConfig};
+pub use consumer::{ConsumedBatch, Consumer};
 pub use error::{Error, Result};
-pub use ingestor::{DurabilityWatcher, Ingestor, WriteHandle};
 pub use model::CompressionType;
+pub use producer::{DurabilityWatcher, Producer, WriteHandle};
 pub use queue::{ManifestEntry, ManifestView, Metadata, parse_manifest};

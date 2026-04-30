@@ -1,4 +1,4 @@
-# RFC 0002: Ingest Metrics
+# RFC 0002: Buffer Metrics
 
 **Status**: Draft
 
@@ -8,23 +8,23 @@
 
 ## Summary
 
-Add metrics to the ingest crate using
+Add metrics to the buffer crate using
 [metrics-rs](https://docs.rs/metrics/latest/metrics/) (v0.24).
 Callers choose the exporter by installing a `metrics::Recorder`.
 
 ## Motivation
 
-The ingest crate exposes only `ConflictCounter` and `queue_len`,
+The buffer crate exposes only `ConflictCounter` and `queue_len`,
 both internal `AtomicU64` fields with no exporter integration.
-Operators cannot tell whether the collector is keeping up, whether
+Operators cannot tell whether the reader is keeping up, whether
 GC deletes are succeeding, or how much manifest contention exists.
 
 RFC 0001 listed observability as TBD.
 
 ## Goals
 
-- Counters, gauges, and histograms for the write path (ingestor)
-  and read path (collector).
+- Counters, gauges, and histograms for the write path (writer)
+  and read path (reader).
 - No dependency on a specific exporter. The `metrics` crate uses
   a recorder facade; when no recorder is installed the macros are
   zero-cost no-ops.
@@ -49,19 +49,19 @@ to the `metrics-rs` crate.
 
 ### Metrics
 
-#### Ingestor (write path)
+#### Buffer (write path)
 
 Recorded in `BatchWriterTask::write_and_enqueue`.
 
 | Name | Type | Labels | Description |
 |------|------|--------|-------------|
-| `ingest.batches_flushed` | counter | | Batches written to object store |
-| `ingest.entries_flushed` | counter | | Entries across all flushed batches |
-| `ingest.bytes_flushed` | counter | | Raw bytes (pre-compression) |
-| `ingest.bytes_written` | counter | | Bytes written (post-compression) |
-| `ingest.flush_duration_seconds` | histogram | | Write + enqueue latency |
-| `ingest.manifest_writes` | counter | `role` | Manifest write attempts |
-| `ingest.manifest_conflicts` | counter | `role` | Manifest CAS conflicts |
+| `buffer.batches_flushed` | counter | | Batches written to object store |
+| `buffer.entries_flushed` | counter | | Entries across all flushed batches |
+| `buffer.bytes_flushed` | counter | | Raw bytes (pre-compression) |
+| `buffer.bytes_written` | counter | | Bytes written (post-compression) |
+| `buffer.flush_duration_seconds` | histogram | | Write + enqueue latency |
+| `buffer.manifest_writes` | counter | `role` | Manifest write attempts |
+| `buffer.manifest_conflicts` | counter | `role` | Manifest CAS conflicts |
 
 `bytes_flushed` vs `bytes_written` gives compression ratio.
 
@@ -69,29 +69,29 @@ Recorded in `BatchWriterTask::write_and_enqueue`.
 
 | Name | Type | Labels | Description |
 |------|------|--------|-------------|
-| `ingest.batches_collected` | counter | | Batches fetched |
-| `ingest.entries_collected` | counter | | Entries fetched |
-| `ingest.bytes_collected` | counter | | Bytes read from object store |
-| `ingest.collector_lag_seconds` | gauge | | Wall clock minus last batch ingestion time |
-| `ingest.queue_length` | gauge | | Entries in manifest queue |
-| `ingest.acks` | counter | | Acks processed |
-| `ingest.gc_files_deleted` | counter | | Batch files deleted by GC |
-| `ingest.gc_files_failed` | counter | | Failed GC deletions |
-| `ingest.gc_duration_seconds` | histogram | | GC cycle wall time |
-| `ingest.fetch_duration_seconds` | histogram | | Batch fetch latency |
-| `ingest.manifest_writes` | counter | `role` | Manifest write attempts |
-| `ingest.manifest_conflicts` | counter | `role` | Manifest CAS conflicts |
+| `buffer.batches_collected` | counter | | Batches fetched |
+| `buffer.entries_collected` | counter | | Entries fetched |
+| `buffer.bytes_collected` | counter | | Bytes read from object store |
+| `buffer.consumer_lag_seconds` | gauge | | Wall clock minus last batch ingestion time |
+| `buffer.queue_length` | gauge | | Entries in manifest queue |
+| `buffer.acks` | counter | | Acks processed |
+| `buffer.gc_files_deleted` | counter | | Batch files deleted by GC |
+| `buffer.gc_files_failed` | counter | | Failed GC deletions |
+| `buffer.gc_duration_seconds` | histogram | | GC cycle wall time |
+| `buffer.fetch_duration_seconds` | histogram | | Batch fetch latency |
+| `buffer.manifest_writes` | counter | `role` | Manifest write attempts |
+| `buffer.manifest_conflicts` | counter | `role` | Manifest CAS conflicts |
 
 #### Labels
 
 `manifest_writes` and `manifest_conflicts` carry a `role` label
-(`"producer"` or `"consumer"`) to distinguish ingestor-side from
-collector-side contention. All other metrics are unlabeled;
-ingestors and collectors run in separate processes.
+(`"producer"` or `"consumer"`) to distinguish producer-side from
+consumer-side contention. All other metrics are unlabeled;
+producers and consumers run in separate processes.
 
 #### Lag calculation
 
-`collector_lag_seconds` is set after each `fetch_batch`:
+`consumer_lag_seconds` is set after each `fetch_batch`:
 
 ```
 lag = (SystemTime::now() - last_metadata.ingestion_time_ms) / 1000

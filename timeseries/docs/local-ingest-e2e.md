@@ -1,8 +1,8 @@
 # Local Ingest End-to-End Test (MinIO)
 
-Verify the ingest pipeline end-to-end: ingestor writes OTLP
-batches to MinIO, the timeseries consumer reads them, and the
-metrics appear on `/metrics`.
+Verify the ingest pipeline end-to-end: the buffer producer
+writes OTLP batches to MinIO, the timeseries consumer reads
+them, and the metrics appear on `/metrics`.
 
 ## Prerequisites
 
@@ -55,7 +55,7 @@ storage:
 
 flush_interval_secs: 5
 
-ingest_consumer:
+buffer_consumer:
   object_store:
     type: Aws
     region: us-east-1
@@ -89,7 +89,7 @@ RUST_LOG=info \
 
 Confirm the log shows:
 ```
-Ingest consumer started manifest_path=ingest/manifest poll_interval=500ms
+Buffer consumer started manifest_path=ingest/manifest poll_interval=500ms
 ```
 
 ### 5. Produce data
@@ -115,27 +115,27 @@ batch 1 flushed
 batch 2 flushed
 batch 3 flushed
 batch 4 flushed
-ingestor closed, 5 batches produced
+buffer closed, 5 batches produced
 ```
 
 ### 6. Verify metrics
 
 ```bash
 sleep 3
-curl -s http://localhost:9099/metrics | grep ingest
+curl -s http://localhost:9099/metrics | grep buffer
 ```
 
 Sample output (values will differ):
 
 ```
-ingest_batches_collected 5
-ingest_entries_collected 10
-ingest_bytes_collected 920
-ingest_acks 5
-ingest_collector_lag_seconds 0.597
-ingest_queue_length 5
-ingest_fetch_duration_seconds_count 5
-ingest_manifest_writes{role="consumer"} 1
+buffer_batches_collected 5
+buffer_entries_collected 10
+buffer_bytes_collected 920
+buffer_acks 5
+buffer_consumer_lag_seconds 0.597
+buffer_queue_length 5
+buffer_fetch_duration_seconds_count 5
+buffer_manifest_writes{role="consumer"} 1
 ```
 
 Query the ingested data:
@@ -158,6 +158,6 @@ rm -rf /tmp/ingest-e2e-test
 shell. Run `unset AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE`
 before starting the server and producer.
 
-**Ingest consumer fails to start**: Check that the MinIO bucket
+**Buffer consumer fails to start**: Check that the MinIO bucket
 exists and that `manifest_path` in the config matches the
-ingestor's `manifest_path`.
+buffer's `manifest_path`.

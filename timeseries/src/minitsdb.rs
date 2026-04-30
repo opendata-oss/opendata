@@ -195,7 +195,11 @@ impl MiniTsdb {
         }
     }
 
-    pub(crate) async fn load(bucket: TimeBucket, storage: Arc<dyn Storage>) -> Result<Self> {
+    pub(crate) async fn load(
+        bucket: TimeBucket,
+        storage: Arc<dyn Storage>,
+        retention: Option<Duration>,
+    ) -> Result<Self> {
         let snapshot = storage.snapshot().await?;
 
         let mut series_dict = HashMap::new();
@@ -213,6 +217,7 @@ impl MiniTsdb {
 
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention,
         };
 
         let initial_snapshot: Arc<dyn StorageSnapshot> = storage
@@ -364,6 +369,7 @@ mod tests {
 
         let flusher = TsdbFlusher {
             storage: storage.clone(),
+            retention: None,
         };
 
         let initial_snapshot: Arc<dyn StorageSnapshot> = storage.snapshot().await.unwrap();

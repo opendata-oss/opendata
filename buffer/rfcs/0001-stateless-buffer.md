@@ -1,4 +1,4 @@
-# RFC 0001: Stateless Ingest
+# RFC 0001: Stateless Buffer
 
 **Status**: Draft
 
@@ -8,16 +8,16 @@
 
 ## Summary
 
-This RFC proposes a shared, stateless ingest module for OpenData.
+This RFC proposes a shared, stateless buffer module for OpenData.
 The module provides the core write-path infrastructure that all OpenData databases
 (Timeseries, Log, Vector, and future databases) can reuse.
-Stateless ingest consists of multiple components -- called ingestors -- that accept write entries from an API layer,
+A stateless buffer consists of multiple components -- called producers -- that accept write entries from an API layer,
 accumulate them in memory, and periodically flush batched data files to object storage.
-On the read side of the ingestion, a collector reads the batches and makes them available to a writer of a database.
-Each ingestor accepts any data, i.e., no mapping from specific ingest data partitions to specific ingestor exist.
-If an ingestor fails, any other still running ingestor can take over the work without running any rebalancing protocol.
-A manifest-backed queue coordinates producers (ingestors) and consumers (collectors) in a stateless, crash-safe way.
-Stateless ingest enables simple high availability ingest and ingest scaling in OpenData systems.
+On the read side of the ingestion, a consumer reads the batches and makes them available to a writer of a database.
+Each producer accepts any data, i.e., no mapping from specific ingest data partitions to specific producer exist.
+If a producer fails, any other still running producer can take over the work without running any rebalancing protocol.
+A manifest-backed queue coordinates producers and consumers in a stateless, crash-safe way.
+A stateless buffer enables simple high availability writes and scaling in OpenData systems.
 
 
 ## Motivation
@@ -32,7 +32,7 @@ The ingestion needs to be fault-tolerant and it needs to be highly-available, th
 independently from the actual write into the OpenData system.
 A stateless ingestion allows simple fail-over and scaling.
 
-Another big motivation for stateless ingest through object storage is cost savings.
+Another big motivation for the stateless buffer through object storage is cost savings.
 The ingested data does not need to be sent to the collector that might run in a different availability zones.
 In other words, data does not need to cross zones which saves costs because reads from object storage in
 different zones do not incur cross-zonal transfer fees.
@@ -40,16 +40,16 @@ different zones do not incur cross-zonal transfer fees.
 
 ## Goals
 
-- Design ingest that is stateless, fault-tolerant, highly-available
-- Specify how the ingest makes data available to the collector that inserts the data to the OpenData system.
-- Specify how the collector can read the ingested data in the correct ingest order including the fail-over case.
+- Design a buffer that is stateless, fault-tolerant, highly-available
+- Specify how the producer makes data available to the consumer that inserts the data to the OpenData system.
+- Specify how the consumer can read the ingested data in the correct ingest order including the fail-over case.
 
 
 ## Non-Goals
 
 - Specify how unacknowledged entries can be re-ingested in case of a re-start.
-  Progress handling is the responsibility of the system that uses the ingestors.
-- Specify fail-over for the external system that uses the ingestors.
+  Progress handling is the responsibility of the system that uses the producers.
+- Specify fail-over for the external system that uses the producers.
 - Specify a service that accepts data to ingest.
 
 
@@ -57,7 +57,7 @@ different zones do not incur cross-zonal transfer fees.
 
 ```ascii
             ┌────────────┐    ┌────────────┐    ┌────────────┐
-            │ Ingestor 1 │    │ Ingestor 2 │    │ Ingestor N │
+            │ Producer 1 │    │ Producer 2 │    │ Producer N │
             │ q-producer │    │ q-producer │    │ q-producer │
             └──┬──────┬──┘    └──┬──────┬──┘    └────┬────┬──┘
                │    ┌─┼──────────┘      │            │    │
@@ -77,9 +77,9 @@ different zones do not incur cross-zonal transfer fees.
                │                             │
                │                             │
                │        ┌────────────────────┼─────┐
-               │        │ Writer             │     │
+               │        │ Consumer           │     │
                │        │        ┌───────────▼──┐  │     ┌────────────┐
-               └────────┼────────▶  Collector   │  ├────▶│  Database  │
+               └────────┼────────▶   Consumer   │  ├────▶│  Database  │
                         │        │  q-consumer  │  │     └────────────┘
                         │        └──────────────┘  │
                         └──────────────────────────┘
@@ -87,10 +87,10 @@ different zones do not incur cross-zonal transfer fees.
 
 ### Queue
 
-The queue coordinates ingestors and collectors via a single queue manifest in object storage
+The queue coordinates producers and consumers via a single queue manifest in object storage
 (`q-manifest` in the diagram).
 
-The queue producers (used internally by the ingestors) write the locations of the batches of ingested data
+The queue producers (used internally by the producers) write the locations of the batches of ingested data
 to the queue manifest.
 More specifically, a queue producer reads the manifest and loads the list of locations into memory.
 It appends the location of the flushed batch to the end of the list and writes the manifest back to object storage.
@@ -99,7 +99,7 @@ That means, a write only succeeds if the queue manifest has not been modified si
 This ensures that locations appended to the queue manifest are not overwritten by other queue producers.
 However, that also means that queue producers contend for appending their locations.
 
-The queue consumer (used internally by the collector) reads the queue manifest to know the locations of the
+The queue consumer (used internally by the consumer) reads the queue manifest to know the locations of the
 data it needs to read next.
 On startup, the consumer increments an `epoch` counter stored in the queue manifest footer.
 Only a consumer whose epoch matches the manifest's current epoch may perform queue operations.
@@ -169,30 +169,30 @@ If a consumer fails, the new consumer increments the epoch, fencing the old one,
 and resumes processing from the earliest unprocessed entry in the queue manifest.
 
 
-### Ingestor
+### Producer
 
-The ingestor provides an API to ingest a vector of opaque byte entries with associated metadata.
+The producer provides an API to produce a vector of opaque byte entries with associated metadata.
 The entries are buffered in a batch in ingestion order.
-The ingestor flushes the batches of ingested entries to object storage and appends the locations of the
+The producer flushes the batches of ingested entries to object storage and appends the locations of the
 flushed objects to the queue with the internally used queue producer (`q-producer` in the diagram).
 Flushes are triggered after a given time interval elapsed or if a batch of the ingested data exceeds a given size.
 
-The API of the ingestor is the following:
+The API of the producer is the following:
 ```rust
-impl Ingestor {
-  pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
+impl Producer {
+  pub fn new(config: ProducerConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
-  pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
+  pub async fn produce(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> { ... }
 
   pub async fn close(self) -> Result<()> { ... }
 }
 ```
 
-An ingestor is constructed by calling the method `new()` passing to it the configuration and a clock.
-The configurations for the ingestor are:
+A producer is constructed by calling the method `new()` passing to it the configuration and a clock.
+The configurations for the producer are:
 
 ```rust
-pub struct IngestorConfig {
+pub struct ProducerConfig {
   /// Determines where and how ingest data is persisted. See [`StorageConfig`].
   pub storage: StorageConfig,
 
@@ -230,16 +230,16 @@ pub struct IngestorConfig {
 The queue manifest takes the name specified in `manifest_path`.
 The config `flush_size_bytes` is a loose limit.
 The batch needs to exceed that size to trigger a flush to object storage.
-The config `max_buffered_inputs` limits the number of `ingest()` calls that can be buffered. 
-When the buffer is full, `ingest()` blocks until the background task consumes a message.
-If this backpressure becomes an issue, new ingestors can be created to better distribute the load.
+The config `max_buffered_inputs` limits the number of `produce()` calls that can be buffered.
+When the buffer is full, `produce()` blocks until the background task consumes a message.
+If this backpressure becomes an issue, new producers can be created to better distribute the load.
 
-A call to `ingest()` takes a vector of opaque byte entries and a metadata payload, and returns a `WriteHandle`
+A call to `produce()` takes a vector of opaque byte entries and a metadata payload, and returns a `WriteHandle`
 with which the caller can await the completion of the flush to object storage of the data entries.
-Because multiple `ingest()` calls may be batched into a single flush, each call's metadata is stored
+Because multiple `produce()` calls may be batched into a single flush, each call's metadata is stored
 as a separate metadata item in the queue manifest entry with a `start_index` pointing to the first record
 in the data batch that the metadata applies to. The ingestion time is also recorded per metadata item.
-The collector can use the metadata items to interpret ranges of records in the batch without reading it.
+The consumer can use the metadata items to interpret ranges of records in the batch without reading it.
 
 The `WriteHandle` contains a `DurabilityWatcher` that allows the caller to check or await durability:
 ```rust
@@ -259,11 +259,11 @@ is appended to the queue.
 More specifically, the location is appended to the end of the list of pending locations in the queue manifest
 (`q-manifest` in the diagram).
 
-Method `close()` flushes unflushed entries and terminates the ingestor.
+Method `close()` flushes unflushed entries and terminates the producer.
 
 ### Data Batch Format
 
-A data batch is the unit of data that an ingestor flushes to object storage.
+A data batch is the unit of data that a producer flushes to object storage.
 Each batch is a compact binary file that contains an optionally compressed block of
 length-prefixed records followed by a fixed-size footer:
 
@@ -305,38 +305,38 @@ pub enum CompressionType {
 }
 ```
 
-When compression is enabled, the ingestor first serializes all records into a contiguous buffer
+When compression is enabled, the producer first serializes all records into a contiguous buffer
 of length-prefixed entries, then compresses that buffer as a single unit.
 The compressed bytes are written to the batch file followed by the uncompressed footer.
 
-On the read side, the collector reads the footer to determine the compression type,
+On the read side, the consumer reads the footer to determine the compression type,
 decompresses the record block if needed, and then parses the length-prefixed entries as usual.
 
-Compression is configured per-ingestor via the `batch_compression` field in `IngestorConfig`
+Compression is configured per-producer via the `batch_compression` field in `ProducerConfig`
 (see below). The default is `None` (uncompressed).
 
 The semantics of the entries are defined by the database that consumes the data.
-The ingest module does not interpret the entries; it preserves them as-is.
+The buffer module does not interpret the entries; it preserves them as-is.
 
 Each batch is stored under the configured `data_path_prefix` with a ULID filename
 (e.g., `data/01J5T4R3KXBMZ7QV9N2WG8YDHP.batch`).
 The location (object storage path) of the batch is then enqueued in the queue manifest
-so the collector can discover and read it.
+so the consumer can discover and read it.
 
 
-### Collector
+### Consumer
 
-The collector reads the locations of the ingested entries in ingestion order from the queue with the
+The consumer reads the locations of the ingested entries in ingestion order from the queue with the
 internal queue consumer (`q-consumer` in the diagram) and returns the batches of entries.
 
-The API of the collector is the following:
+The API of the consumer is the following:
 ```rust
-impl Collector {
-  pub fn new(config: CollectorConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
+impl Consumer {
+  pub fn new(config: ConsumerConfig, clock: Arc<dyn Clock>) -> Result<Self> { ... }
 
   pub async fn initialize(&self, last_acked_sequence: Option<u64>) -> Result<()> { ... }
 
-  pub async fn next_batch(&self) -> Result<Option<CollectedBatch>> { ... }
+  pub async fn next_batch(&self) -> Result<Option<ConsumedBatch>> { ... }
 
   pub async fn ack(&self, sequence: u64) -> Result<()> { ... }
 
@@ -344,34 +344,34 @@ impl Collector {
 }
 ```
 
-A collector is constructed by calling `new()` passing to it the configuration and a clock.
-After construction, the caller must call `initialize()` before using the collector.
+A consumer is constructed by calling `new()` passing to it the configuration and a clock.
+After construction, the caller must call `initialize()` before using the consumer.
 This method increments the epoch in the queue manifest, fencing any previous consumer instance.
 Only a consumer whose epoch matches the manifest's current epoch may perform queue operations;
-if a new collector starts and calls `initialize()`, any previous collector's subsequent
+if a new consumer starts and calls `initialize()`, any previous consumer's subsequent
 `next_batch()` or `ack()` calls will fail with a `Fenced` error.
 
-The `last_acked_sequence` parameter controls where the collector starts reading:
+The `last_acked_sequence` parameter controls where the consumer starts reading:
 - `None` — start from the earliest available entry in the queue.
-- `Some(seq)` — resume after sequence `seq`, so the collector positions both its
+- `Some(seq)` — resume after sequence `seq`, so the consumer positions both its
   acknowledged position and its internal read position at `seq`. The next call
   to `next_batch()` reads sequence `seq + 1`.
 
-The configurations for the collector are:
+The configurations for the consumer are:
 ```rust
-pub struct CollectorConfig {
+pub struct ConsumerConfig {
     pub object_store_config: ObjectStoreConfig,  // configuration of the object store from opendata/common
     pub manifest_path: String,                   // path to the queue manifest, default: "ingest/manifest"
 }
 ```
 The queue manifest takes the name specified in `manifest_path`.
 
-The collector internally creates a queue consumer and an object store client from the configuration.
+The consumer internally creates a queue consumer and an object store client from the configuration.
 
-A `CollectedBatch` contains the deserialized entries, the sequence number, the location of the batch,
-and the per-range metadata items attached by the ingestor(s):
+A `ConsumedBatch` contains the deserialized entries, the sequence number, the location of the batch,
+and the per-range metadata items attached by the producer(s):
 ```rust
-pub struct CollectedBatch {
+pub struct ConsumedBatch {
     pub entries: Vec<Bytes>,
     pub sequence: u64,
     pub location: String,
@@ -379,21 +379,21 @@ pub struct CollectedBatch {
 }
 ```
 
-The `Metadata` struct exposes the per-range metadata that ingestors attach to each batch:
+The `Metadata` struct exposes the per-range metadata that producers attach to each batch:
 ```rust
 pub struct Metadata {
     /// Index of the first entry in the batch that this metadata range covers.
     pub start_index: u32,
     /// Wall-clock ingestion time in milliseconds since the Unix epoch.
     pub ingestion_time_ms: i64,
-    /// Opaque metadata payload supplied by the caller of `Ingestor::ingest`.
+    /// Opaque metadata payload supplied by the caller of `Producer::produce`.
     pub payload: Bytes,
 }
 ```
 
-By calling `next_batch()` the collector reads the next data batch from object storage via the
-queue consumer, deserializes the entries, and returns them as a `CollectedBatch`.
-The collector maintains an internal read cursor that advances in ingestion order.
+By calling `next_batch()` the consumer reads the next data batch from object storage via the
+queue consumer, deserializes the entries, and returns them as a `ConsumedBatch`.
+The consumer maintains an internal read cursor that advances in ingestion order.
 On the first call (when no batch has been fetched yet), it peeks the earliest entry
 in the queue. On subsequent calls, it reads the entry immediately following the last
 successfully fetched sequence. If no entries are available, `None` is returned.
@@ -401,17 +401,17 @@ successfully fetched sequence. If no entries are available, `None` is returned.
 By calling `ack(sequence)` the caller confirms that the batch with the given sequence number
 has been fully processed. Acks must be in order — acking a sequence that is not immediately
 after the last acked sequence returns an error. To amortize the cost of manifest writes,
-the collector batches acks and only calls `dequeue()` on the queue consumer every 100 acks.
+the consumer batches acks and only calls `dequeue()` on the queue consumer every 100 acks.
 This acknowledged position is tracked separately from the internal read cursor so the
-collector can read ahead while still preserving in-order acknowledgements and resume semantics.
+consumer can read ahead while still preserving in-order acknowledgements and resume semantics.
 The `dequeue()` call removes acknowledged entries from the queue manifest but does not delete
 the corresponding data batch files from object storage. Deletion of batch files is handled
 exclusively by the garbage collector (see below).
 
-By calling `flush()` the caller forces the collector to dequeue all acked entries from the
+By calling `flush()` the caller forces the consumer to dequeue all acked entries from the
 queue manifest immediately.
 
-If the collector fails, a new collector can be started. It will increment the epoch,
+If the consumer fails, a new consumer can be started. It will increment the epoch,
 fencing the old consumer. If the caller tracks the last acked sequence, it can pass it to
 `initialize(Some(seq))` to resume where it left off. Otherwise, `initialize(None)` starts
 from the earliest unprocessed entry.
@@ -419,13 +419,13 @@ from the earliest unprocessed entry.
 
 ### Garbage Collection
 
-When the collector dequeues acknowledged entries from the queue manifest, the corresponding
+When the consumer dequeues acknowledged entries from the queue manifest, the corresponding
 data batch files remain in object storage. A background garbage collector periodically
 identifies and deletes these orphaned files.
 
 #### Mechanism
 
-The garbage collector runs as a background task within the collector process. On each cycle it:
+The garbage collector runs as a background task within the consumer process. On each cycle it:
 
 1. **Reads a snapshot of the queue manifest** to obtain the set of all currently referenced
    batch locations and the oldest entry's location.
@@ -465,26 +465,26 @@ pub struct GarbageCollectorConfig {
 }
 ```
 
-These fields are also available on `CollectorConfig` so that the collector can configure and
+These fields are also available on `ConsumerConfig` so that the consumer can configure and
 spawn the garbage collector automatically.
 
 ### Delivery guarantees
 
-Due to the sequence number attached to each ingested batch and the collector API that allows to
+Due to the sequence number attached to each ingested batch and the consumer API that allows to
 read queue entries depending on the sequence number, exactly-once delivery is possible.
 
-To achieve exactly-once the caller of the collector is required to atomically write the
+To achieve exactly-once the caller of the consumer is required to atomically write the
 batch and the corresponding sequence number to the OpenData subsystem.
 The stored sequence number in the subsystem can than be used to retrieve the next batch of
 ingested data.
 
 Since the batch and the corresponding sequence number are atomically written to the
 OpenData subsystem, the sequence number always represents the last written batch.
-After a failure, the ingest can continue at the first batch that was not ingested.
+After a failure, the producer can continue at the first batch that was not ingested.
 No data is ingested twice.
 
-The delivery guarantees of the entries on the ingestor-side that were not confirmed to be 
-durable before a failure depends on the progress tracking of the caller of the ingestor.
+The delivery guarantees of the entries on the producer-side that were not confirmed to be
+durable before a failure depends on the progress tracking of the caller of the producer.
 If they track the progress and re-ingest unacknowledged entries they can achieve at-least-once guarantee.
 
 ### Observability
@@ -503,11 +503,11 @@ Some ideas:
 To avoid contention on the queue manifest files, a stateless broker can be implemented that is responsible to write
 the queue manifest files.
 This idea comes from the following turbopuffer blog post: https://turbopuffer.com/blog/object-storage-queue.
-Since we assume one ingestor per availability zone and a single collector which limits the contention, we decided
+Since we assume one producer per availability zone and a single consumer which limits the contention, we decided
 against the broker.
 One reason for deciding against the broker is that the broker would be an additional component that a user needs to
 deploy and operate.
-We want to keep the ingest as simple as possible.
+We want to keep the buffer as simple as possible.
 In the future, it might be necessary to revise this decision and implement the stateless broker approach if
 contention gets worse.
 
@@ -523,16 +523,16 @@ stale reclaim logic, and a separate consumer manifest file.
 ### Using a counter for the batch names
 
 We could use a counter for the batch names to impose an order.
-During the flushing of batches, the ingestor:
-1. lists the prefix to which the batches are written, 
-2. finds the name with the largest number, 
-3. increases it, and 
+During the flushing of batches, the producer:
+1. lists the prefix to which the batches are written,
+2. finds the name with the largest number,
+3. increases it, and
 4. conditionally tries to write the batch named with the increased number.
 
-If the write fails because a batch with that name already exists, the ingestor increases the number again, 
+If the write fails because a batch with that name already exists, the producer increases the number again,
 tries to write the batch again, and so forth.
 
-The collector:
+The consumer:
 1. lists the prefix to which the batches are written,
 2. finds the batch with the lowest number,
 3. makes that batch available.
@@ -565,5 +565,7 @@ None at this time.
 | 2026-03-30 | Added native compression support to data batch format |
 | 2026-03-30 | Added metadata field to CollectedBatch and documented public Metadata struct |
 | 2026-04-06 | Added Garbage Collection section; collector no longer deletes batch files directly |
+| 2026-04-28 | Renamed Buffer/BufferConfig types to Writer/WriterConfig and Collector/CollectorConfig/CollectedBatch to Reader/ReaderConfig/ReadBatch |
+| 2026-04-28 | Renamed Writer/WriterConfig to Producer/ProducerConfig and Reader/ReaderConfig/ReadBatch to Consumer/ConsumerConfig/ConsumedBatch; renamed Producer's `ingest()` to `produce()` |
 
 

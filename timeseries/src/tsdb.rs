@@ -974,12 +974,21 @@ pub(crate) struct Tsdb {
     /// Also used during queries so that unflushed data is visible.
     ingest_cache: Cache<TimeBucket, Arc<MiniTsdb>>,
 
+    /// Retention duration plumbed into each `MiniTsdb` so the flusher can
+    /// stamp records with a bucket-aligned `Ttl::ExpireAt`. `None` disables
+    /// per-record expiration.
+    retention: Option<Duration>,
+
     // Metadata catalog (keyed by metric name)
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
 }
 
 impl Tsdb {
     pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
+        Self::with_retention(storage, None)
+    }
+
+    pub(crate) fn with_retention(storage: Arc<dyn Storage>, retention: Option<Duration>) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
             .time_to_idle(Duration::from_secs(15 * 60))
@@ -988,6 +997,7 @@ impl Tsdb {
         Self {
             storage,
             ingest_cache,
+            retention,
             metadata_catalog: RwLock::new(HashMap::new()),
         }
     }
@@ -1010,7 +1020,7 @@ impl Tsdb {
         }
 
         // Load from storage and put in ingest cache
-        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone()).await?);
+        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone(), self.retention).await?);
         self.ingest_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
     }
@@ -1091,6 +1101,17 @@ impl Tsdb {
 
         self.storage.flush().await?;
         Ok(())
+    }
+
+    /// Flushes pending writes and creates a durable checkpoint.
+    ///
+    /// The returned [`common::CheckpointInfo::id`] can be passed to
+    /// [`crate::reader::TimeSeriesDbReader::open`] (via
+    /// [`common::StorageReaderRuntime::with_checkpoint_id`]) to open a
+    /// reader pinned to this exact view of the database.
+    pub(crate) async fn create_checkpoint(&self) -> Result<common::CheckpointInfo> {
+        self.flush().await?;
+        Ok(self.storage.create_checkpoint().await?)
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
@@ -1481,6 +1502,15 @@ impl TsdbEngine {
         match self {
             Self::ReadWrite(tsdb) => tsdb.flush().await,
             Self::ReadOnly(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn create_checkpoint(&self) -> Result<common::CheckpointInfo> {
+        match self {
+            Self::ReadWrite(tsdb) => tsdb.create_checkpoint().await,
+            Self::ReadOnly(_) => Err(crate::error::Error::InvalidInput(
+                "checkpoint creation is not supported in read-only mode".to_string(),
+            )),
         }
     }
 
@@ -2505,7 +2535,7 @@ mod tests {
         assert!(matches!(result.unwrap_err(), QueryError::InvalidQuery(_)));
     }
 
-    /// End-to-end test: Ingestor → IngestConsumer → Tsdb → query.
+    /// End-to-end test: Writer → BufferConsumer → Tsdb → query.
     ///
     /// Runs the real consumer poll loop (metadata validation, ack/flush) and
     /// shuts it down gracefully via [`ConsumerHandle`].
@@ -2526,7 +2556,7 @@ mod tests {
         use slatedb::object_store::ObjectStore;
         use slatedb::object_store::memory::InMemory;
 
-        // given — shared in-memory object store for ingestor and consumer
+        // given — shared in-memory object store for writer and consumer
         let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let manifest = "ingest/manifest".to_string();
 
@@ -2578,36 +2608,36 @@ mod tests {
         // Metadata: version=1, signal_type=metrics(1), encoding=otlp_proto(1), reserved=0
         let metadata = Bytes::from_static(&[1, 1, 1, 0]);
 
-        // Produce via Ingestor
-        let ingestor_config = ingest::IngestorConfig {
+        // Produce via Producer
+        let producer_config = buffer::ProducerConfig {
             object_store: common::ObjectStoreConfig::InMemory,
             data_path_prefix: "ingest".to_string(),
             manifest_path: manifest.clone(),
             flush_interval: Duration::from_millis(10),
             flush_size_bytes: 64 * 1024 * 1024,
             max_buffered_inputs: 1000,
-            batch_compression: ingest::CompressionType::None,
+            batch_compression: buffer::CompressionType::None,
         };
-        let ingestor = ingest::Ingestor::with_object_store(
-            ingestor_config,
+        let producer = buffer::Producer::with_object_store(
+            producer_config,
             obj_store.clone(),
             Arc::new(common::clock::SystemClock),
         )
         .unwrap();
-        ingestor
-            .ingest(vec![Bytes::from(proto_bytes)], metadata)
+        producer
+            .produce(vec![Bytes::from(proto_bytes)], metadata)
             .await
             .unwrap();
-        ingestor.close().await.unwrap();
+        producer.close().await.unwrap();
 
-        // Start the real IngestConsumer against the shared object store
+        // Start the real BufferConsumer against the shared object store
         let tsdb = Arc::new(Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(
             Arc::new(OpenTsdbMergeOperator),
         ))));
         let converter = Arc::new(crate::otel::OtelConverter::new(
             crate::otel::OtelConfig::default(),
         ));
-        let consumer_config = crate::promql::config::IngestConsumerConfig {
+        let consumer_config = crate::promql::config::BufferConsumerConfig {
             object_store: common::ObjectStoreConfig::InMemory,
             manifest_path: manifest,
             poll_interval: Duration::from_millis(10),
@@ -2615,7 +2645,7 @@ mod tests {
             gc_interval: Duration::from_secs(300),
             gc_grace_period: Duration::from_secs(600),
         };
-        let consumer = Arc::new(crate::server::ingest_consumer::IngestConsumer::new(
+        let consumer = Arc::new(crate::server::buffer_consumer::BufferConsumer::new(
             tsdb.clone(),
             converter,
             consumer_config,

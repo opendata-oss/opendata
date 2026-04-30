@@ -17,6 +17,7 @@ use common::storage::factory::create_storage_read;
 use common::{StorageReaderRuntime, StorageSemantics};
 use futures::stream::{self, StreamExt};
 use moka::future::Cache;
+use uuid::Uuid;
 
 use crate::error::{QueryError, Result};
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
@@ -184,9 +185,43 @@ impl TimeSeriesDbReader {
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
+        Self::open_inner(storage_config, reader_options, cache_capacity, None).await
+    }
+
+    /// Opens a read-only view pinned to a specific checkpoint.
+    ///
+    /// Unlike [`open`](Self::open), the returned reader serves a frozen view
+    /// of the database as of the checkpoint and does not advance with newer
+    /// writes. The checkpoint must already exist (typically created via
+    /// `TimeSeriesDb::create_checkpoint`).
+    pub async fn open_at_checkpoint(
+        storage_config: StorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+        checkpoint_id: Uuid,
+    ) -> Result<Self> {
+        Self::open_inner(
+            storage_config,
+            reader_options,
+            cache_capacity,
+            Some(checkpoint_id),
+        )
+        .await
+    }
+
+    async fn open_inner(
+        storage_config: StorageConfig,
+        reader_options: slatedb::config::DbReaderOptions,
+        cache_capacity: u64,
+        checkpoint_id: Option<Uuid>,
+    ) -> Result<Self> {
+        let mut runtime = StorageReaderRuntime::new();
+        if let Some(id) = checkpoint_id {
+            runtime = runtime.with_checkpoint_id(id);
+        }
         let storage = create_storage_read(
             &storage_config,
-            StorageReaderRuntime::new(),
+            runtime,
             StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
             reader_options,
         )
@@ -817,6 +852,113 @@ mod tests {
             "expected InvalidQuery, got {:?}",
             err
         );
+    }
+
+    /// Writes data, creates a checkpoint, writes more data, then opens a
+    /// reader pinned to the checkpoint and verifies it sees only the data
+    /// that was durable at checkpoint time (not later writes).
+    #[tokio::test]
+    async fn should_open_reader_pinned_to_checkpoint() {
+        use crate::config::Config;
+        use crate::timeseries::TimeSeriesDb;
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        // given
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+        });
+
+        let writer = TimeSeriesDb::open(Config {
+            storage: storage_config.clone(),
+            flush_interval: Duration::from_secs(60),
+            retention: None,
+        })
+        .await
+        .unwrap();
+
+        writer
+            .write(vec![
+                Series::builder("checkpointed")
+                    .label("env", "test")
+                    .sample(1700000001000, 1.0)
+                    .build(),
+            ])
+            .await
+            .unwrap();
+
+        // when — capture a checkpoint, then write a sample that must NOT be visible.
+        let checkpoint = writer.create_checkpoint().await.unwrap();
+
+        writer
+            .write(vec![
+                Series::builder("checkpointed")
+                    .label("env", "test")
+                    .sample(1700000002000, 2.0)
+                    .build(),
+            ])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let reader_options = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(100),
+            skip_wal_replay: true,
+            ..Default::default()
+        };
+        let reader = TimeSeriesDbReader::open_at_checkpoint(
+            storage_config,
+            reader_options,
+            50,
+            checkpoint.id,
+        )
+        .await
+        .unwrap();
+
+        // then — the pre-checkpoint sample is visible
+        let pre = reader
+            .query(
+                "checkpointed",
+                Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000001000)),
+            )
+            .await
+            .unwrap();
+        match &pre {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].value, 1.0);
+            }
+            _ => panic!("expected Vector, got {:?}", pre),
+        }
+
+        // and — the post-checkpoint sample is NOT visible. PromQL lookback
+        // will surface the earlier (checkpointed) sample, so we assert the
+        // value is the pre-checkpoint one rather than the new write.
+        let post = reader
+            .query(
+                "checkpointed",
+                Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1700000002000)),
+            )
+            .await
+            .unwrap();
+        match &post {
+            QueryValue::Vector(samples) => {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(
+                    samples[0].value, 1.0,
+                    "reader pinned to checkpoint must not see writes made after the checkpoint",
+                );
+                assert_eq!(samples[0].timestamp_ms, 1700000002000);
+            }
+            _ => panic!("expected Vector, got {:?}", post),
+        }
     }
 
     #[test]

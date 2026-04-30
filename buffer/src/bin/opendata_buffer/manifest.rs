@@ -31,7 +31,7 @@ fn dump(path: &PathBuf) {
         }
     };
 
-    let view = match ingest::parse_manifest(Bytes::from(data)) {
+    let view = match buffer::parse_manifest(Bytes::from(data)) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error parsing manifest: {e}");

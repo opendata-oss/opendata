@@ -1,22 +1,22 @@
-# opendata-ingest
+# opendata-buffer
 
-A shared, stateless ingestion library for [OpenData](https://github.com/opendata-oss/opendata) databases.
+A shared, stateless buffer library for [OpenData](https://github.com/opendata-oss/opendata) databases.
 
-Provides write-path infrastructure that all OpenData databases (Timeseries, Log, Vector) can reuse. Ingestors accept opaque byte entries, buffer them in memory, and periodically flush batched data files to object storage. A manifest-backed queue coordinates producers (ingestors) and consumers (collectors) in a stateless, crash-safe way.
+Provides write-path infrastructure that all OpenData databases (Timeseries, Log, Vector) can reuse. Producers accept opaque byte entries, accumulate them in memory, and periodically flush batched data files to object storage. A manifest-backed queue coordinates producers and consumers in a stateless, crash-safe way.
 
-## Why stateless ingest?
+## Why a stateless buffer?
 
-- **Fault tolerance** — ingestors are stateless. If one fails, any other running ingestor can take over without a rebalancing protocol.
-- **Decoupled from writes** — if the downstream database is slow or unavailable, ingested data is safely persisted in object storage rather than dropped or back-pressured.
+- **Fault tolerance** — producers are stateless. If one fails, any other running producer can take over without a rebalancing protocol.
+- **Decoupled from writes** — if the downstream database is slow or unavailable, buffered data is safely persisted in object storage rather than dropped or back-pressured.
 - **Cost savings** — data flows through object storage rather than across availability zones, avoiding cross-zonal transfer fees.
 
 ## Architecture
 
 ```text
-╔═Ingestors══════════════════════════════════════════════════╗
+╔═Producers══════════════════════════════════════════════════╗
 ║                                                            ║░
 ║  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  ║░
-║  │  Ingestor 1  │    │  Ingestor 2  │    │  Ingestor N  │  ║░
+║  │  Producer 1  │    │  Producer 2  │    │  Producer N  │  ║░
 ║  │  q-producer  │    │  q-producer  │    │  q-producer  │  ║░
 ║  └───────┬──────┘    └──────────────┘    └───────┬──────┘  ║░
 ║          │                                       │         ║░
@@ -44,10 +44,10 @@ Provides write-path infrastructure that all OpenData databases (Timeseries, Log,
                 │        ┌───────poll─────────┘
               read       │
                 │        │
-       ╔═Writer═╪════════╪═════════╗
+       ╔═Consumer╪═══════╪═════════╗
        ║        │        │         ║░
        ║        │┌───────┴──────┐  ║░     ╔════════════════╗
-       ║        ││  Collector   │  ║░     ║                ║
+       ║        ││   Consumer   │  ║░     ║                ║
        ║        └▶  q-consumer  ├──write──▶    Database    ║
        ║         └──────────────┘  ║░     ║                ║
        ║                           ║░     ╚════════════════╝
@@ -57,19 +57,19 @@ Provides write-path infrastructure that all OpenData databases (Timeseries, Log,
 
 ## Usage
 
-### Ingestor
+### Producer
 
-The ingestor buffers entries and flushes them as compressed batches to object storage, appending their locations to the queue manifest.
+The producer accumulates entries and flushes them as compressed batches to object storage, appending their locations to the queue manifest.
 
 ```rust
-use ingest::{Ingestor, IngestorConfig};
+use buffer::{Producer, ProducerConfig};
 use bytes::Bytes;
 use std::sync::Arc;
 
-let ingestor = Ingestor::new(IngestorConfig::default(), clock)?;
+let producer = Producer::new(ProducerConfig::default(), clock)?;
 
-// Ingest entries with metadata — returns a handle to await durability
-let handle = ingestor.ingest(
+// Submit entries with metadata — returns a handle to await durability
+let handle = producer.produce(
     vec![Bytes::from("entry-1"), Bytes::from("entry-2")],
     Bytes::from("my-metadata"),
 ).await?;
@@ -78,7 +78,7 @@ let handle = ingestor.ingest(
 handle.watcher.await_durable().await?;
 
 // Flush remaining entries and shut down
-ingestor.close().await?;
+producer.close().await?;
 ```
 
 #### Configuration
@@ -87,48 +87,48 @@ ingestor.close().await?;
 |-------|---------|-------------|
 | `flush_interval` | 100 ms | Time interval that triggers a flush |
 | `flush_size_bytes` | 64 MiB | Batch size threshold that triggers a flush |
-| `max_buffered_inputs` | 1000 | Max buffered `ingest()` calls before backpressure |
+| `max_buffered_inputs` | 1000 | Max buffered `produce()` calls before backpressure |
 | `batch_compression` | `None` | Compression algorithm (`None` or `Zstd`) |
 | `data_path_prefix` | `"ingest"` | Object storage prefix for data batches |
 | `manifest_path` | `"ingest/manifest"` | Path to the queue manifest |
 
-### Collector
+### Consumer
 
-The collector reads batches from the queue in ingestion order and makes them available to a database writer.
+The consumer reads batches from the queue in ingestion order and makes them available to a database writer.
 
 ```rust
-use ingest::{Collector, CollectorConfig};
+use buffer::{Consumer, ConsumerConfig};
 
-let collector = Collector::new(CollectorConfig::default(), clock)?;
+let consumer = Consumer::new(ConsumerConfig::default(), clock)?;
 
-// Initialize the consumer — fences any previous collector via epoch bump
-collector.initialize(None).await?;
+// Initialize the consumer — fences any previous consumer via epoch bump
+consumer.initialize(None).await?;
 
 // Read batches in order
-while let Some(batch) = collector.next_batch().await? {
+while let Some(batch) = consumer.next_batch().await? {
     // batch.entries: Vec<Bytes>
     // batch.sequence: u64
     // batch.metadata: Vec<Metadata>
     process(&batch);
-    collector.ack(batch.sequence).await?;
+    consumer.ack(batch.sequence).await?;
 }
 
 // Force-flush acked entries from the manifest
-collector.flush().await?;
+consumer.flush().await?;
 ```
 
 ## Delivery guarantees
 
-Exactly-once delivery is achievable when the caller atomically writes both the batch and its sequence number to the downstream database. After a failure, the collector resumes from the last committed sequence — no data is processed twice.
+Exactly-once delivery is achievable when the caller atomically writes both the batch and its sequence number to the downstream database. After a failure, the consumer resumes from the last committed sequence — no data is processed twice.
 
-On the ingestor side, callers that track progress and re-ingest unacknowledged entries achieve at-least-once delivery.
+On the producer side, callers that track progress and re-submit unacknowledged entries achieve at-least-once delivery.
 
 ## CLI
 
-A companion CLI is included for inspecting ingest state. Install with:
+A companion CLI is included for inspecting buffer state. Install with:
 
 ```bash
-cargo install opendata-ingest --features cli
+cargo install opendata-buffer --features cli
 ```
 
 ### `manifest dump`
@@ -136,7 +136,7 @@ cargo install opendata-ingest --features cli
 Deserializes a manifest file to JSON:
 
 ```bash
-opendata-ingest manifest dump /path/to/manifest
+opendata-buffer manifest dump /path/to/manifest
 ```
 
 ```json
@@ -163,7 +163,7 @@ opendata-ingest manifest dump /path/to/manifest
 Pipe through `jq` for filtering:
 
 ```bash
-opendata-ingest manifest dump /path/to/manifest | jq '.entries | length'
+opendata-buffer manifest dump /path/to/manifest | jq '.entries | length'
 ```
 
 ## Data batch format

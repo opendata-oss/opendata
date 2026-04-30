@@ -9,7 +9,10 @@ use super::{
     MergeOperator, MergeRecordOp, PutRecordOp, Storage, StorageSnapshot, WriteOptions, WriteResult,
 };
 use crate::storage::RecordOp;
-use crate::{BytesRange, Record, StorageError, StorageIterator, StorageRead, StorageResult, Ttl};
+use crate::{
+    BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
+    Ttl,
+};
 
 /// Trait for providing the current time.
 pub trait Clock: Send + Sync {
@@ -45,12 +48,12 @@ impl StoredValue {
 
 /// Computes the absolute expiration timestamp from TTL options.
 fn compute_expire_ts(now: i64, ttl: Ttl, default_ttl: Option<u64>) -> Option<i64> {
-    let duration = match ttl {
-        Ttl::Default => default_ttl,
+    match ttl {
+        Ttl::Default => default_ttl.map(|ms| now + ms as i64),
         Ttl::NoExpiry => None,
-        Ttl::ExpireAfter(ms) => Some(ms),
-    };
-    duration.map(|ms| now + ms as i64)
+        Ttl::ExpireAfter(ms) => Some(now + ms as i64),
+        Ttl::ExpireAt(ts) => Some(ts),
+    }
 }
 
 /// In-memory implementation of the Storage trait using a BTreeMap.
@@ -442,6 +445,12 @@ impl Storage for InMemoryStorage {
         }
         Ok(())
     }
+
+    async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo> {
+        Err(StorageError::Storage(
+            "checkpoints are not supported for in-memory storage".to_string(),
+        ))
+    }
 }
 
 /// Injected failure that fires either once or on every call.
@@ -629,6 +638,10 @@ impl super::Storage for FailingStorage {
     async fn flush(&self) -> super::StorageResult<()> {
         check_failure(&self.fail_flush)?;
         self.inner.flush().await
+    }
+
+    async fn create_checkpoint(&self) -> super::StorageResult<CheckpointInfo> {
+        self.inner.create_checkpoint().await
     }
 }
 

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use common::storage::{PutRecordOp, RecordOp};
+use common::storage::{MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, RecordOp, Ttl};
 use common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
 
@@ -331,14 +331,17 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
 impl<T: ?Sized + StorageRead> OpenTsdbStorageReadExt for T {}
 
 pub(crate) trait OpenTsdbStorageExt: Storage {
-    fn merge_bucket_list(&self, bucket: TimeBucket) -> Result<RecordOp> {
+    fn merge_bucket_list(&self, bucket: TimeBucket, ttl: Ttl) -> Result<RecordOp> {
         let key = BucketListKey.encode();
         let value = BucketListValue {
             buckets: vec![(bucket.size, bucket.start)],
         }
         .encode();
 
-        Ok(RecordOp::Merge(Record { key, value }.into()))
+        Ok(RecordOp::Merge(MergeRecordOp::new_with_ttl(
+            Record { key, value },
+            MergeOptions { ttl },
+        )))
     }
 
     fn insert_series_id(
@@ -346,6 +349,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         bucket: TimeBucket,
         fingerprint: SeriesFingerprint,
         id: SeriesId,
+        ttl: Ttl,
     ) -> Result<RecordOp> {
         let key = SeriesDictionaryKey {
             time_bucket: bucket.start,
@@ -354,7 +358,10 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
         let value = SeriesDictionaryValue { series_id: id }.encode();
-        Ok(RecordOp::Put(Record { key, value }.into()))
+        Ok(RecordOp::Put(PutRecordOp::new_with_options(
+            Record { key, value },
+            PutOptions { ttl },
+        )))
     }
 
     fn insert_forward_index(
@@ -362,6 +369,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         bucket: TimeBucket,
         series_id: SeriesId,
         series_spec: SeriesSpec,
+        ttl: Ttl,
     ) -> Result<RecordOp> {
         let key = ForwardIndexKey {
             time_bucket: bucket.start,
@@ -376,7 +384,10 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
             labels: series_spec.labels,
         }
         .encode();
-        Ok(RecordOp::Put(Record { key, value }.into()))
+        Ok(RecordOp::Put(PutRecordOp::new_with_options(
+            Record { key, value },
+            PutOptions { ttl },
+        )))
     }
 
     fn merge_inverted_index(
@@ -384,6 +395,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         bucket: TimeBucket,
         label: Label,
         postings: RoaringBitmap,
+        ttl: Ttl,
     ) -> Result<RecordOp> {
         let key = InvertedIndexKey {
             time_bucket: bucket.start,
@@ -393,7 +405,10 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
         let value = InvertedIndexValue { postings }.encode()?;
-        Ok(RecordOp::Merge(Record { key, value }.into()))
+        Ok(RecordOp::Merge(MergeRecordOp::new_with_ttl(
+            Record { key, value },
+            MergeOptions { ttl },
+        )))
     }
 
     fn merge_samples(
@@ -402,6 +417,7 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         series_id: SeriesId,
         metric_name: &str,
         samples: Vec<Sample>,
+        ttl: Ttl,
     ) -> Result<RecordOp> {
         let key = TimeSeriesKey {
             time_bucket: bucket.start,
@@ -411,7 +427,10 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
         }
         .encode();
         let value = TimeSeriesValue { points: samples }.encode()?;
-        Ok(RecordOp::Merge(Record { key, value }.into()))
+        Ok(RecordOp::Merge(MergeRecordOp::new_with_ttl(
+            Record { key, value },
+            MergeOptions { ttl },
+        )))
     }
 }
 
@@ -604,16 +623,19 @@ mod tests {
         )));
         let ops = vec![
             storage
-                .merge_bucket_list(TimeBucket { size: 1, start: 0 })
+                .merge_bucket_list(TimeBucket { size: 1, start: 0 }, Ttl::Default)
                 .unwrap(),
             storage
-                .merge_bucket_list(TimeBucket { size: 1, start: 60 })
+                .merge_bucket_list(TimeBucket { size: 1, start: 60 }, Ttl::Default)
                 .unwrap(),
             storage
-                .merge_bucket_list(TimeBucket {
-                    size: 1,
-                    start: 120,
-                })
+                .merge_bucket_list(
+                    TimeBucket {
+                        size: 1,
+                        start: 120,
+                    },
+                    Ttl::Default,
+                )
                 .unwrap(),
         ];
         storage.apply(ops).await.unwrap();

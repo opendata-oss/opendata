@@ -6,7 +6,7 @@ use slatedb::object_store::ObjectStore;
 use slatedb::object_store::path::Path;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::CollectorConfig;
+use crate::config::ConsumerConfig;
 use crate::error::{Error, Result};
 use crate::gc::GarbageCollector;
 use crate::metric_names as m;
@@ -15,25 +15,25 @@ use crate::queue::{Metadata, QueueConsumer};
 
 const DEQUEUE_INTERVAL: u64 = 100;
 
-/// A batch of entries read from object storage by the [`Collector`].
-pub struct CollectedBatch {
+/// A batch of entries read from object storage by the [`Consumer`].
+pub struct ConsumedBatch {
     /// The deserialized opaque byte entries from the data batch.
     pub entries: Vec<Bytes>,
     /// The queue sequence number of this batch.
     pub sequence: u64,
     /// The object storage path of the data batch.
     pub location: String,
-    /// Metadata ranges attached by the ingestor(s) that contributed to this batch.
+    /// Metadata ranges attached by the buffer(s) that contributed to this batch.
     pub metadata: Vec<Metadata>,
 }
 
 /// Reads batches of ingested entries from object storage via a queue consumer.
 ///
-/// The collector iterates over entries in the queue manifest in ingestion order,
+/// The consumer iterates over entries in the queue manifest in ingestion order,
 /// fetches the corresponding data batches from object storage, and makes them
 /// available to the caller. Epoch-based fencing ensures only a single active
-/// collector processes entries at any time.
-pub struct Collector {
+/// consumer processes entries at any time.
+pub struct Consumer {
     consumer: QueueConsumer,
     object_store: Arc<dyn ObjectStore>,
     gc_shutdown: CancellationToken,
@@ -43,25 +43,25 @@ pub struct Collector {
     last_fetched_sequence: Option<u64>,
 }
 
-impl Collector {
-    /// Create a new collector from the given configuration.
+impl Consumer {
+    /// Create a new consumer from the given configuration.
     ///
     /// Initializes the queue consumer (fencing any previous instance) and spawns
     /// the garbage collector. If `last_acked_sequence` is `Some(seq)`, the
-    /// collector resumes after that sequence; if `None`, it discovers the first
+    /// consumer resumes after that sequence; if `None`, it discovers the first
     /// available entry.
-    pub async fn new(config: CollectorConfig, last_acked_sequence: Option<u64>) -> Result<Self> {
+    pub async fn new(config: ConsumerConfig, last_acked_sequence: Option<u64>) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, last_acked_sequence).await
     }
 
     pub async fn with_object_store(
-        config: CollectorConfig,
+        config: ConsumerConfig,
         object_store: Arc<dyn ObjectStore>,
         last_acked_sequence: Option<u64>,
     ) -> Result<Self> {
-        crate::metric_names::describe_collector_metrics();
+        crate::metric_names::describe_consumer_metrics();
         let consumer =
             QueueConsumer::with_object_store(config.manifest_path.clone(), object_store.clone());
 
@@ -97,7 +97,7 @@ impl Collector {
     /// If no batch has been fetched yet, peeks the earliest entry in the queue.
     /// Otherwise, reads the entry with sequence `last_fetched_sequence + 1`.
     /// Returns `None` if no matching entry is available.
-    pub async fn next_batch(&mut self) -> Result<Option<CollectedBatch>> {
+    pub async fn next_batch(&mut self) -> Result<Option<ConsumedBatch>> {
         let queue_entry = match self.last_fetched_sequence {
             None => self.consumer.peek().await?,
             Some(seq) => self.consumer.read(seq.wrapping_add(1)).await?,
@@ -116,7 +116,7 @@ impl Collector {
                         .unwrap_or_default()
                         .as_millis() as i64;
                     let lag_s = (now_ms - last_meta.ingestion_time_ms) as f64 / 1000.0;
-                    metrics::gauge!(m::COLLECTOR_LAG_SECONDS).set(lag_s.max(0.0));
+                    metrics::gauge!(m::CONSUMER_LAG_SECONDS).set(lag_s.max(0.0));
                 }
                 Ok(batch)
             }
@@ -127,7 +127,7 @@ impl Collector {
     async fn fetch_batch(
         &self,
         queue_entry: crate::queue::QueueEntry,
-    ) -> Result<Option<CollectedBatch>> {
+    ) -> Result<Option<ConsumedBatch>> {
         let start = Instant::now();
         let path = Path::from(queue_entry.location.as_str());
         let data = self
@@ -147,7 +147,7 @@ impl Collector {
         metrics::counter!(m::BYTES_COLLECTED).increment(data_len);
         metrics::histogram!(m::FETCH_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
 
-        Ok(Some(CollectedBatch {
+        Ok(Some(ConsumedBatch {
             entries,
             sequence: queue_entry.sequence,
             location: queue_entry.location,
@@ -159,7 +159,7 @@ impl Collector {
     ///
     /// Acks must be in order — the sequence must immediately follow the last acked
     /// sequence, otherwise an error is returned. To amortize manifest writes, the
-    /// collector only calls `dequeue()` on the queue consumer every
+    /// consumer only calls `dequeue()` on the queue consumer every
     /// 100 acks.
     pub async fn ack(&mut self, sequence: u64) -> Result<()> {
         if let Some(last) = self.last_acked_sequence
@@ -188,7 +188,7 @@ impl Collector {
         Ok(())
     }
 
-    /// Flush pending acks, shut down the garbage collector, and consume the collector.
+    /// Flush pending acks, shut down the garbage collector, and consume the handle.
     pub async fn close(mut self) -> Result<()> {
         self.flush().await?;
         self.gc_shutdown.cancel();
@@ -215,7 +215,7 @@ impl Collector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CollectorConfig;
+    use crate::config::ConsumerConfig;
     use crate::model::{CompressionType, encode_batch};
     use crate::queue::{Metadata, QueueProducer};
     use bytes::Bytes;
@@ -226,8 +226,8 @@ mod tests {
 
     const TEST_MANIFEST_PATH: &str = "test/manifest";
 
-    fn test_collector_config() -> CollectorConfig {
-        CollectorConfig {
+    fn test_collector_config() -> ConsumerConfig {
+        ConsumerConfig {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: TEST_MANIFEST_PATH.to_string(),
             data_path_prefix: "ingest".to_string(),
@@ -248,12 +248,12 @@ mod tests {
 
     async fn make_collector(
         store: &Arc<dyn ObjectStore>,
-        config: CollectorConfig,
+        config: ConsumerConfig,
         last_acked_sequence: Option<u64>,
-    ) -> (QueueProducer, Collector) {
+    ) -> (QueueProducer, Consumer) {
         let producer =
             QueueProducer::with_object_store(TEST_MANIFEST_PATH.to_string(), store.clone());
-        let collector = Collector::with_object_store(config, store.clone(), last_acked_sequence)
+        let collector = Consumer::with_object_store(config, store.clone(), last_acked_sequence)
             .await
             .unwrap();
         (producer, collector)

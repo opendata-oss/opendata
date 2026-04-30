@@ -88,7 +88,7 @@ impl TimeSeriesDb {
         // later reads don't have to replay them across SSTs. Runs before any
         // writer is started, so no concurrent merges can race the Put.
         coalesce_bucket_list(storage.as_ref()).await?;
-        let tsdb = Tsdb::new(storage);
+        let tsdb = Tsdb::with_retention(storage, config.retention);
         Ok(Self { tsdb })
     }
 
@@ -255,6 +255,18 @@ impl TimeSeriesDb {
     /// Returns an error if the flush fails due to storage issues.
     pub async fn flush(&self) -> Result<()> {
         self.tsdb.flush().await
+    }
+
+    /// Flushes pending data and creates a durable checkpoint.
+    ///
+    /// The returned [`common::CheckpointInfo::id`] can be passed to
+    /// [`crate::TimeSeriesDbReader::open_at_checkpoint`] (or to the
+    /// `checkpoint_id` field on `PrometheusConfig`) to open a reader pinned
+    /// to this exact view of the database.
+    ///
+    /// Only supported by SlateDB-backed storage.
+    pub async fn create_checkpoint(&self) -> Result<common::CheckpointInfo> {
+        self.tsdb.create_checkpoint().await
     }
 
     /// Closes the time series database, flushing any pending data and releasing

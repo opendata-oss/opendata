@@ -390,6 +390,13 @@ mod tests {
             async fn flush(&self) -> common::StorageResult<()> {
                 self.check_failure()
             }
+
+            async fn create_checkpoint(&self) -> common::StorageResult<common::CheckpointInfo> {
+                self.check_failure()?;
+                Err(common::StorageError::Storage(
+                    "checkpoints not supported".to_string(),
+                ))
+            }
         }
 
         // given - a log backed by configurable storage

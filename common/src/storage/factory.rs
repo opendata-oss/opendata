@@ -19,6 +19,7 @@ use slatedb::db_cache::{CachedKey, DbCache};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
+use uuid::Uuid;
 
 /// Handle to a foyer hybrid cache that we own and must close explicitly on
 /// shutdown. Cloneable because foyer's `HybridCache` is Arc-backed.
@@ -182,6 +183,7 @@ impl StorageBuilder {
 pub struct StorageReaderRuntime {
     pub(crate) block_cache: Option<Arc<dyn DbCache>>,
     pub(crate) object_store: Option<Arc<dyn ObjectStore>>,
+    pub(crate) checkpoint_id: Option<Uuid>,
 }
 
 impl StorageReaderRuntime {
@@ -204,6 +206,18 @@ impl StorageReaderRuntime {
 
     pub fn with_object_store(mut self, object_store: Arc<dyn ObjectStore>) -> Self {
         self.object_store = Some(object_store);
+        self
+    }
+
+    /// Pins this reader to a specific SlateDB checkpoint.
+    ///
+    /// When set, the reader serves a consistent view of the database as of
+    /// the checkpoint and does not advance with newer writes. The checkpoint
+    /// must already exist in storage (typically created via
+    /// [`crate::Storage::create_checkpoint`]). Only meaningful for SlateDB
+    /// storage.
+    pub fn with_checkpoint_id(mut self, id: Uuid) -> Self {
+        self.checkpoint_id = Some(id);
         self
     }
 }
@@ -326,6 +340,9 @@ pub async fn create_storage_read(
             let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
                 .with_options(reader_options)
                 .with_metrics_recorder(Arc::new(MetricsRsRecorder));
+            if let Some(checkpoint_id) = runtime.checkpoint_id {
+                builder = builder.with_checkpoint_id(checkpoint_id);
+            }
             if let Some(op) = semantics.merge_operator {
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
                 builder = builder.with_merge_operator(Arc::new(adapter));

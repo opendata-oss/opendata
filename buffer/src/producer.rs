@@ -8,7 +8,7 @@ use slatedb::object_store::{ObjectStore, PutPayload};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::IngestorConfig;
+use crate::config::ProducerConfig;
 use crate::error::{Error, Result};
 use crate::metric_names;
 use crate::model::{CompressionType, encode_batch};
@@ -34,7 +34,7 @@ impl DurabilityWatcher {
         self.receiver
             .wait_for(|v| v.is_some())
             .await
-            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?
+            .map_err(|_| Error::Storage("buffer shut down".to_string()))?
             .clone()
             .expect("value must be present after wait_for")
     }
@@ -45,7 +45,7 @@ pub struct WriteHandle {
     pub ingestion_time_ms: i64,
 }
 
-enum IngestMessage {
+enum ProduceMessage {
     Add {
         entries: Vec<Bytes>,
         metadata: Bytes,
@@ -180,7 +180,7 @@ impl BatchWriterTask {
         }
     }
 
-    async fn run(&mut self, mut rx: mpsc::Receiver<IngestMessage>, shutdown: CancellationToken) {
+    async fn run(&mut self, mut rx: mpsc::Receiver<ProduceMessage>, shutdown: CancellationToken) {
         loop {
             let sleep_duration = match self.batch.started_at {
                 Some(started) => (started + self.flush_interval)
@@ -196,14 +196,14 @@ impl BatchWriterTask {
                 },
                 msg = rx.recv() => {
                     match msg {
-                        Some(IngestMessage::Add { entries, metadata, ingestion_time_ms, notifier }) => {
+                        Some(ProduceMessage::Add { entries, metadata, ingestion_time_ms, notifier }) => {
                             if let Err(e) = self.batch.add(entries, metadata, ingestion_time_ms, notifier.clone(), self.clock.now()) {
                                 let _ = notifier.send(Some(Err(e)));
                             } else if self.batch.size_bytes >= self.flush_size_bytes {
                                 let _ = self.write_batch().await;
                             }
                         }
-                        Some(IngestMessage::Flush { result_sender }) => {
+                        Some(ProduceMessage::Flush { result_sender }) => {
                             let _ = result_sender.send(self.write_batch().await);
                         }
                         None => break,
@@ -262,7 +262,7 @@ impl BatchWriterTask {
 
 struct BatchWriter {
     producer: Arc<QueueProducer>,
-    sender: mpsc::Sender<IngestMessage>,
+    sender: mpsc::Sender<ProduceMessage>,
     cancellation_token: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -270,7 +270,7 @@ struct BatchWriter {
 impl BatchWriter {
     fn new(
         object_store: Arc<dyn ObjectStore>,
-        config: &IngestorConfig,
+        config: &ProducerConfig,
         clock: Arc<dyn Clock>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(config.max_buffered_inputs);
@@ -306,14 +306,14 @@ impl BatchWriter {
     ) -> Result<DurabilityWatcher> {
         let (notifier_sender, notifier_receiver) = tokio::sync::watch::channel(None);
         self.sender
-            .send(IngestMessage::Add {
+            .send(ProduceMessage::Add {
                 entries,
                 metadata,
                 ingestion_time_ms,
                 notifier: notifier_sender,
             })
             .await
-            .map_err(|_| Error::Storage("ingestor shut down".to_string()))?;
+            .map_err(|_| Error::Storage("buffer shut down".to_string()))?;
         Ok(DurabilityWatcher {
             receiver: notifier_receiver,
         })
@@ -322,7 +322,7 @@ impl BatchWriter {
     async fn flush(&self) -> Result<()> {
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         self.sender
-            .send(IngestMessage::Flush { result_sender })
+            .send(ProduceMessage::Flush { result_sender })
             .await
             .map_err(|_| Error::Storage("batch writer task not running".to_string()))?;
         result_receiver
@@ -341,29 +341,29 @@ impl BatchWriter {
     }
 }
 
-pub struct Ingestor {
+pub struct Producer {
     writer: BatchWriter,
     clock: Arc<dyn Clock>,
 }
 
-impl Ingestor {
-    /// Create a new ingestor from the given configuration and clock.
-    pub fn new(config: IngestorConfig, clock: Arc<dyn Clock>) -> Result<Self> {
+impl Producer {
+    /// Create a new buffer from the given configuration and clock.
+    pub fn new(config: ProducerConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         let object_store = common::storage::factory::create_object_store(&config.object_store)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Self::with_object_store(config, object_store, clock)
     }
 
-    /// Create a new ingestor using a pre-built object store.
+    /// Create a new buffer using a pre-built object store.
     ///
     /// This is useful when you need to share an object store instance
-    /// between an `Ingestor` and a [`Collector`](crate::Collector) (e.g. in tests).
+    /// between a `Producer` and a [`Consumer`](crate::Consumer) (e.g. in tests).
     pub fn with_object_store(
-        config: IngestorConfig,
+        config: ProducerConfig,
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        metric_names::describe_ingestor_metrics();
+        metric_names::describe_buffer_metrics();
         let writer = BatchWriter::new(object_store, &config, clock.clone());
         Ok(Self { writer, clock })
     }
@@ -375,7 +375,7 @@ impl Ingestor {
     ///
     /// Returns [`Error::InvalidInput`] if `entries` is empty or if `metadata`
     /// exceeds 2³²−1 bytes.
-    pub async fn ingest(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> {
+    pub async fn produce(&self, entries: Vec<Bytes>, metadata: Bytes) -> Result<WriteHandle> {
         if entries.is_empty() {
             return Err(Error::InvalidInput("entries must not be empty".to_string()));
         }
@@ -406,7 +406,7 @@ impl Ingestor {
         self.writer.conflict_rate()
     }
 
-    /// Shut down the ingestor, flushing any remaining buffered entries before returning.
+    /// Shut down the buffer, flushing any remaining buffered entries before returning.
     pub async fn close(self) -> Result<()> {
         self.writer.close().await
     }
@@ -415,7 +415,7 @@ impl Ingestor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IngestorConfig;
+    use crate::config::ProducerConfig;
     use crate::model::decode_batch;
     use crate::queue::{Manifest, QueueEntry};
     use bytes::Bytes;
@@ -432,8 +432,8 @@ mod tests {
         manifest.iter().map(|e| e.unwrap()).collect()
     }
 
-    fn test_config() -> IngestorConfig {
-        IngestorConfig {
+    fn test_config() -> ProducerConfig {
+        ProducerConfig {
             object_store: ObjectStoreConfig::InMemory,
             data_path_prefix: "test-ingest".to_string(),
             manifest_path: "test/manifest".to_string(),
@@ -447,19 +447,19 @@ mod tests {
     #[tokio::test]
     async fn should_ingest_entries_and_enqueue_location() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("data1")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("data1")], Bytes::new())
             .await
             .unwrap();
-        ingestor
-            .ingest(vec![Bytes::from("data2")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("data2")], Bytes::new())
             .await
             .unwrap();
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -470,15 +470,15 @@ mod tests {
     #[tokio::test]
     async fn should_write_valid_batch_to_object_store() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("mydata")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("mydata")], Bytes::new())
             .await
             .unwrap();
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         let path = Path::from(entries[0].location.as_str());
@@ -496,11 +496,11 @@ mod tests {
         let mut config = test_config();
         config.flush_size_bytes = 10;
 
-        let ingestor =
-            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+        let buffer =
+            Producer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        let mut watcher = ingestor
-            .ingest(vec![Bytes::from("some-long-data")], Bytes::new())
+        let mut watcher = buffer
+            .produce(vec![Bytes::from("some-long-data")], Bytes::new())
             .await
             .unwrap();
         watcher.watcher.await_durable().await.unwrap();
@@ -517,11 +517,11 @@ mod tests {
         config.flush_interval = Duration::from_millis(50);
         config.flush_size_bytes = 64 * 1024 * 1024;
 
-        let ingestor =
-            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+        let buffer =
+            Producer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
-        let mut watcher = ingestor
-            .ingest(vec![Bytes::from("v1")], Bytes::new())
+        let mut watcher = buffer
+            .produce(vec![Bytes::from("v1")], Bytes::new())
             .await
             .unwrap();
 
@@ -538,12 +538,12 @@ mod tests {
     #[tokio::test]
     async fn should_not_flush_below_thresholds() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher = ingestor
-            .ingest(vec![Bytes::from("v")], Bytes::new())
+        let watcher = buffer
+            .produce(vec![Bytes::from("v")], Bytes::new())
             .await
             .unwrap();
 
@@ -552,7 +552,7 @@ mod tests {
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
         assert!(store.get(&manifest_path).await.is_err());
 
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         assert!(watcher.watcher.result().unwrap().is_ok());
 
@@ -563,20 +563,20 @@ mod tests {
     #[tokio::test]
     async fn should_batch_multiple_ingests_into_single_file() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let watcher1 = ingestor
-            .ingest(vec![Bytes::from("data1")], Bytes::new())
+        let watcher1 = buffer
+            .produce(vec![Bytes::from("data1")], Bytes::new())
             .await
             .unwrap();
-        let watcher2 = ingestor
-            .ingest(vec![Bytes::from("data2")], Bytes::new())
+        let watcher2 = buffer
+            .produce(vec![Bytes::from("data2")], Bytes::new())
             .await
             .unwrap();
 
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         assert!(watcher1.watcher.result().unwrap().is_ok());
         assert!(watcher2.watcher.result().unwrap().is_ok());
@@ -599,22 +599,22 @@ mod tests {
         let mut config = test_config();
         config.max_buffered_inputs = 1;
 
-        let ingestor =
-            Ingestor::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
+        let buffer =
+            Producer::with_object_store(config, store.clone(), Arc::new(SystemClock)).unwrap();
 
         // First ingest fills the single-slot buffer
-        ingestor
-            .ingest(vec![Bytes::from("data1")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("data1")], Bytes::new())
             .await
             .unwrap();
 
         // Second ingest succeeds once the background task consumes the first message
-        ingestor
-            .ingest(vec![Bytes::from("data2")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("data2")], Bytes::new())
             .await
             .unwrap();
 
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert!(!entries.is_empty());
@@ -627,15 +627,15 @@ mod tests {
         let fixed_time = UNIX_EPOCH + Duration::from_millis(millis as u64);
         let clock = Arc::new(MockClock::with_time(fixed_time));
 
-        let ingestor = Ingestor::with_object_store(test_config(), store.clone(), clock).unwrap();
+        let buffer = Producer::with_object_store(test_config(), store.clone(), clock).unwrap();
 
         let metadata = Bytes::from(r#"{"topic":"events"}"#);
-        let handle = ingestor
-            .ingest(vec![Bytes::from("payload")], metadata.clone())
+        let handle = buffer
+            .produce(vec![Bytes::from("payload")], metadata.clone())
             .await
             .unwrap();
         assert_eq!(handle.ingestion_time_ms, millis);
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -647,16 +647,16 @@ mod tests {
     #[tokio::test]
     async fn should_flush_remaining_entries_on_close() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("unflushed")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("unflushed")], Bytes::new())
             .await
             .unwrap();
 
-        ingestor.close().await.unwrap();
+        buffer.close().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -670,21 +670,21 @@ mod tests {
     #[tokio::test]
     async fn should_produce_separate_batches_per_flush() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("batch1")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("batch1")], Bytes::new())
             .await
             .unwrap();
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::from("batch2")], Bytes::new())
+        buffer
+            .produce(vec![Bytes::from("batch2")], Bytes::new())
             .await
             .unwrap();
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 2);
@@ -712,11 +712,11 @@ mod tests {
     #[tokio::test]
     async fn should_not_flush_empty_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let manifest_path = slatedb::object_store::path::Path::from("test/manifest");
         assert!(store.get(&manifest_path).await.is_err());
@@ -725,15 +725,15 @@ mod tests {
     #[tokio::test]
     async fn should_preserve_all_empty_entries_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(vec![Bytes::new(), Bytes::new()], Bytes::from("meta"))
+        buffer
+            .produce(vec![Bytes::new(), Bytes::new()], Bytes::from("meta"))
             .await
             .unwrap();
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -756,12 +756,12 @@ mod tests {
     #[tokio::test]
     async fn should_preserve_empty_and_non_empty_entries_in_batch() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        ingestor
-            .ingest(
+        buffer
+            .produce(
                 vec![
                     Bytes::from("a"),
                     Bytes::new(),
@@ -772,7 +772,7 @@ mod tests {
             )
             .await
             .unwrap();
-        ingestor.flush().await.unwrap();
+        buffer.flush().await.unwrap();
 
         let entries = read_manifest_entries(&store, "test/manifest").await;
         assert_eq!(entries.len(), 1);
@@ -803,14 +803,14 @@ mod tests {
     #[tokio::test]
     async fn should_reject_empty_entries() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let ingestor =
-            Ingestor::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
+        let buffer =
+            Producer::with_object_store(test_config(), store.clone(), Arc::new(SystemClock))
                 .unwrap();
 
-        let result = ingestor.ingest(vec![], Bytes::new()).await;
+        let result = buffer.produce(vec![], Bytes::new()).await;
         assert!(matches!(result, Err(Error::InvalidInput(_))));
 
-        let result = ingestor.ingest(vec![], Bytes::from("meta")).await;
+        let result = buffer.produce(vec![], Bytes::from("meta")).await;
         assert!(matches!(result, Err(Error::InvalidInput(_))));
     }
 }

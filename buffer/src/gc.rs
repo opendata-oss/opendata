@@ -164,7 +164,7 @@ impl GarbageCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CollectorConfig;
+    use crate::config::ConsumerConfig;
     use crate::model::encode_batch;
     use crate::queue::QueueProducer;
     use bytes::Bytes;
@@ -176,8 +176,8 @@ mod tests {
     const TEST_MANIFEST_PATH: &str = "test/manifest";
     const TEST_DATA_PREFIX: &str = "ingest";
 
-    fn make_config() -> CollectorConfig {
-        CollectorConfig {
+    fn make_config() -> ConsumerConfig {
+        ConsumerConfig {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: TEST_MANIFEST_PATH.to_string(),
             data_path_prefix: TEST_DATA_PREFIX.to_string(),
@@ -186,7 +186,7 @@ mod tests {
         }
     }
 
-    fn make_gc(store: &Arc<dyn ObjectStore>, config: CollectorConfig) -> GarbageCollector {
+    fn make_gc(store: &Arc<dyn ObjectStore>, config: ConsumerConfig) -> GarbageCollector {
         GarbageCollector::new(
             config.manifest_path,
             config.data_path_prefix,
@@ -253,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn should_not_delete_files_within_grace_period() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = CollectorConfig {
+        let config = ConsumerConfig {
             gc_grace_period: Duration::from_secs(600),
             ..make_config()
         };
@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn should_shutdown_collect_loop_on_cancel() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let config = CollectorConfig {
+        let config = ConsumerConfig {
             gc_interval: Duration::from_secs(3600), // very long so it won't fire
             ..make_config()
         };

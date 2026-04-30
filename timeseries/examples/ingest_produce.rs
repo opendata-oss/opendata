@@ -1,4 +1,4 @@
-/// Standalone ingestor that writes a few OTLP gauge metrics to MinIO.
+/// Standalone buffer Producer that writes a few OTLP gauge metrics to MinIO.
 /// Build:  cargo build -p opendata-timeseries --features "http-server,otel" --example ingest_produce
 /// Run:    Same env vars as the server (AWS_*), then ./target/debug/examples/ingest_produce
 use std::sync::Arc;
@@ -62,7 +62,7 @@ fn build_gauge(name: &str, value: f64, host: &str) -> ExportMetricsServiceReques
 
 #[tokio::main]
 async fn main() {
-    let config = ingest::IngestorConfig {
+    let config = buffer::ProducerConfig {
         object_store: common::ObjectStoreConfig::Aws(
             common::storage::config::AwsObjectStoreConfig {
                 region: "us-east-1".to_string(),
@@ -74,10 +74,10 @@ async fn main() {
         flush_interval: Duration::from_millis(100),
         flush_size_bytes: 64 * 1024 * 1024,
         max_buffered_inputs: 1000,
-        batch_compression: ingest::CompressionType::None,
+        batch_compression: buffer::CompressionType::None,
     };
 
-    let ingestor = ingest::Ingestor::new(config, Arc::new(common::clock::SystemClock)).unwrap();
+    let producer = buffer::Producer::new(config, Arc::new(common::clock::SystemClock)).unwrap();
 
     // Metadata: version=1, signal=metrics(1), encoding=otlp_proto(1), reserved=0
     let metadata = Bytes::from_static(&[1, 1, 1, 0]);
@@ -96,11 +96,11 @@ async fn main() {
             Bytes::from(g2.encode_to_vec()),
         ];
 
-        let handle = ingestor.ingest(entries, metadata.clone()).await.unwrap();
+        let handle = producer.produce(entries, metadata.clone()).await.unwrap();
         handle.watcher.clone().await_durable().await.unwrap();
         println!("batch {} flushed", i);
     }
 
-    ingestor.close().await.unwrap();
-    println!("ingestor closed, 5 batches produced");
+    producer.close().await.unwrap();
+    println!("producer closed, 5 batches produced");
 }
