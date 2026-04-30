@@ -261,55 +261,6 @@ pub unsafe extern "C" fn opendata_log_count(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn opendata_log_count_with_options(
-    log: *const opendata_log_t,
-    key: *const u8,
-    key_len: usize,
-    seq_range: *const opendata_log_seq_range_t,
-    options: *const opendata_log_count_options_t,
-    out_count: *mut u64,
-) -> opendata_log_result_t {
-    if let Err(e) = require_handle(log, "log") {
-        return e;
-    }
-    if let Err(e) = require_handle(seq_range, "seq_range") {
-        return e;
-    }
-    if let Err(e) = require_handle(options, "options") {
-        return e;
-    }
-
-    let key_bytes = match bytes_from_ptr(key, key_len, "key") {
-        Ok(b) => Bytes::copy_from_slice(b),
-        Err(e) => return e,
-    };
-
-    let range = match convert_seq_range(&*seq_range) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let rust_options = log::CountOptions {
-        approximate: (*options).approximate,
-    };
-
-    let handle = &*log;
-    match handle.runtime.block_on(
-        handle
-            .log
-            .count_with_options(key_bytes, range, rust_options),
-    ) {
-        Ok(count) => {
-            if !out_count.is_null() {
-                *out_count = count;
-            }
-            success_result()
-        }
-        Err(e) => error_from_log_error(&e),
-    }
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn opendata_log_list_keys(
     log: *const opendata_log_t,
     segment_range: *const opendata_log_segment_range_t,

@@ -70,10 +70,6 @@ typedef struct opendata_log_seq_range_t {
   struct opendata_log_seq_bound_t end;
 } opendata_log_seq_range_t;
 
-typedef struct opendata_log_count_options_t {
-  bool approximate;
-} opendata_log_count_options_t;
-
 typedef struct opendata_log_segment_bound_t {
   uint8_t kind;
   uint32_t value;
@@ -134,13 +130,6 @@ struct opendata_log_result_t opendata_log_count(const struct opendata_log_t *log
                                                 const struct opendata_log_seq_range_t *seq_range,
                                                 uint64_t *out_count);
 
-struct opendata_log_result_t opendata_log_count_with_options(const struct opendata_log_t *log,
-                                                             const uint8_t *key,
-                                                             uintptr_t key_len,
-                                                             const struct opendata_log_seq_range_t *seq_range,
-                                                             const struct opendata_log_count_options_t *options,
-                                                             uint64_t *out_count);
-
 struct opendata_log_result_t opendata_log_list_keys(const struct opendata_log_t *log,
                                                     const struct opendata_log_segment_range_t *segment_range,
                                                     struct opendata_log_key_iterator_t **out_iterator);
@@ -200,13 +189,6 @@ struct opendata_log_result_t opendata_log_reader_count(const struct opendata_log
                                                        uintptr_t key_len,
                                                        const struct opendata_log_seq_range_t *seq_range,
                                                        uint64_t *out_count);
-
-struct opendata_log_result_t opendata_log_reader_count_with_options(const struct opendata_log_reader_t *reader,
-                                                                    const uint8_t *key,
-                                                                    uintptr_t key_len,
-                                                                    const struct opendata_log_seq_range_t *seq_range,
-                                                                    const struct opendata_log_count_options_t *options,
-                                                                    uint64_t *out_count);
 
 struct opendata_log_result_t opendata_log_reader_list_keys(const struct opendata_log_reader_t *reader,
                                                            const struct opendata_log_segment_range_t *segment_range,

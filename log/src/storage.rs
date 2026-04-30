@@ -86,6 +86,24 @@ pub(crate) trait LogStorageRead: StorageRead {
             segment.meta().start_seq,
         ))
     }
+
+    /// Counts log entries for a key within a segment and sequence range by
+    /// scanning every record and tallying. Use this as a fallback when no
+    /// [`LogDirect`](crate::direct::LogDirect) handle is available.
+    async fn count_entries(
+        &self,
+        segment: &LogSegment,
+        key: &Bytes,
+        seq_range: Range<u64>,
+    ) -> Result<u64> {
+        let byte_range = LogEntryKey::scan_range(segment, key, seq_range);
+        let mut iter = self.scan_iter(byte_range).await?;
+        let mut total = 0u64;
+        while iter.next().await?.is_some() {
+            total = total.saturating_add(1);
+        }
+        Ok(total)
+    }
 }
 
 impl<T: StorageRead + ?Sized> LogStorageRead for T {}

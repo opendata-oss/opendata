@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{CountOptions, ReadVisibility, ScanOptions, SegmentConfig};
+use crate::config::{ReadVisibility, ScanOptions, SegmentConfig};
 use crate::error::{AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
@@ -314,18 +314,47 @@ impl LogDb {
     /// Creates a LogDb from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Memory).await
+        Self::from_storage(
+            storage,
+            None,
+            SegmentConfig::default(),
+            ReadVisibility::Memory,
+        )
+        .await
+    }
+
+    /// Creates a LogDb with a paired `LogDirect` handle so tests can
+    /// exercise the SST-walk count path.
+    #[cfg(test)]
+    pub(crate) async fn new_with_direct(
+        storage: Arc<dyn common::Storage>,
+        direct: Arc<crate::direct::LogDirect>,
+    ) -> Result<Self> {
+        Self::from_storage(
+            storage,
+            Some(direct),
+            SegmentConfig::default(),
+            ReadVisibility::Memory,
+        )
+        .await
     }
 
     /// Creates a LogDb with `ReadVisibility::Remote` from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new_durable(storage: Arc<dyn common::Storage>) -> Result<Self> {
-        Self::from_storage(storage, SegmentConfig::default(), ReadVisibility::Remote).await
+        Self::from_storage(
+            storage,
+            None,
+            SegmentConfig::default(),
+            ReadVisibility::Remote,
+        )
+        .await
     }
 
     /// Shared construction logic used by both `LogDb::new` and `LogDbBuilder::build`.
     async fn from_storage(
         storage: Arc<dyn common::Storage>,
+        direct: Option<Arc<crate::direct::LogDirect>>,
         segment_config: SegmentConfig,
         read_visibility: ReadVisibility,
     ) -> Result<Self> {
@@ -358,6 +387,7 @@ impl LogDb {
         let initial_segment_id = segment_cache.latest().map(|s| s.id());
         let read_view = Arc::new(RwLock::new(LogReadView::new(
             snapshot as Arc<dyn common::StorageRead>,
+            direct,
             segment_cache,
         )));
 
@@ -399,13 +429,11 @@ impl LogRead for LogDb {
         Ok(view.scan_with_options(key, seq_range, &options))
     }
 
-    async fn count_with_options(
-        &self,
-        _key: Bytes,
-        _seq_range: impl RangeBounds<Sequence> + Send,
-        _options: CountOptions,
-    ) -> Result<u64> {
-        todo!()
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
+        self.sync_reads().await?;
+        let seq_range = normalize_sequence(&seq_range);
+        let view = self.read_view.read().await;
+        view.count(key, seq_range).await
     }
 
     async fn list_keys(
@@ -498,8 +526,14 @@ impl LogDbBuilder {
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
+        let direct = crate::direct::LogDirect::maybe_from_storage_config(&self.config.storage)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .map(Arc::new);
+
         LogDb::from_storage(
             storage,
+            direct,
             self.config.segmentation,
             self.config.read_visibility,
         )
@@ -1897,6 +1931,223 @@ mod tests {
         assert_eq!(segments[0].start_seq, 0);
     }
 
+    #[tokio::test]
+    async fn count_returns_zero_for_empty_log() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        let n = log.count(Bytes::from("k"), ..).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn count_counts_every_entry_for_key() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(
+            (0..10)
+                .map(|i| Record {
+                    key: Bytes::from("orders"),
+                    value: Bytes::from(format!("order-{i}")),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        let n = log.count(Bytes::from("orders"), ..).await.unwrap();
+        assert_eq!(n, 10);
+    }
+
+    #[tokio::test]
+    async fn count_isolates_per_key() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("a"),
+                value: Bytes::from("1"),
+            },
+            Record {
+                key: Bytes::from("b"),
+                value: Bytes::from("1"),
+            },
+            Record {
+                key: Bytes::from("a"),
+                value: Bytes::from("2"),
+            },
+            Record {
+                key: Bytes::from("b"),
+                value: Bytes::from("2"),
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(log.count(Bytes::from("a"), ..).await.unwrap(), 2);
+        assert_eq!(log.count(Bytes::from("b"), ..).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn count_respects_sequence_range() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(
+            (0..10)
+                .map(|i| Record {
+                    key: Bytes::from("events"),
+                    value: Bytes::from(format!("event-{i}")),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        // [3, 7) covers seqs 3,4,5,6 — 4 entries.
+        assert_eq!(log.count(Bytes::from("events"), 3..7).await.unwrap(), 4);
+        // Lower bound only.
+        assert_eq!(log.count(Bytes::from("events"), 5..).await.unwrap(), 5);
+        // Upper bound only.
+        assert_eq!(log.count(Bytes::from("events"), ..4).await.unwrap(), 4);
+        // Out-of-range upper.
+        assert_eq!(log.count(Bytes::from("events"), 100..200).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn count_sees_writes_without_flush() {
+        // Mirrors should_scan_without_flush — count's internal sync_reads must
+        // pull in unflushed writes the same way scan does.
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v1"),
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(log.count(Bytes::from("k"), ..).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn count_spans_multiple_segments() {
+        // Segments roll on a 1-byte seal_interval (effectively every write).
+        // The count path has to fan out across segments and stitch the
+        // per-segment counts back together.
+        let config = Config {
+            storage: StorageConfig::InMemory,
+            segmentation: SegmentConfig {
+                seal_interval: Some(Duration::from_nanos(1)),
+            },
+            ..Default::default()
+        };
+        let log = LogDb::open(config).await.unwrap();
+        for i in 0..5u8 {
+            log.try_append(vec![Record {
+                key: Bytes::from("k"),
+                value: Bytes::from(vec![i]),
+            }])
+            .await
+            .unwrap();
+            // Small sleep so seal_interval triggers a fresh segment.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let segments = log.list_segments(..).await.unwrap();
+        assert!(segments.len() >= 2, "expected multiple segments");
+        assert_eq!(log.count(Bytes::from("k"), ..).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn count_via_log_reader() {
+        // LogDbReader shares storage with LogDb; what the writer flushes,
+        // the reader counts. Mirrors `should_scan_entries_via_log_reader`.
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let log = LogDb::new(storage.clone()).await.unwrap();
+        log.try_append(
+            (0..5)
+                .map(|i| Record {
+                    key: Bytes::from("orders"),
+                    value: Bytes::from(format!("order-{i}")),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        log.flush().await.unwrap();
+
+        let reader = LogDbReader::new(storage).await.unwrap();
+        assert_eq!(reader.count(Bytes::from("orders"), ..).await.unwrap(), 5);
+        assert_eq!(reader.count(Bytes::from("orders"), 1..4).await.unwrap(), 3);
+        assert_eq!(
+            reader.count(Bytes::from("nonexistent"), ..).await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn count_across_segments_via_log_reader() {
+        // The reader's fan-out across segments is the same code path as
+        // LogDb's (LogReadView::count), but this asserts that the reader's
+        // segment cache is populated correctly to see all segments.
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let log = LogDb::from_storage(
+            storage.clone(),
+            None,
+            SegmentConfig {
+                seal_interval: Some(Duration::from_nanos(1)),
+            },
+            ReadVisibility::Memory,
+        )
+        .await
+        .unwrap();
+        for i in 0..5u8 {
+            log.try_append(vec![Record {
+                key: Bytes::from("k"),
+                value: Bytes::from(vec![i]),
+            }])
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        log.flush().await.unwrap();
+
+        let reader = LogDbReader::new(storage).await.unwrap();
+        let segments = reader.list_segments(..).await.unwrap();
+        assert!(segments.len() >= 2, "expected multiple segments");
+        assert_eq!(reader.count(Bytes::from("k"), ..).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn slate_reader_count_sees_flushed_data() {
+        // Slatedb-backed reader: writes go through LogDb, get flushed, then
+        // the reader's count_in_range path walks the same manifest.
+        let (storage, direct) = slate_storage_with_direct().await;
+        let log = LogDb::new_with_direct(storage.clone(), direct.clone())
+            .await
+            .unwrap();
+        log.try_append(
+            (0..10u8)
+                .map(|i| Record {
+                    key: Bytes::from("k"),
+                    value: Bytes::from(vec![i]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        log.flush().await.unwrap();
+
+        let reader = LogDbReader::new_with_direct(storage, direct).await.unwrap();
+        assert_eq!(reader.count(Bytes::from("k"), ..).await.unwrap(), 10);
+        assert_eq!(reader.count(Bytes::from("k"), 2..7).await.unwrap(), 5);
+    }
+
     /// Helper: creates a SlateDB-backed storage using an in-memory object store.
     /// With `start_paused = true`, SlateDB's WAL flush timer is frozen so writes
     /// remain non-durable until an explicit `flush()` call.
@@ -1905,12 +2156,48 @@ mod tests {
         use slatedb::DbBuilder;
         use slatedb::object_store::memory::InMemory;
 
+        let path = "/test/read_durable";
         let object_store = Arc::new(InMemory::new());
-        let db = DbBuilder::new("/test/read_durable", object_store)
+        let db = DbBuilder::new(path, object_store).build().await.unwrap();
+        Arc::new(SlateDbStorage::new(Arc::new(db)))
+    }
+
+    /// Same as [`slate_storage`] but also builds a [`LogDirect`] handle
+    /// sharing the same in-memory object store. `InMemory` instances are
+    /// process-local, so storage and direct must share the same `Arc` for
+    /// the direct path to see what storage writes.
+    async fn slate_storage_with_direct() -> (Arc<dyn common::Storage>, Arc<crate::direct::LogDirect>)
+    {
+        use common::storage::slate::SlateDbStorage;
+        use slatedb::config::DbReaderOptions;
+        use slatedb::object_store::memory::InMemory;
+        use slatedb::{DbBuilder, DbReader, SstReader};
+
+        let path = "/test/slate_with_direct";
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            DbBuilder::new(path, object_store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn common::Storage> = Arc::new(SlateDbStorage::new(db));
+
+        // Short manifest poll interval so the reader picks up freshly-
+        // flushed writes quickly — otherwise the slate count tests would
+        // race the default 1s polling tick.
+        let reader_options = DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(5),
+            ..Default::default()
+        };
+        let reader = DbReader::builder(path, object_store.clone())
+            .with_options(reader_options)
             .build()
             .await
             .unwrap();
-        Arc::new(SlateDbStorage::new(Arc::new(db)))
+        let sst_reader = SstReader::new(path, object_store, None, None);
+        let direct = crate::direct::LogDirect::from_components(Arc::new(reader), sst_reader);
+        (storage, Arc::new(direct))
     }
 
     #[tokio::test(start_paused = true)]
@@ -2042,5 +2329,50 @@ mod tests {
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.value, Bytes::from("value1"));
         assert!(iter.next().await.unwrap().is_none());
+    }
+
+    /// Exercises the count_in_range + scan split on slatedb-backed storage.
+    /// We write N entries, flush so some land in an L0 SST, then write more
+    /// without flushing — count must include both the SST-flushed prefix
+    /// (via the manifest walk) and the memtable tail (via the scan above
+    /// covered_to).
+    #[tokio::test]
+    async fn slate_count_sees_both_flushed_and_unflushed() {
+        let (storage, direct) = slate_storage_with_direct().await;
+        let log = LogDb::new_with_direct(storage, direct).await.unwrap();
+
+        // First batch — flush to put these into an L0 SST.
+        log.try_append(
+            (0..5u8)
+                .map(|i| Record {
+                    key: Bytes::from("k"),
+                    value: Bytes::from(vec![i]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        log.flush().await.unwrap();
+
+        // Second batch — leave in the memtable.
+        log.try_append(
+            (5..10u8)
+                .map(|i| Record {
+                    key: Bytes::from("k"),
+                    value: Bytes::from(vec![i]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(log.count(Bytes::from("k"), ..).await.unwrap(), 10);
+        // Range that ends inside the flushed prefix — only count_in_range
+        // contributes, scan portion is empty.
+        assert_eq!(log.count(Bytes::from("k"), ..3).await.unwrap(), 3);
+        // Range that starts inside the unflushed tail — only the scan side
+        // should contribute (covered_to from count_in_range is below the
+        // range start, so scan_lo gets pulled to seg_lo).
+        assert_eq!(log.count(Bytes::from("k"), 7..).await.unwrap(), 3);
     }
 }

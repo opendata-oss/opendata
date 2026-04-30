@@ -495,7 +495,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and verify data
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let record = storage_reader.get(Bytes::from("key1")).await.unwrap();
@@ -535,7 +538,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and scan data
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let mut iter = storage_reader
@@ -577,7 +583,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader while writer is still open - this should NOT cause fencing error
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         // Reader can read the data
@@ -604,7 +613,7 @@ mod tests {
         let path = "/test/ttl_db";
         let clock = Arc::new(MockSystemClock::new());
 
-        let db = DbBuilder::new(path, object_store)
+        let db = DbBuilder::new(path, object_store.clone())
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()
@@ -681,7 +690,7 @@ mod tests {
 
         let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
         let slate_merge_op = SlateDbStorage::merge_operator_adapter(merge_op);
-        let db = DbBuilder::new(path, object_store)
+        let db = DbBuilder::new(path, object_store.clone())
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()

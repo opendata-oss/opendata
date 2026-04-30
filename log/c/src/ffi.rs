@@ -110,11 +110,6 @@ pub struct opendata_log_segment_range_t {
 }
 
 #[repr(C)]
-pub struct opendata_log_count_options_t {
-    pub approximate: bool,
-}
-
-#[repr(C)]
 pub struct opendata_log_segment_t {
     pub id: u32,
     pub start_seq: u64,

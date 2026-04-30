@@ -143,23 +143,6 @@ pub struct ScanOptions {
     // - cache_policy: control block cache behavior
 }
 
-/// Options for count operations.
-///
-/// Controls the behavior of [`LogRead::count`](crate::LogRead::count) and
-/// [`LogRead::count_with_options`](crate::LogRead::count_with_options).
-#[derive(Debug, Clone, Default)]
-pub struct CountOptions {
-    /// Whether to return an approximate count.
-    ///
-    /// When `true`, the count may be computed from index metadata without
-    /// reading individual entries, providing faster results at the cost
-    /// of accuracy. Useful for progress indicators and lag estimation.
-    ///
-    /// When `false` (the default), an exact count is computed by scanning
-    /// the relevant index entries.
-    pub approximate: bool,
-}
-
 /// Configuration for opening a [`LogDbReader`](crate::LogDbReader).
 ///
 /// This struct holds settings for read-only log access, including storage

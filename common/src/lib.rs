@@ -18,6 +18,7 @@ pub use storage::factory::{
     create_object_store, create_storage_read,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
+pub use storage::sst_blocks::{BlockOpCounts, CountResult, count_in_range};
 pub use storage::{
     CheckpointInfo, MergeRecordOp, PutRecordOp, Record, Storage, StorageError, StorageIterator,
     StorageRead, StorageResult, Ttl, WriteOptions, WriteResult,
