@@ -13,16 +13,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::Router;
-use axum::http::StatusCode;
-use axum::routing::get;
 use clap::Parser;
 use clickhouse_ingestor::envelope::{ConfiguredEnvelope, PayloadEncoding, SignalType};
+use clickhouse_ingestor::metrics_server;
 use clickhouse_ingestor::{
     AckFlushPolicy, BufferConsumerRuntime, ClickHouseWriter, IngestorConfig,
     OtlpLogsClickHouseAdapter, OtlpLogsDecoder, RuntimeOptions,
 };
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -127,7 +125,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("parsing metrics_server.bind_addr={}", cfg.metrics_server.bind_addr))?;
     let metrics_shutdown = shutdown.clone();
     let metrics_task = tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_handle, metrics_addr, metrics_shutdown).await {
+        if let Err(e) = metrics_server::serve(metrics_handle, metrics_addr, metrics_shutdown).await
+        {
             error!(error = %e, "metrics server exited with error");
         }
     });
@@ -140,37 +139,5 @@ async fn main() -> Result<()> {
         error!(error = %e, "metrics server task join failed");
     }
     runtime_result?;
-    Ok(())
-}
-
-/// Serve `/metrics` (Prometheus text format) and `/-/healthy` on the
-/// configured address until the shutdown token is cancelled.
-async fn serve_metrics(
-    handle: PrometheusHandle,
-    addr: SocketAddr,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let app = Router::new()
-        .route(
-            "/metrics",
-            get({
-                let handle = handle.clone();
-                move || {
-                    let handle = handle.clone();
-                    async move { handle.render() }
-                }
-            }),
-        )
-        .route("/-/healthy", get(|| async { (StatusCode::OK, "OK") }));
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding metrics server to {addr}"))?;
-    info!(%addr, "metrics server listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
-        .context("metrics server error")?;
     Ok(())
 }

@@ -26,6 +26,7 @@ pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod metrics;
+pub mod metrics_server;
 pub mod runtime;
 pub mod signal;
 pub mod source;

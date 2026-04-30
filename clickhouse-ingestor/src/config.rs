@@ -320,6 +320,78 @@ adapter:
     }
 
     #[test]
+    fn metrics_server_section_defaults_when_absent() {
+        // YAML config files in production omit the metrics_server
+        // section; the binary relies on serde(default) producing the
+        // canonical bind address. A regression here would silently
+        // change the production listen port.
+        let yaml = r#"
+buffer:
+  manifest_path: m
+  data_prefix: d
+  object_store:
+    type: InMemory
+clickhouse:
+  endpoint: http://x:8123
+  database: db
+  table: t
+runtime:
+  dry_run: true
+  poll_interval_ms: 250
+  retry_max_attempts: 6
+  retry_initial_backoff_ms: 100
+  request_timeout_secs: 30
+commit_group:
+  max_rows: 1
+  max_bytes: 1
+  max_age_ms: 1
+ack:
+  policy: every_commit_group
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 1
+  max_chunk_bytes: 1
+"#;
+        let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.metrics_server.bind_addr, "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn metrics_server_section_overrides_bind_addr() {
+        let yaml = r#"
+buffer:
+  manifest_path: m
+  data_prefix: d
+  object_store:
+    type: InMemory
+clickhouse:
+  endpoint: http://x:8123
+  database: db
+  table: t
+runtime:
+  dry_run: true
+  poll_interval_ms: 250
+  retry_max_attempts: 6
+  retry_initial_backoff_ms: 100
+  request_timeout_secs: 30
+commit_group:
+  max_rows: 1
+  max_bytes: 1
+  max_age_ms: 1
+ack:
+  policy: every_commit_group
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 1
+  max_chunk_bytes: 1
+metrics_server:
+  bind_addr: 127.0.0.1:8080
+"#;
+        let cfg: IngestorConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.metrics_server.bind_addr, "127.0.0.1:8080");
+    }
+
+    #[test]
     fn ack_every_n_clamps_zero_to_one() {
         let yaml = r#"
 buffer:
