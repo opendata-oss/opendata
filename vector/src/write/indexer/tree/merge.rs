@@ -324,7 +324,8 @@ mod tests {
                 .is_some()
         );
         // assert centroids removed from root
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let root_ids: HashSet<_> = root.iter().map(|p| p.id()).collect();
         assert_eq!(root_ids, HashSet::from([CENTROID_C]));
         // assert all vectors added to reassign set
@@ -465,12 +466,14 @@ mod tests {
                 .get_posting_list(L2_CENTROID_A, DIMS)
                 .await
                 .unwrap(),
+            false,
         );
         let parent_b_posting = PostingList::from_value(
             h.storage
                 .get_posting_list(L2_CENTROID_B, DIMS)
                 .await
                 .unwrap(),
+            false,
         );
         let parent_a_ids: HashSet<_> = parent_a_posting.iter().map(|p| p.id()).collect();
         let parent_b_ids: HashSet<_> = parent_b_posting.iter().map(|p| p.id()).collect();
@@ -502,8 +505,10 @@ mod tests {
         // then
         assert_eq!(merge_count, 2);
         assert_eq!(reassignments.len(), 3);
-        let parent_posting =
-            PostingList::from_value(h.storage.get_posting_list(parent, DIMS).await.unwrap());
+        let parent_posting = PostingList::from_value(
+            h.storage.get_posting_list(parent, DIMS).await.unwrap(),
+            false,
+        );
         let parent_ids: HashSet<_> = parent_posting.iter().map(|p| p.id()).collect();
         assert_eq!(parent_ids, HashSet::from([c]));
     }
@@ -569,7 +574,8 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let root_ids: HashSet<_> = root.iter().map(|p| p.id()).collect();
         assert_eq!(root_ids, HashSet::from([L2_CENTROID_A, L2_CENTROID_B]));
         assert_eq!(ROOT_LEVEL, 0xFF);

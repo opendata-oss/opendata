@@ -327,7 +327,8 @@ with future schema changes that may require sub-type discrimination.
 - `Utf8`: `len: u16` followed by `len` bytes of UTF-8 payload.
 - `Vector<D>`: `D` elements of `f32`, where `D` is the dimensionality stored in collection metadata.
   Total size is `D * 4` bytes.
-- `Array<T>`: `count: u16` followed by `count` serialized elements of type `T`.
+- `Array<S=u16,T>`: `count: S` followed by `count` serialized elements of type `T`. Arrays that 
+  use the default count size `u16` are written as `Array<T>`.
 - `FixedElementArray<T>`: Serialized elements back-to-back with no count prefix;
 - `RoaringTreemap`: Roaring treemap serialization format for compressed u64 integer sets (64-bit
   extension of Roaring bitmap).
@@ -443,29 +444,32 @@ their vectors evaluated.
 ┌────────────────────────────────────────────────────────────────┐
 │                     PostingListValue                           │
 ├────────────────────────────────────────────────────────────────┤
-│  postings: FixedElementArray<Posting>                          │
+│  postings: Array<u32, Posting>                                 │
+│  data: FixedElementArray<f32>                                  │
 │                                                                │
 │  Posting                                                       │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  type:        u8 (0x0 => Append, 0x1 => Delete)          │  │
 |  |  id:          u64                                        │  │
-│  │  vector:      FixedElementArray<f32>                     │  │
-│  │               (dimensions elements)                      │  │
+│  │  offset:      u32 (0xFFFFFFFF | offset in data)          │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 **Structure:**
 
-- The value is a simple array of mutations to the posting. The mutations are ordered by vector id.
-- Each entry specifies a mutation type. 0x0 indicates the vector is added, 0x1 indicates its deleted.
+- The postings field is an array of mutations to the posting. The mutations are ordered by 
+  vector id.
+- Each entry specifies either addition or deletion of a vector. The distinction is made by the 
+  value of the offset field. If its set to `u32::MAX` (`0xFFFFFFFF`) then the entry represents a
+  delete. Otherwise, the entry represents addition and the value indicates the position of the 
+  vector in he dta field.
 - Posting lists are balanced by the hierarchical clustering algorithm (target size configurable,
   e.g., 50-150 vectors)
 - It's expected that posting lists will be relatively small. Our evaluation of SPFresh has found
   that it is optimal to maintain one centroid for ~100 vectors. We also expect Vector to have a
-  high ingestion rate and modest query rate. So we optimize for a structure that can be
-  efficiently updated. The small size means that it should be relatively cheap to intersect with
-  the inverted index at query time.
+  high ingestion rate and modest query rate. For query, deserializing posting lists is a hotspot. 
+  So we optimize for a structure that can be efficiently updated. At query time, we can access the
+  vector data from the raw bytes.
 
 **Merge Operators:**
 

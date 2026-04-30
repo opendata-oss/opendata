@@ -283,7 +283,7 @@ impl QueryEngine {
             let q = query_vec.clone();
             handles.push(tokio::spawn(async move {
                 let posting_list =
-                    PostingList::from_value(snap.get_posting_list(cid, dimensions).await?);
+                    PostingList::from_value(snap.get_posting_list(cid, dimensions).await?, false);
                 let mut scored: Vec<ScoredCandidate> = posting_list
                     .iter()
                     .map(|posting| {
@@ -580,10 +580,10 @@ mod tests {
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
         let all_centroids = vec![
-            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
-            Posting::new(data_id(2), vec![1.4, 0.0, 0.0]),
-            Posting::new(data_id(3), vec![2.0, 0.0, 0.0]),
-            Posting::new(data_id(4), vec![5.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(1), vec![1.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(2), vec![1.4, 0.0, 0.0]),
+            Posting::from_vec(data_id(3), vec![2.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(4), vec![5.0, 0.0, 0.0]),
         ];
 
         // when
@@ -610,8 +610,8 @@ mod tests {
         let query = [0.0, 0.0, 0.0];
         let engine = db.query_engine();
         let all_centroids = vec![
-            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
-            Posting::new(data_id(2), vec![100.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(1), vec![1.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(2), vec![100.0, 0.0, 0.0]),
         ];
 
         // when
@@ -644,9 +644,9 @@ mod tests {
         let engine = db.query_engine();
         // pass centroids in reverse distance order: far, medium, close
         let ids = vec![
-            Posting::new(data_id(1), vec![5.0, 0.0, 0.0]),
-            Posting::new(data_id(3), vec![3.0, 0.0, 0.0]),
-            Posting::new(data_id(2), vec![1.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(1), vec![5.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(3), vec![3.0, 0.0, 0.0]),
+            Posting::from_vec(data_id(2), vec![1.0, 0.0, 0.0]),
         ];
 
         // when
