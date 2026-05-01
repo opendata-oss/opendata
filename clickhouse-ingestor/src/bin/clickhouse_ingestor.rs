@@ -118,11 +118,12 @@ async fn main() -> Result<()> {
         signal_shutdown.cancel();
     });
 
-    let metrics_addr: SocketAddr = cfg
-        .metrics_server
-        .bind_addr
-        .parse()
-        .with_context(|| format!("parsing metrics_server.bind_addr={}", cfg.metrics_server.bind_addr))?;
+    let metrics_addr: SocketAddr = cfg.metrics_server.bind_addr.parse().with_context(|| {
+        format!(
+            "parsing metrics_server.bind_addr={}",
+            cfg.metrics_server.bind_addr
+        )
+    })?;
     let metrics_shutdown = shutdown.clone();
     let metrics_task = tokio::spawn(async move {
         if let Err(e) = metrics_server::serve(metrics_handle, metrics_addr, metrics_shutdown).await

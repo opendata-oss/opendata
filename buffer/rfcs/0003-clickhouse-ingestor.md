@@ -545,11 +545,17 @@ takes priority over the data hash.
 The format is:
 
 ```text
-{manifest_path}:{low_sequence}-{high_sequence}:{adapter_version}:{chunking_fingerprint}:{chunk_index}
+{manifest_path}:{database}.{table}:{low_sequence}-{high_sequence}:{adapter_version}:{chunking_fingerprint}:{chunk_index}
 ```
 
 Where:
 
+- `manifest_path` identifies the Buffer stream. It prevents two
+  manifests writing to the same ClickHouse target from sharing a token
+  namespace.
+- `database.table` identifies the ClickHouse target. It prevents two
+  adapters writing different targets from the same manifest from sharing
+  a token namespace.
 - `low_sequence` / `high_sequence` come from the commit group's
   absorbed sequence range.
 - `adapter_version` is the same `_adapter_version` value the adapter
@@ -756,7 +762,7 @@ Two layers of dedupe, with deliberately different roles:
 
 2. **Backstop: ClickHouse `insert_deduplication_token`.**
    Set per chunk to
-   `"{manifest_path}:{low_sequence}-{high_sequence}:{adapter_version}:{chunking_fingerprint}:{chunk_index}"`
+   `"{manifest_path}:{database}.{table}:{low_sequence}-{high_sequence}:{adapter_version}:{chunking_fingerprint}:{chunk_index}"`
    (see "Idempotency Token Format" above for the full definition).
    Drops a re-sent identical insert within ClickHouse's deduplication
    window. Useful for tight crash-restart loops where the same chunk
@@ -881,45 +887,48 @@ That split is explicitly post-alpha.
 
 ### Configuration
 
-Configuration is layered: a TOML file mounted as a `ConfigMap`, with
+Configuration is layered: a YAML file mounted as a `ConfigMap`, with
 `INGESTOR__` env vars overriding individual keys (Figment-style).
 
-```toml
-[buffer]
-manifest_path  = "ingest/otel/logs/manifest"
-data_prefix    = "ingest/otel/logs/data"
+```yaml
+buffer:
+  manifest_path: ingest/otel/logs/manifest
+  data_prefix: ingest/otel/logs/data
+  object_store:
+    type: Aws
+    bucket: responsive-prod-opendata-otel-logs-us-west-2
+    region: us-west-2
 
-[buffer.object_store]
-type   = "s3"
-bucket = "responsive-prod-opendata-otel-logs-us-west-2"
-region = "us-west-2"
+clickhouse:
+  endpoint: https://...clickhouse.cloud:8443
+  database: responsive
+  table: logs
+  insert_quorum: auto
+  # user/password come from env via Secret
 
-[clickhouse]
-endpoint      = "https://...clickhouse.cloud:8443"
-database      = "responsive"
-table         = "logs"
-insert_quorum = "auto"
-# user/password come from env via Secret
+runtime:
+  dry_run: true
+  poll_interval_ms: 250
+  retry_max_attempts: 6
+  retry_initial_backoff_ms: 100
+  request_timeout_secs: 30
 
-[runtime]
-dry_run                  = true
-poll_interval_ms         = 250
-retry_max_attempts       = 6
-retry_initial_backoff_ms = 100
+commit_group:
+  max_rows: 100000
+  max_bytes: 33554432
+  max_age_ms: 1000
 
-[commit_group]
-max_rows                 = 100000
-max_bytes                = 33554432  # 32 MiB
-max_age_ms               = 1000
+ack:
+  policy: every_commit_group
 
-[ack]
-# "every_commit_group" (default) | "every_n=N"
-flush_policy = "every_commit_group"
+adapter:
+  adapter_version: 1
+  max_chunk_rows: 100000
+  max_chunk_bytes: 33554432
+  apply_deduplication_token: true
 
-[adapter]
-adapter_version  = 1
-bootstrap_table  = false
-max_chunk_rows   = 100000
+metrics_server:
+  bind_addr: 0.0.0.0:9090
 ```
 
 `dry_run = true` runs the full pipeline including decode and adapter,
@@ -953,31 +962,31 @@ Prometheus metrics, scraped by the existing OTel collector:
 - `commit_groups_total` — counter of commit groups flushed.
 - `rows_planned_total` — counter of rows produced by the adapter.
 - `rows_inserted_total` — counter of rows acknowledged by ClickHouse.
-- `insert_chunks_total{result}` — labeled by `success` /
-  `retryable_failure` / `non_retryable_failure`.
+- `insert_chunks_total{result}` — labeled by `success` / `failure`.
 - `insert_latency_seconds` — histogram, per chunk.
 - `commit_group_size_rows` / `commit_group_size_bytes` — histograms.
 - `ack_flush_latency_seconds` — histogram, time from `ack` call to
   `flush` completion.
-- `retry_count_total{reason}` — counter, labeled by retry reason.
+- `retry_count_total{reason}` — counter. The alpha labels retryable
+  attempts as `reason="retryable"`.
 - `last_decoded_sequence` — gauge. Advances even in dry-run.
 - `last_acked_sequence` — gauge. Advances only when not in dry-run.
-- `current_lag_sequences` — gauge, head minus `last_decoded_sequence`.
-  Bounded under healthy operation, including dry-run.
+- `current_lag_sequences` — deferred. The runtime does not currently
+  observe the manifest head sequence, so emitting a gauge now would be
+  misleading. Add this once the buffer crate exposes a read-only
+  head-sequence peek.
 - `time_since_last_successful_ack_seconds` — gauge. Primary alerting
   signal in non-dry-run mode.
 - `decode_failures_total{stage}` — labeled by `envelope` / `signal` /
   `adapter`.
-- `clickhouse_failures_total{classification}` — labeled by
-  `retryable_5xx` / `network` / `timeout` / `rate_limit_429` /
-  `non_retryable`.
+- `clickhouse_failures_total{classification}` — labeled by writer error
+  class (`Retryable` / `NonRetryable`) in the alpha.
 
 `last_decoded_sequence` and `last_acked_sequence` are tracked
 separately so dry-run is observable: in dry-run the decoded gauge
-advances and the acked gauge stays still by design, and
-`current_lag_sequences` measures the runtime's progress through Buffer
-regardless of whether acks are happening. `time_since_last_successful_ack_seconds`
-is meaningful only outside dry-run.
+advances and the acked gauge stays still by design.
+`time_since_last_successful_ack_seconds` is meaningful only outside
+dry-run.
 
 ### Failure Modes
 
@@ -1036,22 +1045,22 @@ seam is not where the complexity lives anyway.
 
 ## Open Questions
 
-- ORDER BY shape for the logs table. The hybrid default
-  `(toDate(Timestamp), ServiceName, _odb_*)` is a working assumption.
-  Phase 3 benchmarks decide whether the alpha ships this shape, an
-  alternative ordering, or a raw landing table plus a query-optimized
-  materialized view. Measurements get folded back into this RFC at
-  Phase 6.
+- ORDER BY shape for the logs table. Alpha shipped the hybrid default
+  `(toDate(Timestamp), ServiceName, _odb_*)`. Production-scale
+  benchmarks remain post-alpha validation and may motivate a new table
+  plus backfill if query patterns demand a different key.
 - Production retention policy for the logs table (the 30-day TTL above
   is a placeholder).
 - Concrete log volume cap for alpha (controller logs only is the
   scope; the byte/record-per-second bound is informed by Phase 1c
   throughput).
-- Whether to keep `bootstrap_table` as a binary feature once the table
-  shape stabilizes, or to commit fully to out-of-band DDL.
+- Whether to add binary-owned schema bootstrap/migration support, or to
+  commit fully to out-of-band DDL. Alpha applied the generated DDL
+  manually in ClickHouse Cloud.
 - Whether the adapter's row format should be `JSONEachRow` for
   development clarity or `RowBinaryWithNamesAndTypes` for throughput.
-  Decide during Phase 3 with measurement.
+  Alpha uses `JSONEachRow`; revisit with measurement if throughput or
+  CPU cost makes serialization material.
 - Whether to introduce a ClickHouse-side checkpoint table that records
   `(manifest_path, last_sequence)` so a fully-empty Buffer can still
   resume. For the alpha this is unnecessary because Buffer keeps
@@ -1070,13 +1079,15 @@ seam is not where the complexity lives anyway.
 - A `FINAL` query over a 5-minute window matches Datadog's count for the
   same window within a documented drift tolerance.
 - The ingestor can be paused (scale to 0) and resumed without data loss.
-- Replaying from an earlier `last_acked_sequence` produces no duplicate
-  rows under `FINAL` queries.
+- Re-inserting an already processed Buffer sequence range produces no
+  duplicate rows under `FINAL` queries. Operator-directed replay from an
+  arbitrary sequence remains post-alpha tooling.
 - Failure injection (block ClickHouse for several minutes) shows expected
   behavior: lag grows, ack age climbs, no data loss, recovery on its own.
 - Heracles-prod deployment is observable via Prometheus and the runbook
   is sufficient for an on-caller other than the author to pause, resume,
-  inspect, or replay.
+  and inspect the system. Replay-from-sequence is documented as a
+  post-alpha gap.
 - This RFC reflects what was actually shipped.
 
 ## Updates
@@ -1089,4 +1100,5 @@ seam is not where the complexity lives anyway.
 | 2026-04-28 | Ack the contiguous range `low..=high` per commit group, not just the high-watermark; clarified normal startup is `Consumer::new(config, None)` (durable Buffer state), not in-process state. |
 | 2026-04-29 | Phase 1a shipped: `opendataexporter` v0.4.0 published with OTLP logs signal support (signal_type=2). Phase 1b Part 2 shipped: Sindri prod collector running v0.4.0 image with both `opendata` (metrics) and `opendata/logs` exporters registered; logs bucket `responsive-prod-opendata-otel-logs-us-west-2` provisioned and idle pending Phase 1c source wiring. No design changes — the source/sink architecture, deployment model, and config shape (incl. bucket name in Configuration §) all matched the RFC as written. |
 | 2026-04-29 | Phase 1c shipped: Fluent Bit `forward` output (scoped via two-stage `rewrite_tag` to namespace=responsive + container=controller, `keep=true` so Datadog still receives originals) → OTel collector `fluentforwardreceiver` on port 8006 → batch → opendata/logs exporter. Collector image `:a05d291` adds `fluentforwardreceiver` to the OCB build alongside otlpreceiver. Datadog path unaffected. Worth folding into the RFC's "Logs Alpha Adapter" or a new "Source-side wiring" subsection: aws-for-fluent-bit:stable bundles Fluent Bit 1.9.10, whose opentelemetry output is metrics-only — `forward` is the working source-side primitive on this version. Records currently land with kubernetes metadata in `attributes["kubernetes"]` rather than canonical OTLP `resource.attributes["k8s.*"]`, and severity is unset. A `transform` processor on the collector to promote those is Phase 5 polish, not a design change. |
-| 2026-04-29 | Phase 4 shipped: Heracles ingestor pod `prod-clickhouse-ingestor` Running on the heracles EKS cluster with `dry_run = true`. Image `ghcr.io/opendata-oss/clickhouse-ingestor:ch-integration-odb-clickhouse-ingestor-59c0364`. Dedicated IRSA role (`heracles-clickhouse-ingestor-service-account-role`) with tight scoping: `GetObject` on the data prefix, `GetObject`/`PutObject`/`DeleteObject` on the manifest, `ListBucket` prefix-scoped to `ingest/otel/logs/*` plus the manifest. Two gate criteria deferred for Phase 5 polish: (a) the binary doesn't yet expose a Prometheus HTTP scrape endpoint — metrics exist in-process but aren't visible to operators; (b) per-batch decode/adapter activity isn't logged at INFO level, so the only observable evidence of Consumer activity is the manifest's epoch fence on startup. Both are small follow-ups, not RFC changes. |
+| 2026-04-29 | Phase 4 shipped: Heracles ingestor pod `prod-clickhouse-ingestor` Running on the heracles EKS cluster with `dry_run = true`. Image `ghcr.io/opendata-oss/clickhouse-ingestor:ch-integration-odb-clickhouse-ingestor-59c0364`. Dedicated IRSA role (`heracles-clickhouse-ingestor-service-account-role`) with tight scoping: `GetObject` on the data prefix, `GetObject`/`PutObject`/`DeleteObject` on the manifest, `ListBucket` prefix-scoped to `ingest/otel/logs/*` plus the manifest. Prometheus scrape endpoint and per-batch INFO logging were identified as Phase 5 polish items. |
+| 2026-04-30 | Phase 5 alpha shipped live: metrics server added (`/metrics`, `/-/healthy`), central OTel collector scrapes the ingestor, ClickHouse Cloud endpoint configured, `dry_run=false` rollout resumed from the earliest unacked sequence, drained sequences 0..97 into `responsive.logs`, and rows planned/inserted/queried matched 245 with zero decode/ClickHouse/retry failures. RFC reconciled with implementation details learned during review: manifest+table idempotency token namespace, YAML config, no emitted `current_lag_sequences` until Buffer exposes a head-sequence peek, manual alpha DDL application, and ORDER BY benchmark moved to post-alpha validation. |

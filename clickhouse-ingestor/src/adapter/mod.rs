@@ -3,7 +3,7 @@
 //! Adapters consume a drained [`CommitGroupBatch`] and produce a
 //! deterministic sequence of [`InsertChunk`]s. Each chunk carries a
 //! per-chunk idempotency token of the form
-//! `{manifest}:{low}-{high}:{adapter_version}:{chunking_fingerprint}:{chunk_index}`,
+//! `{manifest}:{database}.{table}:{low}-{high}:{adapter_version}:{chunking_fingerprint}:{chunk_index}`,
 //! so a replay of the same Buffer sequence range under the same
 //! configuration produces identical tokens (and therefore deduplicates
 //! cleanly at the table level).
