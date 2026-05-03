@@ -155,6 +155,7 @@ mod tests {
             distance_metric: DistanceMetric::L2,
             query_pruning_factor: None,
             metadata_fields: vec![],
+            tracing: Default::default(),
         };
         let reader = VectorDbReader::open(reader_config).await.unwrap();
         let results = reader

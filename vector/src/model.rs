@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use common::StorageConfig;
+use common::{StorageConfig, TracingConfig};
 use serde::{Deserialize, Serialize};
 
 // Re-export types from serde layer
@@ -245,6 +245,15 @@ pub struct Config {
     /// attribute names or type mismatches will fail. If empty, any attribute
     /// names are accepted with types inferred from the first write.
     pub metadata_fields: Vec<MetadataFieldSpec>,
+
+    /// Tracing / query profiling configuration.
+    ///
+    /// When `output_dir` is set, per-operation timing spans (e.g.
+    /// `search_with_options` and its sub-steps) are written to a Chrome
+    /// Trace Format JSON file for later analysis in Perfetto. See
+    /// `common::tracing` for details.
+    #[serde(default)]
+    pub tracing: TracingConfig,
 }
 
 impl Default for Config {
@@ -263,6 +272,7 @@ impl Default for Config {
             chunk_target: 4096,
             query_pruning_factor: None,
             metadata_fields: Vec::new(),
+            tracing: TracingConfig::default(),
         }
     }
 }
@@ -293,6 +303,10 @@ pub struct ReaderConfig {
 
     /// Metadata field schema.
     pub metadata_fields: Vec<MetadataFieldSpec>,
+
+    /// Tracing / query profiling configuration. See [`Config::tracing`].
+    #[serde(default)]
+    pub tracing: TracingConfig,
 }
 
 /// Metadata field specification for schema definition.
