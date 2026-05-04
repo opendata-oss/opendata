@@ -214,4 +214,86 @@ mod tests {
             .unwrap();
         assert_eq!(delta.estimate_size(), 3);
     }
+
+    #[test]
+    fn delta_should_record_deletes_in_frozen_view() {
+        let mut delta = VectorDbWriteDelta::init(());
+
+        delta
+            .apply(VectorDbWrite::Delete(vec![
+                "v1".to_string(),
+                "v2".to_string(),
+            ]))
+            .unwrap();
+        delta
+            .apply(VectorDbWrite::Delete(vec!["v3".to_string()]))
+            .unwrap();
+
+        let (_frozen, frozen_view, _ctx) = delta.freeze();
+        assert_eq!(frozen_view.writes.len(), 0);
+        assert_eq!(frozen_view.deletes, vec!["v1", "v2", "v3"]);
+    }
+
+    #[test]
+    fn delta_should_record_writes_and_deletes_mixed() {
+        let mut delta = VectorDbWriteDelta::init(());
+
+        // Interleave writes and deletes; the frozen view should preserve each
+        // collection's insertion order, regardless of how the calls are mixed.
+        delta
+            .apply(VectorDbWrite::Write(vec![
+                make_write("v1", vec![1.0, 0.0, 0.0]),
+                make_write("v2", vec![0.0, 1.0, 0.0]),
+            ]))
+            .unwrap();
+        delta
+            .apply(VectorDbWrite::Delete(vec!["d1".to_string()]))
+            .unwrap();
+        delta
+            .apply(VectorDbWrite::Write(vec![make_write(
+                "v3",
+                vec![0.0, 0.0, 1.0],
+            )]))
+            .unwrap();
+        delta
+            .apply(VectorDbWrite::Delete(vec![
+                "d2".to_string(),
+                "d3".to_string(),
+            ]))
+            .unwrap();
+
+        let (_frozen, frozen_view, _ctx) = delta.freeze();
+        assert_eq!(frozen_view.writes.len(), 3);
+        assert_write(&frozen_view.writes[0], "v1", &[1.0, 0.0, 0.0]);
+        assert_write(&frozen_view.writes[1], "v2", &[0.0, 1.0, 0.0]);
+        assert_write(&frozen_view.writes[2], "v3", &[0.0, 0.0, 1.0]);
+        assert_eq!(frozen_view.deletes, vec!["d1", "d2", "d3"]);
+    }
+
+    #[test]
+    fn delta_estimate_size_should_include_deletes() {
+        let mut delta = VectorDbWriteDelta::init(());
+        assert_eq!(delta.estimate_size(), 0);
+
+        delta
+            .apply(VectorDbWrite::Delete(vec!["d1".to_string()]))
+            .unwrap();
+        assert_eq!(delta.estimate_size(), 1);
+
+        delta
+            .apply(VectorDbWrite::Write(vec![make_write(
+                "v1",
+                vec![1.0, 0.0, 0.0],
+            )]))
+            .unwrap();
+        assert_eq!(delta.estimate_size(), 2);
+
+        delta
+            .apply(VectorDbWrite::Delete(vec![
+                "d2".to_string(),
+                "d3".to_string(),
+            ]))
+            .unwrap();
+        assert_eq!(delta.estimate_size(), 4);
+    }
 }
