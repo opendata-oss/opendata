@@ -313,7 +313,10 @@ mod tests {
     }
 
     fn make_frozen(writes: Vec<VectorWrite>) -> Arc<VectorDbDeltaView> {
-        Arc::new(VectorDbDeltaView { writes })
+        Arc::new(VectorDbDeltaView {
+            writes,
+            deletes: Vec::new(),
+        })
     }
 
     #[tokio::test]

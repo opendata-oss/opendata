@@ -6,6 +6,7 @@ use tracing::debug;
 
 pub(crate) enum VectorDbWrite {
     Write(Vec<VectorWrite>),
+    Delete(Vec<String>),
 }
 
 /// A vector write ready for the coordinator.
@@ -50,20 +51,24 @@ impl Delta for VectorDbWriteDelta {
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         match write {
             VectorDbWrite::Write(writes) => self.apply_write(writes),
+            VectorDbWrite::Delete(ids) => self.apply_delete(ids),
         }
     }
 
     fn estimate_size(&self) -> usize {
         let view = self.view.read().expect("lock poisoned");
-        // view.writes.len() * self.context.opts.dimensions * 4
-        view.writes.len()
+        view.writes.len() + view.deletes.len()
     }
 
     fn freeze(self) -> (Self::Frozen, Self::FrozenView, Self::Context) {
         let frozen = Arc::new(VectorDbDeltaView::clone(
             &self.view.read().expect("lock poisoned"),
         ));
-        debug!("freezing delta view with {} writes", frozen.writes.len());
+        debug!(
+            "freezing delta view with {} writes and {} deletes",
+            frozen.writes.len(),
+            frozen.deletes.len()
+        );
         let frozen_view = frozen.clone();
         (frozen, frozen_view, ())
     }
@@ -79,7 +84,17 @@ impl VectorDbWriteDelta {
         vector_writes: Vec<VectorWrite>,
     ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let mut view = self.view.write().expect("lock poisoned");
-        view.apply(vector_writes);
+        view.apply_writes(vector_writes);
+        drop(view);
+        Ok(Arc::new(()))
+    }
+
+    fn apply_delete(
+        &mut self,
+        ids: Vec<String>,
+    ) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+        let mut view = self.view.write().expect("lock poisoned");
+        view.apply_deletes(ids);
         drop(view);
         Ok(Arc::new(()))
     }
@@ -88,15 +103,23 @@ impl VectorDbWriteDelta {
 #[derive(Clone)]
 pub(crate) struct VectorDbDeltaView {
     pub(crate) writes: Vec<VectorWrite>,
+    pub(crate) deletes: Vec<String>,
 }
 
 impl VectorDbDeltaView {
     fn new() -> Self {
-        Self { writes: Vec::new() }
+        Self {
+            writes: Vec::new(),
+            deletes: Vec::new(),
+        }
     }
 
-    fn apply(&mut self, writes: Vec<VectorWrite>) {
+    fn apply_writes(&mut self, writes: Vec<VectorWrite>) {
         self.writes.extend(writes);
+    }
+
+    fn apply_deletes(&mut self, ids: Vec<String>) {
+        self.deletes.extend(ids);
     }
 }
 
