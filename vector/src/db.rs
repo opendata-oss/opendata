@@ -708,6 +708,46 @@ impl VectorDb {
         Ok(())
     }
 
+    /// Delete vectors by external ID.
+    ///
+    /// Removes the specified vectors from the database. Deleted vectors will
+    /// no longer appear in search results or `get` lookups.
+    ///
+    /// # Atomicity
+    ///
+    /// This operation is atomic: either all deletions in the batch are
+    /// accepted, or none are.
+    ///
+    /// # Idempotency
+    ///
+    /// Deleting an external ID that does not exist is not an error. Duplicate
+    /// IDs within a single call are silently deduplicated.
+    ///
+    /// # Validation
+    ///
+    /// External IDs must be at most 64 bytes UTF-8. Oversized IDs cause the
+    /// entire call to be rejected with `Error::InvalidInput` before any work
+    /// is queued.
+    pub async fn delete<I, S>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut collected: Vec<String> = Vec::new();
+        for id in ids {
+            let id: String = id.into();
+            if id.len() > 64 {
+                return Err(Error::InvalidInput(format!(
+                    "External ID too long: {} bytes (max 64)",
+                    id.len()
+                )));
+            }
+            collected.push(id);
+        }
+
+        unimplemented!("VectorDb::delete will be wired to the coordinator in Phase 3")
+    }
+
     /// Force flush all pending data to durable storage.
     ///
     /// Flushes the in-memory delta to the storage memtable, then persists
