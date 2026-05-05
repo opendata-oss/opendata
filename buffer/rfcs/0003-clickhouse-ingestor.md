@@ -1063,6 +1063,142 @@ never threads in-process state across the restart.
 Credentials live only in environment variables sourced from K8s
 `Secret`s. They are never in the ConfigMap.
 
+### Future: Config-Driven Multi-Source Ingestors
+
+The alpha configuration is intentionally single-source:
+
+```text
+one Buffer manifest -> one configured signal decoder -> one adapter -> one ClickHouse table
+```
+
+That is the smallest shape that proves the runtime, ack semantics, and
+dedupe model. The same foundation can grow into a configurable
+ClickHouse ingestor that hosts many independent source pipelines in one
+process.
+
+The future configuration shape should make sources first-class:
+
+```yaml
+clickhouse:
+  endpoint: https://...clickhouse.cloud:8443
+  # user/password still come from env via Secret
+  writer_pool:
+    max_in_flight_inserts: 4
+
+sources:
+  - name: responsive_controller_logs
+    buffer:
+      manifest_path: ingest/otel/logs/manifest
+      data_prefix: ingest/otel/logs/data
+      object_store:
+        type: Aws
+        bucket: responsive-prod-opendata-otel-logs-us-west-2
+        region: us-west-2
+    envelope:
+      version: 1
+      signal_type: logs
+      encoding: otlp_protobuf
+    decoder: otlp_logs
+    adapter: otlp_logs
+    target:
+      database: responsive
+      table: logs
+    adapter_config:
+      adapter_version: 1
+      max_chunk_rows: 100000
+      max_chunk_bytes: 33554432
+      apply_deduplication_token: true
+    commit_group:
+      max_rows: 100000
+      max_bytes: 33554432
+      max_age_ms: 1000
+    ack:
+      policy: every_commit_group
+
+  - name: another_logs_stream
+    buffer:
+      manifest_path: ingest/otel/another-logs/manifest
+      data_prefix: ingest/otel/another-logs/data
+      object_store_ref: shared_logs_bucket
+    envelope:
+      version: 1
+      signal_type: logs
+      encoding: otlp_protobuf
+    decoder: otlp_logs
+    adapter: otlp_logs
+    target:
+      database: responsive
+      table: another_logs
+```
+
+Operationally, a multi-source process is a set of independent pipelines:
+
+- Each source gets its own `buffer::Consumer`, `CommitGroup`, adapter
+  instance, and `AckController`.
+- A source's ack high-watermark is independent of every other source.
+  A failure in one source must not advance another source's Buffer ack.
+- Sources may share a `ClickHouseWriter` / connection pool, but the
+  writer must apply per-source backpressure so one hot stream does not
+  starve lower-volume streams.
+- Metrics are labeled by `source`, `signal`, `database`, and `table`.
+- The process health model should distinguish "one source failing" from
+  "the whole ingestor is unhealthy." For example, readiness can fail if
+  any required source is stopped, while optional sources can surface as
+  degraded metrics/alerts.
+
+This is config-driven selection of compiled adapters, not arbitrary
+schema-by-config. The initial registry is a small mapping:
+
+```text
+(signal_type=logs, encoding=otlp_protobuf, adapter=otlp_logs)
+  -> OtlpLogsDecoder + OtlpLogsClickHouseAdapter
+```
+
+Adding a new signal means adding a decoder and adapter implementation,
+then exposing them through the registry. A later schema-management
+project can make field mappings or generated DDL configurable, but that
+is separate from making source pipelines configurable.
+
+There is one important dedupe constraint for multiple sources. The
+alpha table's `ORDER BY` uses
+`(toDate(Timestamp), ServiceName, _odb_sequence, _odb_entry_index,
+_odb_record_index)` because only one Buffer manifest writes to the
+table. If two manifests can write to the same ClickHouse table, the
+source identity is not unique unless the table key includes the
+manifest identity too. A future config validator must enforce one of
+these policies:
+
+- **One manifest per table.** Multiple sources are allowed in one
+  process, but each source writes to its own ClickHouse table.
+- **Shared table with manifest in the dedupe key.** If multiple source
+  manifests write to the same table, the table schema must include
+  `_odb_manifest_path` in the `ORDER BY` tuple, e.g.
+  `(toDate(Timestamp), ServiceName, _odb_manifest_path,
+  _odb_sequence, _odb_entry_index, _odb_record_index)`.
+
+The idempotency token already includes `manifest_path`, so insert-token
+namespaces are safe across sources. The table-level key must be made
+equally safe when tables are shared.
+
+Incremental path:
+
+1. Normalize the current alpha config into a single-element `sources`
+   list without changing behavior.
+2. Add a source registry and run N independent source tasks in one
+   process, sharing only the ClickHouse writer pool and metrics server.
+3. Add config validation that rejects unsafe shared-table layouts unless
+   the table's dedupe key includes `_odb_manifest_path`.
+4. Add per-source health, per-source backpressure, and runbook support
+   for pausing/resuming one source without restarting the whole process.
+5. Only after that, consider richer adapter configuration or
+   binary-owned DDL/schema validation.
+
+This future work still does **not** imply multi-table fanout from one
+Buffer manifest. Buffer currently has one active consumer per manifest;
+fanout from a single manifest would require explicit Buffer consumer
+group semantics or separate producer manifests. Until that exists, the
+safe scaling unit is "many manifests, many independent source tasks."
+
 ### Operational Metrics
 
 Prometheus metrics, scraped by the existing OTel collector:
@@ -1128,7 +1264,7 @@ into a ClickHouse table. Rejected because:
 - The Buffer manifest is the source of truth for ordering and ack.
   `S3Queue` has its own coordination model.
 - We would lose the layered runtime/decoder/adapter design that makes
-  this work reusable for sinks other than ClickHouse.
+  this work reusable for future signals into ClickHouse.
 
 ### Build a Custom ClickHouse Table Engine
 
@@ -1145,12 +1281,79 @@ durability and ordering guarantees, and because shipping logs to multiple
 sinks (ClickHouse plus future ones) is materially easier when Buffer is
 the fan-out point.
 
+### Copy the ClickHouse Kafka Sink Connector Exactly-Once Design
+
+The [ClickHouse Kafka sink connector][clickhouse-kafka-sink] has an
+exactly-once mode for Kafka Connect. Its [design document][kafka-design]
+uses three ingredients:
+
+1. Kafka Connect provides at-least-once delivery and does not commit
+   source offsets past a `put()` call that has not completed.
+2. The connector stores per-topic/partition state in ClickHouse
+   `KeeperMap`: the previous Kafka offset range plus whether that range
+   is `BEFORE_PROCESSING` or `AFTER_PROCESSING`.
+3. Retries are shaped to reproduce identical ClickHouse inserts for the
+   same topic/partition offset range. The connector sets
+   `insert_deduplication_token` from
+   `{topic}-{partition}-{minOffset}-{maxOffset}` and relies on
+   ClickHouse insert deduplication to suppress duplicate insert blocks
+   inside the deduplication window.
+
+The state machine handles new, same, overlapping, and contained Kafka
+offset ranges. If the previous state is `AFTER_PROCESSING`, an
+overlapping retry can skip the already-inserted prefix and insert only
+the new suffix. If the previous state is `BEFORE_PROCESSING`, the
+connector may reinsert the same range and depend on ClickHouse insert
+dedupe. It also disables internal buffering in exactly-once mode because
+buffering changes batch boundaries, which breaks the identical-block
+dedupe assumption.
+
+That design is a good fit for Kafka because Kafka offsets are the source
+identity and Kafka Connect controls offset commits. It is not the right
+fit for ODB:
+
+- Buffer already has its own durable checkpoint: `ack` + `flush` on the
+  manifest. Adding KeeperMap would introduce a second checkpoint store
+  that must be kept consistent with Buffer.
+- The Kafka connector's dedupe is bounded by ClickHouse's insert
+  deduplication window. If an insert succeeds, the connector crashes
+  before `AFTER_PROCESSING`, and the same Kafka range is retried after
+  the dedupe window expires, a plain MergeTree target can admit duplicate
+  rows. Our design uses insert tokens for the same best-case fast path,
+  but makes long-window replay correctness depend on the table's
+  source-coordinate `ReplacingMergeTree` key.
+- The Kafka connector must reconstruct previous insert block boundaries
+  to make ClickHouse's block-level dedupe work. Our runtime deliberately
+  decouples Buffer ack ranges from ClickHouse chunk boundaries: a commit
+  group can coalesce multiple Buffer sequences and split them into
+  deterministic chunks, with `chunk_index` and `chunking_fingerprint`
+  preserving token safety.
+- Kafka's source identity is `(topic, partition, offset)`. ODB's source
+  identity for rows is `(manifest_path, sequence, entry_index,
+  record_index)`, and `record_index` is decoder-owned because one Buffer
+  entry can decode to multiple logical rows.
+- The Kafka design optimizes for duplicate-free plain reads when the
+  insert dedupe window catches the retry. We get the same behavior in
+  that best case. The difference is that ODB keeps a table-level backstop
+  for explicit replay, changed chunking config, or retry outside the
+  insert dedupe window, at the cost of eventual dedupe unless readers use
+  `FINAL` or query-time dedupe before merges run.
+
+So the ODB design borrows the useful part — deterministic insert tokens
+for tight retries — but does not copy the Kafka connector's KeeperMap
+state machine. Buffer ack remains the source checkpoint, and
+`ReplacingMergeTree(_adapter_version)` remains the long-term dedupe
+mechanism.
+
 ### Per-Signal Binaries Without a Generic Runtime
 
 We could write a logs-specific binary now and worry about reuse later.
 Rejected because the runtime is the *point* — the work to factor it out
 afterward is much larger than getting the seam right up front, and the
 seam is not where the complexity lives anyway.
+
+[clickhouse-kafka-sink]: https://clickhouse.com/docs/integrations/kafka/clickhouse-kafka-connect-sink
+[kafka-design]: https://github.com/ClickHouse/clickhouse-kafka-connect/blob/a96f3341cb5a707a4c999dbac37725caeeaebbf1/docs/DESIGN.md
 
 ## Open Questions
 
@@ -1211,3 +1414,4 @@ seam is not where the complexity lives anyway.
 | 2026-04-29 | Phase 1c shipped: Fluent Bit `forward` output (scoped via two-stage `rewrite_tag` to namespace=responsive + container=controller, `keep=true` so Datadog still receives originals) → OTel collector `fluentforwardreceiver` on port 8006 → batch → opendata/logs exporter. Collector image `:a05d291` adds `fluentforwardreceiver` to the OCB build alongside otlpreceiver. Datadog path unaffected. Worth folding into the RFC's "Logs Alpha Adapter" or a new "Source-side wiring" subsection: aws-for-fluent-bit:stable bundles Fluent Bit 1.9.10, whose opentelemetry output is metrics-only — `forward` is the working source-side primitive on this version. Records currently land with kubernetes metadata in `attributes["kubernetes"]` rather than canonical OTLP `resource.attributes["k8s.*"]`, and severity is unset. A `transform` processor on the collector to promote those is Phase 5 polish, not a design change. |
 | 2026-04-29 | Phase 4 shipped: Heracles ingestor pod `prod-clickhouse-ingestor` Running on the heracles EKS cluster with `dry_run = true`. Image `ghcr.io/opendata-oss/clickhouse-ingestor:ch-integration-odb-clickhouse-ingestor-59c0364`. Dedicated IRSA role (`heracles-clickhouse-ingestor-service-account-role`) with tight scoping: `GetObject` on the data prefix, `GetObject`/`PutObject`/`DeleteObject` on the manifest, `ListBucket` prefix-scoped to `ingest/otel/logs/*` plus the manifest. Prometheus scrape endpoint and per-batch INFO logging were identified as Phase 5 polish items. |
 | 2026-04-30 | Phase 5 alpha shipped live: metrics server added (`/metrics`, `/-/healthy`), central OTel collector scrapes the ingestor, ClickHouse Cloud endpoint configured, `dry_run=false` rollout resumed from the earliest unacked sequence, drained sequences 0..97 into `responsive.logs`, and rows planned/inserted/queried matched 245 with zero decode/ClickHouse/retry failures. RFC reconciled with implementation details learned during review: manifest+table idempotency token namespace, YAML config, no emitted `current_lag_sequences` until Buffer exposes a head-sequence peek, manual alpha DDL application, and ORDER BY benchmark moved to post-alpha validation. |
+| 2026-05-05 | Added execution overview/correctness exposition, Kafka sink connector comparison, and future config-driven multi-source ingestor path. |
