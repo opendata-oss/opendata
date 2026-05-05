@@ -43,7 +43,7 @@ pub(crate) struct VectorDbOpDelta {
 
 impl Delta for VectorDbOpDelta {
     type Context = ();
-    type Op = VectorDbOp;
+    type Write = VectorDbOp;
     type Frozen = Arc<VectorDbDeltaView>;
     type FrozenView = Arc<VectorDbDeltaView>;
     type ApplyResult = Arc<dyn Any + Send + Sync + 'static>;
@@ -55,7 +55,7 @@ impl Delta for VectorDbOpDelta {
         }
     }
 
-    fn apply(&mut self, op: Self::Op) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
+    fn apply(&mut self, op: Self::Write) -> Result<Arc<dyn Any + Send + Sync + 'static>, String> {
         let mut view = self.view.write().expect("lock poisoned");
         view.push(op);
         drop(view);

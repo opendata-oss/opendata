@@ -139,7 +139,7 @@ impl TsdbWriteDelta {
 
 impl Delta for TsdbWriteDelta {
     type Context = TsdbContext;
-    type Op = Vec<Series>;
+    type Write = Vec<Series>;
     type Frozen = FrozenTsdbDelta;
     type FrozenView = ();
     type ApplyResult = ();
@@ -157,7 +157,7 @@ impl Delta for TsdbWriteDelta {
         }
     }
 
-    fn apply(&mut self, write: Self::Op) -> Result<Self::ApplyResult, String> {
+    fn apply(&mut self, write: Self::Write) -> Result<Self::ApplyResult, String> {
         for series in &write {
             self.ingest(series)?;
         }

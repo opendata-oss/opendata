@@ -33,7 +33,7 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// next delta can continue where this one left off.
     type Context: Send + Sync + 'static;
     /// A single write operation applied via [`apply`](Delta::apply).
-    type Op: Send + 'static;
+    type Write: Send + 'static;
     /// Immutable snapshot produced by [`freeze`](Delta::freeze), consumed by
     /// the [`Flusher`] to persist the batch to storage.
     type Frozen: Send + Sync + 'static;
@@ -58,7 +58,7 @@ pub trait Delta: Sized + Send + Sync + 'static {
     fn init(context: Self::Context) -> Self;
 
     /// Apply a write to the delta and return a result for the caller.
-    fn apply(&mut self, write: Self::Op) -> Result<Self::ApplyResult, String>;
+    fn apply(&mut self, write: Self::Write) -> Result<Self::ApplyResult, String>;
 
     /// Estimate the size of the delta in bytes.
     fn estimate_size(&self) -> usize;
