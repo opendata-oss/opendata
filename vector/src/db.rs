@@ -29,7 +29,7 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
+use crate::write::delta::{VectorDbOp, VectorDbOpDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
@@ -132,7 +132,7 @@ pub struct VectorDb {
     storage: Arc<dyn Storage>,
 
     /// The WriteCoordinator itself (stored to keep it alive).
-    write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
+    write_coordinator: WriteCoordinator<VectorDbOpDelta, VectorDbFlusher>,
 
     /// snapshot state for queries
     last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
@@ -539,7 +539,7 @@ impl VectorDb {
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .write(VectorDbWrite::Write(writes))
+            .write(VectorDbOp::Write(writes))
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
@@ -588,7 +588,7 @@ impl VectorDb {
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .write_timeout(VectorDbWrite::Write(writes), timeout)
+            .write_timeout(VectorDbOp::Write(writes), timeout)
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
@@ -705,6 +705,56 @@ impl VectorDb {
             }
         }
 
+        Ok(())
+    }
+
+    /// Delete vectors by external ID.
+    ///
+    /// Removes the specified vectors from the database. Deleted vectors will
+    /// no longer appear in search results or `get` lookups.
+    ///
+    /// # Atomicity
+    ///
+    /// This operation is atomic: either all deletions in the batch are
+    /// accepted, or none are.
+    ///
+    /// # Idempotency
+    ///
+    /// Deleting an external ID that does not exist is not an error. Duplicate
+    /// IDs within a single call are silently deduplicated.
+    ///
+    /// # Validation
+    ///
+    /// External IDs must be at most 64 bytes UTF-8. Oversized IDs cause the
+    /// entire call to be rejected with `Error::InvalidInput` before any work
+    /// is queued.
+    pub async fn delete<I, S>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut collected: Vec<String> = Vec::new();
+        for id in ids {
+            let id: String = id.into();
+            if id.len() > 64 {
+                return Err(Error::InvalidInput(format!(
+                    "External ID too long: {} bytes (max 64)",
+                    id.len()
+                )));
+            }
+            collected.push(id);
+        }
+
+        let mut handle = self
+            .write_coordinator
+            .handle(WRITE_CHANNEL)
+            .write(VectorDbOp::Delete(collected))
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
         Ok(())
     }
 
@@ -1326,5 +1376,387 @@ mod tests {
             }
             other => panic!("expected Vector attribute, got {:?}", other),
         }
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_delete_existing_vector(storage: Arc<dyn Storage>) {
+        use crate::model::Filter;
+        use crate::serde::FieldValue;
+
+        // given
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
+            .await
+            .unwrap();
+        db.write(vec![
+            Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 99i64)
+                .build(),
+            Vector::builder("vec-2", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 149i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // The single bootstrap leaf centroid all data vectors land in.
+        let leaf = VectorId::centroid_id(1, 1);
+        let vec1_id = storage
+            .lookup_internal_id("vec-1")
+            .await
+            .unwrap()
+            .expect("vec-1 should have a dictionary entry pre-delete");
+
+        // when
+        db.delete(vec!["vec-1"]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // then
+        assert!(
+            storage
+                .get(IdDictionaryKey::new("vec-1").encode())
+                .await
+                .unwrap()
+                .is_none(),
+            "expected IdDictionary entry for vec-1 to be tombstoned"
+        );
+        assert!(
+            storage
+                .get(VectorDataKey::new(vec1_id).encode())
+                .await
+                .unwrap()
+                .is_none(),
+            "expected VectorData for vec-1 to be tombstoned"
+        );
+        assert!(
+            storage
+                .get_vector_index_data(vec1_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "expected VectorIndexData for vec-1 to be tombstoned"
+        );
+        let posting_list = storage.get_posting_list(leaf, 3).await.unwrap();
+        let has_delete = posting_list
+            .iter()
+            .any(|p| p.is_delete() && p.id() == vec1_id);
+        assert!(
+            has_delete,
+            "expected posting list at leaf centroid {:?} to contain a Delete entry for {:?}",
+            leaf, vec1_id
+        );
+        let cat_idx = storage
+            .get_metadata_index("category", FieldValue::String("shoes".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            cat_idx.excluded.contains(vec1_id.id()),
+            "expected vec-1 to be in the excluded bitmap of metadata index ('category', 'shoes')"
+        );
+        let price_idx = storage
+            .get_metadata_index("price", FieldValue::Int64(99))
+            .await
+            .unwrap();
+        assert!(
+            price_idx.excluded.contains(vec1_id.id()),
+            "expected vec-1 to be in the excluded bitmap of metadata index ('price', 99)"
+        );
+
+        // get() / search() / filtered search() reflect the deletion
+        assert!(db.get("vec-1").await.unwrap().is_none());
+        assert!(db.get("vec-2").await.unwrap().is_some());
+
+        let q = Query::new(vec![1.0, 0.0, 0.0]).with_limit(10);
+        let ids: Vec<String> = db
+            .search(&q)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.vector.id)
+            .collect();
+        assert_eq!(ids, vec!["vec-2".to_string()]);
+
+        let filtered = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::eq("category", "shoes"));
+        let filtered_ids: Vec<String> = db
+            .search(&filtered)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.vector.id)
+            .collect();
+        assert!(
+            filtered_ids.is_empty(),
+            "expected filtered search by category='shoes' to be empty after deleting vec-1, got {:?}",
+            filtered_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn should_be_idempotent() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+
+        // (1) unknown ID — no error, single or repeated
+        db.delete(vec!["does-not-exist"]).await.unwrap();
+        db.delete(vec!["does-not-exist"]).await.unwrap();
+
+        // (2) existing ID, two separate delete batches
+        db.write(vec![
+            Vector::builder("id-2", vec![1.0, 0.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.delete(vec!["id-2"]).await.unwrap();
+        db.flush().await.unwrap();
+        assert!(db.get("id-2").await.unwrap().is_none());
+        // re-deleting the now-absent ID must still succeed
+        db.delete(vec!["id-2"]).await.unwrap();
+        db.flush().await.unwrap();
+        assert!(db.get("id-2").await.unwrap().is_none());
+
+        // (3) same ID twice in a single batch
+        db.write(vec![
+            Vector::builder("id-3", vec![0.0, 1.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 2i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.delete(vec!["id-3", "id-3"]).await.unwrap();
+        db.flush().await.unwrap();
+        assert!(db.get("id-3").await.unwrap().is_none());
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_be_atomic_when_validation_fails(storage: Arc<dyn Storage>) {
+        // given
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
+            .await
+            .unwrap();
+        db.write(vec![
+            Vector::builder("a", vec![1.0, 0.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 1i64)
+                .build(),
+            Vector::builder("b", vec![0.0, 1.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 2i64)
+                .build(),
+            Vector::builder("c", vec![0.0, 0.0, 1.0])
+                .attribute("category", "x")
+                .attribute("price", 3i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        let oversized = "x".repeat(65);
+        let result = db
+            .delete(vec!["a".to_string(), oversized, "c".to_string()])
+            .await;
+        db.flush().await.unwrap();
+
+        // then - error returned
+        let err = result.expect_err("expected InvalidInput");
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+
+        // and crucially, none of the valid IDs were deleted
+        assert!(
+            db.get("a").await.unwrap().is_some(),
+            "a should not be deleted"
+        );
+        assert!(
+            db.get("b").await.unwrap().is_some(),
+            "b should not be deleted"
+        );
+        assert!(
+            db.get("c").await.unwrap().is_some(),
+            "c should not be deleted"
+        );
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_allow_id_reuse_after_delete(storage: Arc<dyn Storage>) {
+        // given
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
+            .await
+            .unwrap();
+        db.write(vec![
+            Vector::builder("id-1", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 99i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.delete(vec!["id-1".to_string()]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        db.write(vec![
+            Vector::builder("id-1", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 199i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // then
+        let v = db.get("id-1").await.unwrap().expect("expected id-1");
+        let vector_attr = v
+            .attributes
+            .iter()
+            .find(|a| a.name == VECTOR_FIELD_NAME)
+            .expect("missing vector attribute");
+        match &vector_attr.value {
+            AttributeValue::Vector(values) => assert_eq!(*values, vec![0.0, 1.0, 0.0]),
+            other => panic!("expected Vector attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_persist_delete_across_reopen() {
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+        });
+        let config = Config {
+            storage: storage_config.clone(),
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+
+        // Write, delete, flush, drop
+        {
+            let db = VectorDb::open(config.clone()).await.unwrap();
+            db.write(vec![
+                Vector::new("vec-1", vec![1.0, 0.0, 0.0]),
+                Vector::new("vec-2", vec![0.0, 1.0, 0.0]),
+            ])
+            .await
+            .unwrap();
+            db.flush().await.unwrap();
+            db.delete(vec!["vec-1".to_string()]).await.unwrap();
+            db.close().await.unwrap();
+        }
+
+        // Reopen and verify the deletion survived
+        let db2 = VectorDb::open(config).await.unwrap();
+        assert!(db2.get("vec-1").await.unwrap().is_none());
+        assert!(db2.get("vec-2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn should_reject_oversized_id_in_delete() {
+        // given
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        let too_long = "x".repeat(65);
+
+        // when
+        let result = db.delete(vec![too_long]).await;
+
+        // then
+        let err = result.expect_err("expected InvalidInput");
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_then_delete_in_same_window_should_end_deleted() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![1.0, 0.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.delete(vec!["foo"]).await.unwrap();
+        db.flush().await.unwrap();
+
+        assert!(db.get("foo").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_then_write_in_same_window_should_end_present() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        db.delete(vec!["foo"]).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 2i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        let v = db.get("foo").await.unwrap().expect("foo should be present");
+        let cat = v
+            .attributes
+            .iter()
+            .find(|a| a.name == "category")
+            .expect("category attribute");
+        match &cat.value {
+            AttributeValue::String(s) => assert_eq!(s, "boots"),
+            other => panic!("expected String attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_accept_str_iter() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        // Vec<&str>
+        db.delete(vec!["a", "b"]).await.unwrap();
+        // Array of &str
+        db.delete(["c"]).await.unwrap();
+        // Vec<String>
+        db.delete(vec!["d".to_string()]).await.unwrap();
     }
 }

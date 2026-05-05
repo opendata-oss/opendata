@@ -327,13 +327,13 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
     async fn handle_write(
         &mut self,
-        write: D::Write,
+        op: D::Write,
         result_tx: oneshot::Sender<handle::EpochResult<D::ApplyResult>>,
     ) -> Result<(), String> {
         let write_epoch = self.epoch;
         self.epoch += 1;
 
-        let result = self.delta.apply(write);
+        let result = self.delta.apply(op);
         // Ignore error if receiver was dropped (fire-and-forget write)
         let _ = result_tx.send(
             result

@@ -30,7 +30,6 @@ pub fn put_id_dictionary(external_id: &str, internal_id: VectorId) -> RecordOp {
 }
 
 /// Create a RecordOp to delete an IdDictionary mapping.
-#[allow(dead_code)]
 pub fn delete_id_dictionary(external_id: &str) -> RecordOp {
     let key = IdDictionaryKey::new(external_id).encode();
     RecordOp::Delete(key)

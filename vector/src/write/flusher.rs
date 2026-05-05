@@ -1,5 +1,5 @@
 use crate::db::LastAppliedSnapshot;
-use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
+use crate::write::delta::{VectorDbDeltaView, VectorDbOpDelta};
 use crate::write::indexer::tree::centroids::{
     CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader,
 };
@@ -55,7 +55,7 @@ impl VectorDbFlusher {
 }
 
 #[async_trait]
-impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
+impl Flusher<VectorDbOpDelta> for VectorDbFlusher {
     async fn flush_delta(
         &mut self,
         frozen: Arc<VectorDbDeltaView>,
@@ -70,7 +70,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
         let result = self
             .indexer
             .update_index(
-                frozen.writes.clone(),
+                frozen.ops.clone(),
                 update_epoch,
                 self.last_snapshot.clone(),
                 self.last_snapshot_epoch,
@@ -157,6 +157,7 @@ mod tests {
     use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use crate::write::delta::VectorDbDeltaView;
+    use crate::write::delta::VectorDbOp;
     use crate::write::delta::VectorWrite;
     use crate::write::indexer::tree::IndexerOpts;
     use crate::write::indexer::tree::centroids::TreeDepth;
@@ -313,7 +314,9 @@ mod tests {
     }
 
     fn make_frozen(writes: Vec<VectorWrite>) -> Arc<VectorDbDeltaView> {
-        Arc::new(VectorDbDeltaView { writes })
+        Arc::new(VectorDbDeltaView {
+            ops: vec![VectorDbOp::Write(writes)],
+        })
     }
 
     #[tokio::test]
