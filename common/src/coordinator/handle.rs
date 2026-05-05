@@ -183,9 +183,9 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// - [`WriteError::Shutdown`] — the coordinator has stopped.
     pub async fn write_timeout(
         &self,
-        write: D::Op,
+        write: D::Write,
         timeout: Duration,
-    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Op>> {
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_timeout(
@@ -220,8 +220,8 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// - [`WriteError::Shutdown`] — the coordinator has stopped.
     pub async fn write(
         &self,
-        write: D::Op,
-    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Op>> {
+        write: D::Write,
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::Write {
@@ -245,8 +245,8 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// can be retried without cloning.
     pub async fn try_write(
         &self,
-        write: D::Op,
-    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Op>> {
+        write: D::Write,
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .try_send(WriteCommand::Write {
