@@ -29,7 +29,7 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
+use crate::write::delta::{VectorDbOp, VectorDbOpDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
@@ -132,7 +132,7 @@ pub struct VectorDb {
     storage: Arc<dyn Storage>,
 
     /// The WriteCoordinator itself (stored to keep it alive).
-    write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
+    write_coordinator: WriteCoordinator<VectorDbOpDelta, VectorDbFlusher>,
 
     /// snapshot state for queries
     last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
@@ -539,7 +539,7 @@ impl VectorDb {
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .write(VectorDbWrite::Write(writes))
+            .write(VectorDbOp::Write(writes))
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
@@ -588,7 +588,7 @@ impl VectorDb {
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .write_timeout(VectorDbWrite::Write(writes), timeout)
+            .write_timeout(VectorDbOp::Write(writes), timeout)
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
@@ -745,7 +745,17 @@ impl VectorDb {
             collected.push(id);
         }
 
-        unimplemented!("VectorDb::delete will be wired to the coordinator in Phase 3")
+        let mut handle = self
+            .write_coordinator
+            .handle(WRITE_CHANNEL)
+            .write(VectorDbOp::Delete(collected))
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        Ok(())
     }
 
     /// Force flush all pending data to durable storage.
@@ -1395,7 +1405,11 @@ mod tests {
 
         // The single bootstrap leaf centroid all data vectors land in.
         let leaf = VectorId::centroid_id(1, 1);
-        let vec1_id = data_id(0);
+        let vec1_id = storage
+            .lookup_internal_id("vec-1")
+            .await
+            .unwrap()
+            .expect("vec-1 should have a dictionary entry pre-delete");
 
         // when
         db.delete(vec!["vec-1"]).await.unwrap();
@@ -1419,7 +1433,11 @@ mod tests {
             "expected VectorData for vec-1 to be tombstoned"
         );
         assert!(
-            storage.get_vector_index_data(vec1_id).await.unwrap().is_none(),
+            storage
+                .get_vector_index_data(vec1_id)
+                .await
+                .unwrap()
+                .is_none(),
             "expected VectorIndexData for vec-1 to be tombstoned"
         );
         let posting_list = storage.get_posting_list(leaf, 3).await.unwrap();
@@ -1561,9 +1579,18 @@ mod tests {
         );
 
         // and crucially, none of the valid IDs were deleted
-        assert!(db.get("a").await.unwrap().is_some(), "a should not be deleted");
-        assert!(db.get("b").await.unwrap().is_some(), "b should not be deleted");
-        assert!(db.get("c").await.unwrap().is_some(), "c should not be deleted");
+        assert!(
+            db.get("a").await.unwrap().is_some(),
+            "a should not be deleted"
+        );
+        assert!(
+            db.get("b").await.unwrap().is_some(),
+            "b should not be deleted"
+        );
+        assert!(
+            db.get("c").await.unwrap().is_some(),
+            "c should not be deleted"
+        );
     }
 
     #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
@@ -1670,8 +1697,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_then_delete_in_same_window_should_end_deleted() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![1.0, 0.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.delete(vec!["foo"]).await.unwrap();
+        db.flush().await.unwrap();
+
+        assert!(db.get("foo").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_then_write_in_same_window_should_end_present() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        db.delete(vec!["foo"]).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 2i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        let v = db.get("foo").await.unwrap().expect("foo should be present");
+        let cat = v
+            .attributes
+            .iter()
+            .find(|a| a.name == "category")
+            .expect("category attribute");
+        match &cat.value {
+            AttributeValue::String(s) => assert_eq!(s, "boots"),
+            other => panic!("expected String attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn should_accept_str_iter() {
-        // Compile-only smoke test for the IntoIterator<Item = impl Into<String>> signature.
         let db = VectorDb::open(create_test_config()).await.unwrap();
         // Vec<&str>
         db.delete(vec!["a", "b"]).await.unwrap();

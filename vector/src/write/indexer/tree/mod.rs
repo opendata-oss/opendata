@@ -7,7 +7,7 @@
 use crate::DistanceMetric;
 use crate::Result;
 use crate::serde::vector_id::{LEAF_LEVEL, VectorId};
-use crate::write::delta::VectorWrite;
+use crate::write::delta::VectorDbOp;
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, CentroidCache, TreeDepth, TreeLevel,
 };
@@ -15,7 +15,7 @@ use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
+use crate::write::indexer::tree::vector::{DeleteVectors, ReassignVectors, WriteVectors};
 use common::StorageRead;
 use common::storage::RecordOp;
 #[cfg(debug_assertions)]
@@ -40,6 +40,7 @@ mod vector;
 pub(crate) struct IndexerStats {
     pub(crate) inserts: usize,
     pub(crate) updates: usize,
+    pub(crate) deletes: usize,
     pub(crate) merges: HashMap<TreeLevel, usize>,
     pub(crate) splits: HashMap<TreeLevel, usize>,
     pub(crate) reassignments: HashMap<TreeLevel, usize>,
@@ -135,35 +136,55 @@ impl Indexer {
 
     pub(crate) async fn update_index(
         &mut self,
-        updates: Vec<VectorWrite>,
+        ops: Vec<VectorDbOp>,
         update_epoch: u64,
         snapshot: Arc<dyn StorageRead>,
         snapshot_epoch: u64,
     ) -> Result<IndexUpdateResults> {
+        let op_count: usize = ops.iter().map(VectorDbOp::len).sum();
         let update_span = debug_span!(
             "update_index",
             update_epoch,
             snapshot_epoch,
-            write_count = updates.len(),
+            write_count = op_count,
             depth = self.state.centroids_meta().depth as u16
         );
         let update_start = Instant::now();
         let mut stats = IndexerStats::default();
         let mut delta = VectorIndexDelta::new(&self.state);
 
-        let write = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, updates);
-        let write_start = Instant::now();
-        let (inserts, updates) = write.execute(&self.state, &mut delta).await?;
-        debug!(
-            parent: &update_span,
-            op = "write_vectors",
-            elapsed_ms = elapsed_ms(write_start),
-            inserts,
-            updates,
-            "completed"
-        );
-        stats.inserts = inserts;
-        stats.updates = updates;
+        for op in ops {
+            match op {
+                VectorDbOp::Write(writes) => {
+                    let write = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, writes);
+                    let write_start = Instant::now();
+                    let (inserts, updates) = write.execute(&self.state, &mut delta).await?;
+                    debug!(
+                        parent: &update_span,
+                        op = "write_vectors",
+                        elapsed_ms = elapsed_ms(write_start),
+                        inserts,
+                        updates,
+                        "completed"
+                    );
+                    stats.inserts += inserts;
+                    stats.updates += updates;
+                }
+                VectorDbOp::Delete(ids) => {
+                    let delete = DeleteVectors::new(&snapshot, snapshot_epoch, ids);
+                    let delete_start = Instant::now();
+                    let deletes = delete.execute(&self.state, &mut delta).await?;
+                    debug!(
+                        parent: &update_span,
+                        op = "delete_vectors",
+                        elapsed_ms = elapsed_ms(delete_start),
+                        deletes,
+                        "completed"
+                    );
+                    stats.deletes += deletes;
+                }
+            }
+        }
 
         let depth = TreeDepth::of(self.state.centroids_meta().depth);
         let mut next_level = TreeLevel::leaf(depth);

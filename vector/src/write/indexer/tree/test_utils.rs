@@ -308,6 +308,15 @@ impl IndexerOpTestHarness {
         self.apply_delta(delta).await;
     }
 
+    pub async fn delete_and_apply(&mut self, ids: Vec<String>) -> usize {
+        let snapshot = self.snapshot().await;
+        let mut delta = VectorIndexDelta::new(&self.state);
+        let dv = super::vector::DeleteVectors::new(&snapshot, SNAPSHOT_EPOCH, ids);
+        let count = dv.execute(&self.state, &mut delta).await.unwrap();
+        self.apply_delta(delta).await;
+        count
+    }
+
     pub async fn validate(&self) {
         let snapshot = self.storage.snapshot().await.unwrap();
         validator::validate(snapshot, &self.state, self.dimensions)

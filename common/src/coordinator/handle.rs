@@ -216,9 +216,9 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// - [`WriteError::Shutdown`] — the coordinator has stopped.
     pub async fn write_timeout(
         &self,
-        write: D::Write,
+        write: D::Op,
         timeout: Duration,
-    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Op>> {
         const COMMAND: &str = "write_timeout";
         self.record_queue_depth();
         let started = Instant::now();
@@ -263,8 +263,8 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// - [`WriteError::Shutdown`] — the coordinator has stopped.
     pub async fn write(
         &self,
-        write: D::Write,
-    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+        write: D::Op,
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Op>> {
         const COMMAND: &str = "write";
         self.record_queue_depth();
         let started = Instant::now();
@@ -298,8 +298,8 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// can be retried without cloning.
     pub async fn try_write(
         &self,
-        write: D::Write,
-    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+        write: D::Op,
+    ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Op>> {
         const COMMAND: &str = "try_write";
         self.record_queue_depth();
         let started = Instant::now();

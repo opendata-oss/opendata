@@ -101,6 +101,7 @@ impl VectorIndexState {
 #[derive(Debug)]
 pub(crate) struct ForwardIndexDelta {
     dictionary_updates: HashMap<String, VectorId>,
+    dictionary_deletes: HashSet<String>,
     vector_updates: HashMap<VectorId, VectorDataValue>,
     vector_index_updates: HashMap<VectorId, VectorIndexDataValue>,
     vector_deletes: HashSet<VectorId>,
@@ -112,6 +113,7 @@ impl ForwardIndexDelta {
     pub(crate) fn new(initial_state: &VectorIndexState) -> Self {
         Self {
             dictionary_updates: HashMap::new(),
+            dictionary_deletes: HashSet::new(),
             vector_updates: HashMap::new(),
             vector_index_updates: HashMap::new(),
             vector_deletes: HashSet::new(),
@@ -139,6 +141,7 @@ impl ForwardIndexDelta {
             .collect();
         let value = VectorDataValue::new(external_id, fields);
         self.vector_updates.insert(vector_id, value);
+        self.dictionary_deletes.remove(external_id);
         self.dictionary_updates
             .insert(String::from(external_id), vector_id);
         vector_id
@@ -162,9 +165,18 @@ impl ForwardIndexDelta {
         self.vector_index_updates.remove(&vector_id);
     }
 
+    pub(crate) fn delete_external_id(&mut self, external_id: String, vector_id: VectorId) {
+        if let Some(pending_id) = self.dictionary_updates.remove(&external_id) {
+            self.vector_updates.remove(&pending_id);
+        }
+        self.dictionary_deletes.insert(external_id);
+        self.delete_vector(vector_id);
+    }
+
     pub(crate) fn freeze(self, state: &mut VectorIndexState, output_ops: &mut Vec<RecordOp>) {
         let ForwardIndexDelta {
             dictionary_updates,
+            dictionary_deletes,
             vector_updates,
             vector_index_updates,
             vector_deletes,
@@ -173,6 +185,9 @@ impl ForwardIndexDelta {
         } = self;
 
         // === Apply mutations to state ===
+        for external_id in &dictionary_deletes {
+            state.dictionary.remove(external_id);
+        }
         for (external_id, &internal_id) in &dictionary_updates {
             state.dictionary.insert(external_id.clone(), internal_id);
         }
@@ -182,6 +197,11 @@ impl ForwardIndexDelta {
 
         // === Construct record ops ===
         output_ops.extend(ops);
+
+        // Dictionary deletes (tombstones).
+        for external_id in &dictionary_deletes {
+            output_ops.push(record::delete_id_dictionary(external_id));
+        }
 
         // Dictionary puts
         for (external_id, &internal_id) in &dictionary_updates {
@@ -676,6 +696,14 @@ impl<'a> VectorIndexView<'a> {
         if let Some(id) = self.delta.forward_index.dictionary_updates.get(external_id) {
             return Some(*id);
         }
+        if self
+            .delta
+            .forward_index
+            .dictionary_deletes
+            .contains(external_id)
+        {
+            return None;
+        }
         self.state.dictionary().get(external_id).cloned()
     }
 
@@ -1079,6 +1107,95 @@ mod tests {
         // then:
         assert!(storage.get_vector_data(id, DIMS).await.unwrap().is_none());
         assert!(storage.get_vector_index_data(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_external_id_should_tombstone_dictionary_and_remove_from_state() {
+        // given
+        let (storage, mut state) = setup().await;
+        let mut delta = ForwardIndexDelta::new(&state);
+        let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
+        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+        assert_eq!(state.dictionary().get("v1"), Some(&id));
+
+        // when
+        let mut delta = ForwardIndexDelta::new(&state);
+        delta.delete_external_id("v1".to_string(), id);
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+
+        // then
+        assert!(state.dictionary().get("v1").is_none());
+        assert!(storage.lookup_internal_id("v1").await.unwrap().is_none());
+        assert!(storage.get_vector_data(id, DIMS).await.unwrap().is_none());
+        assert!(storage.get_vector_index_data(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn add_vector_within_same_delta_should_supersede_pending_delete() {
+        // given
+        let (storage, mut state) = setup().await;
+        let mut delta = ForwardIndexDelta::new(&state);
+        let old_id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
+        delta.update_vector_index_data(old_id, vec![leaf_centroid(1)], make_indexed_fields());
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+        assert_eq!(state.dictionary().get("v1"), Some(&old_id));
+
+        // when
+        let mut delta = ForwardIndexDelta::new(&state);
+        delta.delete_external_id("v1".to_string(), old_id);
+        let new_id = delta.add_vector("v1", &make_attributes(vec![3.0, 4.0]));
+        delta.update_vector_index_data(new_id, vec![leaf_centroid(1)], make_indexed_fields());
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+
+        // then
+        assert_eq!(state.dictionary().get("v1"), Some(&new_id));
+        assert_eq!(
+            storage.lookup_internal_id("v1").await.unwrap(),
+            Some(new_id)
+        );
+        assert!(
+            storage
+                .get_vector_data(old_id, DIMS)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_vector_data(new_id, DIMS)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_external_id_within_same_delta_should_supersede_pending_add() {
+        // given
+        let (storage, mut state) = setup().await;
+
+        // when
+        let mut delta = ForwardIndexDelta::new(&state);
+        let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
+        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.delete_external_id("v1".to_string(), id);
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+
+        // then
+        assert!(state.dictionary().get("v1").is_none());
+        assert!(storage.lookup_internal_id("v1").await.unwrap().is_none());
+        assert!(storage.get_vector_data(id, DIMS).await.unwrap().is_none());
     }
 
     #[tokio::test]
