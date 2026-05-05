@@ -237,6 +237,99 @@ impl WriteVectors {
     }
 }
 
+struct ResolvedDelete {
+    external_id: String,
+    vector_id: VectorId,
+    old: VectorIndexDataValue,
+}
+
+pub(crate) struct DeleteVectors {
+    snapshot: Arc<dyn StorageRead>,
+    snapshot_epoch: u64,
+    external_ids: Vec<String>,
+}
+
+impl DeleteVectors {
+    pub(crate) fn new(
+        snapshot: &Arc<dyn StorageRead>,
+        snapshot_epoch: u64,
+        ids: Vec<String>,
+    ) -> Self {
+        Self {
+            snapshot: snapshot.clone(),
+            snapshot_epoch,
+            external_ids: ids,
+        }
+    }
+
+    /// Returns the number of vectors actually deleted (i.e., excludes
+    /// unknown IDs that were silently skipped).
+    pub(crate) async fn execute(
+        self,
+        state: &VectorIndexState,
+        delta: &mut VectorIndexDelta,
+    ) -> Result<usize> {
+        if self.external_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Dedupe within the batch
+        let unique: HashSet<String> = self.external_ids.into_iter().collect();
+
+        let resolutions = {
+            let view = VectorIndexView::new(delta, state, &self.snapshot, self.snapshot_epoch);
+
+            let mut futures: Vec<BoxFuture<'static, Result<ResolvedDelete>>> = Vec::new();
+            for external_id in unique {
+                let Some(vector_id) = view.vector_id(&external_id) else {
+                    continue;
+                };
+                let index_data_fut = view.vector_index_data(vector_id);
+                futures.push(Box::pin(async move {
+                    let old = index_data_fut.await?.ok_or_else(|| {
+                        Internal(format!("missing vector index data for id {}", vector_id))
+                    })?;
+                    Ok(ResolvedDelete {
+                        external_id,
+                        vector_id,
+                        old,
+                    })
+                }));
+            }
+
+            let results = AsyncBatchDriver::execute(futures).await;
+            let mut resolved = Vec::with_capacity(results.len());
+            for r in results {
+                resolved.push(r?);
+            }
+            resolved
+        };
+
+        let count = resolutions.len();
+        for r in resolutions {
+            // Tombstone IdDictionary, VectorData, VectorIndexData.
+            delta
+                .forward_index
+                .delete_external_id(r.external_id, r.vector_id);
+            // Remove the vector from each centroid posting it currently lives in.
+            for old_centroid in r.old.postings {
+                delta
+                    .search_index
+                    .remove_from_posting(old_centroid, r.vector_id);
+            }
+            // Exclude the vector from each indexed (field, value) entry.
+            for field in r.old.indexed_fields {
+                delta.search_index.remove_from_inverted_index(
+                    field.field_name,
+                    field.value,
+                    r.vector_id,
+                );
+            }
+        }
+        Ok(count)
+    }
+}
+
 struct VerifiedVectorReassignment {
     reassignment: ReassignVector,
     new_centroid: VectorId,
@@ -856,5 +949,102 @@ mod tests {
             PostingList::from_value(h.storage.get_posting_list(c1, DIMS).await.unwrap());
         let ids_c1: HashSet<VectorId> = posting_c1.iter().map(|p: &Posting| p.id()).collect();
         assert!(!ids_c1.contains(&id_a));
+    }
+
+    #[tokio::test]
+    async fn delete_known_external_id_should_remove_from_postings_and_inverted_index() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(
+            &opts,
+            vec![
+                make_write("a", vec![1.0, 0.0, 0.0], "shoes"),
+                make_write("b", vec![0.0, 1.0, 0.0], "shoes"),
+            ],
+        )
+        .await;
+        let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+        let id_b = h.storage.lookup_internal_id("b").await.unwrap().unwrap();
+        let leaf = centroid_id(CENTROID_ID_NUM);
+
+        // when
+        let count = h.delete_and_apply(vec!["a".to_string()]).await;
+
+        // then
+        assert_eq!(count, 1);
+
+        // dictionary entry tombstoned
+        assert!(h.storage.lookup_internal_id("a").await.unwrap().is_none());
+        // VectorData and VectorIndexData tombstoned
+        assert!(
+            h.storage
+                .get_vector_data(id_a, DIMS)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.storage
+                .get_vector_index_data(id_a)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let posting =
+            PostingList::from_value(h.storage.get_posting_list(leaf, DIMS).await.unwrap());
+        let posting_ids: HashSet<VectorId> = posting.iter().map(|p: &Posting| p.id()).collect();
+        assert!(posting_ids.contains(&id_b));
+        assert!(!posting_ids.contains(&id_a));
+
+        let shoes = h
+            .storage
+            .get_metadata_index("category", FieldValue::String("shoes".to_string()))
+            .await
+            .unwrap();
+        assert!(shoes.excluded.contains(id_a.id()));
+        assert!(shoes.included.contains(id_b.id()));
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_external_id_should_be_noop() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(&opts, vec![make_write("a", vec![1.0, 0.0, 0.0], "shoes")])
+            .await;
+        let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
+
+        // when
+        let count = h.delete_and_apply(vec!["does-not-exist".to_string()]).await;
+
+        // then
+        assert_eq!(count, 0);
+        assert!(
+            h.storage
+                .get_vector_data(id_a, DIMS)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_should_dedupe_duplicate_ids_within_batch() {
+        // given
+        let mut h = make_single_centroid_harness().await;
+        let opts = create_opts();
+        h.write_and_apply(&opts, vec![make_write("a", vec![1.0, 0.0, 0.0], "shoes")])
+            .await;
+
+        // when
+        let count = h
+            .delete_and_apply(vec!["a".to_string(), "a".to_string()])
+            .await;
+
+        // then
+        assert_eq!(count, 1);
+        assert!(h.storage.lookup_internal_id("a").await.unwrap().is_none());
     }
 }

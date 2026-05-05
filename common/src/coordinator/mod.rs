@@ -57,7 +57,7 @@ impl Default for WriteCoordinatorConfig {
 
 pub(crate) enum WriteCommand<D: Delta> {
     Write {
-        write: D::Write,
+        write: D::Op,
         result_tx: oneshot::Sender<handle::EpochResult<D::ApplyResult>>,
     },
     Flush {
@@ -327,13 +327,13 @@ impl<D: Delta> WriteCoordinatorTask<D> {
 
     async fn handle_write(
         &mut self,
-        write: D::Write,
+        op: D::Op,
         result_tx: oneshot::Sender<handle::EpochResult<D::ApplyResult>>,
     ) -> Result<(), String> {
         let write_epoch = self.epoch;
         self.epoch += 1;
 
-        let result = self.delta.apply(write);
+        let result = self.delta.apply(op);
         // Ignore error if receiver was dropped (fire-and-forget write)
         let _ = result_tx.send(
             result
@@ -735,7 +735,7 @@ mod tests {
 
     impl Delta for TestDelta {
         type Context = TestContext;
-        type Write = TestWrite;
+        type Op = TestWrite;
         type DeltaView = TestDeltaReader;
         type Frozen = FrozenTestDelta;
         type FrozenView = Arc<HashMap<String, u64>>;
@@ -750,7 +750,7 @@ mod tests {
             }
         }
 
-        fn apply(&mut self, write: Self::Write) -> Result<(), String> {
+        fn apply(&mut self, write: Self::Op) -> Result<(), String> {
             if let Some(error) = &self.context.error {
                 return Err(error.clone());
             }
