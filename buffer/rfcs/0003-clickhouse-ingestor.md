@@ -182,6 +182,85 @@ The infra/app boundary is meaningful:
 This boundary is what lets us add a metrics adapter or a traces adapter
 later without rewriting the consumer loop.
 
+### Execution Overview
+
+The following diagram shows one successful consume-to-write cycle. The
+numbered labels correspond to the steps below, in the same spirit as an
+execution overview diagram: each component's job is shown at the point
+where ownership of the data changes. The Buffer store and ClickHouse are
+external systems; the runtime, decoders, commit group, adapter, writer,
+and ack controller run inside the `clickhouse-ingestor` process.
+
+```text
+
+                          ╔═══clickhouse-ingestor process═════════════════════════════════════════════════════════════════════╗                                 
+                          ║                                                                                                   ║                                 
+                          ║                                                                                                   ║                                 
+                          ║                                                                                                   ║                                 
+                          ║   ┌────────────────┐      ┌────────────────┐      ┌────────────────┐      ┌────────────────────┐  ║                                 
+                          ║   │ BufferConsumer │      │MetadataEnvelope│      │ SignalDecoder  │      │    CommitGroup     │  ║                                 
+                        ┌─╫───▶    Runtime     ├─(2)──▶    Decoder     ├─(3)──▶OTLP -> records ├─(4)──▶  range low..high   │  ║                                 
+                        │ ║   │                │      │                │      │                │      │                    │  ║                                 
+╔══Object Storage══╗    │ ║   └────────────────┘      └────────────────┘      └────────────────┘      └──────────┬─────────┘  ║                                 
+║                  ║    │ ║                                                                                      │            ║                                 
+║    Manifest      ║    │ ║                   ┌───────────────────────────────(5)────────────────────────────────┘            ║                                 
+║          +       ├─(1)┘ ║                   │                                                                               ║                                 
+║     Batches      ║      ║                   │                                                                               ║         ╔═══════Clickhouse═════╗
+║                  ║      ║          ┌────────▼───────┐          ┌──────────────────┐          ┌────────────────┐             ║         ║                      ║
+╚═════════▲════════╝      ║          │    Adapter     │          │  InsertChunk[]   │          │ClickHouseWriter│             ║         ║      ClickHouse      ║
+          │               ║          │  plan chunks   ├───(6)────▶   rows + token   ├───(7)────▶  sync insert   ├──────────(8)╫─────────▶  ReplacingMergeTree  ║
+          │               ║          │                │          │                  │          │                │             ║         ║                      ║
+          │               ║          └────────────────┘          └──────────────────┘          └────────┬───────┘             ║         ║                      ║
+          │               ║                                                                             │                     ║         ╚══════════════════════╝
+          │               ║                                              ┌──────────────(9)─────────────┘                     ║                                 
+          │               ║                                              │                                                    ║                                 
+          │               ║                                     ┌────────▼───────┐                                            ║                                 
+          │               ║                                     │ AckController  │                                            ║                                 
+          └───────────────╫────(10)─────────────────────────────┤  ack + flush   │                                            ║                                 
+                          ║                                     │                │                                            ║                                 
+                          ║                                     └────────────────┘                                            ║                                 
+                          ║                                                                                                   ║                                 
+                          ║                                                                                                   ║                                 
+                          ╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝                               
+```
+
+1. `BufferConsumerRuntime` reads the next unacked Buffer batch from the
+   object store via `Consumer::next_batch()`. It materializes a
+   `RawBufferBatch` containing `RawEntry[]` plus source coordinates
+   (`sequence`, `entry_index`, manifest path, data path, ingestion time).
+   No durable ack state changes yet.
+2. `MetadataEnvelopeDecoder` consumes the `RawBufferBatch`, parses each
+   entry's metadata envelope, and outputs `MetadataEnvelope[]` aligned
+   with `RawEntry[]`. It validates `(version, signal_type, encoding)`
+   against the configured ingestor; a mismatch is fail-closed.
+3. `SignalDecoder` consumes `RawEntry[] + MetadataEnvelope[]` and outputs
+   decoded signal records. For OTLP logs, one `RawEntry` can become many
+   `DecodedLogRecord`s, so the decoder assigns `record_index` and
+   completes the source identity
+   `(sequence, entry_index, record_index)`.
+4. `CommitGroup` consumes decoded records, appends them to the open
+   group, and separately advances the input range
+   `low_sequence..=high_sequence`. This range advances even when a batch
+   decodes to zero rows.
+5. When a row, byte, or age threshold trips, the adapter receives the
+   drained `CommitGroupBatch`, sorts records deterministically, maps them
+   to ClickHouse rows, and plans the chunk sequence.
+6. The adapter outputs `InsertChunk[]`. Each chunk contains rows, column
+   names, ClickHouse settings, `chunk_index`, and a deterministic
+   `insert_deduplication_token`.
+7. `ClickHouseWriter` consumes `InsertChunk[]` and performs synchronous
+   inserts one chunk at a time. Retryable failures retry the same chunk
+   body and token.
+8. ClickHouse accepts the insert into the target `ReplacingMergeTree`
+   table. In the best case, a replay inside the insert deduplication
+   window is dropped here before duplicate rows are materialized.
+9. After every chunk for the commit group succeeds, the runtime invokes
+   `AckController` with the successful `low_sequence..=high_sequence`
+   range.
+10. `AckController` acks every sequence in that contiguous range and
+    flushes the Buffer manifest under the configured flush policy. This
+    is the durable source checkpoint.
+
 ### Runtime
 
 `BufferConsumerRuntime` owns the integration with `buffer::Consumer` and
@@ -771,9 +850,39 @@ Two layers of dedupe, with deliberately different roles:
    reusing one token across chunks with different rows would let
    ClickHouse drop valid data.
 
-The alpha explicitly does not promise duplicate-free reads without
-`FINAL` on freshly inserted ranges. The runbook documents the query
-patterns that are safe.
+The correctness argument is:
+
+- The only durable source checkpoint is the Buffer ack + flush. If the
+  process crashes before that checkpoint, Buffer will replay from the
+  last flushed ack boundary.
+- A replay of the same commit group under the same adapter version and
+  chunking configuration produces the same ordered rows, the same chunk
+  boundaries, and the same per-chunk tokens.
+- In the best case, where that replay happens while ClickHouse still has
+  the original insert in its deduplication window, ClickHouse suppresses
+  the duplicate chunk before rows are materialized. In that case plain
+  reads have no duplicate rows and do not need `FINAL`.
+- If the replay falls outside the insert deduplication window, or the
+  chunking fingerprint changes because the chunking configuration
+  changed, ClickHouse may materialize duplicate physical rows. This is
+  why insert-level dedupe is not the load-bearing guarantee.
+- The table-level source-coordinate key is the long-term guarantee. A
+  duplicate physical row for the same logical source record has the same
+  `ORDER BY` tuple, and `ReplacingMergeTree(_adapter_version)` collapses
+  it on background merge or at query time with `FINAL`. If the adapter
+  version changed but the `ORDER BY` tuple did not, the higher
+  `_adapter_version` row wins.
+
+This gives the same read-time behavior as insert-only dedupe designs in
+the common tight-retry case: the duplicate is dropped by ClickHouse's
+insert dedupe path and never appears to readers. The additional
+guarantee is for long-window replays, explicit operator replays, or
+changed chunking config, where insert-only dedupe can admit duplicate
+rows but the target table still has enough source identity to collapse
+them. The alpha therefore does not promise duplicate-free plain reads in
+the cases where the table-level backstop is needed before merges run;
+those readers must use `FINAL` or query-time dedupe. The runbook
+documents the query patterns that are safe.
 
 ### System Column Ownership
 
