@@ -11,9 +11,7 @@
 This RFC defines a Rust ingestor that consumes OpenData Buffer batches and
 writes them into ClickHouse. The ingestor is generic over signal type
 (OTLP logs first, OTLP metrics and traces later), but ClickHouse-specific
-as a sink. The target abstraction is "many OpenData data sources can
-write to ClickHouse through the same pipeline," not "one runtime can
-write to any database."
+as a sink. 
 
 The ingestor is layered: a `BufferConsumerRuntime` polls Buffer; a
 per-entry `MetadataEnvelopeDecoder` parses producer-supplied envelopes; a
@@ -29,28 +27,21 @@ table.
 ## Motivation
 
 The Buffer module described in RFC 0001 gives producers a durable,
-ordered, object-store-backed queue. Today the OpenData databases, Log and
+ordered, object-store-backed queue. Today the OpenData databases, like 
 Timeseries, each ship their own consumer loop. We also need consumers for
 external analytical stores that can use Buffer as their ingest path.
 
-ClickHouse is the chosen sink because:
+ClickHouse is a natural choice as our first sink since it is an increasingly
+popular OLAP database suitable for a variety of use cases.
 
-- It handles log and metric queries well.
-- It is operationally proven and easy to run as a managed service.
-- Its `ReplacingMergeTree` engine gives at-merge or at-query
-  deduplication, which lines up well with Buffer's at-least-once
-  acknowledgement model.
-- It supports server-side insert deduplication tokens, which combine
-  with Buffer's deterministic sequence numbering.
-
-Reuse is across signal types into ClickHouse, not across sinks. Signal
-types refer to telemetry categories (0 = Metrics, 1 = Logs, etc.) and
+For now, we will focus on observability data and reuse across signal types 
+into ClickHouse. Signal types refer to telemetry categories 
+(0 = Metrics, 1 = Logs, etc.) and
 were introduced in [the timeseries buffer consumer](https://github.com/opendata-oss/opendata/blob/ch-integration/odb-clickhouse-ingestor/timeseries/rfcs/0006-buffer-consumer.md).
 The same polling, retry, coalesce, and ack pipeline should work for OTLP
 logs, OTLP metrics, traces, and future OpenData signals. ClickHouse-specific
 requirements around insert sizing, token semantics, and replicated
-dedupe drive the layering. Generalizing the code to non-ClickHouse sinks 
-would blur the design. 
+dedupe drive the layering. 
 
 The first implementation targets OTLP logs. Metrics, traces, and richer
 schema management are follow-on work, but the runtime boundaries should
@@ -77,7 +68,7 @@ loop.
 
 - Sink generalization. Non-ClickHouse sinks (Postgres, BigQuery,
   S3-as-Parquet, observability vendors) are out of scope. The runtime
-  may be reused for other signals, but always into ClickHouse.
+  may be reused for other payload types, but always into ClickHouse.
 - Schema management or schema evolution beyond a per-adapter version
   bump. Adapter table DDL is committed in the crate and applied
   out-of-band for v0.
@@ -122,14 +113,7 @@ Key properties the ingestor relies on:
 
 - A single active consumer per manifest, enforced by epoch fencing.
 - In-order delivery within a consumer.
-- In-order acks. **Important nuance:** `Consumer::ack(n)` advances the
-  in-memory acked position but does not by itself durably dequeue the
-  manifest. The current consumer batches dequeues internally and only
-  flushes them to object storage every N acks. The explicit durability
-  boundary is `Consumer::flush()`, which forces the dequeue to be
-  written. The ingestor must call `flush()` after `ack(n)` whenever it
-  wants the high-watermark to be replay-safe across crashes; otherwise
-  up to N-1 acked sequences can be replayed after a restart.
+- In-order acks. 
 - Per-range metadata: each `Metadata` item describes a contiguous range
   of records within the data batch and carries an opaque `payload` set
   by the producer. **A single Buffer batch can contain multiple ranges
@@ -770,13 +754,6 @@ impl AckController {
     ) -> impl Future<Output = Result<()>> + '_;
 }
 ```
-
-The runtime owns the `Consumer`. The controller is a policy helper that
-the runtime invokes; it never holds a long-lived `Arc<Consumer>` because
-the consumer's manifest mutations (`ack`, `flush`, `dequeue`) are not
-safe under shared mutable access. If we need to share a consumer across
-tasks, a separate `ConsumerHandle` must synchronize access internally.
-
 Per commit group:
 
 - All chunks succeed: ack the contiguous range
