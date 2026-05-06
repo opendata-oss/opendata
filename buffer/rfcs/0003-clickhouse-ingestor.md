@@ -26,7 +26,7 @@ executes the chunks; and an `AckController` advances and flushes the
 Buffer ack high-watermark only after a commit group is fully durable.
 
 The first concrete adapter ingests OTLP logs into a `ReplacingMergeTree`
-table, with the Responsive controller as the alpha producer.
+table.
 
 ## Motivation
 
@@ -55,10 +55,10 @@ and would dilute the design — ClickHouse has specific requirements
 around insert sizing, token semantics, and replicated dedupe that
 non-trivially shape the layering.
 
-The alpha use case is shipping Responsive controller logs to ClickHouse
-in production. Today these logs reach Datadog through Fluent Bit. Datadog
-stays the operational path during alpha; the new pipeline runs alongside
-it and is evaluated for correctness, not yet relied on.
+The first implementation targets OTLP logs. Metrics, traces, and richer
+schema management are follow-on work, but the runtime boundaries should
+be chosen now so those additions do not require rewriting the consumer
+loop.
 
 ## Goals
 
@@ -70,12 +70,11 @@ it and is evaluated for correctness, not yet relied on.
   ack controller.
 - Define ack, flush, and retry semantics that produce a clear, observable
   at-least-once guarantee with no silent replay window.
-- Define the alpha OTLP logs adapter, including ClickHouse table shape,
+- Define the v0 OTLP logs adapter, including ClickHouse table shape,
   the dedupe model, and the ORDER BY tradeoff.
 - Define the operational surface: configuration, dry-run, metrics, and
   failure handling.
-- Set the alpha acceptance criteria so the prototype has a clear stop
-  condition.
+- Set validation criteria for the v0 implementation.
 
 ## Non-Goals
 
@@ -84,7 +83,7 @@ it and is evaluated for correctness, not yet relied on.
   may be reused for other signals, but always into ClickHouse.
 - Schema management or schema evolution beyond a per-adapter version
   bump. Adapter table DDL is committed in the crate and applied
-  out-of-band for the alpha.
+  out-of-band for v0.
 - Multi-table fanout from a single Buffer manifest.
 - Server-side rollups, aggregation, or transformation that does not fit
   into a stateless row-mapping function.
@@ -92,8 +91,6 @@ it and is evaluated for correctness, not yet relied on.
   tied to a specific signal/encoding. Configuration controls which
   adapter is selected, batch thresholds, dedupe policy, and operational
   flags — not arbitrary DDL.
-- Replacing Datadog as the operational logs path. Datadog stays live
-  during the alpha.
 - Producer-side concerns. The Buffer producer/consumer contract from
   RFC 0001 is taken as-is.
 
@@ -151,7 +148,7 @@ The ingestor lives entirely on the sink side of the system:
 
 ```text
 producer side (out of scope for this RFC):
-  controller logs
+  telemetry producers
     -> Fluent Bit
     -> OTEL Collector logs pipeline
     -> opendata-go OpenData exporter
@@ -371,8 +368,7 @@ The metadata payload that producers put on each entry is currently a
 ```
 
 with `version = 1`, `signal_type ∈ {1: metrics, 2: logs}`, and
-`encoding ∈ {1: OTLP protobuf}` for the producers we have today. Logs
-support is added in Phase 1a of the alpha plan.
+`encoding ∈ {1: OTLP protobuf}` for the current producers.
 
 The decoder parses this header **per `RawEntry`**, not per batch:
 
@@ -404,14 +400,14 @@ Two-step contract:
    with different envelopes into the same Buffer batch (RFC 0001
    `Producer::produce` model), so this step never assumes batch
    uniformity.
-2. `validate_consistent` enforces, for the alpha, that every envelope
+2. `validate_consistent` enforces, for v0, that every envelope
    in a batch matches the configured `(signal_type, encoding)` of the
    running ingestor. Mismatched envelopes within a batch are a fail-closed
-   condition. This is a deliberate alpha simplification — once the alpha
-   stabilizes, a future release can route per-entry to per-signal
+   condition. This is a deliberate v0 tradeoff: v0 expects a homogeneous
+   signal stream, and a future release can route per-entry to per-signal
    pipelines rather than rejecting the whole batch.
 
-Compatibility policy for the alpha:
+Compatibility policy for v0:
 
 - Unknown `version` on any entry: fail closed. Do not ack. Emit a loud
   error metric. Retry until configuration or code is updated.
@@ -421,8 +417,8 @@ Compatibility policy for the alpha:
 
 A future release may add a quarantine / dead-letter mode that acks the
 offending range and records it elsewhere. That mode is explicitly out of
-scope for the alpha; Buffer's strict ordering means the safest default
-during prototype work is to halt rather than silently drop.
+scope for v0; Buffer's strict ordering means the safest initial default
+is to halt rather than silently drop.
 
 ### Signal Decoder
 
@@ -448,7 +444,7 @@ the signal decoder is called, so the decoder can rely on uniformity
 within a single call. Passing the slice rather than a single envelope
 keeps the door open for a future per-entry routing mode.
 
-For the alpha there is exactly one implementation, `OtlpLogsDecoder`,
+For v0 there is exactly one implementation, `OtlpLogsDecoder`,
 which produces:
 
 ```rust
@@ -662,9 +658,9 @@ column resolves the winner) or insert as logically distinct rows. The
 table engine, not the token, owns correctness across config changes.
 
 If chunking is non-deterministic for any reason (e.g. concurrent merges
-inside the adapter), the alpha guarantee degrades to "duplicates may
+inside the adapter), the v0 guarantee degrades to "duplicates may
 remain past merge until query-time `FINAL`." We pick the deterministic
-path for alpha and verify it in tests.
+path for v0 and verify it in tests.
 
 ### ClickHouse Writer
 
@@ -677,7 +673,7 @@ path for alpha and verify it in tests.
 - Writer-level metrics (insert latency, byte volume, classification
   counts).
 
-Insert behavior for alpha:
+Insert behavior for v0:
 
 - **Sync inserts only.** `async_insert = 0` is set on every chunk. The
   writer does not return success for a chunk until ClickHouse has
@@ -698,7 +694,7 @@ Insert behavior for alpha:
   fast-path backstop; correctness across longer crash windows is
   provided by the table engine, not by the token.
 - **Format.** Inserts use `RowBinary` or `JSONEachRow`, chosen for the
-  alpha based on row complexity (Map columns push us toward `JSONEachRow`
+  v0 implementation based on row complexity (Map columns push us toward `JSONEachRow`
   unless we use `RowBinaryWithNamesAndTypes`).
 
 Error classification:
@@ -712,7 +708,7 @@ Error classification:
 
 ### Ack and Retry Semantics
 
-The alpha guarantee is **at-least-once delivery** to ClickHouse, with
+The v0 guarantee is **at-least-once delivery** to ClickHouse, with
 deduplication at the table level. The `AckController` owns the durable
 boundary.
 
@@ -774,8 +770,7 @@ impl AckController {
     ///     }
     ///
     /// A future `Consumer::ack_through(high)` API would let the loop
-    /// collapse into one call; that is a buffer-crate change and
-    /// post-v0.
+    /// collapse into one call; that is a future buffer-crate change.
     pub fn on_commit_group_success(
         &mut self,
         consumer: &mut Consumer,
@@ -837,7 +832,7 @@ Two layers of dedupe, with deliberately different roles:
      changes are a new schema and require a new table plus a backfill
      or rewrite path. The adapter trait should make this constraint
      explicit; the row-mapping function for ORDER BY columns gets a
-     dedicated stability test in the alpha test suite.
+     dedicated stability test in the v0 test suite.
 
 2. **Backstop: ClickHouse `insert_deduplication_token`.**
    Set per chunk to
@@ -879,7 +874,7 @@ insert dedupe path and never appears to readers. The additional
 guarantee is for long-window replays, explicit operator replays, or
 changed chunking config, where insert-only dedupe can admit duplicate
 rows but the target table still has enough source identity to collapse
-them. The alpha therefore does not promise duplicate-free plain reads in
+them. v0 therefore does not promise duplicate-free plain reads in
 the cases where the table-level backstop is needed before merges run;
 those readers must use `FINAL` or query-time dedupe. The runbook
 documents the query patterns that are safe.
@@ -905,10 +900,10 @@ decoder extends them to `(sequence, entry_index, record_index)`. The
 adapter chooses which of those to materialize as columns. `_adapter_version`
 is computed entirely by the adapter and lives outside the runtime trait.
 
-### Logs Alpha Adapter
+### OTLP Logs Adapter
 
-The alpha adapter targets a single ClickHouse logs table with a shape
-chosen to support the controller debugging workload:
+The v0 logs adapter targets a single ClickHouse logs table with a shape
+chosen to support log search and debugging workloads:
 
 ```sql
 CREATE TABLE logs (
@@ -943,11 +938,11 @@ Notes:
   across mapping changes.
 - `PARTITION BY` is on `Timestamp` for natural retention via TTL and
   efficient partition drops.
-- The TTL is a placeholder — the production retention policy is an open
-  question.
+- The TTL is a placeholder — retention policy should be set by
+  operators.
 - `Map(LowCardinality(String), String)` is a pragmatic default for OTLP
-  attribute maps. If the alpha shows that frequent attribute keys deserve
-  promoted columns, that is a post-alpha materialized-view change.
+  attribute maps. Promoting frequent attribute keys to dedicated columns
+  or materialized views is a future optimization.
 
 The row mapping is mechanical: copy timestamp, severity, body, service
 name, attributes; populate the system columns from `SourceCoordinates`;
@@ -968,7 +963,7 @@ a tradeoff between dedupe identity and query layout:
   dedupe collapses logically distinct rows that happen to share those
   columns.
 
-The alpha default above hybridizes: a query-useful prefix
+The v0 default above hybridizes: a query-useful prefix
 `(toDate(Timestamp), ServiceName, ...)` followed by the source-coordinate
 suffix that preserves uniqueness. Because every column in the prefix is
 a deterministic function of the source row (the timestamp and service
@@ -976,28 +971,15 @@ name come from the OTLP record itself, and a replay produces the same
 values), the same logical record always lands in the same `ORDER BY`
 slot, so dedupe still works.
 
-This shape is a working default, not a final answer. Phase 3 of the
-execution plan calls for a benchmark of three representative log query
-shapes against this default and against a raw-landing-table-plus-
-materialized-view alternative. The alpha ships with whichever shape
-the benchmark recommends; the choice and the measurements are folded
-back into this RFC at Phase 6.
-
-### Deployment Model
-
-The ingestor is a single Rust binary deployed by Heracles into the
-`responsive` namespace as a regular K8s `Deployment`. The image is built
-from the `opendata` workspace through Heracles' existing service-build
-scaffolding (the same pattern as `opendata-log` and `opendata-timeseries`).
-
-A future split into a separate `opendata-connectors` repo, with its own
-release cadence, is anticipated once we have more than one connector.
-That split is explicitly post-alpha.
+This shape is a working default, not a final answer. Before changing the
+table layout, benchmark representative log query shapes against this
+default and against a raw-landing-table-plus-materialized-view
+alternative.
 
 ### Configuration
 
-Configuration is layered: a YAML file mounted as a `ConfigMap`, with
-`INGESTOR__` env vars overriding individual keys (Figment-style).
+Configuration is layered: a YAML file with `INGESTOR__` env vars
+overriding individual keys (Figment-style).
 
 ```yaml
 buffer:
@@ -1005,12 +987,12 @@ buffer:
   data_prefix: ingest/otel/logs/data
   object_store:
     type: Aws
-    bucket: responsive-prod-opendata-otel-logs-us-west-2
+    bucket: opendata-otel-logs
     region: us-west-2
 
 clickhouse:
   endpoint: https://...clickhouse.cloud:8443
-  database: responsive
+  database: observability
   table: logs
   insert_quorum: auto
   # user/password come from env via Secret
@@ -1041,9 +1023,9 @@ metrics_server:
 ```
 
 `dry_run = true` runs the full pipeline including decode and adapter,
-but skips the ClickHouse insert, the Buffer ack, and the flush. This is
-the gate state for Heracles deployment (Phase 4) and the intermediate
-state for production rollout (Phase 5).
+but skips the ClickHouse insert, the Buffer ack, and the flush. This lets
+operators validate source compatibility and decode behavior before
+advancing the durable Buffer checkpoint.
 
 **Dry-run → live transition requires a process restart.** While in
 dry-run, the ingestor's in-process `Consumer` advances its fetch
@@ -1051,21 +1033,22 @@ cursor as batches are read, but the durable acked position on the
 manifest does not move (acks are skipped). Hot-flipping `dry_run` to
 `false` would resume from the in-process cursor and skip every batch
 already decoded since startup. The supported procedure is: change
-config in the ConfigMap → roll the deployment.
+config → restart the process.
 
 The ingestor's normal startup path is `Consumer::new(config, None)`,
 which initializes from the earliest unacked sequence on the manifest
 — i.e. from durable Buffer state, not in-process state. Operator-
 supplied `last_acked_sequence` is reserved for explicit replay
-scenarios documented in the runbook (Phase 6); the normal startup
-never threads in-process state across the restart.
+scenarios documented in the runbook; the normal startup never threads
+in-process state across the restart.
 
-Credentials live only in environment variables sourced from K8s
-`Secret`s. They are never in the ConfigMap.
+Credentials live only in environment variables sourced from the
+operator's secret management mechanism. They are never in the YAML
+config file.
 
 ### Future: Config-Driven Multi-Source Ingestors
 
-The alpha configuration is intentionally single-source:
+The v0 configuration is intentionally single-source:
 
 ```text
 one Buffer manifest -> one configured signal decoder -> one adapter -> one ClickHouse table
@@ -1086,13 +1069,13 @@ clickhouse:
     max_in_flight_inserts: 4
 
 sources:
-  - name: responsive_controller_logs
+  - name: service_logs
     buffer:
       manifest_path: ingest/otel/logs/manifest
       data_prefix: ingest/otel/logs/data
       object_store:
         type: Aws
-        bucket: responsive-prod-opendata-otel-logs-us-west-2
+        bucket: opendata-otel-logs
         region: us-west-2
     envelope:
       version: 1
@@ -1101,7 +1084,7 @@ sources:
     decoder: otlp_logs
     adapter: otlp_logs
     target:
-      database: responsive
+      database: observability
       table: logs
     adapter_config:
       adapter_version: 1
@@ -1127,7 +1110,7 @@ sources:
     decoder: otlp_logs
     adapter: otlp_logs
     target:
-      database: responsive
+      database: observability
       table: another_logs
 ```
 
@@ -1160,7 +1143,7 @@ project can make field mappings or generated DDL configurable, but that
 is separate from making source pipelines configurable.
 
 There is one important dedupe constraint for multiple sources. The
-alpha table's `ORDER BY` uses
+v0 table's `ORDER BY` uses
 `(toDate(Timestamp), ServiceName, _odb_sequence, _odb_entry_index,
 _odb_record_index)` because only one Buffer manifest writes to the
 table. If two manifests can write to the same ClickHouse table, the
@@ -1182,7 +1165,7 @@ equally safe when tables are shared.
 
 Incremental path:
 
-1. Normalize the current alpha config into a single-element `sources`
+1. Normalize the current v0 config into a single-element `sources`
    list without changing behavior.
 2. Add a source registry and run N independent source tasks in one
    process, sharing only the ClickHouse writer pool and metrics server.
@@ -1212,7 +1195,7 @@ Prometheus metrics, scraped by the existing OTel collector:
 - `commit_group_size_rows` / `commit_group_size_bytes` — histograms.
 - `ack_flush_latency_seconds` — histogram, time from `ack` call to
   `flush` completion.
-- `retry_count_total{reason}` — counter. The alpha labels retryable
+- `retry_count_total{reason}` — counter. v0 labels retryable
   attempts as `reason="retryable"`.
 - `last_decoded_sequence` — gauge. Advances even in dry-run.
 - `last_acked_sequence` — gauge. Advances only when not in dry-run.
@@ -1225,7 +1208,7 @@ Prometheus metrics, scraped by the existing OTel collector:
 - `decode_failures_total{stage}` — labeled by `envelope` / `signal` /
   `adapter`.
 - `clickhouse_failures_total{classification}` — labeled by writer error
-  class (`Retryable` / `NonRetryable`) in the alpha.
+  class (`Retryable` / `NonRetryable`) in v0.
 
 `last_decoded_sequence` and `last_acked_sequence` are tracked
 separately so dry-run is observable: in dry-run the decoded gauge
@@ -1269,9 +1252,9 @@ into a ClickHouse table. Rejected because:
 ### Build a Custom ClickHouse Table Engine
 
 A custom engine that natively reads ODB manifests would put the Buffer
-protocol inside ClickHouse itself. Rejected for alpha — wrong blast
-radius. Possibly revisitable as a long-term optimization once the
-external ingestor design has stabilized.
+protocol inside ClickHouse itself. Rejected for v0 because it has the
+wrong blast radius. Possibly revisitable as a long-term optimization
+once the external ingestor design has stabilized.
 
 ### Inline the Sink in the Producer
 
@@ -1355,63 +1338,80 @@ seam is not where the complexity lives anyway.
 [clickhouse-kafka-sink]: https://clickhouse.com/docs/integrations/kafka/clickhouse-kafka-connect-sink
 [kafka-design]: https://github.com/ClickHouse/clickhouse-kafka-connect/blob/a96f3341cb5a707a4c999dbac37725caeeaebbf1/docs/DESIGN.md
 
-## Open Questions
+## Future Improvements
 
-- ORDER BY shape for the logs table. Alpha shipped the hybrid default
-  `(toDate(Timestamp), ServiceName, _odb_*)`. Production-scale
-  benchmarks remain post-alpha validation and may motivate a new table
-  plus backfill if query patterns demand a different key.
-- Production retention policy for the logs table (the 30-day TTL above
-  is a placeholder).
-- Concrete log volume cap for alpha (controller logs only is the
-  scope; the byte/record-per-second bound is informed by Phase 1c
-  throughput).
-- Whether to add binary-owned schema bootstrap/migration support, or to
-  commit fully to out-of-band DDL. Alpha applied the generated DDL
-  manually in ClickHouse Cloud.
-- Whether the adapter's row format should be `JSONEachRow` for
-  development clarity or `RowBinaryWithNamesAndTypes` for throughput.
-  Alpha uses `JSONEachRow`; revisit with measurement if throughput or
-  CPU cost makes serialization material.
-- Whether to introduce a ClickHouse-side checkpoint table that records
-  `(manifest_path, last_sequence)` so a fully-empty Buffer can still
-  resume. For the alpha this is unnecessary because Buffer keeps
-  unacked entries; revisit if we ever truncate Buffer for cost reasons.
-- Whether `AckFlushPolicy::EveryN` should be allowed in production at
-  all, given that the operator-visible value is "more throughput in
-  exchange for an explicit replay window." Default for alpha is
-  `EveryCommitGroup`; revisit if manifest-write rate becomes the
-  bottleneck.
+The design above deliberately keeps v0 narrow. These follow-ups are
+compatible with the layering in this RFC and should not require changing
+the Buffer ack model.
 
-## Alpha Acceptance Criteria
+- **Per-entry signal routing.** v0 expects each ingestor instance to read
+  a homogeneous `(signal_type, encoding)` stream. A future version can
+  route entries to different signal pipelines instead of failing a mixed
+  batch.
+- **Dead-letter / quarantine mode.** v0 fails closed on unknown
+  metadata, unsupported encodings, decode errors, and schema mismatches.
+  A future mode can deliberately ack offending ranges after recording
+  them elsewhere, but that requires an explicit operator-facing data-loss
+  policy.
+- **Config-driven multi-source runtime.** Normalize the single-source
+  config into a `sources` list, run one independent pipeline per
+  manifest, share only the writer pool and metrics server, and enforce
+  shared-table dedupe-key validation.
+- **Replay tooling.** Normal startup resumes from durable Buffer state.
+  Operator-directed replay from an arbitrary sequence needs explicit
+  tooling and guardrails so it cannot accidentally skip or duplicate
+  data without table-level dedupe.
+- **ORDER BY and engine benchmarks.** Benchmark the v0 logs key
+  `(toDate(Timestamp), ServiceName, _odb_*)` against query-shaped keys,
+  raw landing tables plus materialized views, plain `MergeTree`, and
+  `ReplacingMergeTree`.
+- **Schema bootstrap and validation.** v0 assumes DDL is applied
+  out-of-band. A future version can own table creation, validate that
+  the live table matches the adapter's required columns and key, and
+  reject unsafe shared-table configurations before consuming.
+- **Row serialization format.** `JSONEachRow` is straightforward for map
+  columns and development. `RowBinaryWithNamesAndTypes` may reduce CPU
+  and bytes on the wire and should be evaluated with measurement.
+- **ClickHouse-side checkpoint.** Buffer ack is the source checkpoint.
+  A separate ClickHouse checkpoint table is unnecessary while Buffer
+  keeps unacked entries, but may be useful if operators later truncate
+  Buffer manifests aggressively for cost reasons.
+- **Ack flush policy.** `EveryCommitGroup` gives the smallest replay
+  window. `EveryN` can reduce manifest writes but makes replay windows
+  explicit; operator use should be gated on measurement and operator
+  tolerance for replay.
+- **Retention and storage policy.** TTL and storage settings should be
+  operator config, not baked into the adapter.
 
-- Controller logs are ingested into ClickHouse end-to-end through the
-  documented path: Fluent Bit → OTEL Collector → opendata-go logs
-  exporter → Buffer → clickhouse-ingestor → ClickHouse.
-- A `FINAL` query over a 5-minute window matches Datadog's count for the
-  same window within a documented drift tolerance.
-- The ingestor can be paused (scale to 0) and resumed without data loss.
-- Re-inserting an already processed Buffer sequence range produces no
-  duplicate rows under `FINAL` queries. Operator-directed replay from an
-  arbitrary sequence remains post-alpha tooling.
-- Failure injection (block ClickHouse for several minutes) shows expected
-  behavior: lag grows, ack age climbs, no data loss, recovery on its own.
-- Heracles-prod deployment is observable via Prometheus and the runbook
-  is sufficient for an on-caller other than the author to pause, resume,
-  and inspect the system. Replay-from-sequence is documented as a
-  post-alpha gap.
-- This RFC reflects what was actually shipped.
+## Validation Criteria
 
-## Updates
+- OTLP logs are ingested end to end through the documented path:
+  producer → Buffer → clickhouse-ingestor → ClickHouse.
+- Dry-run mode performs Buffer reads, envelope decoding, signal decoding,
+  commit-grouping, and adapter planning without ClickHouse inserts,
+  Buffer acks, or manifest flushes.
+- A clean shutdown drains the in-flight commit group, inserts all chunks,
+  acks the contiguous Buffer sequence range, flushes the manifest, and
+  exits with a durable high-watermark.
+- Restart after a crash replays from the last flushed Buffer ack
+  boundary and does not lose rows.
+- Re-inserting an already processed Buffer sequence range produces one
+  logical row per `(sequence, entry_index, record_index)` under
+  `FINAL` queries.
+- Replaying the same commit group with the same chunking config produces
+  the same ordered rows, chunk boundaries, and dedupe tokens.
+- If ClickHouse is unreachable, inserts fail retryably, Buffer ack does
+  not advance, lag grows, and the ingestor catches up after recovery.
+- Non-retryable decode or ClickHouse errors fail closed: no Buffer ack
+  advance, clear metrics/logs, and operator intervention required.
+- Metrics expose decoded progress, acked progress, commit-group counts,
+  insert chunk results, retry counts, and ClickHouse failure
+  classifications.
 
-| Date       | Description                                                                                                                                             |
-|------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 2026-04-28 | Initial draft                                                                                                                                            |
-| 2026-04-28 | Per-entry metadata envelope; CommitGroup and AckController layers; chunked idempotency token; ReplacingMergeTree(_adapter_version); ORDER BY tradeoff. |
-| 2026-04-28 | v0 traps: dry-run→live restart rule; commit-group input progress independent of rows; max-age timer flush; token includes adapter_version + chunking fingerprint; ORDER BY mapping change requires new table; AckController is not an Arc owner. |
-| 2026-04-28 | Ack the contiguous range `low..=high` per commit group, not just the high-watermark; clarified normal startup is `Consumer::new(config, None)` (durable Buffer state), not in-process state. |
-| 2026-04-29 | Phase 1a shipped: `opendataexporter` v0.4.0 published with OTLP logs signal support (signal_type=2). Phase 1b Part 2 shipped: Sindri prod collector running v0.4.0 image with both `opendata` (metrics) and `opendata/logs` exporters registered; logs bucket `responsive-prod-opendata-otel-logs-us-west-2` provisioned and idle pending Phase 1c source wiring. No design changes — the source/sink architecture, deployment model, and config shape (incl. bucket name in Configuration §) all matched the RFC as written. |
-| 2026-04-29 | Phase 1c shipped: Fluent Bit `forward` output (scoped via two-stage `rewrite_tag` to namespace=responsive + container=controller, `keep=true` so Datadog still receives originals) → OTel collector `fluentforwardreceiver` on port 8006 → batch → opendata/logs exporter. Collector image `:a05d291` adds `fluentforwardreceiver` to the OCB build alongside otlpreceiver. Datadog path unaffected. Worth folding into the RFC's "Logs Alpha Adapter" or a new "Source-side wiring" subsection: aws-for-fluent-bit:stable bundles Fluent Bit 1.9.10, whose opentelemetry output is metrics-only — `forward` is the working source-side primitive on this version. Records currently land with kubernetes metadata in `attributes["kubernetes"]` rather than canonical OTLP `resource.attributes["k8s.*"]`, and severity is unset. A `transform` processor on the collector to promote those is Phase 5 polish, not a design change. |
-| 2026-04-29 | Phase 4 shipped: Heracles ingestor pod `prod-clickhouse-ingestor` Running on the heracles EKS cluster with `dry_run = true`. Image `ghcr.io/opendata-oss/clickhouse-ingestor:ch-integration-odb-clickhouse-ingestor-59c0364`. Dedicated IRSA role (`heracles-clickhouse-ingestor-service-account-role`) with tight scoping: `GetObject` on the data prefix, `GetObject`/`PutObject`/`DeleteObject` on the manifest, `ListBucket` prefix-scoped to `ingest/otel/logs/*` plus the manifest. Prometheus scrape endpoint and per-batch INFO logging were identified as Phase 5 polish items. |
-| 2026-04-30 | Phase 5 alpha shipped live: metrics server added (`/metrics`, `/-/healthy`), central OTel collector scrapes the ingestor, ClickHouse Cloud endpoint configured, `dry_run=false` rollout resumed from the earliest unacked sequence, drained sequences 0..97 into `responsive.logs`, and rows planned/inserted/queried matched 245 with zero decode/ClickHouse/retry failures. RFC reconciled with implementation details learned during review: manifest+table idempotency token namespace, YAML config, no emitted `current_lag_sequences` until Buffer exposes a head-sequence peek, manual alpha DDL application, and ORDER BY benchmark moved to post-alpha validation. |
-| 2026-05-05 | Added execution overview/correctness exposition, Kafka sink connector comparison, and future config-driven multi-source ingestor path. |
+## Revision History
+
+| Date       | Description |
+|------------|-------------|
+| 2026-04-28 | Initial draft. |
+| 2026-04-28 | Added per-entry metadata envelope, CommitGroup and AckController layers, chunked idempotency tokens, `ReplacingMergeTree(_adapter_version)`, and ORDER BY tradeoff. |
+| 2026-05-05 | Added execution overview, dedupe correctness exposition, Kafka sink connector comparison, and future config-driven multi-source path. |
