@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[cfg(feature = "buffer")]
+use common::ObjectStoreConfig;
 use common::StorageConfig;
 use serde::{Deserialize, Serialize};
 
@@ -245,6 +247,12 @@ pub struct Config {
     /// attribute names or type mismatches will fail. If empty, any attribute
     /// names are accepted with types inferred from the first write.
     pub metadata_fields: Vec<MetadataFieldSpec>,
+
+    /// Buffer consumer configuration. When `Some`, the server starts a
+    /// background task that ingests vectors from an `opendata-buffer` queue.
+    #[cfg(feature = "buffer")]
+    #[serde(default)]
+    pub buffer_consumer: Option<BufferConsumerConfig>,
 }
 
 impl Default for Config {
@@ -263,8 +271,66 @@ impl Default for Config {
             chunk_target: 4096,
             query_pruning_factor: None,
             metadata_fields: Vec::new(),
+            #[cfg(feature = "buffer")]
+            buffer_consumer: None,
         }
     }
+}
+
+/// Configuration for the embedded buffer consumer task.
+///
+/// Mirrors [`buffer::ConsumerConfig`], plus a poll interval used by the
+/// vector consumer when the queue is empty.
+#[cfg(feature = "buffer")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferConsumerConfig {
+    /// Object store where the buffer queue lives. Must match the producer.
+    pub object_store: ObjectStoreConfig,
+
+    /// Path to the queue manifest in object storage. Must match the producer.
+    #[serde(default = "default_buffer_manifest_path")]
+    pub manifest_path: String,
+
+    /// Path prefix for data batch objects. Must match the producer.
+    #[serde(default = "default_buffer_data_path_prefix")]
+    pub data_path_prefix: String,
+
+    /// Poll interval when the queue is empty.
+    #[serde(default = "default_buffer_poll_interval", with = "duration_secs")]
+    pub poll_interval: Duration,
+
+    /// How often the garbage collector runs.
+    #[serde(default = "default_buffer_gc_interval", with = "duration_secs")]
+    pub gc_interval: Duration,
+
+    /// Minimum age before an unreferenced batch file is deleted.
+    #[serde(default = "default_buffer_gc_grace_period", with = "duration_secs")]
+    pub gc_grace_period: Duration,
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_manifest_path() -> String {
+    "ingest/manifest".to_string()
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_data_path_prefix() -> String {
+    "ingest".to_string()
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_poll_interval() -> Duration {
+    Duration::from_millis(100)
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_gc_interval() -> Duration {
+    Duration::from_secs(300)
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_gc_grace_period() -> Duration {
+    Duration::from_secs(600)
 }
 
 /// Options for search operations.

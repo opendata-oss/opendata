@@ -3,6 +3,8 @@
 //! This module provides an HTTP API for interacting with the vector database,
 //! exposing upsert, search, and get operations via REST endpoints.
 
+#[cfg(feature = "buffer")]
+pub(crate) mod buffer_consumer;
 mod config;
 mod error;
 mod handlers;

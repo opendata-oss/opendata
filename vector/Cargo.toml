@@ -23,6 +23,7 @@ required-features = ["http-server"]
 default = []
 http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with"]
 embedded-reader = ["dep:reqwest", "dep:serde_json"]
+buffer = ["http-server", "dep:buffer"]
 bench-internals = []
 avx512 = []
 
@@ -59,6 +60,9 @@ serde_with = { workspace = true, optional = true }
 
 # Embedded reader dependencies (optional, enabled by embedded-reader feature)
 reqwest = { workspace = true, optional = true, features = ["json"] }
+
+# Buffer consumer dependencies (optional, enabled by buffer feature)
+buffer = { workspace = true, optional = true }
 
 [[bin]]
 name = "gen_sift100k_groundtruth"

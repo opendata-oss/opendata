@@ -42,7 +42,7 @@ impl WriteRequest {
         }
     }
 
-    fn from_protobuf(body: &[u8]) -> Result<Self, Error> {
+    pub(crate) fn from_protobuf(body: &[u8]) -> Result<Self, Error> {
         let proto_request = proto::WriteRequest::decode(body)
             .map_err(|e| Error::InvalidInput(format!("Invalid protobuf: {}", e)))?;
         Self::from_proto_request(proto_request)
