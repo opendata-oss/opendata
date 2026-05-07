@@ -165,7 +165,11 @@ impl ForwardIndexDelta {
         self.vector_index_updates.remove(&vector_id);
     }
 
-    pub(crate) fn delete_external_id(&mut self, external_id: String, vector_id: VectorId) {
+    pub(crate) fn delete_external_id_and_vector(
+        &mut self,
+        external_id: String,
+        vector_id: VectorId,
+    ) {
         if let Some(pending_id) = self.dictionary_updates.remove(&external_id) {
             self.vector_updates.remove(&pending_id);
         }
@@ -1123,7 +1127,7 @@ mod tests {
 
         // when
         let mut delta = ForwardIndexDelta::new(&state);
-        delta.delete_external_id("v1".to_string(), id);
+        delta.delete_external_id_and_vector("v1".to_string(), id);
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1149,7 +1153,7 @@ mod tests {
 
         // when
         let mut delta = ForwardIndexDelta::new(&state);
-        delta.delete_external_id("v1".to_string(), old_id);
+        delta.delete_external_id_and_vector("v1".to_string(), old_id);
         let new_id = delta.add_vector("v1", &make_attributes(vec![3.0, 4.0]));
         delta.update_vector_index_data(new_id, vec![leaf_centroid(1)], make_indexed_fields());
         let mut ops = vec![];
@@ -1187,7 +1191,7 @@ mod tests {
         let mut delta = ForwardIndexDelta::new(&state);
         let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
         delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
-        delta.delete_external_id("v1".to_string(), id);
+        delta.delete_external_id_and_vector("v1".to_string(), id);
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();

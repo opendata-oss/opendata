@@ -15,7 +15,7 @@ use crate::write::indexer::tree::merge::MergeCentroids;
 use crate::write::indexer::tree::root::SplitRoot;
 use crate::write::indexer::tree::split::{ReassignVector, SplitCentroids};
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
-use crate::write::indexer::tree::vector::{DeleteVectors, ReassignVectors, WriteVectors};
+use crate::write::indexer::tree::vector::{ReassignVectors, WriteVectors};
 use common::StorageRead;
 use common::storage::RecordOp;
 #[cfg(debug_assertions)]
@@ -153,38 +153,21 @@ impl Indexer {
         let mut stats = IndexerStats::default();
         let mut delta = VectorIndexDelta::new(&self.state);
 
-        for op in ops {
-            match op {
-                VectorDbOp::Write(writes) => {
-                    let write = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, writes);
-                    let write_start = Instant::now();
-                    let (inserts, updates) = write.execute(&self.state, &mut delta).await?;
-                    debug!(
-                        parent: &update_span,
-                        op = "write_vectors",
-                        elapsed_ms = elapsed_ms(write_start),
-                        inserts,
-                        updates,
-                        "completed"
-                    );
-                    stats.inserts += inserts;
-                    stats.updates += updates;
-                }
-                VectorDbOp::Delete(ids) => {
-                    let delete = DeleteVectors::new(&snapshot, snapshot_epoch, ids);
-                    let delete_start = Instant::now();
-                    let deletes = delete.execute(&self.state, &mut delta).await?;
-                    debug!(
-                        parent: &update_span,
-                        op = "delete_vectors",
-                        elapsed_ms = elapsed_ms(delete_start),
-                        deletes,
-                        "completed"
-                    );
-                    stats.deletes += deletes;
-                }
-            }
-        }
+        let batch = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, ops);
+        let batch_start = Instant::now();
+        let (inserts, updates, deletes) = batch.execute(&self.state, &mut delta).await?;
+        debug!(
+            parent: &update_span,
+            op = "write_vectors",
+            elapsed_ms = elapsed_ms(batch_start),
+            inserts,
+            updates,
+            deletes,
+            "completed"
+        );
+        stats.inserts += inserts;
+        stats.updates += updates;
+        stats.deletes += deletes;
 
         let depth = TreeDepth::of(self.state.centroids_meta().depth);
         let mut next_level = TreeLevel::leaf(depth);
