@@ -4,12 +4,23 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::coordinator::Flusher;
-use common::storage::{Storage, StorageSnapshot, Ttl};
+use common::storage::{RecordOp, Storage, StorageSnapshot, Ttl};
 
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::model::TimeBucket;
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
 use crate::tsdb_metrics;
+
+/// Sum the wire-equivalent size of an op as `key.len() + value.len()`. This
+/// is intentionally cheap (just two `Bytes::len` reads) so it is safe to
+/// accumulate while building the op vec on the flush hot path.
+fn op_estimated_bytes(op: &RecordOp) -> usize {
+    match op {
+        RecordOp::Put(p) => p.record.key.len() + p.record.value.len(),
+        RecordOp::Merge(m) => m.record.key.len() + m.record.value.len(),
+        RecordOp::Delete(k) => k.len(),
+    }
+}
 
 /// Flusher implementation for the timeseries write coordinator.
 ///
@@ -45,26 +56,42 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         _epoch_range: &Range<u64>,
     ) -> Result<Arc<dyn StorageSnapshot>, String> {
         if frozen.is_empty() {
-            return self.storage.snapshot().await.map_err(|e| e.to_string());
+            let snap_start = std::time::Instant::now();
+            let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string());
+            ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS)
+                .record(snap_start.elapsed().as_secs_f64());
+            return snapshot;
         }
 
         let new_series_count = frozen.series_dict_delta.len() as u64;
+        let sample_count: u64 = frozen.samples.values().map(|s| s.points.len() as u64).sum();
         let start = std::time::Instant::now();
         let ttl = bucket_ttl(frozen.bucket, self.retention);
 
-        let mut ops = Vec::new();
-        // Suppress the BucketList merge when this bucket is already listed.
-        // Without this check, every flush emits an identical single-element
-        // merge operand on a singleton hot key that only coalesces at major
-        // compaction. `merge_batch_bucket_list` still dedupes, so concurrent
-        // first-sightings from two flushers are safe.
+        // Phase 1: bucket-list lookup. Skips the redundant BucketList merge
+        // operand on hot key when this bucket is already listed.
+        let lookup_start = std::time::Instant::now();
         let bucket_announced = self
             .storage
             .bucket_list_contains(frozen.bucket)
             .await
             .map_err(|e| e.to_string())?;
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_BUCKET_LIST_LOOKUP_DURATION_SECONDS)
+            .record(lookup_start.elapsed().as_secs_f64());
+
+        // Phase 2: build storage ops. Track estimated key+value bytes by
+        // summing `Bytes::len()` on each produced op (cheap, no extra clone).
+        let build_start = std::time::Instant::now();
+        let mut ops = Vec::new();
+        let mut estimated_bytes: u64 = 0;
+        let push_op = |ops: &mut Vec<RecordOp>, estimated: &mut u64, op: RecordOp| {
+            *estimated += op_estimated_bytes(&op) as u64;
+            ops.push(op);
+        };
         if !bucket_announced {
-            ops.push(
+            push_op(
+                &mut ops,
+                &mut estimated_bytes,
                 self.storage
                     .merge_bucket_list(frozen.bucket, ttl)
                     .map_err(|e| e.to_string())?,
@@ -72,7 +99,9 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         }
 
         for (fingerprint, series_id) in &frozen.series_dict_delta {
-            ops.push(
+            push_op(
+                &mut ops,
+                &mut estimated_bytes,
                 self.storage
                     .insert_series_id(frozen.bucket, *fingerprint, *series_id, ttl)
                     .map_err(|e| e.to_string())?,
@@ -80,7 +109,9 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         }
 
         for entry in frozen.forward_index.series.iter() {
-            ops.push(
+            push_op(
+                &mut ops,
+                &mut estimated_bytes,
                 self.storage
                     .insert_forward_index(frozen.bucket, *entry.key(), entry.value().clone(), ttl)
                     .map_err(|e| e.to_string())?,
@@ -88,7 +119,9 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         }
 
         for entry in frozen.inverted_index.postings.iter() {
-            ops.push(
+            push_op(
+                &mut ops,
+                &mut estimated_bytes,
                 self.storage
                     .merge_inverted_index(
                         frozen.bucket,
@@ -101,7 +134,9 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         }
 
         for (series_id, series_samples) in frozen.samples {
-            ops.push(
+            push_op(
+                &mut ops,
+                &mut estimated_bytes,
                 self.storage
                     .merge_samples(
                         frozen.bucket,
@@ -113,10 +148,23 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
                     .map_err(|e| e.to_string())?,
             );
         }
+        let ops_count = ops.len() as u64;
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_BUILD_OPS_DURATION_SECONDS)
+            .record(build_start.elapsed().as_secs_f64());
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_OPS).record(ops_count as f64);
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_ESTIMATED_BYTES)
+            .record(estimated_bytes as f64);
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_NEW_SERIES).record(new_series_count as f64);
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_SAMPLES).record(sample_count as f64);
 
+        // Phase 3: SlateDB apply. Time spent here reflects SlateDB write
+        // backpressure (memtable full, WAL stall, etc.).
+        let apply_start = std::time::Instant::now();
         let result = self.storage.apply(ops).await.map_err(|e| e.to_string());
-        let elapsed = start.elapsed().as_secs_f64();
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_APPLY_DURATION_SECONDS)
+            .record(apply_start.elapsed().as_secs_f64());
 
+        let elapsed = start.elapsed().as_secs_f64();
         match &result {
             Ok(_) => {
                 ::metrics::counter!(tsdb_metrics::TSDB_FLUSH_TOTAL, "status" => "success")
@@ -131,7 +179,13 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_DURATION_SECONDS).record(elapsed);
 
         result?;
-        self.storage.snapshot().await.map_err(|e| e.to_string())
+
+        // Phase 4: snapshot refresh.
+        let snap_start = std::time::Instant::now();
+        let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string());
+        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS)
+            .record(snap_start.elapsed().as_secs_f64());
+        snapshot
     }
 
     async fn flush_storage(&self) -> Result<(), String> {
