@@ -1,3 +1,4 @@
+use super::metrics;
 use super::{BroadcastedView, WriteCommand};
 use super::{Delta, Durability, WriteError, WriteResult};
 use crate::StorageRead;
@@ -6,7 +7,7 @@ use crate::storage::StorageSnapshot;
 use futures::FutureExt;
 use futures::future::Shared;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// A point-in-time view of all applied writes, broadcast by the coordinator
@@ -142,6 +143,7 @@ impl<M: Clone + Send + 'static> WriteHandle<M> {
 /// This is the main interface for interacting with the write coordinator.
 /// It can be cloned and shared across tasks.
 pub struct WriteCoordinatorHandle<D: Delta> {
+    name: Arc<str>,
     write_tx: mpsc::Sender<WriteCommand<D>>,
     watchers: EpochWatcher,
     view: Arc<BroadcastedView<D>>,
@@ -149,11 +151,13 @@ pub struct WriteCoordinatorHandle<D: Delta> {
 
 impl<D: Delta> WriteCoordinatorHandle<D> {
     pub(crate) fn new(
+        name: String,
         write_tx: mpsc::Sender<WriteCommand<D>>,
         watchers: EpochWatcher,
         view: Arc<BroadcastedView<D>>,
     ) -> Self {
         Self {
+            name: Arc::from(name),
             write_tx,
             watchers,
             view,
@@ -166,6 +170,35 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// Returns 0 if no data has been flushed yet.
     pub fn flushed_epoch(&self) -> u64 {
         *self.watchers.written_rx.borrow()
+    }
+
+    /// Sample queue depth on each send. Cheap atomic reads on `mpsc::Sender`.
+    fn record_queue_depth(&self) {
+        let max = self.write_tx.max_capacity();
+        let free = self.write_tx.capacity();
+        ::metrics::gauge!(
+            metrics::COORDINATOR_QUEUE_DEPTH,
+            "channel" => self.name.to_string(),
+        )
+        .set(max.saturating_sub(free) as f64);
+    }
+
+    fn record_send(&self, command: &'static str, status: &'static str, started: Instant) {
+        ::metrics::histogram!(
+            metrics::COORDINATOR_SEND_DURATION_SECONDS,
+            "command" => command,
+            "status" => status,
+        )
+        .record(started.elapsed().as_secs_f64());
+    }
+
+    fn record_backpressure(&self, command: &'static str, reason: &'static str) {
+        ::metrics::counter!(
+            metrics::COORDINATOR_QUEUE_BACKPRESSURE_TOTAL,
+            "command" => command,
+            "reason" => reason,
+        )
+        .increment(1);
     }
 }
 
@@ -186,8 +219,12 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
         write: D::Write,
         timeout: Duration,
     ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+        const COMMAND: &str = "write_timeout";
+        self.record_queue_depth();
+        let started = Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.write_tx
+        let send_result = self
+            .write_tx
             .send_timeout(
                 WriteCommand::Write {
                     write,
@@ -195,18 +232,24 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
                 },
                 timeout,
             )
-            .await
-            .map_err(|e| match e {
-                mpsc::error::SendTimeoutError::Timeout(WriteCommand::Write { write, .. }) => {
-                    WriteError::TimeoutError(write)
-                }
-                mpsc::error::SendTimeoutError::Closed(WriteCommand::Write { write, .. }) => {
-                    WriteError::Shutdown
-                }
-                _ => unreachable!("sent a Write command"),
-            })?;
-
-        Ok(WriteHandle::new(rx, self.watchers.clone()))
+            .await;
+        match send_result {
+            Ok(()) => {
+                self.record_send(COMMAND, "ok", started);
+                Ok(WriteHandle::new(rx, self.watchers.clone()))
+            }
+            Err(mpsc::error::SendTimeoutError::Timeout(WriteCommand::Write { write, .. })) => {
+                self.record_send(COMMAND, "timeout", started);
+                self.record_backpressure(COMMAND, "timeout");
+                Err(WriteError::TimeoutError(write))
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(WriteCommand::Write { .. })) => {
+                self.record_send(COMMAND, "shutdown", started);
+                self.record_backpressure(COMMAND, "closed");
+                Err(WriteError::Shutdown)
+            }
+            Err(_) => unreachable!("sent a Write command"),
+        }
     }
 
     /// Submit a write to the coordinator, blocking indefinitely until there is
@@ -222,19 +265,29 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
         &self,
         write: D::Write,
     ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+        const COMMAND: &str = "write";
+        self.record_queue_depth();
+        let started = Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.write_tx
+        let send_result = self
+            .write_tx
             .send(WriteCommand::Write {
                 write,
                 result_tx: tx,
             })
-            .await
-            .map_err(|e| match e {
-                mpsc::error::SendError(WriteCommand::Write { write, .. }) => WriteError::Shutdown,
-                _ => unreachable!("sent a Write command"),
-            })?;
-
-        Ok(WriteHandle::new(rx, self.watchers.clone()))
+            .await;
+        match send_result {
+            Ok(()) => {
+                self.record_send(COMMAND, "ok", started);
+                Ok(WriteHandle::new(rx, self.watchers.clone()))
+            }
+            Err(mpsc::error::SendError(WriteCommand::Write { .. })) => {
+                self.record_send(COMMAND, "shutdown", started);
+                self.record_backpressure(COMMAND, "closed");
+                Err(WriteError::Shutdown)
+            }
+            Err(_) => unreachable!("sent a Write command"),
+        }
     }
 
     /// Submit a write to the coordinator.
@@ -247,23 +300,31 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
         &self,
         write: D::Write,
     ) -> Result<WriteHandle<D::ApplyResult>, WriteError<D::Write>> {
+        const COMMAND: &str = "try_write";
+        self.record_queue_depth();
+        let started = Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .try_send(WriteCommand::Write {
-                write,
-                result_tx: tx,
-            })
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(WriteCommand::Write { write, .. }) => {
-                    WriteError::Backpressure(write)
-                }
-                mpsc::error::TrySendError::Closed(WriteCommand::Write { write, .. }) => {
-                    WriteError::Shutdown
-                }
-                _ => unreachable!("sent a Write command"),
-            })?;
-
-        Ok(WriteHandle::new(rx, self.watchers.clone()))
+        let send_result = self.write_tx.try_send(WriteCommand::Write {
+            write,
+            result_tx: tx,
+        });
+        match send_result {
+            Ok(()) => {
+                self.record_send(COMMAND, "ok", started);
+                Ok(WriteHandle::new(rx, self.watchers.clone()))
+            }
+            Err(mpsc::error::TrySendError::Full(WriteCommand::Write { write, .. })) => {
+                self.record_send(COMMAND, "backpressure", started);
+                self.record_backpressure(COMMAND, "full");
+                Err(WriteError::Backpressure(write))
+            }
+            Err(mpsc::error::TrySendError::Closed(WriteCommand::Write { .. })) => {
+                self.record_send(COMMAND, "shutdown", started);
+                self.record_backpressure(COMMAND, "closed");
+                Err(WriteError::Shutdown)
+            }
+            Err(_) => unreachable!("sent a Write command"),
+        }
     }
 
     /// Request a flush of the current delta.
@@ -273,18 +334,30 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
     /// to guarantee durability, and the durable watermark will be advanced.
     /// Returns a handle that can be used to wait for the flush to complete.
     pub async fn flush(&self, flush_storage: bool) -> WriteResult<WriteHandle> {
+        const COMMAND: &str = "flush";
+        self.record_queue_depth();
+        let started = Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .try_send(WriteCommand::Flush {
-                epoch_tx: tx,
-                flush_storage,
-            })
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => WriteError::Backpressure(()),
-                mpsc::error::TrySendError::Closed(_) => WriteError::Shutdown,
-            })?;
-
-        Ok(WriteHandle::new(rx, self.watchers.clone()))
+        let send_result = self.write_tx.try_send(WriteCommand::Flush {
+            epoch_tx: tx,
+            flush_storage,
+        });
+        match send_result {
+            Ok(()) => {
+                self.record_send(COMMAND, "ok", started);
+                Ok(WriteHandle::new(rx, self.watchers.clone()))
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.record_send(COMMAND, "backpressure", started);
+                self.record_backpressure(COMMAND, "full");
+                Err(WriteError::Backpressure(()))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.record_send(COMMAND, "shutdown", started);
+                self.record_backpressure(COMMAND, "closed");
+                Err(WriteError::Shutdown)
+            }
+        }
     }
 
     pub fn view(&self) -> Arc<View<D>> {
@@ -299,6 +372,7 @@ impl<D: Delta> WriteCoordinatorHandle<D> {
 impl<D: Delta> Clone for WriteCoordinatorHandle<D> {
     fn clone(&self) -> Self {
         Self {
+            name: self.name.clone(),
             write_tx: self.write_tx.clone(),
             watchers: self.watchers.clone(),
             view: self.view.clone(),

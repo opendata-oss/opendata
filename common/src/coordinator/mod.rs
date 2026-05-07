@@ -2,6 +2,7 @@
 
 mod error;
 mod handle;
+pub(crate) mod metrics;
 pub mod subscriber;
 mod traits;
 
@@ -12,6 +13,7 @@ use std::ops::{Deref, DerefMut};
 pub use error::{WriteError, WriteResult};
 use futures::stream::{self, SelectAll, StreamExt};
 pub use handle::{View, WriteCoordinatorHandle, WriteHandle};
+pub use metrics::describe_coordinator_metrics;
 pub use subscriber::{SubscribeError, ViewMonitor, ViewSubscriber};
 pub use traits::{Delta, Durability, EpochStamped, Flusher};
 
@@ -125,10 +127,11 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
 
         let mut handles = HashMap::new();
         for name in channels {
-            let write_tx = write_txs.remove(&name.to_string()).expect("unreachable");
+            let name = name.to_string();
+            let write_tx = write_txs.remove(&name).expect("unreachable");
             handles.insert(
-                name.to_string(),
-                WriteCoordinatorHandle::new(write_tx, watcher.clone(), view.clone()),
+                name.clone(),
+                WriteCoordinatorHandle::new(name, write_tx, watcher.clone(), view.clone()),
             );
         }
 
@@ -294,7 +297,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                                 epoch: self.epoch.saturating_sub(1),
                                 result: (),
                             }));
-                            self.handle_flush(flush_storage).await;
+                            self.handle_flush(FlushReason::Explicit, flush_storage).await;
                         }
                         None => {
                             // All write channels closed
@@ -304,7 +307,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
                 }
 
                 _ = self.flush_interval.tick() => {
-                    self.handle_flush(false).await;
+                    self.handle_flush(FlushReason::Interval, false).await;
                 }
 
                 _ = self.stop_tok.cancelled() => {
@@ -314,7 +317,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         }
 
         // Flush any remaining pending writes before shutdown
-        self.handle_flush(false).await;
+        self.handle_flush(FlushReason::Shutdown, false).await;
 
         // Signal the flush task to stop
         self.flush_stop_tok.cancel();
@@ -333,7 +336,11 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         let write_epoch = self.epoch;
         self.epoch += 1;
 
+        let apply_start = std::time::Instant::now();
         let result = self.delta.apply(write);
+        ::metrics::histogram!(metrics::COORDINATOR_DELTA_APPLY_DURATION_SECONDS)
+            .record(apply_start.elapsed().as_secs_f64());
+
         // Ignore error if receiver was dropped (fire-and-forget write)
         let _ = result_tx.send(
             result
@@ -350,30 +357,42 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         // Ignore error if no watchers are listening - this is non-fatal
         self.watermarks.update_applied(write_epoch);
 
-        if self.delta.estimate_size() >= self.config.flush_size_threshold {
-            self.handle_flush(false).await;
+        let estimated = self.delta.estimate_size();
+        ::metrics::gauge!(metrics::COORDINATOR_DELTA_ESTIMATED_BYTES).set(estimated as f64);
+        if estimated >= self.config.flush_size_threshold {
+            self.handle_flush(FlushReason::SizeThreshold, false).await;
         }
 
         Ok(())
     }
 
-    async fn handle_flush(&mut self, flush_storage: bool) {
-        self.flush_if_delta_has_writes().await;
+    async fn handle_flush(&mut self, reason: FlushReason, flush_storage: bool) {
+        self.flush_if_delta_has_writes(reason).await;
         if flush_storage {
-            let _ = self.flush_tx.send(FlushEvent::FlushStorage).await;
+            self.send_flush_event(FlushEvent::FlushStorage).await;
         }
     }
 
-    async fn flush_if_delta_has_writes(&mut self) {
+    async fn flush_if_delta_has_writes(&mut self, reason: FlushReason) {
         if self.epoch == self.delta_start_epoch {
             return;
         }
 
         self.flush_interval.reset();
 
+        ::metrics::counter!(metrics::COORDINATOR_FLUSH_TOTAL, "reason" => reason.as_str())
+            .increment(1);
+
         let epoch_range = self.delta_start_epoch..self.epoch;
         self.delta_start_epoch = self.epoch;
+
+        let freeze_start = std::time::Instant::now();
         let (frozen, frozen_reader) = self.delta.freeze_and_init();
+        ::metrics::histogram!(metrics::COORDINATOR_DELTA_FREEZE_DURATION_SECONDS)
+            .record(freeze_start.elapsed().as_secs_f64());
+        // Reset estimated bytes gauge: the new delta starts empty.
+        ::metrics::gauge!(metrics::COORDINATOR_DELTA_ESTIMATED_BYTES).set(0.0);
+
         let stamped_frozen = EpochStamped::new(frozen, epoch_range.clone());
         let stamped_frozen_reader = EpochStamped::new(frozen_reader, epoch_range.clone());
         let reader = self.delta.reader();
@@ -382,12 +401,44 @@ impl<D: Delta> WriteCoordinatorTask<D> {
         self.view.update_delta_frozen(stamped_frozen_reader, reader);
         // this is the blocking section of the flush, new writes will not be accepted
         // until the event is sent to the FlushTask
-        let _ = self
-            .flush_tx
-            .send(FlushEvent::FlushDelta {
-                frozen: stamped_frozen,
-            })
-            .await;
+        self.send_flush_event(FlushEvent::FlushDelta {
+            frozen: stamped_frozen,
+        })
+        .await;
+    }
+
+    async fn send_flush_event(&self, event: FlushEvent<D>) {
+        // Sample queue depth (in-flight events) just before sending. `max_capacity`
+        // and `capacity` are cheap atomic reads.
+        let max = self.flush_tx.max_capacity();
+        let free = self.flush_tx.capacity();
+        ::metrics::gauge!(metrics::COORDINATOR_FLUSH_EVENT_QUEUE_DEPTH)
+            .set(max.saturating_sub(free) as f64);
+
+        let send_start = std::time::Instant::now();
+        let _ = self.flush_tx.send(event).await;
+        ::metrics::histogram!(metrics::COORDINATOR_FLUSH_EVENT_SEND_DURATION_SECONDS)
+            .record(send_start.elapsed().as_secs_f64());
+    }
+}
+
+/// Reason a flush was triggered. Used as a low-cardinality `reason` label.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FlushReason {
+    SizeThreshold,
+    Interval,
+    Explicit,
+    Shutdown,
+}
+
+impl FlushReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            FlushReason::SizeThreshold => "size_threshold",
+            FlushReason::Interval => "interval",
+            FlushReason::Explicit => "explicit",
+            FlushReason::Shutdown => "shutdown",
+        }
     }
 }
 
@@ -428,10 +479,15 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
         match event {
             FlushEvent::FlushDelta { frozen } => self.handle_flush(frozen).await,
             FlushEvent::FlushStorage => {
-                self.flusher
+                let start = std::time::Instant::now();
+                let result = self
+                    .flusher
                     .flush_storage()
                     .await
-                    .map_err(|e| WriteError::FlushError(e.to_string()))?;
+                    .map_err(|e| WriteError::FlushError(e.to_string()));
+                ::metrics::histogram!(metrics::COORDINATOR_FLUSH_STORAGE_DURATION_SECONDS)
+                    .record(start.elapsed().as_secs_f64());
+                result?;
                 self.watermarks.update_durable(self.last_flushed_epoch);
                 Ok(())
             }
@@ -441,11 +497,15 @@ impl<D: Delta, F: Flusher<D>> FlushTask<D, F> {
     async fn handle_flush(&mut self, frozen: EpochStamped<D::Frozen>) -> WriteResult<()> {
         let delta = frozen.val;
         let epoch_range = frozen.epoch_range;
-        let snapshot = self
+        let start = std::time::Instant::now();
+        let result = self
             .flusher
             .flush_delta(delta, &epoch_range)
             .await
-            .map_err(|e| WriteError::FlushError(e.to_string()))?;
+            .map_err(|e| WriteError::FlushError(e.to_string()));
+        ::metrics::histogram!(metrics::COORDINATOR_FLUSH_DELTA_DURATION_SECONDS)
+            .record(start.elapsed().as_secs_f64());
+        let snapshot = result?;
         self.last_flushed_epoch = epoch_range.end - 1;
         // Publish the refreshed view first so any waiter awoken by the
         // watermark notification below observes a view that already includes
