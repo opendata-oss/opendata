@@ -8,35 +8,69 @@
 
 ## Summary
 
-Add three methods to `buffer::Consumer` so high-throughput consumers can
-fetch and decode many data batches concurrently while keeping manifest
-mutation serialized:
+Add a fetch-handle type and three methods to `buffer::Consumer` so
+high-throughput consumers can fetch and decode many data batches
+concurrently while keeping manifest mutation serialized:
 
 ```rust
 impl Consumer {
     pub async fn next_descriptors(&mut self, max: usize)
         -> Result<Vec<BatchDescriptor>>;
 
-    pub async fn fetch_descriptor(&self, descriptor: BatchDescriptor)
+    /// Convenience wrapper for serial callers. The high-throughput
+    /// runtime uses [`fetch_handle`] instead.
+    pub async fn fetch_descriptor(&mut self, descriptor: BatchDescriptor)
         -> Result<ConsumedBatch>;
 
+    /// Cheap, cloneable handle to the read path. Holds an `Arc` to
+    /// the object store; carries no manifest state and no mutable
+    /// cursor. The owning `Consumer` keeps `&mut`-only access to
+    /// manifest operations (`next_descriptors`, `ack`, `ack_through`,
+    /// `flush`).
+    pub fn fetch_handle(&self) -> ConsumerFetchHandle;
+
     pub async fn ack_through(&mut self, sequence: u64) -> Result<()>;
+}
+
+#[derive(Clone)]
+pub struct ConsumerFetchHandle { /* Arc<dyn ObjectStore> + manifest_path */ }
+
+impl ConsumerFetchHandle {
+    /// Stateless fetch + decode. Takes `&self`; safe to call
+    /// concurrently from many tasks. Does not touch the consumer's
+    /// cursors.
+    pub async fn fetch(&self, descriptor: BatchDescriptor)
+        -> Result<ConsumedBatch>;
 }
 
 pub struct BatchDescriptor {
     pub sequence: u64,
     pub location: String,
     pub metadata: Vec<Metadata>,
+    /// Object size in bytes when known. Reserved for byte-budget
+    /// accounting in `opendata-ingest-runtime` (RFC 0002 in
+    /// `opendata-contrib`). v1 manifests do not carry size, so this
+    /// is always `None` until a future manifest format extension
+    /// fills it in. Callers that observe `None` use a pessimistic
+    /// reservation per their own configuration; see "BatchDescriptor
+    /// and Object Size" below.
+    pub object_bytes: Option<u64>,
 }
 ```
 
 `next_descriptors` reads the manifest once and returns a contiguous run
 of entries past the consumer's read-ahead cursor without performing any
-object-store fetch. `fetch_descriptor` performs the object fetch and
-batch decode for a single descriptor. It takes `&self` so multiple
-fetches can run concurrently. `ack_through(seq)` advances the durable
-ack frontier through `seq` in one call, replacing the per-sequence loop
-the high-throughput runtime would otherwise need.
+object-store fetch. `ConsumerFetchHandle::fetch` performs the object
+fetch and batch decode for a single descriptor; it is stateless and
+clone-shareable across worker tasks. `Consumer::fetch_descriptor` is a
+convenience wrapper for serial callers; under the hood it constructs a
+local handle and calls `fetch` (it takes `&mut self` only because
+it forwards lag-metric updates to the consumer's serial cursor —
+parallel callers should use the handle directly). `ack_through(seq)`
+advances the durable ack frontier through `seq` in one call,
+replacing the per-sequence loop the high-throughput runtime would
+otherwise need; durable-dequeue happens **before** any in-memory
+state advances.
 
 The existing `next_batch`, `ack`, `flush`, and `close` API is preserved
 unchanged; `next_batch` becomes a thin compatibility wrapper over
@@ -189,7 +223,8 @@ Two properties the new API depends on:
 
 ### Public API Surface
 
-Add `BatchDescriptor` and three methods to `Consumer`:
+Add `BatchDescriptor`, `ConsumerFetchHandle`, and four methods to
+`Consumer`:
 
 ```rust
 /// Lightweight pointer to one manifest entry. Carries everything a
@@ -199,6 +234,30 @@ pub struct BatchDescriptor {
     pub sequence: u64,
     pub location: String,
     pub metadata: Vec<Metadata>,
+    /// Object size in bytes when known. v1 always emits `None`
+    /// because the current manifest format does not carry size.
+    /// Reserved for a future manifest extension and for the runtime's
+    /// byte-budget accounting.
+    pub object_bytes: Option<u64>,
+}
+
+/// Cheap, cloneable handle to the read path. Construction is O(1)
+/// (clones an `Arc<dyn ObjectStore>` and copies the manifest path
+/// string). Carries no manifest state and no mutable cursor; safe to
+/// share across many fetch worker tasks.
+#[derive(Clone)]
+pub struct ConsumerFetchHandle {
+    object_store: Arc<dyn ObjectStore>,
+    manifest_path: String,  // for tracing/labels only
+}
+
+impl ConsumerFetchHandle {
+    /// Fetch and decode one batch. Stateless: does not touch any
+    /// `Consumer` cursor. Two concurrent calls against distinct
+    /// descriptors are fully independent; two concurrent calls
+    /// against the same descriptor are safe but waste a GET.
+    pub async fn fetch(&self, descriptor: BatchDescriptor)
+        -> Result<ConsumedBatch>;
 }
 
 impl Consumer {
@@ -207,7 +266,8 @@ impl Consumer {
     ///
     /// Does not perform any object-store GET. Does not mutate the
     /// durable ack frontier. Advances an in-memory `last_handed_out`
-    /// cursor by the number of descriptors returned.
+    /// cursor by the number of descriptors returned. See "Descriptor
+    /// Handout Contract" below for caller obligations.
     ///
     /// Returns an empty `Vec` if no new entries are available;
     /// returns `Err(Error::Fenced)` if the consumer's epoch no longer
@@ -215,21 +275,26 @@ impl Consumer {
     pub async fn next_descriptors(&mut self, max: usize)
         -> Result<Vec<BatchDescriptor>>;
 
-    /// Fetch and decode a single batch from object storage.
-    ///
-    /// Takes `&self` so callers can run multiple fetches concurrently
-    /// (e.g. behind an `Arc<Consumer>` or by cloning a fetch handle —
-    /// see "Concurrency Model" below). Does not consult the manifest;
-    /// the descriptor must come from a prior `next_descriptors` call
-    /// on this consumer.
-    pub async fn fetch_descriptor(&self, descriptor: BatchDescriptor)
+    /// Construct a cloneable fetch handle. Cheap; returns a new
+    /// handle on each call (callers that need many handles can call
+    /// once and clone, or call repeatedly — both are O(1)).
+    pub fn fetch_handle(&self) -> ConsumerFetchHandle;
+
+    /// Convenience wrapper for serial callers. Equivalent to
+    /// `self.fetch_handle().fetch(descriptor).await`, but also
+    /// updates the consumer's serial lag cursor (used by the
+    /// `consumer_lag_seconds` gauge under the legacy `next_batch`
+    /// path). Parallel callers should use `fetch_handle()` and
+    /// drive the gauge themselves if they want it.
+    pub async fn fetch_descriptor(&mut self, descriptor: BatchDescriptor)
         -> Result<ConsumedBatch>;
 
     /// Advance the durable ack frontier through (and including)
-    /// `sequence`. Equivalent to calling `ack(seq)` for every sequence
-    /// from `last_acked_sequence + 1` through `sequence` followed by
-    /// `flush()`, but performed as one in-memory update plus one
-    /// `dequeue(sequence)` manifest write.
+    /// `sequence`. Performs `dequeue(sequence)` against the manifest,
+    /// then updates in-memory state on success. If `dequeue` returns
+    /// an error (storage failure, fence), the consumer's
+    /// `last_acked_sequence` does not advance and the metrics counter
+    /// does not increment.
     ///
     /// Returns an error if `sequence` is less than or equal to the
     /// current `last_acked_sequence`. The frontier is monotonic.
@@ -238,6 +303,59 @@ impl Consumer {
 ```
 
 The existing methods stay with their current signatures.
+
+#### Why a separate handle (not just `Arc<Consumer>`)?
+
+A previous draft of this RFC suggested putting the consumer behind
+`Arc<Consumer>` and calling `fetch_descriptor(&self, ...)` from
+worker tasks. That does not work in practice: every other useful
+method on `Consumer` (`next_descriptors`, `ack`, `ack_through`,
+`flush`, `close`) takes `&mut self`. Holding any of those calls open
+while fetch tasks run requires either:
+
+- An interior-mutability rewrite of every cursor on `Consumer`, which
+  changes the safety story across the whole API surface, or
+- A second instance of `Consumer` (which is impossible — Buffer
+  enforces one active consumer per manifest via epoch fencing), or
+- A separate handle whose only job is reading object storage.
+
+The handle is the cheapest option. It owns nothing manifest-related,
+clones via `Arc`, and disappears when the consumer is dropped (the
+`Arc<dyn ObjectStore>` it holds is the same one the consumer uses, so
+a stale handle has no exclusive resource).
+
+The high-throughput runtime's expected pattern is:
+
+```rust
+// One owner task drives the manifest:
+let consumer = Consumer::new(...).await?;
+let fetcher  = consumer.fetch_handle();
+
+// Spawn N fetch workers, each holding a clone:
+for _ in 0..fetch_concurrency {
+    let f = fetcher.clone();
+    let rx = descriptor_rx.clone();
+    tokio::spawn(async move {
+        while let Some(d) = rx.recv().await {
+            let batch = f.fetch(d).await?;
+            // ...send to decode stage...
+        }
+        Ok::<(), Error>(())
+    });
+}
+
+// Owner task: poll, ack, flush.
+loop {
+    let descriptors = consumer.next_descriptors(K).await?;
+    for d in descriptors { descriptor_tx.send(d).await?; }
+    // ...wait for completions, then:
+    consumer.ack_through(high).await?;
+}
+```
+
+The `&mut Consumer` in the owner task and the `&self` on the handle
+do not interact at the borrow-checker level: the handle holds an
+`Arc<dyn ObjectStore>`, not a borrow of the consumer.
 
 ### `next_batch` Becomes a Compatibility Wrapper
 
@@ -251,6 +369,34 @@ pub async fn next_batch(&mut self) -> Result<Option<ConsumedBatch>> {
 }
 ```
 
+`fetch_descriptor` itself is the wrapper that drives the serial lag
+cursor. Internally:
+
+```rust
+pub async fn fetch_descriptor(&mut self, descriptor: BatchDescriptor)
+    -> Result<ConsumedBatch>
+{
+    let handle = self.fetch_handle();
+    let batch  = handle.fetch(descriptor).await?;
+    if let Some(last_meta) = batch.metadata.last() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let lag_s = (now_ms - last_meta.ingestion_time_ms) as f64 / 1000.0;
+        metrics::gauge!(m::CONSUMER_LAG_SECONDS).set(lag_s.max(0.0));
+    }
+    self.last_fetched_sequence = match self.last_fetched_sequence {
+        Some(prev) => Some(prev.max(batch.sequence)),
+        None => Some(batch.sequence),
+    };
+    Ok(batch)
+}
+```
+
+The `&mut self` is required because the lag-cursor update belongs to
+the consumer; the handle path leaves that observation to the caller.
+
 Existing callers (the timeseries consumer, the vector consumer, the
 ClickHouse alpha) get the same return type and the same per-call cost.
 The lag gauge, latency histogram, and counter increments that
@@ -260,86 +406,212 @@ exactly once per fetched batch under both code paths. The
 
 ### Concurrency Model
 
-The Consumer is split into two roles:
+The Consumer is split into two roles, each with its own type:
 
-- **Manifest owner** (`&mut self`): `next_descriptors`, `ack`,
-  `ack_through`, `flush`, `close`. These mutate the in-memory cursor or
-  perform manifest CAS writes. One holder at a time.
-- **Fetcher** (`&self`): `fetch_descriptor`. Performs an object-store
-  GET and `decode_batch` against a descriptor that is already
-  determined. Does not touch manifest state.
+- **Manifest owner** (`Consumer` with `&mut self` access):
+  `next_descriptors`, `fetch_descriptor`, `ack`, `ack_through`,
+  `flush`, `close`. These mutate the in-memory cursor or perform
+  manifest CAS writes. **One holder at a time.** Sharing `Consumer`
+  across tasks requires the caller to pick one owner task and route
+  manifest operations through it (channels, actor pattern, etc.); the
+  RFC does not provide cross-task coordination primitives.
+- **Fetcher** (`ConsumerFetchHandle` with `&self` access): `fetch`.
+  Performs an object-store GET and `decode_batch` against a
+  descriptor that is already determined. Stateless. Does not touch
+  manifest state. **Cloneable; safe to share across many tasks.**
 
 Two patterns that callers can rely on:
 
-1. **Single-task pipeline**: one task owns `&mut Consumer`, calls
-   `next_descriptors(K)`, hands the resulting descriptors to a `Vec`
-   of futures (each calling `consumer.fetch_descriptor(d)`),
-   `try_join_all`s them, then calls `ack_through` after sink commit.
-   This is the high-throughput runtime's day-one shape.
-2. **Shared fetcher**: callers may put the consumer behind
-   `Arc<Consumer>` (after a one-time mutable construction) and clone
-   the `Arc` into N fetch tasks. The `&self` signature on
-   `fetch_descriptor` makes this safe. Manifest-owning methods
-   (`next_descriptors`, `ack`, `ack_through`, `flush`, `close`) take
-   `&mut Consumer` and therefore cannot be called through an `Arc`
-   without interior mutability; that is intentional.
+1. **Owner + N fetch workers** (high-throughput runtime, Phase 6):
+   one task owns `&mut Consumer` and drives the manifest. It calls
+   `next_descriptors(K)` to refill a bounded channel of descriptors;
+   N fetch workers each hold a clone of `consumer.fetch_handle()`
+   and pop descriptors off the channel. Workers send completed
+   batches back through another channel. The owner task observes
+   completions and calls `ack_through(high)` periodically. The
+   manifest owner runs in parallel with the fetch workers because
+   their state is disjoint (the handle holds no `Consumer` borrow).
+2. **Single-task serial** (legacy callers): one task calls
+   `next_batch` (or `next_descriptors(1)` + `fetch_descriptor`) and
+   `ack` in a loop. No handle needed. This is what the timeseries
+   and vector consumers do today; they do not change.
 
-Two non-obvious safety arguments:
+Three non-obvious safety arguments:
 
-- **Re-fetching a descriptor is safe.** Two tasks calling
-  `fetch_descriptor` with the same descriptor both perform an object-
-  store GET and return identical `ConsumedBatch` values. There is no
-  mutation. Callers should not normally do this (it wastes a GET) but
-  doing so is not a correctness bug.
+- **Re-fetching a descriptor is safe.** Two `fetch` calls against the
+  same descriptor both perform an object-store GET and return
+  identical `ConsumedBatch` values. There is no mutation. Callers
+  should not normally do this (it wastes a GET) but doing so is not a
+  correctness bug.
 - **A descriptor outliving the manifest entry is safe to fetch.** If
   the manifest is dequeued through `descriptor.sequence` between
-  `next_descriptors` and `fetch_descriptor`, the data object on object
-  storage is still there until GC runs; the GET still succeeds. If GC
-  has already deleted the object (because the grace period elapsed),
-  the GET returns a 404, which `fetch_descriptor` surfaces as
-  `Error::Storage`. Callers control this gap by acking *after* fetch +
-  process, not before, which is already the consumer pattern.
+  `next_descriptors` and `fetch`, the data object on object storage
+  is still there until GC runs; the GET still succeeds. If GC has
+  already deleted the object (because the grace period elapsed), the
+  GET returns a 404, which `fetch` surfaces as `Error::Storage`.
+  Callers control this gap by acking *after* fetch + process, not
+  before, which is already the consumer pattern.
+- **The handle never observes fence on its own.** Fence is detected
+  inside `next_descriptors` (the next manifest read after fencing
+  returns `Error::Fenced`). A fetch worker that holds a stale handle
+  for a fenced consumer keeps fetching successfully against object
+  storage; the manifest owner is the one that learns about the fence
+  and propagates it to workers (e.g. by closing the descriptor
+  channel). This is intentional: fetch workers do not need
+  manifest-level state to do their job. A future RFC could add a
+  `handle.is_active() -> bool` if the runtime needs an out-of-band
+  fence signal that doesn't go through the descriptor channel.
 
 ### Cursor Semantics
 
-The Consumer maintains three monotonic cursors:
+The Consumer maintains three monotonic cursors. **All three live on
+`Consumer` and are mutated only through `&mut self` methods.**
+`ConsumerFetchHandle` is stateless and never touches them.
 
 | Cursor | Mutator | Meaning |
 |---|---|---|
-| `last_acked_sequence` | `ack`, `ack_through` | Highest sequence the manifest has been instructed to dequeue (subject to amortized flush). |
-| `last_fetched_sequence` | `fetch_descriptor` | Highest sequence whose data object the consumer has read. |
+| `last_acked_sequence` | `ack` (success), `ack_through` (after dequeue success) | Highest sequence durably dequeued from the manifest. |
+| `last_fetched_sequence` | `fetch_descriptor` (the `&mut self` wrapper) | Highest sequence whose data object the **serial wrapper path** has read. Used by the `consumer_lag_seconds` gauge. |
 | `last_handed_out_sequence` (new) | `next_descriptors` | Highest sequence the consumer has handed out as a descriptor. |
 
-The new cursor `last_handed_out_sequence` is what `next_descriptors`
-uses to find the next contiguous run on a manifest re-read. It is
-distinct from `last_fetched_sequence` because callers may hand out
-descriptors before fetching the corresponding objects.
+`last_handed_out_sequence` is what `next_descriptors` uses to find the
+next contiguous run on a manifest re-read. It is distinct from
+`last_fetched_sequence` because callers may hand out descriptors before
+the corresponding fetches resolve.
 
 Initial value of all three is `last_acked_sequence` from construction
 (`None` for a fresh consumer; `Some(seq)` when the caller passed
 `last_acked_sequence: Some(seq)`).
 
 `next_batch` advances `last_handed_out_sequence` and
-`last_fetched_sequence` together, preserving today's behavior.
+`last_fetched_sequence` together (via the wrapped
+`next_descriptors(1)` and `fetch_descriptor` calls), preserving
+today's behavior.
 
-`fetch_descriptor` advances **only** `last_fetched_sequence`, and only
-to `descriptor.sequence` if `descriptor.sequence` is greater than the
-current value. (Multiple fetches may resolve out of order; the cursor
-records the maximum so the lag gauge stays meaningful.) It does **not**
-mutate `last_handed_out_sequence` (the descriptor was already handed
-out) or `last_acked_sequence` (the caller acks separately).
+`fetch_descriptor` (the `&mut self` wrapper) advances
+`last_fetched_sequence` to `max(current, descriptor.sequence)` after
+the fetch succeeds. It does **not** mutate `last_handed_out_sequence`
+(the descriptor was already handed out) or `last_acked_sequence` (the
+caller acks separately).
 
-`ack_through(seq)` sets `last_acked_sequence = seq` and calls
-`QueueConsumer::dequeue(seq)` once. The `ack_count`-based amortization
-that `ack` uses today is replaced with an explicit per-call dequeue;
-callers that want amortization can either keep using `ack` or call
-`ack_through` less often (e.g. once per commit group, which is what the
-high-throughput runtime does). Concretely:
+**`ConsumerFetchHandle::fetch` does not advance any cursor on the
+consumer.** Parallel-fetch callers that want a `consumer_lag_seconds`-
+equivalent gauge observe it themselves from `batch.metadata.last()`
+and emit their own metric, or wire the runtime's metrics layer to do
+so. Earlier drafts of this RFC proposed an interior-mutable max
+cursor on the handle; that was rejected because it adds atomic state
+to the hot fetch path for a metric that the runtime already wants to
+own (the runtime's `runtime_stage_latency_seconds{stage=fetch}`
+histogram is finer-grained than a single max-sequence gauge).
+
+`ack_through(seq)` performs **dequeue first, then in-memory state
+update**. If `dequeue` returns an error (storage failure, fence), the
+consumer's `last_acked_sequence` does not advance and the metrics
+counter does not increment. Concretely:
 
 - `ack(seq)` keeps its existing per-sequence loop semantics with
   amortized dequeue every `DEQUEUE_INTERVAL = 100` acks.
-- `ack_through(seq)` always performs one dequeue at call time. It is
+- `ack_through(seq)` always performs one dequeue at call time, and
+  applies its in-memory updates only after dequeue succeeds. It is
   the right primitive when the caller already batches.
+
+### Descriptor Handout Contract
+
+`next_descriptors` advances `last_handed_out_sequence` *before* the
+caller has fetched the corresponding objects. This is intentional —
+read-ahead is the whole point — but it puts a contract on the caller
+that does not exist for the serial `next_batch` API. The contract is:
+
+> **Once `next_descriptors` returns a descriptor, the caller is
+> responsible for either (a) successfully fetching and processing it,
+> or (b) accepting that it will be re-handed-out only via process
+> restart (which restarts read-ahead from the durable
+> `last_acked_sequence`, dropping any in-flight descriptors).**
+
+Specifically:
+
+- **Lost descriptors are not reissued within a process.** If a worker
+  task panics, drops a channel send, or otherwise discards a
+  descriptor without acking the corresponding sequence, the
+  consumer's `last_handed_out_sequence` has already advanced past it.
+  The next `next_descriptors` call will not return the lost
+  descriptor; it will return descriptors strictly after it.
+- **Acking a sequence that was lost is forbidden.** The caller's own
+  bookkeeping (commit-group high watermark, route completion record)
+  must not mark a lost sequence complete. If it does, `ack_through`
+  will durably ack a sequence whose data was never processed, and the
+  data is lost.
+- **Recovery is process restart.** A new `Consumer::new(config,
+  last_acked_sequence)` initializes `last_handed_out_sequence =
+  last_acked_sequence`, so `next_descriptors` re-emits everything the
+  durable frontier hasn't acked. This is the only supported path for
+  reissuing lost descriptors.
+- **Out-of-order completion is fine, gaps are not.** Workers may
+  complete fetches in any order. The runtime's ack coordinator (RFC
+  0002 in opendata-contrib) tracks contiguous completion and only
+  calls `ack_through` for the highest contiguous complete sequence.
+  A gap (one descriptor in the run is permanently lost) means the
+  ack frontier never advances past that gap until restart.
+
+The high-throughput runtime in opendata-contrib RFC 0002 enforces
+this contract by making the descriptor channel bounded and by
+treating dropped descriptors as a runtime fatal — workers that lose
+a descriptor halt the runtime and force a restart. The buffer crate
+itself does not detect lost descriptors; that is the caller's job.
+
+A future "return descriptor" API (let the caller hand a descriptor
+back so it can be reissued without restart) is *not* in scope for
+this RFC. It would require maintaining a per-descriptor "handed
+out / returned / fetched" state inside `Consumer` that does not
+exist today, and the runtime can already recover via the documented
+restart path.
+
+### BatchDescriptor and Object Size
+
+`BatchDescriptor.object_bytes: Option<u64>` is reserved for the
+runtime's byte-budget accounting (RFC 0002 in opendata-contrib).
+The current Buffer manifest format does not carry per-entry object
+size:
+
+```rust
+pub struct ManifestEntry {
+    pub sequence: u64,
+    pub location: String,
+    pub metadata: Vec<Metadata>,
+}
+```
+
+So v1 of this RFC always emits `object_bytes: None`. The field
+exists in the public type so:
+
+1. The runtime can adopt the field today and use a configured
+   pessimistic reservation (`source.estimated_max_batch_bytes`) when
+   the value is `None`.
+2. A future manifest format extension (or an opt-in producer-side
+   metadata payload) can populate the field without breaking the
+   public API.
+
+Changing the manifest format to carry object size is **out of scope
+for this RFC** (declared a non-goal above) but is a natural
+follow-up after the read-ahead path is stable. Until then, the
+runtime overcounts in-flight bytes in the common case and pauses
+source pulls slightly earlier than tight accounting would; this is
+intentional slack.
+
+Other ways to populate `object_bytes`, considered and rejected for
+v1:
+
+- **HEAD before GET**: an extra network round trip on every fetch.
+  Adds ~1 RTT to fetch latency for a metric-tightening benefit.
+  Rejected; the runtime's pessimistic reservation is cheaper.
+- **Read object metadata from the GET response and attach it to a
+  later descriptor**: requires the consumer to remember per-sequence
+  sizes across calls, which is exactly the kind of state we are
+  trying to keep out of `ConsumerFetchHandle`. Rejected for v1.
+- **Use `Metadata.payload` to carry a producer-supplied size hint**:
+  the payload is opaque and producer-defined (RFC 0001); requiring
+  producers to put a size there would couple the buffer crate to
+  its consumers in a way RFC 0001 was careful to avoid. Rejected.
 
 ### Epoch Fencing
 
@@ -363,19 +635,26 @@ a fence surfaces within one polling interval.
 
 ### Object Fetch Path
 
-`fetch_descriptor` performs the same work `Consumer::fetch_batch` does
-today:
+`ConsumerFetchHandle::fetch` performs the same work
+`Consumer::fetch_batch` does today:
 
 1. `object_store.get(&Path::from(descriptor.location.as_str())).await`
 2. `data.bytes().await`
 3. `decode_batch(data)` to produce `Vec<Bytes>` entries
 4. Construct `ConsumedBatch { entries, sequence, location, metadata }`
 
-The metrics that `fetch_batch` emits today
-(`BATCHES_COLLECTED`, `ENTRIES_COLLECTED`, `BYTES_COLLECTED`,
-`FETCH_DURATION_SECONDS`, `CONSUMER_LAG_SECONDS`) move to
-`fetch_descriptor`, so per-batch metrics are emitted exactly once per
-fetched batch under both old and new APIs.
+The metrics split between two sites:
+
+- **Per-fetch counters and the per-fetch latency histogram**
+  (`BATCHES_COLLECTED`, `ENTRIES_COLLECTED`, `BYTES_COLLECTED`,
+  `FETCH_DURATION_SECONDS`) move to `ConsumerFetchHandle::fetch`.
+  These fire exactly once per fetched batch under both old and new
+  APIs.
+- **The serial lag gauge** (`CONSUMER_LAG_SECONDS`) stays on the
+  `&mut self` `fetch_descriptor` wrapper. Parallel-fetch callers do
+  not advance the consumer's serial cursor and do not update this
+  gauge; they observe lag through their own runtime metrics
+  (`runtime_stage_latency_seconds{stage=fetch}` in RFC 0002).
 
 `decode_batch` runs on the calling task. Callers that want to put it
 on a blocking pool can call `tokio::task::spawn_blocking` around the
@@ -455,6 +734,10 @@ manifests of the sizes we run.
 
 ### `ack_through` Implementation
 
+The dequeue is the durable boundary. In-memory state is updated **only
+after** dequeue succeeds, so a fence or storage error leaves
+`last_acked_sequence` and the metrics counter unchanged:
+
 ```rust
 pub async fn ack_through(&mut self, sequence: u64) -> Result<()> {
     if let Some(last) = self.last_acked_sequence
@@ -469,10 +752,15 @@ pub async fn ack_through(&mut self, sequence: u64) -> Result<()> {
         None => sequence + 1,
         Some(last) => sequence - last,
     };
+
+    // Durable dequeue first. Bubbles up Fenced and Storage errors
+    // without touching local state.
+    self.consumer.dequeue(sequence).await?;
+
+    // Only mutate in-memory state after dequeue succeeds.
     self.last_acked_sequence = Some(sequence);
     self.ack_count = self.ack_count.wrapping_add(count_advanced);
     metrics::counter!(m::ACKS).increment(count_advanced);
-    self.consumer.dequeue(sequence).await?;
     Ok(())
 }
 ```
@@ -480,6 +768,15 @@ pub async fn ack_through(&mut self, sequence: u64) -> Result<()> {
 The dequeue is unconditional. `ack` keeps its amortized-every-100-acks
 behavior; the high-throughput runtime opts into immediate dequeue by
 calling `ack_through`.
+
+**Important caller contract**: when `ack_through` returns `Err(_)`, the
+caller must treat the requested range as **not** durably acked and
+must not advance any of its own bookkeeping (commit-group high
+watermark, route completion record, etc.) past the previous
+successful ack. A retry of `ack_through(sequence)` against the same
+sequence is safe; if the underlying dequeue is idempotent (which it
+is for `QueueConsumer::dequeue`) the second call either succeeds or
+returns the same error class.
 
 `Consumer::flush` keeps its meaning: if the caller used `ack` and is
 between amortization boundaries, `flush` forces the dequeue. After
@@ -569,9 +866,12 @@ API compatibility:
 - `next_batch`, `ack`, `flush`, `close`, `len`, `is_empty`,
   `conflict_rate`, `Consumer::new`, `Consumer::with_object_store`,
   `ConsumerConfig`, `ConsumedBatch`, `Metadata`: all unchanged.
-- New types: `BatchDescriptor`, `RawConsumedBatch` (Tier 2 only).
-- New methods: `next_descriptors`, `fetch_descriptor`, `ack_through`,
-  and (Tier 2) `fetch_descriptor_raw`.
+- New types: `BatchDescriptor`, `ConsumerFetchHandle`, and
+  `RawConsumedBatch` (Tier 2 only).
+- New methods: `next_descriptors`, `fetch_handle`, `fetch_descriptor`
+  (which now takes `&mut self` and is a wrapper over the handle),
+  `ack_through`, and (Tier 2) `fetch_descriptor_raw` /
+  `ConsumerFetchHandle::fetch_raw`.
 - New public re-exports (Tier 2): `decode_batch`, `CompressionType`.
 
 Behavioral compatibility:
@@ -718,9 +1018,12 @@ batch-decode boundary.
 
 ## Migration Plan
 
-1. **Phase 2.1–2.5**: implement `BatchDescriptor`, `next_descriptors`,
-   `fetch_descriptor`, `ack_through`, and rewrite `next_batch` as a
-   wrapper. Tests in 2.6.
+1. **Phase 2.1–2.5**: implement `BatchDescriptor` (with
+   `object_bytes: Option<u64>` reserved as `None`), `ConsumerFetchHandle`,
+   `next_descriptors`, `fetch_handle`, `fetch_descriptor` (now `&mut
+   self`, wrapping the handle plus serial-cursor update),
+   `ack_through` (with the documented dequeue-first ordering), and
+   rewrite `next_batch` as a wrapper. Tests in 2.6.
 2. **opendata-contrib RFC 0002 / Phase 4**: the runtime extraction
    uses `next_descriptors` + `fetch_descriptor` from day one (with
    `max = 1` until Phase 6 turns concurrency on). `ack_through` is
@@ -760,12 +1063,42 @@ breakage.
   a no-op.
 - `ack_through(seq)` errors when `seq <= last_acked_sequence`.
 
-### Fencing
+### Fencing and Failure Atomicity
 
 - A fenced consumer's `next_descriptors` returns `Error::Fenced` on the
   next call after the fence happens.
-- `fetch_descriptor` against a descriptor obtained before fencing
-  succeeds (the data object is still readable until GC).
+- A fenced consumer's `ack_through(seq)` returns `Error::Fenced`
+  *and* leaves `last_acked_sequence` and `buffer.acks` unchanged. A
+  subsequent retry against an unfenced consumer succeeds.
+- A storage-error `ack_through` (object store unreachable) leaves
+  `last_acked_sequence` and `buffer.acks` unchanged. Recovery is to
+  retry once storage is reachable.
+- `ConsumerFetchHandle::fetch` against a descriptor obtained before
+  fencing succeeds (the data object is still readable until GC). The
+  handle does not detect fence on its own.
+
+### Concurrency (handle path)
+
+- `Consumer::fetch_handle()` returns a value that is `Clone + Send +
+  Sync + 'static`.
+- Two clones of a fetch handle, called concurrently from two
+  `tokio::spawn` tasks against distinct descriptors, complete with no
+  manifest contention.
+- A fetch handle clone outlives the spawned task that produced it
+  (drop-after-spawn does not invalidate the handle).
+- `ConsumerFetchHandle::fetch` does **not** mutate any cursor on the
+  parent `Consumer`. After a fetch handle call, `next_batch` /
+  `fetch_descriptor` from the owner task observe unchanged
+  `last_fetched_sequence`.
+
+### Descriptor Handout Contract
+
+- After `next_descriptors` returns a descriptor with sequence `S`, a
+  subsequent `next_descriptors` call without an intervening
+  `ack_through` returns descriptors with sequence > `S` only.
+- Process restart (`Consumer::new(_, Some(durable_frontier))`)
+  re-emits descriptors strictly after `durable_frontier`, including
+  any sequences a previous process handed out but did not ack.
 
 ### Compatibility
 
@@ -797,3 +1130,4 @@ breakage.
 | Date | Description |
 |---|---|
 | 2026-05-07 | Initial draft. Adds `BatchDescriptor`, `Consumer::next_descriptors`, `Consumer::fetch_descriptor`, `Consumer::ack_through`, and an optional Tier 2 raw-decode hook behind a feature flag. Preserves epoch fencing and existing API/behavior. |
+| 2026-05-07 (rev 2) | Phase 0 gate revision. (1) Added `ConsumerFetchHandle` (Clone + Send + Sync + 'static) so manifest-owner stays `&mut self` while N fetch workers run concurrently — Arc-of-Consumer alone could not do this because every other useful method takes `&mut`. (2) Made `ConsumerFetchHandle::fetch` stateless; dropped the `&self` cursor mutation; serial lag gauge stays on the `&mut self` `fetch_descriptor` wrapper. (3) Reordered `ack_through` so `dequeue` runs before any in-memory state advances; storage/fence errors leave `last_acked_sequence` and metrics untouched. (4) Added explicit "Descriptor Handout Contract" section: lost descriptors are not reissued within a process; recovery is restart from the durable ack frontier. (5) Added `BatchDescriptor.object_bytes: Option<u64>` reserved field with v1-always-None policy and pessimistic-reservation guidance for the runtime; documented why HEAD/payload-hint/in-consumer-memory alternatives were rejected for v1. Validation Criteria expanded to cover handle concurrency, fail-atomic ack_through, and the descriptor handout contract. |
