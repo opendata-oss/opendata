@@ -98,6 +98,33 @@ impl UpsertVectorsResponse {
     }
 }
 
+/// DeleteRequest is the request body for POST /api/v1/vector/delete.
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub(crate) ids: Vec<String>,
+}
+
+/// DeleteVectorsResponse is the response for POST /api/v1/vector/delete.
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteVectorsResponse {
+    #[prost(string, tag = "1")]
+    pub(crate) status: String,
+    #[prost(int32, tag = "2")]
+    pub(crate) vectors_deleted: i32,
+}
+
+impl DeleteVectorsResponse {
+    pub(crate) fn success(vectors_deleted: i32) -> Self {
+        Self {
+            status: "success".to_string(),
+            vectors_deleted,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct ComparisonFilter {
     #[prost(string, tag = "1")]
@@ -267,6 +294,47 @@ mod tests {
         // then
         assert_eq!(decoded.status, "success");
         assert_eq!(decoded.vectors_upserted, 5);
+    }
+
+    #[test]
+    fn should_encode_and_decode_delete_request() {
+        // given
+        let request = DeleteRequest {
+            ids: vec!["doc-1".to_string(), "doc-2".to_string()],
+        };
+
+        // when
+        let encoded = request.encode_to_vec();
+        let decoded = DeleteRequest::decode(encoded.as_slice()).unwrap();
+
+        // then
+        assert_eq!(decoded.ids, request.ids);
+    }
+
+    #[test]
+    fn should_encode_and_decode_delete_vectors_response() {
+        // given
+        let response = DeleteVectorsResponse::success(3);
+
+        // when
+        let encoded = response.encode_to_vec();
+        let decoded = DeleteVectorsResponse::decode(encoded.as_slice()).unwrap();
+
+        // then
+        assert_eq!(decoded.status, "success");
+        assert_eq!(decoded.vectors_deleted, 3);
+    }
+
+    #[test]
+    fn should_serialize_delete_response_with_camel_case() {
+        // given
+        let response = DeleteVectorsResponse::success(2);
+
+        // when
+        let json = serde_json::to_string(&response).unwrap();
+
+        // then
+        assert!(json.contains(r#""vectorsDeleted":2"#));
     }
 
     #[test]

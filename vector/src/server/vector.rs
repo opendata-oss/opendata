@@ -12,7 +12,8 @@ use tokio::signal;
 use super::buffer_consumer::{BufferConsumer, ConsumerHandle};
 use super::config::VectorServerConfig;
 use super::handlers::{
-    AppState, handle_get_vector, handle_healthy, handle_ready, handle_search, handle_write,
+    AppState, handle_delete, handle_get_vector, handle_healthy, handle_ready, handle_search,
+    handle_write,
 };
 use super::middleware::TracingLayer;
 #[cfg(feature = "buffer")]
@@ -80,6 +81,7 @@ impl VectorServer {
 
         let app = Router::new()
             .route("/api/v1/vector/write", post(handle_write))
+            .route("/api/v1/vector/delete", post(handle_delete))
             .route("/api/v1/vector/search", post(handle_search::<VectorDb>))
             .route(
                 "/api/v1/vector/vectors/{id}",

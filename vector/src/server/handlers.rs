@@ -12,10 +12,10 @@ use axum::http::{HeaderMap, StatusCode};
 
 use super::error::ApiError;
 use super::proto::{
-    AttributeValueMessage, AttributeValueProto, GetVectorResponse, SearchResponse,
-    SearchResultProto, UpsertVectorsResponse, Vector, VectorValueProto,
+    AttributeValueMessage, AttributeValueProto, DeleteVectorsResponse, GetVectorResponse,
+    SearchResponse, SearchResultProto, UpsertVectorsResponse, Vector, VectorValueProto,
 };
-use super::request::{SearchRequest, WriteRequest};
+use super::request::{DeleteRequest, SearchRequest, WriteRequest};
 use super::response::{ApiResponse, ResponseFormat, to_api_response};
 use crate::{FieldType, VectorDb, VectorDbRead};
 
@@ -48,6 +48,23 @@ pub(crate) async fn handle_write(
     state.db.write(request.upsert_vectors).await?;
 
     let response = UpsertVectorsResponse::success(count as i32);
+    Ok(to_api_response(response, format))
+}
+
+/// Handle POST /api/v1/vector/delete
+pub(crate) async fn handle_delete(
+    State(state): State<AppState<VectorDb>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<ApiResponse, ApiError> {
+    let format = ResponseFormat::from_headers(&headers);
+
+    let request = DeleteRequest::from_body(&headers, &body)?;
+    let count = request.ids.len();
+
+    state.db.delete(request.ids).await?;
+
+    let response = DeleteVectorsResponse::success(count as i32);
     Ok(to_api_response(response, format))
 }
 

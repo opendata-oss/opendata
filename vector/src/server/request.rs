@@ -114,6 +114,44 @@ impl WriteRequest {
     }
 }
 
+/// Unified delete request that can be parsed from either JSON or protobuf.
+#[derive(Debug)]
+pub struct DeleteRequest {
+    pub ids: Vec<String>,
+}
+
+impl DeleteRequest {
+    /// Parse a delete request from the raw body based on Content-Type header.
+    pub fn from_body(headers: &HeaderMap, body: &[u8]) -> Result<Self, Error> {
+        if is_protobuf_content(headers) {
+            Self::from_protobuf(body)
+        } else {
+            Self::from_json(body)
+        }
+    }
+
+    fn from_protobuf(body: &[u8]) -> Result<Self, Error> {
+        let proto_request = proto::DeleteRequest::decode(body)
+            .map_err(|e| Error::InvalidInput(format!("Invalid protobuf: {}", e)))?;
+        Self::validate(proto_request.ids)
+    }
+
+    fn from_json(body: &[u8]) -> Result<Self, Error> {
+        let json_request: JsonDeleteRequest = serde_json::from_slice(body)
+            .map_err(|e| Error::InvalidInput(format!("Invalid JSON: {}", e)))?;
+        Self::validate(json_request.ids)
+    }
+
+    fn validate(ids: Vec<String>) -> Result<Self, Error> {
+        for (i, id) in ids.iter().enumerate() {
+            if id.is_empty() {
+                return Err(Error::InvalidInput(format!("ids[{}]: id is required", i)));
+            }
+        }
+        Ok(Self { ids })
+    }
+}
+
 /// Unified search request that can be parsed from either JSON or protobuf.
 #[derive(Debug)]
 pub struct SearchRequest {
@@ -211,6 +249,13 @@ fn proto_attribute_to_value(value: proto::AttributeValueProto) -> crate::Attribu
 #[serde(rename_all = "camelCase")]
 struct JsonWriteRequest {
     upsert_vectors: Vec<JsonVector>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonDeleteRequest {
+    #[serde(default)]
+    ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -780,6 +825,58 @@ mod tests {
             request.upsert_vectors[0].attribute("count"),
             Some(AttributeValue::Int64(7))
         ));
+    }
+
+    #[test]
+    fn should_parse_delete_request_from_json() {
+        // given
+        let json = br#"{"ids": ["doc-1", "doc-2"]}"#;
+
+        // when
+        let request = DeleteRequest::from_body(&protojson_headers(), json).unwrap();
+
+        // then
+        assert_eq!(request.ids, vec!["doc-1".to_string(), "doc-2".to_string()]);
+    }
+
+    #[test]
+    fn should_parse_delete_request_from_protobuf() {
+        // given
+        let body = proto::DeleteRequest {
+            ids: vec!["doc-1".to_string(), "doc-2".to_string()],
+        }
+        .encode_to_vec();
+
+        // when
+        let request = DeleteRequest::from_body(&protobuf_headers(), &body).unwrap();
+
+        // then
+        assert_eq!(request.ids, vec!["doc-1".to_string(), "doc-2".to_string()]);
+    }
+
+    #[test]
+    fn should_accept_empty_delete_request() {
+        // given
+        let json = br#"{"ids": []}"#;
+
+        // when
+        let request = DeleteRequest::from_body(&protojson_headers(), json).unwrap();
+
+        // then
+        assert!(request.ids.is_empty());
+    }
+
+    #[test]
+    fn should_reject_delete_request_with_empty_id() {
+        // given
+        let json = br#"{"ids": ["doc-1", ""]}"#;
+
+        // when
+        let result = DeleteRequest::from_body(&protojson_headers(), json);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("id is required"));
     }
 
     #[test]
