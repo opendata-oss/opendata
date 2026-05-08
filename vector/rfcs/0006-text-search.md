@@ -174,6 +174,7 @@ subsequent block. It is typical (e.g. in Lucene) to further improve on this by a
 blocks for larger ranges (e.g. every 32 blocks in Lucene).
 
 **Impacts**
+
 To support cheaply computing max scores for a window, you can store max score statistics for the 
 documents covered by the Skip block. In particular, you can store the "dominating" term 
 frequencies (F), length (L) pairs, called Impacts, of the contained documents. Impacts have a 
@@ -252,8 +253,7 @@ then written 4 more times in SR0 before it's compacted away) to the write amplif
 for the FTS data, so it's roughly doubled. This is not ideal, but feels manageable.
 
 To address 3 and 5 we'll simply load the bitmap from storage after every flush and put it in the 
-`LastDbSnapshot` published by the Flusher. For 100M documents with a 20% deletions threshold, 
-the bitmap should be at most ~4MB so this should be a quick read, typically out of cache.
+`LastDbSnapshot` published by the Flusher.
 
 ## Configurations
 
