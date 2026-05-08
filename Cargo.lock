@@ -422,6 +422,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffer-bench"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "metrics",
+ "opendata-buffer",
+ "opendata-common",
+ "serde",
+ "serde_json",
+ "slatedb",
+ "tikv-jemallocator",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
