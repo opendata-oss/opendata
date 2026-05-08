@@ -131,18 +131,22 @@ have to change.
 
 - Add a public read-ahead API that returns multiple
   contiguous descriptors per manifest read.
-- Add a public concurrent-safe `fetch_descriptor(&self, ...)` so callers
-  can run object-store GETs in parallel without sharing `&mut Consumer`.
+- Add a cloneable, concurrency-safe `ConsumerFetchHandle` whose
+  `fetch(&self, ...)` runs object-store GETs in parallel without
+  sharing `&mut Consumer`.
 - Add `ack_through(sequence)` so callers can advance the durable
-  ack frontier in one call.
+  ack frontier in one call, with dequeue-first ordering so the
+  in-memory cursor and the metrics counter only advance after the
+  durable manifest mutation succeeds.
 - Preserve the existing `next_batch`, `ack`, `flush`, `close` API
   unchanged. `next_batch` becomes a thin wrapper over the new API.
 - Preserve epoch fencing exactly. Read-ahead must surface a `Fenced`
   error the same way the serial path does.
 - Keep manifest mutation (epoch increment, dequeue) serialized through
   one owner.
-- Document the concurrency contract for `fetch_descriptor` so callers
-  can rely on it without inspecting the implementation.
+- Document the concurrency contract for `ConsumerFetchHandle::fetch`
+  and the descriptor-handout contract on `next_descriptors` so callers
+  can rely on them without inspecting the implementation.
 
 ## Non-Goals
 
@@ -717,6 +721,10 @@ pub async fn next_descriptors(&mut self, max: usize)
             sequence: e.sequence,
             location: e.location,
             metadata: e.metadata,
+            // Reserved field; the current manifest format does not
+            // carry per-entry object size. See "BatchDescriptor and
+            // Object Size" above.
+            object_bytes: None,
         })
         .collect())
 }
@@ -789,14 +797,21 @@ The high-throughput runtime wants to put `decode_batch` on a blocking
 CPU pool. Two ways to expose that:
 
 **Option A (chosen):** make `decode_batch` and `CompressionType` public,
-and add a sibling `fetch_descriptor_raw` that returns the raw object
-bytes plus the descriptor without decoding:
+and add a sibling `ConsumerFetchHandle::fetch_raw` that returns the
+raw object bytes plus the descriptor without decoding. The raw method
+lives on the handle (not on `Consumer`) because parallel-fetch callers
+are the use case; serial callers continue to use `fetch_descriptor`
+which already calls `decode_batch` inline.
 
 ```rust
 pub use crate::model::{decode_batch, CompressionType};
 
-impl Consumer {
-    pub async fn fetch_descriptor_raw(&self, descriptor: BatchDescriptor)
+impl ConsumerFetchHandle {
+    /// Like `fetch`, but returns the still-encoded object bytes.
+    /// Callers invoke `decode_batch` themselves (typically inside
+    /// `tokio::task::spawn_blocking`) to keep the CPU-bound decode
+    /// off the I/O task.
+    pub async fn fetch_raw(&self, descriptor: BatchDescriptor)
         -> Result<RawConsumedBatch>;
 }
 
@@ -811,7 +826,7 @@ pub struct RawConsumedBatch {
 Callers wrap the decode in `spawn_blocking`:
 
 ```rust
-let raw = consumer.fetch_descriptor_raw(d).await?;
+let raw = fetch_handle.fetch_raw(d).await?;
 let entries = tokio::task::spawn_blocking(move || decode_batch(raw.raw_bytes))
     .await
     .map_err(|e| Error::Storage(e.to_string()))??;
@@ -824,7 +839,7 @@ let batch = ConsumedBatch {
 ```
 
 **Option B:** keep `decode_batch` private and add an explicit
-`Consumer::fetch_descriptor_blocking_decode` that internally spawns
+`ConsumerFetchHandle::fetch_blocking_decode` that internally spawns
 blocking. Rejected because it bakes a Tokio scheduling decision into
 the buffer crate — callers running on a different scheduler (e.g.
 async-std, smol, or Tokio with a specific blocking-pool size) lose
@@ -834,7 +849,8 @@ Option A is small, additive, and gives the runtime exactly the seam it
 wants without committing the buffer crate to a scheduling model.
 
 The Tier 2 surface ships behind a feature flag in v0.x or as a separate
-release; v1 of this RFC requires only the three core methods.
+release; v1 of this RFC requires only the core read-ahead +
+`fetch_handle` + `ack_through` methods.
 
 ### Metrics
 
@@ -868,9 +884,9 @@ API compatibility:
   `ConsumerConfig`, `ConsumedBatch`, `Metadata`: all unchanged.
 - New types: `BatchDescriptor`, `ConsumerFetchHandle`, and
   `RawConsumedBatch` (Tier 2 only).
-- New methods: `next_descriptors`, `fetch_handle`, `fetch_descriptor`
-  (which now takes `&mut self` and is a wrapper over the handle),
-  `ack_through`, and (Tier 2) `fetch_descriptor_raw` /
+- New methods: `Consumer::next_descriptors`, `Consumer::fetch_handle`,
+  `Consumer::fetch_descriptor` (which now takes `&mut self` and is a
+  wrapper over the handle), `Consumer::ack_through`, and (Tier 2)
   `ConsumerFetchHandle::fetch_raw`.
 - New public re-exports (Tier 2): `decode_batch`, `CompressionType`.
 
@@ -1119,11 +1135,13 @@ breakage.
 
 ### Tier 2 (when feature is enabled)
 
-- `fetch_descriptor_raw(d)` returns a `RawConsumedBatch` whose
-  `decode_batch(raw_bytes)` produces an `entries` vector identical to
-  the one returned by `fetch_descriptor(d)`.
+- `ConsumerFetchHandle::fetch_raw(d)` returns a `RawConsumedBatch`
+  whose `decode_batch(raw_bytes)` produces an `entries` vector
+  identical to the one returned by `Consumer::fetch_descriptor(d)`.
 - `decode_batch` is callable from `tokio::task::spawn_blocking` and
   produces the same output as the in-line decode.
+- `fetch_raw` lives only on the handle (not on `Consumer`); serial
+  callers continue to use `Consumer::fetch_descriptor`.
 
 ## Revision History
 
@@ -1131,3 +1149,4 @@ breakage.
 |---|---|
 | 2026-05-07 | Initial draft. Adds `BatchDescriptor`, `Consumer::next_descriptors`, `Consumer::fetch_descriptor`, `Consumer::ack_through`, and an optional Tier 2 raw-decode hook behind a feature flag. Preserves epoch fencing and existing API/behavior. |
 | 2026-05-07 (rev 2) | Phase 0 gate revision. (1) Added `ConsumerFetchHandle` (Clone + Send + Sync + 'static) so manifest-owner stays `&mut self` while N fetch workers run concurrently — Arc-of-Consumer alone could not do this because every other useful method takes `&mut`. (2) Made `ConsumerFetchHandle::fetch` stateless; dropped the `&self` cursor mutation; serial lag gauge stays on the `&mut self` `fetch_descriptor` wrapper. (3) Reordered `ack_through` so `dequeue` runs before any in-memory state advances; storage/fence errors leave `last_acked_sequence` and metrics untouched. (4) Added explicit "Descriptor Handout Contract" section: lost descriptors are not reissued within a process; recovery is restart from the durable ack frontier. (5) Added `BatchDescriptor.object_bytes: Option<u64>` reserved field with v1-always-None policy and pessimistic-reservation guidance for the runtime; documented why HEAD/payload-hint/in-consumer-memory alternatives were rejected for v1. Validation Criteria expanded to cover handle concurrency, fail-atomic ack_through, and the descriptor handout contract. |
+| 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Goals section updated to name `ConsumerFetchHandle` and the dequeue-first ack ordering; the rev-1 phrasing about "concurrent-safe `fetch_descriptor(&self, ...)`" no longer matched the rev-2 design. (b) `next_descriptors` pseudocode now populates `BatchDescriptor.object_bytes: None` explicitly (was missing — the manifest entry has no size yet). (c) Tier 2 raw-decode method moved from `Consumer::fetch_descriptor_raw(&self, ...)` to `ConsumerFetchHandle::fetch_raw(&self, ...)`. The serial Consumer no longer has a raw entry point; serial callers use `Consumer::fetch_descriptor` (which decodes inline), parallel callers use the handle's `fetch` or `fetch_raw`. Validation Criteria and Compatibility list updated to match. |
