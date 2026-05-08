@@ -854,13 +854,24 @@ release; v1 of this RFC requires only the core read-ahead +
 
 ### Metrics
 
-Carry over the existing buffer metrics with one rename:
+Carry over the existing buffer metrics, splitting them between the
+handle's fetch path (which any caller can drive concurrently) and the
+serial `Consumer::fetch_descriptor` wrapper (which additionally
+maintains the consumer's lag cursor):
 
 - `buffer.batches_collected` (counter): increments inside
-  `fetch_descriptor`. Same as today's `next_batch` increment.
+  `ConsumerFetchHandle::fetch`. Each successful fetch increments by 1
+  regardless of which call path drove it (handle directly, or via the
+  `&mut self` `Consumer::fetch_descriptor` wrapper).
 - `buffer.bytes_collected`, `buffer.entries_collected`,
-  `buffer.fetch_duration_seconds`, `buffer.consumer_lag_seconds`:
-  all move into `fetch_descriptor`.
+  `buffer.fetch_duration_seconds`: all increment inside
+  `ConsumerFetchHandle::fetch`.
+- `buffer.consumer_lag_seconds` (gauge): increments inside the serial
+  `Consumer::fetch_descriptor` wrapper only. Parallel callers that
+  only use `ConsumerFetchHandle::fetch` do not advance this gauge —
+  the consumer's serial cursor is not the right observation point
+  under N-way concurrency, and the runtime owns its own
+  `runtime_stage_latency_seconds{stage=fetch}` histogram (RFC 0002).
 - `buffer.acks` (counter): now also incremented by `ack_through`
   by the number of sequences the call advances over. So a counter rate
   reads "sequences acked per second" under both APIs.
@@ -916,30 +927,35 @@ methods, which is fine — the migration is per-consumer.
   `Err(Error::Storage(_))`, mirroring today's `next_batch`. The
   consumer's cursor does not advance; a retry succeeds against a
   recovered store.
-- **Object fetch fails on `fetch_descriptor`**: returns
-  `Err(Error::Storage(_))`. The cursor (`last_fetched_sequence`) does
-  not advance for that descriptor. Callers may retry the same
-  descriptor.
+- **Object fetch fails (`ConsumerFetchHandle::fetch`, or its
+  serial-wrapper caller `Consumer::fetch_descriptor`)**: returns
+  `Err(Error::Storage(_))`. The handle is stateless, so no cursor
+  advances; the wrapper does not advance `last_fetched_sequence`
+  either, since it only updates the cursor after a successful decode.
+  Callers may retry the same descriptor with the same handle clone.
 - **Object fetch returns 404 (GC race)**: surfaces as `Error::Storage`
   with a "404"-shaped message. Documented in
-  `fetch_descriptor`'s rustdoc; the runbook tells operators to extend
-  `gc_grace_period` or to investigate over-aggressive ack flushing if
-  this fires in production.
+  `ConsumerFetchHandle::fetch`'s rustdoc (and inherited by the
+  `Consumer::fetch_descriptor` wrapper); the runbook tells operators
+  to extend `gc_grace_period` or to investigate over-aggressive ack
+  flushing if this fires in production.
 - **Caller calls `ack_through(seq)` with `seq <= last_acked_sequence`**:
   returns `Err(Error::Storage("non-monotonic ack_through: ..."))`. The
   caller's cursor does not advance.
-- **Caller calls `fetch_descriptor` with a sequence that is no longer
-  in the manifest** (descriptor predates a recent dequeue or restart):
-  the GET still succeeds against the still-present data object until
-  GC deletes it; identical to the "descriptor outliving manifest entry"
-  case. After GC, falls back to the 404 path above.
-- **Fence between `next_descriptors` and `fetch_descriptor`**: the
-  fetch is unaffected (it does not consult the manifest). The next
-  `next_descriptors` or `ack_through` returns `Error::Fenced`. The
-  fetched batch is correct but should not be acked by a fenced
-  consumer. The caller's runtime layer is responsible for not advancing
-  ack state after a fence; today's `BufferConsumerRuntime` already
-  treats `Fenced` as fatal.
+- **Caller calls `fetch` with a sequence that is no longer in the
+  manifest** (descriptor predates a recent dequeue or restart): the
+  GET still succeeds against the still-present data object until GC
+  deletes it; identical to the "descriptor outliving manifest entry"
+  case. After GC, falls back to the 404 path above. Applies equally
+  to handle and wrapper.
+- **Fence between `next_descriptors` and a later fetch**: the fetch
+  is unaffected (the handle does not consult the manifest, and the
+  wrapper delegates to the handle). The next `next_descriptors` or
+  `ack_through` returns `Error::Fenced`. The fetched batch is
+  correct but should not be acked by a fenced consumer. The caller's
+  runtime layer is responsible for not advancing ack state after a
+  fence; today's `BufferConsumerRuntime` already treats `Fenced` as
+  fatal.
 
 ## Alternatives Considered
 
@@ -1162,3 +1178,4 @@ breakage.
 | 2026-05-07 (rev 2) | Phase 0 gate revision. (1) Added `ConsumerFetchHandle` (Clone + Send + Sync + 'static) so manifest-owner stays `&mut self` while N fetch workers run concurrently — Arc-of-Consumer alone could not do this because every other useful method takes `&mut`. (2) Made `ConsumerFetchHandle::fetch` stateless; dropped the `&self` cursor mutation; serial lag gauge stays on the `&mut self` `fetch_descriptor` wrapper. (3) Reordered `ack_through` so `dequeue` runs before any in-memory state advances; storage/fence errors leave `last_acked_sequence` and metrics untouched. (4) Added explicit "Descriptor Handout Contract" section: lost descriptors are not reissued within a process; recovery is restart from the durable ack frontier. (5) Added `BatchDescriptor.object_bytes: Option<u64>` reserved field with v1-always-None policy and pessimistic-reservation guidance for the runtime; documented why HEAD/payload-hint/in-consumer-memory alternatives were rejected for v1. Validation Criteria expanded to cover handle concurrency, fail-atomic ack_through, and the descriptor handout contract. |
 | 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Goals section updated to name `ConsumerFetchHandle` and the dequeue-first ack ordering; the rev-1 phrasing about "concurrent-safe `fetch_descriptor(&self, ...)`" no longer matched the rev-2 design. (b) `next_descriptors` pseudocode now populates `BatchDescriptor.object_bytes: None` explicitly (was missing — the manifest entry has no size yet). (c) Tier 2 raw-decode method moved from `Consumer::fetch_descriptor_raw(&self, ...)` to `ConsumerFetchHandle::fetch_raw(&self, ...)`. The serial Consumer no longer has a raw entry point; serial callers use `Consumer::fetch_descriptor` (which decodes inline), parallel callers use the handle's `fetch` or `fetch_raw`. Validation Criteria and Compatibility list updated to match. |
 | 2026-05-07 (rev 4) | Implementation Notes / Migration Plan / Validation Criteria swept for stale `fetch_descriptor` concurrency wording. Tests now name `ConsumerFetchHandle::fetch` from cloned handles (not `Arc<Consumer>` of a `&self`-fetch_descriptor); migration step 2 routes Phase 4 fetches through one handle clone and step 3 fans out to N handle clones; Validation Criteria asserts both `Consumer::fetch_descriptor` (the `&mut self` wrapper) and `ConsumerFetchHandle::fetch` return matching `ConsumedBatch` values, and that two handle clones can fetch in parallel while the manifest owner runs `next_descriptors` / `ack_through`. |
+| 2026-05-07 (rev 5) | Metrics + Failure Modes split between `ConsumerFetchHandle::fetch` (per-fetch counters: `batches_collected`, `bytes_collected`, `entries_collected`, `fetch_duration_seconds`; object-fetch failures and 404s attributed here) and the `Consumer::fetch_descriptor` `&mut self` wrapper (`consumer_lag_seconds` only; the wrapper additionally maintains the serial lag cursor). Earlier wording attributed all per-fetch metrics and all object-fetch failures to `fetch_descriptor`, which conflicted with the rev-2 design that runs parallel fetches through the handle. |
