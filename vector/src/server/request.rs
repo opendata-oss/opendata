@@ -130,7 +130,7 @@ impl DeleteRequest {
         }
     }
 
-    fn from_protobuf(body: &[u8]) -> Result<Self, Error> {
+    pub(crate) fn from_protobuf(body: &[u8]) -> Result<Self, Error> {
         let proto_request = proto::DeleteRequest::decode(body)
             .map_err(|e| Error::InvalidInput(format!("Invalid protobuf: {}", e)))?;
         Self::validate(proto_request.ids)
