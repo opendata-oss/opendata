@@ -14,9 +14,11 @@ common.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
+libc = "0.2"
 metrics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 slatedb.workspace = true
 tokio.workspace = true
 

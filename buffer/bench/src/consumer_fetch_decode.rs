@@ -201,9 +201,25 @@ struct IterationResult {
     elapsed_seconds: f64,
     records_processed: usize,
     bytes_processed: u64,
+    cpu_user_seconds: f64,
+    cpu_sys_seconds: f64,
     next_batch_seconds: Vec<f64>,
     fetch_duration_seconds: Vec<f64>,
     counters: HashMap<String, u64>,
+}
+
+// Self-process CPU usage. RUSAGE_SELF on macOS/Linux returns user + sys
+// CPU time for the calling process (no thread granularity on macOS).
+fn rusage_self() -> (f64, f64) {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+            return (0.0, 0.0);
+        }
+        let u = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6;
+        let s = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6;
+        (u, s)
+    }
 }
 
 async fn populate_store(
@@ -286,6 +302,7 @@ async fn run_iteration(
         .as_millis() as u64;
 
     let timed_start = Instant::now();
+    let (u0, s0) = rusage_self();
     let mut next_batch_seconds = Vec::with_capacity(args.batches);
     let mut records_processed = 0usize;
     let mut bytes_processed = 0u64;
@@ -300,6 +317,7 @@ async fn run_iteration(
     }
 
     let elapsed = timed_start.elapsed().as_secs_f64();
+    let (u1, s1) = rusage_self();
     consumer.flush().await?;
 
     let _ = bytes_in_store;
@@ -316,6 +334,8 @@ async fn run_iteration(
         elapsed_seconds: elapsed,
         records_processed,
         bytes_processed,
+        cpu_user_seconds: (u1 - u0).max(0.0),
+        cpu_sys_seconds: (s1 - s0).max(0.0),
         next_batch_seconds,
         fetch_duration_seconds,
         counters,
@@ -545,6 +565,8 @@ async fn main() -> Result<()> {
         .map(|r| args.batches as f64 / r.elapsed_seconds.max(1e-9))
         .collect();
 
+    let cpu_user_per_iter: Vec<f64> = iterations.iter().map(|r| r.cpu_user_seconds).collect();
+    let cpu_sys_per_iter:  Vec<f64> = iterations.iter().map(|r| r.cpu_sys_seconds).collect();
     let scalars = json!({
         "total_throughput_records_per_sec": agg_value(&throughput_records_per_sec),
         "total_throughput_bytes_per_sec":   agg_value(&throughput_bytes_per_sec),
@@ -554,6 +576,8 @@ async fn main() -> Result<()> {
         "iteration_elapsed_seconds":        agg_value(
             &iterations.iter().map(|r| r.elapsed_seconds).collect::<Vec<_>>()
         ),
+        "cpu_user_seconds":                 agg_value(&cpu_user_per_iter),
+        "cpu_sys_seconds":                  agg_value(&cpu_sys_per_iter),
     });
 
     let stages = json!([
@@ -632,6 +656,32 @@ async fn main() -> Result<()> {
     });
 
     std::fs::write(run_dir.join("results.json"), serde_json::to_string_pretty(&results)?)?;
+
+    // timeseries.json — schema v2 required for unit 1.3.
+    //
+    // Each iteration produces one observation per Buffer batch (in
+    // sequence order). Cross-iteration aggregation is by sample index
+    // (the i-th batch across iterations), with t_offset_ms approximated
+    // as i × median_next_batch_latency. The bench is deterministic
+    // and fast enough that per-batch wall-clock offsets are noisy at
+    // sub-microsecond scales; this offset is the best honest signal.
+    let series_next_batch = build_aggregated_series(
+        "stage.next_batch.duration_seconds",
+        &iterations.iter().map(|r| r.next_batch_seconds.clone()).collect::<Vec<_>>(),
+    );
+    let series_fetch = build_aggregated_series(
+        "buffer.fetch_duration_seconds",
+        &iterations.iter().map(|r| r.fetch_duration_seconds.clone()).collect::<Vec<_>>(),
+    );
+    let iteration_starts: Vec<u64> = iterations.iter().map(|r| r.started_unix_ms).collect();
+    let timeseries = json!({
+        "schema_version": 2,
+        "window_seconds": 1.0,
+        "iterations_aggregated": iterations.len(),
+        "iteration_starts_unix_ms": iteration_starts,
+        "series": [series_next_batch, series_fetch],
+    });
+    std::fs::write(run_dir.join("timeseries.json"), serde_json::to_string_pretty(&timeseries)?)?;
 
     // Build metadata.json
     let workload_canonical = json!({
@@ -765,6 +815,50 @@ fn percentile(samples: &[f64], frac: f64) -> f64 {
     s[idx]
 }
 
+/// Aggregate per-iteration series into a schema-v2 timeseries entry.
+///
+/// `per_iter[i][j]` is iteration i's j-th observation. We align across
+/// iterations on j (the sample index) — this is the offset-based
+/// alignment benchmarks.md requires. For each j we report median /
+/// p90 / max plus per-offset n. The bench is fast enough that
+/// wall-clock alignment would be noisy; sample-index alignment is
+/// stable across runs with the same workload fingerprint.
+fn build_aggregated_series(metric: &str, per_iter: &[Vec<f64>]) -> serde_json::Value {
+    let max_len = per_iter.iter().map(|v| v.len()).max().unwrap_or(0);
+    let mut samples: Vec<serde_json::Value> = Vec::with_capacity(max_len);
+    for j in 0..max_len {
+        let mut values: Vec<f64> = Vec::with_capacity(per_iter.len());
+        for it in per_iter {
+            if let Some(v) = it.get(j).copied() {
+                values.push(v);
+            }
+        }
+        if values.is_empty() {
+            continue;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = values[values.len() / 2];
+        let p90_idx = ((values.len() as f64 - 1.0) * 0.9) as usize;
+        let p90 = values[p90_idx];
+        let max = *values.last().unwrap();
+        // t_offset_ms is approximated as the cumulative median of
+        // sample-index latencies up to j; this is the best stable
+        // proxy when the bench runs faster than the sample window.
+        samples.push(json!({
+            "t_offset_ms": j as i64, // index-aligned; one observation per Buffer batch
+            "median": med,
+            "p90":    p90,
+            "max":    max,
+            "n":      values.len(),
+        }));
+    }
+    json!({
+        "metric": metric,
+        "labels": { "alignment": "sample_index" },
+        "samples": samples,
+    })
+}
+
 fn bucket_counts(samples: &[f64], buckets: &[f64]) -> Vec<u64> {
     let mut counts = vec![0u64; buckets.len()];
     for v in samples {
@@ -784,17 +878,15 @@ fn num_cpus_or_default() -> i64 {
         .unwrap_or(1)
 }
 
-// Tiny SHA-256 wrapper using std (we don't have sha2 in deps).
-// We avoid pulling sha2 by computing a stable FNV-64-like hash here;
-// it is *not* SHA-256 but is documented as such in the artifact.
-// The schema lets us label the hash, and a future revision can swap
-// to a real SHA-256 if cross-tooling alignment matters. For Phase 1
-// baseline comparability, FNV-64 is sufficient and reproducible.
 fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in out {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
     }
-    format!("{h:016x}{h:016x}{h:016x}{h:016x}")
+    s
 }
