@@ -815,14 +815,14 @@ fn percentile(samples: &[f64], frac: f64) -> f64 {
     s[idx]
 }
 
-/// Aggregate per-iteration series into a schema-v2 timeseries entry.
-///
-/// `per_iter[i][j]` is iteration i's j-th observation. We align across
-/// iterations on j (the sample index) — this is the offset-based
-/// alignment benchmarks.md requires. For each j we report median /
-/// p90 / max plus per-offset n. The bench is fast enough that
-/// wall-clock alignment would be noisy; sample-index alignment is
-/// stable across runs with the same workload fingerprint.
+/// Aggregate per-iteration series into a schema-v2 timeseries entry,
+/// aligned on sample index (one observation per Buffer batch). See
+/// `plans/odb-high-throughput/benchmarks.md` rev 5: each sample
+/// carries `sample_index` (not `t_offset_ms`) and the series envelope
+/// declares `labels.alignment = "sample_index"`. Sample-index
+/// alignment is the right axis when individual observations are
+/// sub-millisecond — wall-clock offsets would round to integer-ms
+/// noise.
 fn build_aggregated_series(metric: &str, per_iter: &[Vec<f64>]) -> serde_json::Value {
     let max_len = per_iter.iter().map(|v| v.len()).max().unwrap_or(0);
     let mut samples: Vec<serde_json::Value> = Vec::with_capacity(max_len);
@@ -841,11 +841,8 @@ fn build_aggregated_series(metric: &str, per_iter: &[Vec<f64>]) -> serde_json::V
         let p90_idx = ((values.len() as f64 - 1.0) * 0.9) as usize;
         let p90 = values[p90_idx];
         let max = *values.last().unwrap();
-        // t_offset_ms is approximated as the cumulative median of
-        // sample-index latencies up to j; this is the best stable
-        // proxy when the bench runs faster than the sample window.
         samples.push(json!({
-            "t_offset_ms": j as i64, // index-aligned; one observation per Buffer batch
+            "sample_index": j as i64,
             "median": med,
             "p90":    p90,
             "max":    max,
