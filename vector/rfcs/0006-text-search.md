@@ -201,7 +201,7 @@ discusses how we can address this by chunking posting lists.
 
 When vectors are deleted, we need to remove the vector from term postings and update term 
 statistics for the vector's terms. Our current approach to handling deletes is to read some 
-metadata about the vector (`VectorIndexMetadata`) that gives us enough information to 
+metadata about the vector (`VectorIndexMetadata`) that gives us enough information to apply 
 updates to the attribute postings. Then, Vector marks the vector deleted for each of its 
 attributes and centroid postings. This approach poses 2 problems for FTS. First, we depend on 
 this metadata being relatively small so that its likely to be in cache and can be cheaply read 
@@ -237,7 +237,7 @@ the vector to the underlying postings/stats, and compactions always merge consec
 This means that once a Deletions merge entry reaches SR0, the documents it references will have 
 already been removed from the postings/stats.
 
-To address 2 and 3, we'll customize compaction of the FTS segment by tracking the current number 
+To address 2, 3, and 4 we'll customize compaction of the FTS segment by tracking the current number 
 of outstanding deletes. When this count is greater than some % of total vectors, Vector will do 
 a full compaction of the segment. This requires a custom compaction policy that wraps and defaults 
 to the `SizeTieredCompactionScheduler` from slatedb, but adds this special case for the FTS 
@@ -251,7 +251,7 @@ terms * 4 bytes/term = 74GB. At a write rate of 1K upserts/second, 20% deletes a
 then written 4 more times in SR0 before it's compacted away) to the write amplification factor 
 for the FTS data, so it's roughly doubled. This is not ideal, but feels manageable.
 
-To address 3 and 4 we'll simply load the bitmap from storage after every flush and put it in the 
+To address 3 and 5 we'll simply load the bitmap from storage after every flush and put it in the 
 `LastDbSnapshot` published by the Flusher. For 100M documents with a 20% deletions threshold, 
 the bitmap should be at most ~4MB so this should be a quick read, typically out of cache.
 
