@@ -194,43 +194,55 @@ impl Consumer {
 
     /// Read the next data batch from object storage.
     ///
-    /// Compatibility wrapper over [`Consumer::next_descriptors`] +
-    /// [`Consumer::fetch_descriptor`]. Behavior is preserved from
-    /// pre-RFC-0003: peeks the next manifest entry past the last
-    /// handed-out / fetched sequence, fetches the corresponding object,
-    /// and returns it. Returns `None` if no matching entry is
+    /// Compatibility shim for pre-RFC-0003 callers. Behavior is
+    /// preserved: peeks the next manifest entry past the last
+    /// handed-out / fetched sequence, fetches the corresponding
+    /// object, and returns it. Returns `None` if no matching entry is
     /// available.
     ///
-    /// **Fetch failure preserves legacy semantics.** Pre-RFC-0003
-    /// `next_batch` advanced its cursor only after a successful fetch;
-    /// callers expect that a transient `Storage` error from `next_batch`
-    /// can be retried and the same batch is re-attempted. The
-    /// new-API path (`next_descriptors` + `fetch_descriptor`) does not
-    /// roll back: lost descriptors are not reissued in-process per the
-    /// descriptor-handout contract. To preserve the legacy semantics
-    /// for `next_batch` callers, this wrapper rolls back
-    /// `last_handed_out_sequence` to its pre-call value when the
-    /// downstream fetch fails. The wrapper has exclusive `&mut self`
-    /// access, so the rollback is safe — no other path could observe
-    /// the descriptor between the handout and the fetch failure.
+    /// **Cancellation-safe and fetch-failure-safe.** The cursor
+    /// (`last_handed_out_sequence`) advances **only after** a
+    /// successful fetch. If the fetch fails, or if the future is
+    /// dropped mid-fetch (cancellation), the cursor is unchanged and
+    /// a subsequent `next_batch` re-fetches the same entry. This
+    /// preserves the legacy "fetch failure does not advance the
+    /// cursor" semantics that pre-RFC-0003 callers rely on.
+    ///
+    /// The implementation is a manual peek-fetch-advance flow rather
+    /// than a wrapper over [`Consumer::next_descriptors`] +
+    /// [`Consumer::fetch_descriptor`]: `next_descriptors` advances
+    /// the cursor at handout time per the
+    /// "Descriptor Handout Contract" (lost descriptors are not
+    /// reissued in-process), which is correct for the new-API
+    /// caller but is exactly the legacy regression this method must
+    /// avoid. Inlining keeps the cursor-advance after the
+    /// `fetch_descriptor` await, making cancellation safety a
+    /// structural invariant rather than a `Drop`-guard liability.
     pub async fn next_batch(&mut self) -> Result<Option<ConsumedBatch>> {
-        let saved_handed_out = self.last_handed_out_sequence;
-        let mut descriptors = self.next_descriptors(1).await?;
-        let Some(descriptor) = descriptors.pop() else {
+        let entries = self
+            .consumer
+            .descriptors_after(self.last_handed_out_sequence, 1)
+            .await?;
+        metrics::gauge!(m::QUEUE_LENGTH).set(self.consumer.len() as f64);
+        let Some(entry) = entries.into_iter().next() else {
             return Ok(None);
         };
-        match self.fetch_descriptor(descriptor).await {
-            Ok(batch) => Ok(Some(batch)),
-            Err(e) => {
-                // Roll back so the next call to next_batch re-issues
-                // the same descriptor (legacy "fetch failure does not
-                // advance the cursor" semantics). The descriptor was
-                // never visible to a caller because next_batch owns it
-                // for the duration of this method.
-                self.last_handed_out_sequence = saved_handed_out;
-                Err(e)
-            }
-        }
+        let descriptor = BatchDescriptor {
+            sequence: entry.sequence,
+            location: entry.location,
+            metadata: entry.metadata,
+            // Reserved field; v1 manifests do not carry per-entry
+            // object size.
+            object_bytes: None,
+        };
+        // fetch_descriptor advances last_fetched_sequence on success
+        // and updates the consumer_lag_seconds gauge. We then advance
+        // last_handed_out_sequence ourselves — only on success. If
+        // the fetch errors or the future is cancelled, neither cursor
+        // moves and the next next_batch re-issues the same entry.
+        let batch = self.fetch_descriptor(descriptor).await?;
+        self.last_handed_out_sequence = Some(batch.sequence);
+        Ok(Some(batch))
     }
 
     /// Read the manifest once and return up to `max` contiguous
@@ -1001,6 +1013,78 @@ mod tests {
         let b2 = collector.next_batch().await.unwrap().unwrap();
         assert_eq!(b2.sequence, 1);
         assert_eq!(b2.location, location_b);
+    }
+
+    #[tokio::test]
+    async fn should_next_batch_not_advance_cursor_when_future_is_dropped() {
+        // Cancellation safety: a `next_batch` future dropped before it
+        // completes must not have advanced last_handed_out_sequence.
+        // The next next_batch must return the same entry.
+        //
+        // The structural property this verifies: last_handed_out_sequence
+        // is mutated *after* the fetch_descriptor await returns Ok.
+        // If the future is dropped before that line, the cursor is
+        // unchanged. (Earlier versions of next_batch advanced the
+        // cursor inside next_descriptors(1) before the fetch — that
+        // version was cancellation-unsafe even though the Err path
+        // rolled back.)
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        write_batch(&store, "batches/cancel-a", &entries).await;
+        write_batch(&store, "batches/cancel-b", &entries).await;
+        producer
+            .enqueue("batches/cancel-a".to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue("batches/cancel-b".to_string(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(collector.last_handed_out_sequence, None);
+
+        // Construct the future and drop it without ever polling it.
+        // This is the cleanest test of "the body never runs" and
+        // exercises the no-side-effects-before-fetch invariant.
+        {
+            let fut = collector.next_batch();
+            drop(fut);
+        }
+        assert_eq!(
+            collector.last_handed_out_sequence, None,
+            "dropped (unpolled) next_batch future must not advance the cursor"
+        );
+
+        // Race a real next_batch against an immediate timeout. If the
+        // timeout wins, the future was cancelled mid-flight (after
+        // some polls) and the cursor must still not have advanced.
+        // If the future wins, the cursor advanced exactly to the
+        // returned batch's sequence.
+        let r = tokio::time::timeout(std::time::Duration::ZERO, collector.next_batch()).await;
+        match r {
+            Ok(Ok(Some(b))) => {
+                assert_eq!(b.sequence, 0);
+                assert_eq!(b.location, "batches/cancel-a");
+                assert_eq!(collector.last_handed_out_sequence, Some(0));
+            }
+            Ok(Ok(None)) => panic!("expected a batch"),
+            Ok(Err(e)) => panic!("unexpected error: {e:?}"),
+            Err(_elapsed) => {
+                // Cancellation path: cursor unchanged.
+                assert_eq!(collector.last_handed_out_sequence, None);
+            }
+        }
+
+        // Functional retry: regardless of which branch above executed,
+        // a normal next_batch now returns the next un-fetched entry.
+        // If we cancelled, that's A (sequence 0). If we succeeded,
+        // that's B (sequence 1).
+        let next = collector.next_batch().await.unwrap().unwrap();
+        assert!(
+            next.sequence == 0 || next.sequence == 1,
+            "after cancellation or success, next_batch must return one of the two enqueued entries"
+        );
     }
 
     #[tokio::test]
