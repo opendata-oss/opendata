@@ -1027,10 +1027,14 @@ batch-decode boundary.
   (`raw-fetch`) so consumers that do not need it do not pay for the
   added types in their public API surface.
 - Tests must cover: `next_descriptors` returning < `max` when the
-  manifest is shorter; `fetch_descriptor` from two tasks against an
-  `Arc<Consumer>`; `ack_through` skipping over a contiguous range;
-  `ack_through` rejecting non-monotonic input; fence detection on
-  `next_descriptors`; `next_batch` parity with the wrapper.
+  manifest is shorter; concurrent `ConsumerFetchHandle::fetch` calls
+  from two tasks against clones of one handle (the manifest owner
+  task continues `next_descriptors` and `ack_through` while fetches
+  run); `ack_through` skipping over a contiguous range; `ack_through`
+  rejecting non-monotonic input; `ack_through` leaving in-memory state
+  untouched on `Fenced` and storage errors (dequeue-first invariant);
+  fence detection on `next_descriptors`; `next_batch` parity with the
+  wrapper.
 
 ## Migration Plan
 
@@ -1041,13 +1045,16 @@ batch-decode boundary.
    `ack_through` (with the documented dequeue-first ordering), and
    rewrite `next_batch` as a wrapper. Tests in 2.6.
 2. **opendata-contrib RFC 0002 / Phase 4**: the runtime extraction
-   uses `next_descriptors` + `fetch_descriptor` from day one (with
-   `max = 1` until Phase 6 turns concurrency on). `ack_through` is
-   used wherever the runtime would otherwise loop `ack`. Other
-   consumers (timeseries, vector) keep using `next_batch` and `ack`
-   unchanged.
-3. **opendata-contrib Phase 6**: the runtime increases `max` and
-   parallelizes `fetch_descriptor`. No further buffer changes.
+   uses `next_descriptors` from day one and routes object fetches
+   through one clone of `Consumer::fetch_handle()` (with `max = 1`
+   and a single fetch task until Phase 6 turns N-way concurrency on).
+   `ack_through` is used wherever the runtime would otherwise loop
+   `ack`. Other consumers (timeseries, vector) keep using `next_batch`
+   and `ack` unchanged.
+3. **opendata-contrib Phase 6**: the runtime increases `max`, clones
+   the fetch handle into N worker tasks, and runs
+   `ConsumerFetchHandle::fetch` in parallel. No further buffer
+   changes.
 4. **Tier 2 raw-decode hook**: lands when the high-throughput runtime
    is ready to put `decode_batch` on a blocking pool (Phase 6+). Until
    then, the feature flag stays off and the public surface is just the
@@ -1069,11 +1076,15 @@ breakage.
 - `next_batch` after a fresh `Consumer::new` returns the same
   `ConsumedBatch.sequence` and the same `entries` as in v0.x for the
   same manifest state.
-- `fetch_descriptor(d)` against a `d` from `next_descriptors` returns a
-  `ConsumedBatch` with `sequence == d.sequence`,
-  `location == d.location`, and `metadata == d.metadata`.
-- Two concurrent `fetch_descriptor` calls (under `Arc<Consumer>`)
-  against distinct descriptors complete with no manifest contention.
+- `Consumer::fetch_descriptor(d)` (the `&mut self` wrapper) and
+  `ConsumerFetchHandle::fetch(d)` against a `d` from
+  `next_descriptors` both return a `ConsumedBatch` with
+  `sequence == d.sequence`, `location == d.location`, and
+  `metadata == d.metadata`.
+- Two concurrent `ConsumerFetchHandle::fetch` calls (against clones
+  of one handle) targeting distinct descriptors complete with no
+  manifest contention; the owner task can run `next_descriptors` /
+  `ack_through` in parallel without borrow-checker conflict.
 - `ack_through(seq)` advances `last_acked_sequence` to `seq` and
   removes manifest entries `<= seq`. `flush()` after `ack_through` is
   a no-op.
@@ -1150,3 +1161,4 @@ breakage.
 | 2026-05-07 | Initial draft. Adds `BatchDescriptor`, `Consumer::next_descriptors`, `Consumer::fetch_descriptor`, `Consumer::ack_through`, and an optional Tier 2 raw-decode hook behind a feature flag. Preserves epoch fencing and existing API/behavior. |
 | 2026-05-07 (rev 2) | Phase 0 gate revision. (1) Added `ConsumerFetchHandle` (Clone + Send + Sync + 'static) so manifest-owner stays `&mut self` while N fetch workers run concurrently — Arc-of-Consumer alone could not do this because every other useful method takes `&mut`. (2) Made `ConsumerFetchHandle::fetch` stateless; dropped the `&self` cursor mutation; serial lag gauge stays on the `&mut self` `fetch_descriptor` wrapper. (3) Reordered `ack_through` so `dequeue` runs before any in-memory state advances; storage/fence errors leave `last_acked_sequence` and metrics untouched. (4) Added explicit "Descriptor Handout Contract" section: lost descriptors are not reissued within a process; recovery is restart from the durable ack frontier. (5) Added `BatchDescriptor.object_bytes: Option<u64>` reserved field with v1-always-None policy and pessimistic-reservation guidance for the runtime; documented why HEAD/payload-hint/in-consumer-memory alternatives were rejected for v1. Validation Criteria expanded to cover handle concurrency, fail-atomic ack_through, and the descriptor handout contract. |
 | 2026-05-07 (rev 3) | Phase 0 gate reconciliation. (a) Goals section updated to name `ConsumerFetchHandle` and the dequeue-first ack ordering; the rev-1 phrasing about "concurrent-safe `fetch_descriptor(&self, ...)`" no longer matched the rev-2 design. (b) `next_descriptors` pseudocode now populates `BatchDescriptor.object_bytes: None` explicitly (was missing — the manifest entry has no size yet). (c) Tier 2 raw-decode method moved from `Consumer::fetch_descriptor_raw(&self, ...)` to `ConsumerFetchHandle::fetch_raw(&self, ...)`. The serial Consumer no longer has a raw entry point; serial callers use `Consumer::fetch_descriptor` (which decodes inline), parallel callers use the handle's `fetch` or `fetch_raw`. Validation Criteria and Compatibility list updated to match. |
+| 2026-05-07 (rev 4) | Implementation Notes / Migration Plan / Validation Criteria swept for stale `fetch_descriptor` concurrency wording. Tests now name `ConsumerFetchHandle::fetch` from cloned handles (not `Arc<Consumer>` of a `&self`-fetch_descriptor); migration step 2 routes Phase 4 fetches through one handle clone and step 3 fans out to N handle clones; Validation Criteria asserts both `Consumer::fetch_descriptor` (the `&mut self` wrapper) and `ConsumerFetchHandle::fetch` return matching `ConsumedBatch` values, and that two handle clones can fetch in parallel while the manifest owner runs `next_descriptors` / `ack_through`. |
