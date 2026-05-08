@@ -660,11 +660,11 @@ async fn main() -> Result<()> {
     // timeseries.json — schema v2 required for unit 1.3.
     //
     // Each iteration produces one observation per Buffer batch (in
-    // sequence order). Cross-iteration aggregation is by sample index
-    // (the i-th batch across iterations), with t_offset_ms approximated
-    // as i × median_next_batch_latency. The bench is deterministic
-    // and fast enough that per-batch wall-clock offsets are noisy at
-    // sub-microsecond scales; this offset is the best honest signal.
+    // sequence order). Cross-iteration aggregation is on sample
+    // index (the i-th batch across iterations) — see benchmarks.md
+    // rev 5 for the `sample_index` axis. The bench is fast enough
+    // that per-batch wall-clock offsets would round to integer-ms
+    // noise; sample-index alignment is the right axis here.
     let series_next_batch = build_aggregated_series(
         "stage.next_batch.duration_seconds",
         &iterations.iter().map(|r| r.next_batch_seconds.clone()).collect::<Vec<_>>(),
