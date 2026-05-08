@@ -16,6 +16,7 @@ use crate::queue::{Metadata, QueueConsumer};
 const DEQUEUE_INTERVAL: u64 = 100;
 
 /// A batch of entries read from object storage by the [`Consumer`].
+#[derive(Debug)]
 pub struct ConsumedBatch {
     /// The deserialized opaque byte entries from the data batch.
     pub entries: Vec<Bytes>,
@@ -199,11 +200,36 @@ impl Consumer {
     /// handed-out / fetched sequence, fetches the corresponding object,
     /// and returns it. Returns `None` if no matching entry is
     /// available.
+    ///
+    /// **Fetch failure preserves legacy semantics.** Pre-RFC-0003
+    /// `next_batch` advanced its cursor only after a successful fetch;
+    /// callers expect that a transient `Storage` error from `next_batch`
+    /// can be retried and the same batch is re-attempted. The
+    /// new-API path (`next_descriptors` + `fetch_descriptor`) does not
+    /// roll back: lost descriptors are not reissued in-process per the
+    /// descriptor-handout contract. To preserve the legacy semantics
+    /// for `next_batch` callers, this wrapper rolls back
+    /// `last_handed_out_sequence` to its pre-call value when the
+    /// downstream fetch fails. The wrapper has exclusive `&mut self`
+    /// access, so the rollback is safe — no other path could observe
+    /// the descriptor between the handout and the fetch failure.
     pub async fn next_batch(&mut self) -> Result<Option<ConsumedBatch>> {
+        let saved_handed_out = self.last_handed_out_sequence;
         let mut descriptors = self.next_descriptors(1).await?;
-        match descriptors.pop() {
-            Some(d) => Ok(Some(self.fetch_descriptor(d).await?)),
-            None => Ok(None),
+        let Some(descriptor) = descriptors.pop() else {
+            return Ok(None);
+        };
+        match self.fetch_descriptor(descriptor).await {
+            Ok(batch) => Ok(Some(batch)),
+            Err(e) => {
+                // Roll back so the next call to next_batch re-issues
+                // the same descriptor (legacy "fetch failure does not
+                // advance the cursor" semantics). The descriptor was
+                // never visible to a caller because next_batch owns it
+                // for the duration of this method.
+                self.last_handed_out_sequence = saved_handed_out;
+                Err(e)
+            }
         }
     }
 
@@ -895,24 +921,86 @@ mod tests {
 
     #[tokio::test]
     async fn should_fetch_handle_return_same_consumed_batch_as_fetch_descriptor() {
+        // Fetch the *same* descriptor through both paths and compare:
+        // sequence, location, metadata, entries must all match.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
-        enqueue_n(&store, &producer, 2).await;
-
-        let descriptors = collector.next_descriptors(2).await.unwrap();
-        let handle = collector.fetch_handle();
-        let from_handle = handle.fetch(descriptors[0].clone()).await.unwrap();
-        let from_wrapper = collector
-            .fetch_descriptor(descriptors[1].clone())
+        let entries = test_entries();
+        let location = "batches/handle-vs-wrapper";
+        write_batch(&store, location, &entries).await;
+        let metadata = vec![Metadata {
+            start_index: 0,
+            ingestion_time_ms: 1_700_000_000_000,
+            payload: Bytes::from(r#"{"k":"v"}"#),
+        }];
+        producer
+            .enqueue(location.to_string(), metadata.clone())
             .await
             .unwrap();
 
-        assert_eq!(from_handle.sequence, descriptors[0].sequence);
-        assert_eq!(from_handle.location, descriptors[0].location);
+        let descriptors = collector.next_descriptors(1).await.unwrap();
+        assert_eq!(descriptors.len(), 1);
+        let d = descriptors[0].clone();
+
+        let from_handle = collector.fetch_handle().fetch(d.clone()).await.unwrap();
+        let from_wrapper = collector.fetch_descriptor(d).await.unwrap();
+
+        assert_eq!(from_handle.sequence, from_wrapper.sequence);
+        assert_eq!(from_handle.location, from_wrapper.location);
+        assert_eq!(from_handle.metadata, from_wrapper.metadata);
+        assert_eq!(from_handle.entries, from_wrapper.entries);
+        // And both must match what the producer actually wrote.
+        assert_eq!(from_handle.location, location);
         assert_eq!(from_handle.entries.len(), 2);
-        assert_eq!(from_wrapper.sequence, descriptors[1].sequence);
-        assert_eq!(from_wrapper.location, descriptors[1].location);
-        assert_eq!(from_wrapper.entries.len(), 2);
+        assert_eq!(from_handle.metadata, metadata);
+    }
+
+    #[tokio::test]
+    async fn should_next_batch_not_advance_cursor_on_fetch_failure() {
+        // Pre-RFC-0003 contract: next_batch advances its cursor only
+        // after a successful fetch. The wrapper must roll back the
+        // private last_handed_out_sequence on fetch error so a retry
+        // re-issues the same batch.
+        use slatedb::object_store::path::Path;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        let location_a = "batches/a-fails-then-succeeds";
+        let location_b = "batches/b";
+        write_batch(&store, location_a, &entries).await;
+        write_batch(&store, location_b, &entries).await;
+        producer
+            .enqueue(location_a.to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue(location_b.to_string(), vec![])
+            .await
+            .unwrap();
+
+        // Delete A's data object so the fetch will fail.
+        store.delete(&Path::from(location_a)).await.unwrap();
+
+        // First next_batch fails on the fetch.
+        let r = collector.next_batch().await;
+        assert!(
+            matches!(r, Err(Error::Storage(_))),
+            "expected Storage error, got {r:?}"
+        );
+
+        // Re-write A so the next fetch succeeds.
+        write_batch(&store, location_a, &entries).await;
+
+        // Second next_batch must return A — cursor did not advance past
+        // it on the previous failure.
+        let b = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b.sequence, 0);
+        assert_eq!(b.location, location_a);
+        // Acknowledge A and confirm forward progress to B.
+        collector.ack(b.sequence).await.unwrap();
+        let b2 = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b2.sequence, 1);
+        assert_eq!(b2.location, location_b);
     }
 
     #[tokio::test]
