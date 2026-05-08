@@ -49,6 +49,11 @@ pub(crate) const FETCH_DURATION_SECONDS: &str = "buffer.fetch_duration_seconds";
 pub(crate) const MANIFEST_WRITES: &str = "buffer.manifest_writes";
 pub(crate) const MANIFEST_CONFLICTS: &str = "buffer.manifest_conflicts";
 
+/// Increments by `descriptors.len()` on every successful
+/// `Consumer::next_descriptors` call. Lets operators see read-ahead
+/// activity directly. Added in RFC 0003.
+pub(crate) const DESCRIPTORS_HANDED_OUT: &str = "buffer.descriptors_handed_out";
+
 pub(crate) fn describe_buffer_metrics() {
     metrics::describe_counter!(BATCHES_FLUSHED, "Batches written to object store");
     metrics::describe_counter!(ENTRIES_FLUSHED, "Entries across all flushed batches");
@@ -84,4 +89,8 @@ pub(crate) fn describe_consumer_metrics() {
     );
     metrics::describe_counter!(MANIFEST_WRITES, "Consumer manifest write attempts");
     metrics::describe_counter!(MANIFEST_CONFLICTS, "Consumer manifest CAS conflicts");
+    metrics::describe_counter!(
+        DESCRIPTORS_HANDED_OUT,
+        "Manifest entries returned by Consumer::next_descriptors"
+    );
 }

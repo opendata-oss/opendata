@@ -720,6 +720,11 @@ impl QueueConsumer {
 
     /// Return the first entry in the queue without dequeueing it.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
+    ///
+    /// Superseded by [`QueueConsumer::descriptors_after`] for the
+    /// `Consumer::next_batch` path; retained for tests and future
+    /// callers that need a single-entry peek.
+    #[allow(dead_code)]
     pub(crate) async fn peek(&self) -> Result<Option<QueueEntry>> {
         let (manifest, _) = self.read_manifest().await?;
         if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
@@ -728,8 +733,48 @@ impl QueueConsumer {
         manifest.iter().next().transpose()
     }
 
+    /// Return up to `max` contiguous queue entries with sequence strictly
+    /// greater than `after_sequence` (or all entries when `after_sequence`
+    /// is `None`), in manifest order.
+    ///
+    /// Reads the manifest once. Does not mutate it. Returns `Fenced` if
+    /// the consumer's epoch does not match the manifest's epoch. This is
+    /// the read-ahead primitive `Consumer::next_descriptors` builds on
+    /// (RFC 0003).
+    pub(crate) async fn descriptors_after(
+        &self,
+        after_sequence: Option<u64>,
+        max: usize,
+    ) -> Result<Vec<QueueEntry>> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let (manifest, _) = self.read_manifest().await?;
+        if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
+            return Err(Error::Fenced);
+        }
+        let mut out = Vec::with_capacity(max);
+        for entry in manifest.iter() {
+            let entry = entry?;
+            if let Some(after) = after_sequence
+                && entry.sequence <= after
+            {
+                continue;
+            }
+            out.push(entry);
+            if out.len() >= max {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Return the entry with the given sequence number, or None if not found.
     /// Returns `Fenced` if the consumer's epoch does not match the manifest's epoch.
+    ///
+    /// Superseded by [`QueueConsumer::descriptors_after`] for bulk
+    /// reads; retained for legacy single-sequence lookups.
+    #[allow(dead_code)]
     pub(crate) async fn read(&self, sequence: u64) -> Result<Option<QueueEntry>> {
         let (manifest, _) = self.read_manifest().await?;
         if manifest.epoch != self.epoch.load(Ordering::Relaxed) {
