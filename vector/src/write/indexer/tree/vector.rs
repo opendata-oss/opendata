@@ -979,7 +979,7 @@ mod tests {
         );
 
         let posting =
-            PostingList::from_value(h.storage.get_posting_list(leaf, DIMS).await.unwrap());
+            PostingList::from_value(h.storage.get_posting_list(leaf, DIMS).await.unwrap(), false);
         let posting_ids: HashSet<VectorId> = posting.iter().map(|p: &Posting| p.id()).collect();
         assert!(posting_ids.contains(&id_b));
         assert!(!posting_ids.contains(&id_a));
