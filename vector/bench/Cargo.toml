@@ -12,6 +12,7 @@ serde_yaml.workspace = true
 anyhow.workspace = true
 async-channel = "2"
 async-trait.workspace = true
+chrono.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
