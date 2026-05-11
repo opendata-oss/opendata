@@ -1,15 +1,21 @@
 //! Background buffer consumer that reads vector batches from a buffer queue
 //! and ingests them into [`VectorDb`].
 //!
-//! The wire format on the buffer is a `prost`-encoded
-//! [`super::proto::WriteRequest`], identical to what the HTTP write handler
-//! accepts under `application/protobuf`. Each entry is preceded by a 2-byte
-//! metadata payload `[version=1, payload_encoding=1]` so future format
-//! changes can be detected.
+//! Entries are accompanied by a 3-byte metadata payload
+//! `[version, operation, payload_encoding]`:
+//!
+//! - `operation` selects the action and which message type the entry decodes to:
+//!   - `1` ([`OPERATION_UPSERT`]): a `prost`-encoded
+//!     [`super::proto::WriteRequest`], identical to what the HTTP write
+//!     handler accepts under `application/protobuf`. Applied via
+//!     [`VectorDb::write`].
+//!   - `2` ([`OPERATION_DELETE`]): a `prost`-encoded
+//!     [`super::proto::DeleteRequest`]. Applied via [`VectorDb::delete`].
+//! - `payload_encoding` describes the wire format. Currently only
+//!   `1` ([`PAYLOAD_ENCODING_VECTOR_PROTO`]) is supported.
 //!
 //! Per-entry decoding errors are logged and skipped; they do not stop the
-//! poll loop. Entries that successfully decode are written via
-//! [`VectorDb::write`].
+//! poll loop.
 
 use std::sync::Arc;
 
@@ -20,19 +26,22 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use super::request::WriteRequest;
+use super::request::{DeleteRequest, WriteRequest};
 use crate::VectorDb;
 use crate::model::BufferConsumerConfig;
 
 const METADATA_VERSION: u8 = 1;
+const OPERATION_UPSERT: u8 = 1;
+const OPERATION_DELETE: u8 = 2;
 const PAYLOAD_ENCODING_VECTOR_PROTO: u8 = 1;
-const METADATA_LEN: usize = 2;
+const METADATA_LEN: usize = 3;
 const PREFETCH_BATCH_BUFFER: usize = 1;
 const ACK_SEQUENCE_BUFFER: usize = 1;
 const MAX_ERROR_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 struct BufferMetadata {
+    operation: u8,
     payload_encoding: u8,
 }
 
@@ -49,7 +58,8 @@ impl BufferMetadata {
             return Err(format!("unknown metadata version: {}", payload[0]));
         }
         Ok(Self {
-            payload_encoding: payload[1],
+            operation: payload[1],
+            payload_encoding: payload[2],
         })
     }
 }
@@ -327,6 +337,14 @@ async fn process_entry(
         ));
     }
 
+    match parsed.operation {
+        OPERATION_UPSERT => apply_upsert(db, entry).await,
+        OPERATION_DELETE => apply_delete(db, entry).await,
+        other => Err(format!("unsupported operation: {}", other)),
+    }
+}
+
+async fn apply_upsert(db: &VectorDb, entry: &Bytes) -> Result<(), String> {
     let request = WriteRequest::from_protobuf(entry.as_ref())
         .map_err(|e| format!("vector proto decode failed: {e}"))?;
 
@@ -337,6 +355,21 @@ async fn process_entry(
     db.write(request.upsert_vectors)
         .await
         .map_err(|e| format!("vector db write failed: {e}"))?;
+
+    Ok(())
+}
+
+async fn apply_delete(db: &VectorDb, entry: &Bytes) -> Result<(), String> {
+    let request = DeleteRequest::from_protobuf(entry.as_ref())
+        .map_err(|e| format!("vector delete proto decode failed: {e}"))?;
+
+    if request.ids.is_empty() {
+        return Ok(());
+    }
+
+    db.delete(request.ids)
+        .await
+        .map_err(|e| format!("vector db delete failed: {e}"))?;
 
     Ok(())
 }
@@ -358,34 +391,139 @@ fn find_metadata_for_entry(metadata: &[Metadata], idx: u32) -> Option<&Metadata>
 mod tests {
     use super::*;
 
+    fn make_producer(
+        obj_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        manifest: &str,
+        data_prefix: &str,
+    ) -> buffer::Producer {
+        use std::time::Duration;
+
+        use common::ObjectStoreConfig;
+        use common::clock::SystemClock;
+
+        let producer_config = buffer::ProducerConfig {
+            object_store: ObjectStoreConfig::InMemory,
+            data_path_prefix: data_prefix.to_string(),
+            manifest_path: manifest.to_string(),
+            flush_interval: Duration::from_millis(10),
+            flush_size_bytes: 64 * 1024 * 1024,
+            max_buffered_inputs: 1000,
+            batch_compression: buffer::CompressionType::None,
+        };
+        buffer::Producer::with_object_store(producer_config, obj_store, Arc::new(SystemClock))
+            .unwrap()
+    }
+
+    async fn produce_upsert(producer: &buffer::Producer, vectors: Vec<(&str, Vec<f32>)>) {
+        use std::collections::HashMap;
+
+        use prost::Message;
+
+        use crate::server::proto;
+
+        let proto_request = proto::WriteRequest {
+            upsert_vectors: vectors
+                .into_iter()
+                .map(|(id, values)| proto::Vector {
+                    id: id.to_string(),
+                    attributes: HashMap::from([(
+                        "vector".to_string(),
+                        proto::AttributeValueMessage::new(proto::AttributeValueProto::VectorValue(
+                            proto::VectorValueProto { values },
+                        )),
+                    )]),
+                })
+                .collect(),
+        };
+        let entry_bytes = proto_request.encode_to_vec();
+        let metadata_bytes = Bytes::from_static(&[
+            METADATA_VERSION,
+            OPERATION_UPSERT,
+            PAYLOAD_ENCODING_VECTOR_PROTO,
+        ]);
+
+        producer
+            .produce(vec![Bytes::from(entry_bytes)], metadata_bytes)
+            .await
+            .unwrap();
+    }
+
+    async fn produce_delete(producer: &buffer::Producer, ids: Vec<String>) {
+        use prost::Message;
+
+        use crate::server::proto;
+
+        let proto_request = proto::DeleteRequest { ids };
+        let entry_bytes = proto_request.encode_to_vec();
+        let metadata_bytes = Bytes::from_static(&[
+            METADATA_VERSION,
+            OPERATION_DELETE,
+            PAYLOAD_ENCODING_VECTOR_PROTO,
+        ]);
+
+        producer
+            .produce(vec![Bytes::from(entry_bytes)], metadata_bytes)
+            .await
+            .unwrap();
+    }
+
     #[test]
-    fn should_decode_valid_metadata() {
+    fn should_decode_metadata_for_upsert_operation() {
         // given
-        let payload = vec![1, 1];
+        let payload = vec![
+            METADATA_VERSION,
+            OPERATION_UPSERT,
+            PAYLOAD_ENCODING_VECTOR_PROTO,
+        ];
 
         // when
         let meta = BufferMetadata::decode(&payload).unwrap();
 
         // then
+        assert_eq!(meta.operation, OPERATION_UPSERT);
+        assert_eq!(meta.payload_encoding, PAYLOAD_ENCODING_VECTOR_PROTO);
+    }
+
+    #[test]
+    fn should_decode_metadata_for_delete_operation() {
+        // given
+        let payload = vec![
+            METADATA_VERSION,
+            OPERATION_DELETE,
+            PAYLOAD_ENCODING_VECTOR_PROTO,
+        ];
+
+        // when
+        let meta = BufferMetadata::decode(&payload).unwrap();
+
+        // then
+        assert_eq!(meta.operation, OPERATION_DELETE);
         assert_eq!(meta.payload_encoding, PAYLOAD_ENCODING_VECTOR_PROTO);
     }
 
     #[test]
     fn should_decode_metadata_with_trailing_bytes() {
         // given
-        let payload = vec![1, 1, 0, 0];
+        let payload = vec![
+            METADATA_VERSION,
+            OPERATION_UPSERT,
+            PAYLOAD_ENCODING_VECTOR_PROTO,
+            0,
+            0,
+        ];
 
         // when
         let meta = BufferMetadata::decode(&payload).unwrap();
 
         // then
+        assert_eq!(meta.operation, OPERATION_UPSERT);
         assert_eq!(meta.payload_encoding, PAYLOAD_ENCODING_VECTOR_PROTO);
     }
 
     #[test]
     fn should_reject_unknown_version() {
         // given
-        let payload = vec![99, 1];
+        let payload = vec![99, OPERATION_UPSERT, PAYLOAD_ENCODING_VECTOR_PROTO];
 
         // when
         let result = BufferMetadata::decode(&payload);
@@ -398,7 +536,7 @@ mod tests {
     #[test]
     fn should_reject_short_metadata() {
         // given
-        let payload = vec![1];
+        let payload = vec![METADATA_VERSION, OPERATION_UPSERT];
 
         // when
         let result = BufferMetadata::decode(&payload);
@@ -415,12 +553,12 @@ mod tests {
             Metadata {
                 start_index: 0,
                 ingestion_time_ms: 1000,
-                payload: Bytes::from_static(&[1, 1]),
+                payload: Bytes::from_static(&[1, 1, 1]),
             },
             Metadata {
                 start_index: 3,
                 ingestion_time_ms: 2000,
-                payload: Bytes::from_static(&[1, 1]),
+                payload: Bytes::from_static(&[1, 1, 1]),
             },
         ];
 
@@ -443,78 +581,32 @@ mod tests {
 
     /// End-to-end: Producer → BufferConsumer → VectorDb → search.
     #[tokio::test]
-    async fn should_ingest_via_consumer_and_search_back() {
-        use std::collections::HashMap;
+    async fn should_apply_upsert_via_consumer() {
         use std::time::Duration;
 
         use common::ObjectStoreConfig;
-        use common::clock::SystemClock;
-        use prost::Message;
         use slatedb::object_store::ObjectStore;
         use slatedb::object_store::memory::InMemory;
 
         use crate::VectorDbRead;
         use crate::model::{Config, DistanceMetric, Query};
-        use crate::server::proto;
 
         // given
         let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let manifest = "ingest/manifest".to_string();
         let data_prefix = "ingest".to_string();
 
-        // Build a WriteRequest with two vectors
-        let proto_request = proto::WriteRequest {
-            upsert_vectors: vec![
-                proto::Vector {
-                    id: "vec-1".to_string(),
-                    attributes: HashMap::from([(
-                        "vector".to_string(),
-                        proto::AttributeValueMessage::new(proto::AttributeValueProto::VectorValue(
-                            proto::VectorValueProto {
-                                values: vec![1.0, 0.0, 0.0],
-                            },
-                        )),
-                    )]),
-                },
-                proto::Vector {
-                    id: "vec-2".to_string(),
-                    attributes: HashMap::from([(
-                        "vector".to_string(),
-                        proto::AttributeValueMessage::new(proto::AttributeValueProto::VectorValue(
-                            proto::VectorValueProto {
-                                values: vec![0.0, 1.0, 0.0],
-                            },
-                        )),
-                    )]),
-                },
+        let producer = make_producer(obj_store.clone(), &manifest, &data_prefix);
+        produce_upsert(
+            &producer,
+            vec![
+                ("vec-1", vec![1.0, 0.0, 0.0]),
+                ("vec-2", vec![0.0, 1.0, 0.0]),
             ],
-        };
-        let entry_bytes = proto_request.encode_to_vec();
-        let metadata_bytes = Bytes::from_static(&[METADATA_VERSION, PAYLOAD_ENCODING_VECTOR_PROTO]);
-
-        // Produce via Producer
-        let producer_config = buffer::ProducerConfig {
-            object_store: ObjectStoreConfig::InMemory,
-            data_path_prefix: data_prefix.clone(),
-            manifest_path: manifest.clone(),
-            flush_interval: Duration::from_millis(10),
-            flush_size_bytes: 64 * 1024 * 1024,
-            max_buffered_inputs: 1000,
-            batch_compression: buffer::CompressionType::None,
-        };
-        let producer = buffer::Producer::with_object_store(
-            producer_config,
-            obj_store.clone(),
-            Arc::new(SystemClock),
         )
-        .unwrap();
-        producer
-            .produce(vec![Bytes::from(entry_bytes)], metadata_bytes)
-            .await
-            .unwrap();
+        .await;
         producer.close().await.unwrap();
 
-        // Open a vector db (in-memory storage)
         let db = Arc::new(
             VectorDb::open(Config {
                 dimensions: 3,
@@ -525,7 +617,6 @@ mod tests {
             .unwrap(),
         );
 
-        // Start the consumer against the shared object store
         let consumer_config = BufferConsumerConfig {
             object_store: ObjectStoreConfig::InMemory,
             manifest_path: manifest,
@@ -537,20 +628,115 @@ mod tests {
         let consumer = Arc::new(BufferConsumer::new(db.clone(), consumer_config));
         let handle = consumer.run_with_object_store(obj_store).await.unwrap();
 
-        // Wait for the consumer to process and write
+        // when / then — both vectors must be reachable via get() and search()
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             db.flush().await.unwrap();
-            let results = db
+            let search_results = db
                 .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(2))
                 .await
                 .unwrap();
-            if results.iter().any(|r| r.vector.id == "vec-1") {
+            let vec_1 = db.get("vec-1").await.unwrap();
+            let vec_2 = db.get("vec-2").await.unwrap();
+            let vec_1_in_search = search_results.iter().any(|r| r.vector.id == "vec-1");
+            let vec_2_in_search = search_results.iter().any(|r| r.vector.id == "vec-2");
+            if vec_1.is_some() && vec_2.is_some() && vec_1_in_search && vec_2_in_search {
                 break;
             }
             if std::time::Instant::now() >= deadline {
                 handle.shutdown().await;
-                panic!("consumer did not ingest the produced batch in time");
+                panic!(
+                    "consumer did not ingest the produced batch in time \
+                     (vec-1 get={}, vec-2 get={}, vec-1 search={}, vec-2 search={})",
+                    vec_1.is_some(),
+                    vec_2.is_some(),
+                    vec_1_in_search,
+                    vec_2_in_search,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        handle.shutdown().await;
+    }
+
+    /// End-to-end: Producer (upsert + delete) → BufferConsumer → VectorDb,
+    /// confirming that a delete payload removes a previously-upserted vector.
+    #[tokio::test]
+    async fn should_apply_delete_via_consumer() {
+        use std::time::Duration;
+
+        use common::ObjectStoreConfig;
+        use slatedb::object_store::ObjectStore;
+        use slatedb::object_store::memory::InMemory;
+
+        use crate::VectorDbRead;
+        use crate::model::{Config, DistanceMetric, Query};
+
+        // given
+        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest = "ingest/manifest".to_string();
+        let data_prefix = "ingest".to_string();
+
+        let producer = make_producer(obj_store.clone(), &manifest, &data_prefix);
+        produce_upsert(
+            &producer,
+            vec![
+                ("vec-1", vec![1.0, 0.0, 0.0]),
+                ("vec-2", vec![0.0, 1.0, 0.0]),
+            ],
+        )
+        .await;
+        produce_delete(&producer, vec!["vec-1".to_string()]).await;
+        producer.close().await.unwrap();
+
+        let db = Arc::new(
+            VectorDb::open(Config {
+                dimensions: 3,
+                distance_metric: DistanceMetric::L2,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+
+        let consumer_config = BufferConsumerConfig {
+            object_store: ObjectStoreConfig::InMemory,
+            manifest_path: manifest,
+            data_path_prefix: data_prefix,
+            poll_interval: Duration::from_millis(10),
+            gc_interval: Duration::from_secs(300),
+            gc_grace_period: Duration::from_secs(600),
+        };
+        let consumer = Arc::new(BufferConsumer::new(db.clone(), consumer_config));
+        let handle = consumer.run_with_object_store(obj_store).await.unwrap();
+
+        // when / then — vec-1 must be gone from both get() and search(),
+        // and vec-2 must remain reachable via both
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            db.flush().await.unwrap();
+            let search_results = db
+                .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(2))
+                .await
+                .unwrap();
+            let vec_1 = db.get("vec-1").await.unwrap();
+            let vec_2 = db.get("vec-2").await.unwrap();
+            let vec_1_in_search = search_results.iter().any(|r| r.vector.id == "vec-1");
+            let vec_2_in_search = search_results.iter().any(|r| r.vector.id == "vec-2");
+            if vec_1.is_none() && vec_2.is_some() && !vec_1_in_search && vec_2_in_search {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                handle.shutdown().await;
+                panic!(
+                    "consumer did not apply delete in time \
+                     (vec-1 get={}, vec-2 get={}, vec-1 search={}, vec-2 search={})",
+                    vec_1.is_some(),
+                    vec_2.is_some(),
+                    vec_1_in_search,
+                    vec_2_in_search,
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
