@@ -21,8 +21,8 @@ use promql_parser::parser;
 use promql_parser::parser::LabelModifier;
 use promql_parser::parser::token::{
     T_ADD, T_ATAN2, T_AVG, T_BOTTOMK, T_COUNT, T_COUNT_VALUES, T_DIV, T_EQLC, T_GROUP, T_GTE,
-    T_GTR, T_LAND, T_LOR, T_LSS, T_LTE, T_LUNLESS, T_MAX, T_MIN, T_MOD, T_MUL, T_NEQ, T_POW,
-    T_QUANTILE, T_STDDEV, T_STDVAR, T_SUB, T_SUM, T_TOPK,
+    T_GTR, T_LAND, T_LIMITK, T_LOR, T_LSS, T_LTE, T_LUNLESS, T_MAX, T_MIN, T_MOD, T_MUL, T_NEQ,
+    T_POW, T_QUANTILE, T_STDDEV, T_STDVAR, T_SUB, T_SUM, T_TOPK, TokenId,
 };
 
 use crate::promql::operators::aggregate::AggregateKind;
@@ -679,45 +679,9 @@ fn lower_aggregate(
         T_STDDEV => Ok(aggregate_streaming(AggregateKind::Stddev, child, grouping)),
         T_STDVAR => Ok(aggregate_streaming(AggregateKind::Stdvar, child, grouping)),
         T_GROUP => Ok(aggregate_streaming(AggregateKind::Group, child, grouping)),
-        T_TOPK | T_BOTTOMK => {
-            let param = agg
-                .param
-                .as_deref()
-                .ok_or_else(|| PlanError::InvalidArgument {
-                    function: aggregate_op_name(op_id).to_string(),
-                    expected: "integer `k` parameter".to_string(),
-                    got: "missing parameter".to_string(),
-                })?;
-            let (k, param_plan) = match lower(param, ctx)? {
-                LogicalPlan::Scalar(k_f) => {
-                    // Match the existing engine at `evaluator.rs::coerce_k_size`
-                    // — cast `f64 → i64` with `as`, accepting platform-defined
-                    // overflow on very large inputs. `k < 1` is treated as "no
-                    // selection" by the breaker operator; we do not reject it
-                    // here.
-                    (k_f as i64, None)
-                }
-                lowered if lowered.produces_scalar() => (0, Some(Box::new(lowered))),
-                lowered => {
-                    return Err(PlanError::InvalidArgument {
-                        function: aggregate_op_name(op_id).to_string(),
-                        expected: "scalar `k` parameter".to_string(),
-                        got: describe_logical_plan(&lowered),
-                    });
-                }
-            };
-            let kind = if op_id == T_TOPK {
-                AggregateKind::Topk(k)
-            } else {
-                AggregateKind::Bottomk(k)
-            };
-            Ok(LogicalPlan::Aggregate {
-                kind,
-                child: Box::new(child),
-                param: param_plan,
-                grouping,
-            })
-        }
+        T_TOPK => lower_k_aggregate(agg, ctx, child, grouping, op_id, AggregateKind::Topk),
+        T_BOTTOMK => lower_k_aggregate(agg, ctx, child, grouping, op_id, AggregateKind::Bottomk),
+        T_LIMITK => lower_k_aggregate(agg, ctx, child, grouping, op_id, AggregateKind::Limitk),
         T_QUANTILE => {
             let param = agg
                 .param
@@ -770,7 +734,52 @@ fn aggregate_streaming(
     }
 }
 
-fn aggregate_op_name(op_id: u16) -> &'static str {
+/// Shared lowering for `topk` / `bottomk` / `limitk`: parse the `k`
+/// parameter (literal int or scalar child) and build the kind via
+/// the caller-supplied constructor.
+fn lower_k_aggregate(
+    agg: &parser::AggregateExpr,
+    ctx: &LoweringContext,
+    child: LogicalPlan,
+    grouping: AggregateGrouping,
+    op_id: TokenId,
+    make_kind: fn(i64) -> AggregateKind,
+) -> Result<LogicalPlan, PlanError> {
+    let param = agg
+        .param
+        .as_deref()
+        .ok_or_else(|| PlanError::InvalidArgument {
+            function: aggregate_op_name(op_id).to_string(),
+            expected: "integer `k` parameter".to_string(),
+            got: "missing parameter".to_string(),
+        })?;
+    let (k, param_plan) = match lower(param, ctx)? {
+        LogicalPlan::Scalar(k_f) => {
+            // Match the existing engine at `evaluator.rs::coerce_k_size`
+            // — cast `f64 → i64` with `as`, accepting platform-defined
+            // overflow on very large inputs. `k < 1` is treated as "no
+            // selection" by the breaker operator; we do not reject it
+            // here.
+            (k_f as i64, None)
+        }
+        lowered if lowered.produces_scalar() => (0, Some(Box::new(lowered))),
+        lowered => {
+            return Err(PlanError::InvalidArgument {
+                function: aggregate_op_name(op_id).to_string(),
+                expected: "scalar `k` parameter".to_string(),
+                got: describe_logical_plan(&lowered),
+            });
+        }
+    };
+    Ok(LogicalPlan::Aggregate {
+        kind: make_kind(k),
+        child: Box::new(child),
+        param: param_plan,
+        grouping,
+    })
+}
+
+fn aggregate_op_name(op_id: TokenId) -> &'static str {
     match op_id {
         T_SUM => "sum",
         T_AVG => "avg",
@@ -782,6 +791,7 @@ fn aggregate_op_name(op_id: u16) -> &'static str {
         T_GROUP => "group",
         T_TOPK => "topk",
         T_BOTTOMK => "bottomk",
+        T_LIMITK => "limitk",
         T_QUANTILE => "quantile",
         T_COUNT_VALUES => "count_values",
         _ => "<unknown>",
@@ -832,7 +842,7 @@ fn lower_binary(bin: &parser::BinaryExpr, ctx: &LoweringContext) -> Result<Logic
     })
 }
 
-fn binary_op_kind(op_id: u16, return_bool: bool) -> Option<BinaryOpKind> {
+fn binary_op_kind(op_id: TokenId, return_bool: bool) -> Option<BinaryOpKind> {
     Some(match op_id {
         T_ADD => BinaryOpKind::Add,
         T_SUB => BinaryOpKind::Sub,
