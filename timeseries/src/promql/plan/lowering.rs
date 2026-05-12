@@ -770,7 +770,7 @@ fn aggregate_streaming(
     }
 }
 
-fn aggregate_op_name(op_id: u8) -> &'static str {
+fn aggregate_op_name(op_id: u16) -> &'static str {
     match op_id {
         T_SUM => "sum",
         T_AVG => "avg",
@@ -832,7 +832,7 @@ fn lower_binary(bin: &parser::BinaryExpr, ctx: &LoweringContext) -> Result<Logic
     })
 }
 
-fn binary_op_kind(op_id: u8, return_bool: bool) -> Option<BinaryOpKind> {
+fn binary_op_kind(op_id: u16, return_bool: bool) -> Option<BinaryOpKind> {
     Some(match op_id {
         T_ADD => BinaryOpKind::Add,
         T_SUB => BinaryOpKind::Sub,
