@@ -15,7 +15,8 @@ use super::handlers::{
     AppState, handle_delete, handle_get_vector, handle_healthy, handle_ready, handle_search,
     handle_write,
 };
-use super::middleware::TracingLayer;
+use super::metrics::{MetricsState, handle_metrics};
+use super::middleware::{MetricsLayer, TracingLayer};
 #[cfg(feature = "buffer")]
 use crate::model::BufferConsumerConfig;
 use crate::{FieldType, MetadataFieldSpec, VectorDb};
@@ -25,6 +26,7 @@ pub struct VectorServer {
     db: Arc<VectorDb>,
     config: VectorServerConfig,
     metadata_fields: Vec<MetadataFieldSpec>,
+    metrics: MetricsState,
     #[cfg(feature = "buffer")]
     buffer_consumer: Option<Arc<BufferConsumer>>,
 }
@@ -35,11 +37,13 @@ impl VectorServer {
         db: Arc<VectorDb>,
         config: VectorServerConfig,
         metadata_fields: Vec<MetadataFieldSpec>,
+        metrics: MetricsState,
     ) -> Self {
         Self {
             db,
             config,
             metadata_fields,
+            metrics,
             #[cfg(feature = "buffer")]
             buffer_consumer: None,
         }
@@ -59,6 +63,7 @@ impl VectorServer {
             db,
             config,
             metadata_fields,
+            metrics,
             #[cfg(feature = "buffer")]
             buffer_consumer,
         } = self;
@@ -79,6 +84,10 @@ impl VectorServer {
             None => None,
         };
 
+        let metrics_router = Router::new()
+            .route("/metrics", get(handle_metrics))
+            .with_state(metrics);
+
         let app = Router::new()
             .route("/api/v1/vector/write", post(handle_write))
             .route("/api/v1/vector/delete", post(handle_delete))
@@ -89,8 +98,10 @@ impl VectorServer {
             )
             .route("/-/healthy", get(handle_healthy))
             .route("/-/ready", get(handle_ready))
-            .layer(TracingLayer::new())
-            .with_state(state);
+            .with_state(state)
+            .merge(metrics_router)
+            .layer(MetricsLayer::new())
+            .layer(TracingLayer::new());
 
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         tracing::info!("Starting Vector HTTP server on {}", addr);

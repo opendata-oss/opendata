@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::math::distance;
+use crate::metric_names::{QUERY_SEARCH_DURATION_SECONDS, QUERY_VECTORS_SCORED_TOTAL};
 use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::vector_data::VectorDataValue;
@@ -145,6 +146,18 @@ impl QueryEngine {
     }
 
     pub(crate) async fn search_with_options(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        let search_start = Instant::now();
+        let result = self.search_with_options_inner(query, options).await;
+        metrics::histogram!(QUERY_SEARCH_DURATION_SECONDS)
+            .record(search_start.elapsed().as_secs_f64());
+        result
+    }
+
+    async fn search_with_options_inner(
         &self,
         query: &Query,
         options: SearchOptions,
@@ -306,13 +319,16 @@ impl QueryEngine {
             elapsed_ms = elapsed.as_millis()
         );
         let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
+        let mut total_scored: u64 = 0;
         for result in results {
             let scored =
                 result.map_err(|e| Error::Internal(format!("task join error: {}", e)))??;
+            total_scored += scored.len() as u64;
             if !scored.is_empty() {
                 sorted_lists.push(scored);
             }
         }
+        metrics::counter!(QUERY_VECTORS_SCORED_TOTAL).increment(total_scored);
 
         Ok(sorted_lists)
     }

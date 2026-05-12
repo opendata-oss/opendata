@@ -1,4 +1,6 @@
 use crate::Result;
+use crate::metric_names::INDEXER_ANN_SPLITS_TOTAL;
+use crate::serde::vector_id::ROOT_LEVEL;
 use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::centroids::SearchResult;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
@@ -35,6 +37,12 @@ impl SplitRoot {
         if view.root_count() < self.opts.root_threshold_vectors as u64 {
             return Ok(());
         }
+
+        metrics::counter!(
+            INDEXER_ANN_SPLITS_TOTAL,
+            "level" => ROOT_LEVEL.to_string(),
+        )
+        .increment(1);
 
         let original_root_postings = view.root_posting_list(self.opts.dimensions).get().await?;
         let root_vecs: Vec<_> = original_root_postings

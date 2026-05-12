@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::metric_names::INDEXER_ANN_MERGES_TOTAL;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::vector_id::VectorId;
 use crate::write::indexer::drivers::AsyncBatchDriver;
@@ -121,6 +122,12 @@ impl MergeCentroids {
                 ));
             }
         }
+
+        metrics::counter!(
+            INDEXER_ANN_MERGES_TOTAL,
+            "level" => self.level.level().to_string(),
+        )
+        .increment(merge_count as u64);
 
         // return reassign set
         Ok((reassignments, merge_count))

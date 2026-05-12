@@ -8,6 +8,7 @@ pub(crate) mod buffer_consumer;
 mod config;
 mod error;
 mod handlers;
+mod metrics;
 mod middleware;
 mod proto;
 mod request;
@@ -16,5 +17,6 @@ mod vector;
 mod vector_reader;
 
 pub use config::{VectorServerConfig, load_reader_config, load_vector_config};
+pub use metrics::MetricsState;
 pub use vector::VectorServer;
 pub use vector_reader::VectorReaderServer;

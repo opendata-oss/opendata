@@ -8,7 +8,8 @@ use tracing_subscriber::EnvFilter;
 use vector::VectorDb;
 use vector::VectorDbReader;
 use vector::server::{
-    VectorReaderServer, VectorServer, VectorServerConfig, load_reader_config, load_vector_config,
+    MetricsState, VectorReaderServer, VectorServer, VectorServerConfig, load_reader_config,
+    load_vector_config,
 };
 
 /// CLI arguments for the vector server.
@@ -50,6 +51,15 @@ async fn main() {
         )
         .init();
 
+    // Install the metrics-rs Prometheus recorder before any subsystem
+    // (including slatedb) emits metrics. The resulting handle is rendered by
+    // the `/metrics` route.
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_state = MetricsState {
+        handle: recorder.handle(),
+    };
+    metrics::set_global_recorder(recorder).expect("global metrics recorder already installed");
+
     // Parse CLI arguments
     let args = CliArgs::parse();
     let server_config = VectorServerConfig { port: args.port };
@@ -68,7 +78,7 @@ async fn main() {
                     .expect("Failed to open vector database"),
             );
 
-            let server = VectorServer::new(db, server_config, metadata_fields);
+            let server = VectorServer::new(db, server_config, metadata_fields, metrics_state);
 
             #[cfg(feature = "buffer")]
             let server = match buffer_consumer_config {
@@ -90,7 +100,12 @@ async fn main() {
                 .await
                 .expect("Failed to open vector database reader");
 
-            let server = VectorReaderServer::new(Arc::new(reader), server_config, metadata_fields);
+            let server = VectorReaderServer::new(
+                Arc::new(reader),
+                server_config,
+                metadata_fields,
+                metrics_state,
+            );
             server.run().await;
         }
     }

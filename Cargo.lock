@@ -2745,6 +2745,8 @@ dependencies = [
  "figment",
  "futures",
  "log",
+ "metrics",
+ "metrics-exporter-prometheus",
  "opendata-buffer",
  "opendata-common",
  "opendata-macros",

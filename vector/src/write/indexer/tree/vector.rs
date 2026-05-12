@@ -1,5 +1,6 @@
 use crate::Error::Internal;
 use crate::Result;
+use crate::metric_names::{INDEXER_ANN_REASSIGNS_TOTAL, INDEXER_WRITES_TOTAL};
 use crate::model::AttributeValue;
 use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
@@ -63,6 +64,9 @@ impl WriteVectors {
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
     ) -> Result<(usize, usize, usize)> {
+        let total_writes: usize = self.ops.iter().map(VectorDbOp::len).sum();
+        metrics::counter!(INDEXER_WRITES_TOTAL).increment(total_writes as u64);
+
         let (writes, delete_ids) = Self::collapse_ops(self.ops);
         if writes.is_empty() && delete_ids.is_empty() {
             return Ok((0, 0, 0));
@@ -419,7 +423,8 @@ impl ReassignVectors {
             reassignments
         };
 
-        if self.level.is_leaf() {
+        let level = self.level;
+        let reassigned = if level.is_leaf() {
             Self::execute_vector_reassignments(
                 &self.opts,
                 &self.snapshot,
@@ -428,7 +433,7 @@ impl ReassignVectors {
                 delta,
                 reassignments,
             )
-            .await
+            .await?
         } else {
             Self::execute_centroid_reassignments(
                 &self.snapshot,
@@ -437,8 +442,14 @@ impl ReassignVectors {
                 delta,
                 reassignments,
             )
-            .await
-        }
+            .await?
+        };
+        metrics::counter!(
+            INDEXER_ANN_REASSIGNS_TOTAL,
+            "level" => level.level().to_string(),
+        )
+        .increment(reassigned as u64);
+        Ok(reassigned)
     }
 
     async fn execute_centroid_reassignments(

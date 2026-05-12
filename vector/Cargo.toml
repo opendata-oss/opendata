@@ -21,7 +21,7 @@ required-features = ["http-server"]
 
 [features]
 default = []
-http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with"]
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with", "dep:metrics-exporter-prometheus"]
 embedded-reader = ["dep:reqwest", "dep:serde_json"]
 buffer = ["http-server", "dep:buffer"]
 bench-internals = []
@@ -34,6 +34,7 @@ common.workspace = true
 bytemuck.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
+metrics.workspace = true
 fail.workspace = true
 figment.workspace = true
 futures.workspace = true
@@ -58,6 +59,7 @@ clap = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 # Embedded reader dependencies (optional, enabled by embedded-reader feature)
 reqwest = { workspace = true, optional = true, features = ["json"] }

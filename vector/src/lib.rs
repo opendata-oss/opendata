@@ -37,6 +37,7 @@ pub mod admin;
 pub mod db;
 pub(crate) mod error;
 pub mod math;
+pub mod metric_names;
 pub mod model;
 pub(crate) mod query_engine;
 pub mod reader;

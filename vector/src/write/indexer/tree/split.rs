@@ -1,5 +1,6 @@
 use crate::math::kmeans::Clustering;
 use crate::math::{distance, heuristics, kmeans};
+use crate::metric_names::INDEXER_ANN_SPLITS_TOTAL;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::vector_id::VectorId;
 use crate::write::indexer::drivers::AsyncBatchDriver;
@@ -416,6 +417,12 @@ impl SplitCentroids {
                 new_centroids,
             })
         }
+
+        metrics::counter!(
+            INDEXER_ANN_SPLITS_TOTAL,
+            "level" => self.level.level().to_string(),
+        )
+        .increment(splits.len() as u64);
 
         // return reassign set
         let reassignments: Vec<_> = reassignments.values().cloned().collect();

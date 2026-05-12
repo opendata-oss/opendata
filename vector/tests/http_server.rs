@@ -10,7 +10,7 @@ use reqwest::Client;
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use vector::server::{VectorServer, VectorServerConfig};
+use vector::server::{MetricsState, VectorServer, VectorServerConfig};
 use vector::{Config, DistanceMetric, FieldType, MetadataFieldSpec, VectorDb};
 
 #[derive(Clone, Debug)]
@@ -130,10 +130,15 @@ async fn setup_server_with_vectors() -> TestServerFixture {
         ..Default::default()
     };
     let db = Arc::new(VectorDb::open(config).await.unwrap());
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_state = MetricsState {
+        handle: metrics_recorder.handle(),
+    };
     let server = VectorServer::new(
         db.clone(),
         VectorServerConfig { port },
         metadata_fields.clone(),
+        metrics_state,
     );
     let server_task = tokio::spawn(async move {
         server.run().await;

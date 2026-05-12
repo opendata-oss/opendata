@@ -13,6 +13,7 @@
 
 use crate::VectorDbReader;
 use crate::error::{Error, Result};
+use crate::metric_names::{VECTOR_DELETES_TOTAL, VECTOR_UPSERTS_TOTAL};
 use crate::model::{
     AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
     attributes_to_map,
@@ -538,6 +539,8 @@ impl VectorDb {
             writes.push(self.prepare_vector_write(vector)?);
         }
 
+        metrics::counter!(VECTOR_UPSERTS_TOTAL).increment(writes.len() as u64);
+
         // Send all writes to coordinator in a single batch and wait to be applied
         let mut write_handle = self
             .write_coordinator
@@ -586,6 +589,8 @@ impl VectorDb {
         for vector in vectors {
             writes.push(self.prepare_vector_write(vector)?);
         }
+
+        metrics::counter!(VECTOR_UPSERTS_TOTAL).increment(writes.len() as u64);
 
         // Send all writes to coordinator in a single batch and wait to be applied
         let mut write_handle = self
@@ -747,6 +752,8 @@ impl VectorDb {
             }
             collected.push(id);
         }
+
+        metrics::counter!(VECTOR_DELETES_TOTAL).increment(collected.len() as u64);
 
         let mut handle = self
             .write_coordinator
