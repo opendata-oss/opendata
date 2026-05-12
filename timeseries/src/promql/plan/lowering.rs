@@ -21,8 +21,8 @@ use promql_parser::parser;
 use promql_parser::parser::LabelModifier;
 use promql_parser::parser::token::{
     T_ADD, T_ATAN2, T_AVG, T_BOTTOMK, T_COUNT, T_COUNT_VALUES, T_DIV, T_EQLC, T_GROUP, T_GTE,
-    T_GTR, T_LAND, T_LIMITK, T_LOR, T_LSS, T_LTE, T_LUNLESS, T_MAX, T_MIN, T_MOD, T_MUL, T_NEQ,
-    T_POW, T_QUANTILE, T_STDDEV, T_STDVAR, T_SUB, T_SUM, T_TOPK, TokenId,
+    T_GTR, T_LAND, T_LIMIT_RATIO, T_LIMITK, T_LOR, T_LSS, T_LTE, T_LUNLESS, T_MAX, T_MIN, T_MOD,
+    T_MUL, T_NEQ, T_POW, T_QUANTILE, T_STDDEV, T_STDVAR, T_SUB, T_SUM, T_TOPK, TokenId,
 };
 
 use crate::promql::operators::aggregate::AggregateKind;
@@ -699,6 +699,33 @@ fn lower_aggregate(
                 grouping,
             })
         }
+        T_LIMIT_RATIO => {
+            let param = agg
+                .param
+                .as_deref()
+                .ok_or_else(|| PlanError::InvalidArgument {
+                    function: "limit_ratio".to_string(),
+                    expected: "numeric `r` parameter".to_string(),
+                    got: "missing parameter".to_string(),
+                })?;
+            let (r, param_plan) = match lower(param, ctx)? {
+                LogicalPlan::Scalar(r_f) => (r_f, None),
+                lowered if lowered.produces_scalar() => (0.0, Some(Box::new(lowered))),
+                lowered => {
+                    return Err(PlanError::InvalidArgument {
+                        function: "limit_ratio".to_string(),
+                        expected: "scalar `r` parameter".to_string(),
+                        got: describe_logical_plan(&lowered),
+                    });
+                }
+            };
+            Ok(LogicalPlan::Aggregate {
+                kind: AggregateKind::LimitRatio(r),
+                child: Box::new(child),
+                param: param_plan,
+                grouping,
+            })
+        }
         T_COUNT_VALUES => {
             let param = agg
                 .param
@@ -792,6 +819,7 @@ fn aggregate_op_name(op_id: TokenId) -> &'static str {
         T_TOPK => "topk",
         T_BOTTOMK => "bottomk",
         T_LIMITK => "limitk",
+        T_LIMIT_RATIO => "limit_ratio",
         T_QUANTILE => "quantile",
         T_COUNT_VALUES => "count_values",
         _ => "<unknown>",

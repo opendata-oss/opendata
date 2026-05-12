@@ -439,6 +439,29 @@ eval instant at 50m limitk(9999, http_requests{group="canary"})
 eval instant at 50m count(limitk(scalar(foo), http_requests))
 	{} 3
 
+# Tests for limit_ratio.
+# Inclusion is per-series via labelset hash; r=1 / r=-1 cover everyone
+# and r=0 / NaN cover no one regardless of hash. Intermediate r is
+# under-determined here (hash depends on Blake3 fingerprint), so the
+# negation-symmetric partition property is asserted via cardinality only.
+eval instant at 50m count(limit_ratio(1, http_requests))
+	{} 9
+
+eval instant at 50m count(limit_ratio(-1, http_requests))
+	{} 9
+
+eval instant at 50m count(limit_ratio(0, http_requests))
+	#empty
+
+# r and r-1 are complementary: every series lands in exactly one of the
+# two subsets, so their cardinalities sum to total.
+eval instant at 50m count(limit_ratio(0.3, http_requests)) + count(limit_ratio(-0.7, http_requests))
+	{} 9
+
+# Dynamic r via scalar child: scalar(foo)/scalar(foo) = 1 ⇒ all included.
+eval instant at 50m count(limit_ratio(scalar(foo)/scalar(foo), http_requests))
+	{} 9
+
 ignore
 # Ignore reason: the promqltest DSL currently parses `eval instant ...` only;
 # `eval range ...` is not recognized yet. Remaining checks below also cover
