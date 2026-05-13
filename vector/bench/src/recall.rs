@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 
 use bencher::{Bench, Benchmark, Params, Summary};
 use chrono::{DateTime, Local};
-use common::StorageConfig;
+use common::{StorageConfig, StorageError};
 use common::storage::config::SlateDbStorageConfig;
-use common::storage::factory::{FoyerCache, FoyerCacheOptions};
+use common::storage::factory::{CachedEntry, CachedKey, FoyerCache, FoyerCacheOptions};
 use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
 use tokio::sync::{mpsc, oneshot};
 use vector::{
@@ -987,6 +987,47 @@ impl Benchmark for RecallBenchmark {
         };
         let mut sb = StorageBuilder::new(&config.storage).await?;
         if let Some(bytes) = dataset.block_cache_bytes {
+            use foyer::{
+                Engine, HybridCacheBuilder, HybridCachePolicy, DeviceBuilder,
+            };
+
+            let memory_capacity = usize::try_from(bytes).map_err(|_| {
+                StorageError::Storage(format!(
+                    "memory_capacity {} exceeds usize::MAX on this platform",
+                    bytes,
+                ))
+            })?;
+            let disk_capacity = usize::try_from(1024u64 * 1024 * 1024 * 500).map_err(|_| {
+                StorageError::Storage(format!(
+                    "disk_capacity {} exceeds usize::MAX on this platform",
+                    1024u64 * 1024 * 1024 * 500
+                ))
+            })?;
+
+            let cache = HybridCacheBuilder::new()
+                .with_name("slatedb_block_cache")
+                //.with_policy(policy)
+                .memory(memory_capacity)
+                .with_weighter(|_: &CachedKey, v: &CachedEntry| v.size())
+                .storage()
+                .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
+                .with_engine_config(
+                    foyer::BlockEngineConfig::new(
+                        foyer::FsDeviceBuilder::new("/mnt/cache/foyer")
+                            .with_capacity(disk_capacity)
+                            .build()
+                            .unwrap(),
+                    )
+                        .with_block_size(64 * 1024)
+                        .with_flushers(4)
+                        .with_buffer_pool_size(256 * 1024 * 1024)
+                        .with_submit_queue_size_threshold(1024 * 1024 * 1024),
+                )
+                .build()
+                .await
+                .map_err(|e| {
+                    StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
+                })?;
             let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
                 max_capacity: bytes,
                 shards: 16,

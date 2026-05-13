@@ -12,7 +12,7 @@ use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::DbReader;
 use slatedb::config::Settings;
-pub use slatedb::db_cache::CachedEntry;
+pub use slatedb::db_cache::{CachedKey, CachedEntry};
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::db_cache::{CachedKey, DbCache};

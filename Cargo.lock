@@ -4734,6 +4734,7 @@ dependencies = [
  "async-trait",
  "bencher",
  "chrono",
+ "foyer",
  "futures",
  "opendata-common",
  "opendata-vector",
