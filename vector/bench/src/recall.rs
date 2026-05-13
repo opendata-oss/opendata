@@ -989,7 +989,7 @@ impl Benchmark for RecallBenchmark {
         if let Some(bytes) = dataset.block_cache_bytes {
             let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
                 max_capacity: bytes,
-                ..Default::default()
+                shards: 16,
             });
             sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
             println!("  Block cache: {} bytes", bytes);
