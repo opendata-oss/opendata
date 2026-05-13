@@ -1028,10 +1028,10 @@ impl Benchmark for RecallBenchmark {
                 .map_err(|e| {
                     StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
                 })?;
-            let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+            /*let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
                 max_capacity: bytes,
                 shards: 16,
-            });
+            });*/
             sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
             println!("  Block cache: {} bytes", bytes);
         }
