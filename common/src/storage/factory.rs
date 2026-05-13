@@ -112,6 +112,7 @@ impl StorageBuilder {
                     db_builder = db_builder.with_db_cache(managed.db_cache);
                     managed_cache = Some(managed.hybrid);
                 }
+                db_builder = db_builder.with_sst_block_size(slatedb::SstBlockSize::Block32Kib);
                 StorageBuilderInner::SlateDb(Box::new(db_builder))
             }
         };
@@ -157,7 +158,7 @@ impl StorageBuilder {
             }
             StorageBuilderInner::SlateDb(db_builder) => {
                 let mut db_builder = *db_builder;
-                db_builder = db_builder.with_metrics_recorder(Arc::new(MetricsRsRecorder));
+                // db_builder = db_builder.with_metrics_recorder(Arc::new(MetricsRsRecorder));
                 if let Some(op) = self.semantics.merge_operator {
                     let adapter = SlateDbStorage::merge_operator_adapter(op);
                     db_builder = db_builder.with_merge_operator(Arc::new(adapter));
@@ -338,8 +339,8 @@ pub async fn create_storage_read(
             };
 
             let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
-                .with_options(reader_options)
-                .with_metrics_recorder(Arc::new(MetricsRsRecorder));
+                .with_options(reader_options);
+                //.with_metrics_recorder(Arc::new(MetricsRsRecorder));
             if let Some(checkpoint_id) = runtime.checkpoint_id {
                 builder = builder.with_checkpoint_id(checkpoint_id);
             }
@@ -383,8 +384,7 @@ async fn create_block_cache_from_config(
     match config {
         BlockCacheConfig::FoyerHybrid(foyer_config) => {
             use foyer::{
-                DirectFsDeviceOptions, Engine, HybridCacheBuilder, HybridCachePolicy,
-                LargeEngineOptions,
+                Engine, HybridCacheBuilder, HybridCachePolicy, DeviceBuilder,
             };
 
             let memory_capacity = usize::try_from(foyer_config.memory_capacity).map_err(|_| {
@@ -430,15 +430,16 @@ async fn create_block_cache_from_config(
                 .with_policy(policy)
                 .memory(memory_capacity)
                 .with_weighter(|_, v: &CachedEntry| v.size())
-                .storage(Engine::Large(
-                    LargeEngineOptions::new()
-                        .with_flushers(foyer_config.flushers)
-                        .with_buffer_pool_size(buffer_pool_size)
-                        .with_submit_queue_size_threshold(submit_queue_size_threshold),
-                ))
-                .with_device_options(
-                    DirectFsDeviceOptions::new(&foyer_config.disk_path)
-                        .with_capacity(disk_capacity),
+                .storage()
+                .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
+                .with_engine_config(
+                    foyer::BlockEngineConfig::new(
+                        foyer::FsDeviceBuilder::new(&foyer_config.disk_path)
+                            .with_capacity(disk_capacity)
+                            .build()
+                            .unwrap(),
+                    )
+                    .with_block_size(64 * 1024),
                 )
                 .build()
                 .await

@@ -73,7 +73,8 @@ They differ only in:
 - how many base vectors the benchmark ingests
 - which ground-truth file is used
 
-The benchmark reads `bvecs` directly, so unlike DEEP you do **not** need to convert the base/query files.
+The benchmark reads `bvecs` directly. The download flow below fetches `u8bin` (from the FB mirror) and converts
+it to `bvecs` in one step.
 
 Expected layout:
 
@@ -87,42 +88,87 @@ vector/bench/data/bigann/
 └── bigann_groundtruth_1B.ivecs
 ```
 
-Run these commands from the **workspace root**.
+The original IRISA FTP mirror (`ftp.irisa.fr`) is frequently unreachable. The instructions below use the Facebook
+`big-ann-benchmarks` mirror over HTTPS instead. That mirror publishes vectors as `u8bin` and ground truth as the
+big-ann `.bin` format, so a short conversion step turns them into the `bvecs` / `ivecs` layout the benchmark reads.
+
+Run these commands from the **workspace root**. If you want the data somewhere other than `vector/bench/data/`
+(e.g. a large external disk), set `DATA_ROOT` to the parent directory and pass `data_dir = "$DATA_ROOT"` in your
+bench config — the benchmark resolves dataset files relative to `data_dir/bigann/`.
 
 ```bash
-mkdir -p vector/bench/data/bigann
+DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
+mkdir -p "$DATA_ROOT/bigann"
 
-curl -L -o vector/bench/data/bigann/bigann_base.bvecs.gz \
-  ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz
+# Base vectors (~128 GB uncompressed; the mirror serves the file uncompressed).
+curl -L -o "$DATA_ROOT/bigann/bigann_base.u8bin" \
+  https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/base.1B.u8bin
 
-curl -L -o vector/bench/data/bigann/bigann_query.bvecs.gz \
-  ftp://ftp.irisa.fr/local/texmex/corpus/bigann_query.bvecs.gz
+# Query vectors (~1.3 MB).
+curl -L -o "$DATA_ROOT/bigann/bigann_query.u8bin" \
+  https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/query.public.10K.u8bin
 
-curl -L -o vector/bench/data/bigann/bigann_gnd.tar.gz \
-  ftp://ftp.irisa.fr/local/texmex/corpus/bigann_gnd.tar.gz
+# Ground truth (8 MB each). Note: the mirror does NOT publish a 50M ground truth file;
+# `sift50m` would require computing ground truth locally.
+curl -L -o "$DATA_ROOT/bigann/bigann-10M.bin" \
+  https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/GT_10M/bigann-10M
+curl -L -o "$DATA_ROOT/bigann/bigann-100M.bin" \
+  https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/GT_100M/bigann-100M
+curl -L -o "$DATA_ROOT/bigann/bigann-1B.bin" \
+  https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/GT_1B/bigann-1B
 
-gzip -dc vector/bench/data/bigann/bigann_base.bvecs.gz \
-  > vector/bench/data/bigann/bigann_base.bvecs
+DATA_ROOT="$DATA_ROOT" python3 - <<'PY'
+import os
+from pathlib import Path
+import numpy as np
 
-gzip -dc vector/bench/data/bigann/bigann_query.bvecs.gz \
-  > vector/bench/data/bigann/bigann_query.bvecs
+root = Path(os.environ["DATA_ROOT"]) / "bigann"
 
-mkdir -p /tmp/bigann_gnd_extract
-tar xzf vector/bench/data/bigann/bigann_gnd.tar.gz -C /tmp/bigann_gnd_extract
+def u8bin_to_bvecs(src: Path, dst: Path) -> None:
+    # u8bin: u32 n, u32 d, then n*d uint8 values.
+    # bvecs: for each vector, u32 d then d uint8 values.
+    with src.open("rb") as f:
+        n = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+        d = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+    data = np.memmap(src, dtype=np.uint8, mode="r", offset=8, shape=(n, d))
+    out = np.memmap(
+        dst,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "u1", (d,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    chunk = 1_000_000
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        out["dim"][start:end] = d
+        out["vec"][start:end] = data[start:end]
+    out.flush()
 
-cp /tmp/bigann_gnd_extract/gnd/idx_10M.ivecs \
-  vector/bench/data/bigann/bigann_groundtruth_10M.ivecs
+def ann_gt_to_ivecs(src: Path, dst: Path) -> None:
+    # big-ann ground truth: u32 n, u32 k, n*k int32 ids, n*k float32 dists.
+    # ivecs: for each row, u32 k then k int32 ids (distances dropped).
+    with src.open("rb") as f:
+        n = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+        k = int(np.fromfile(f, dtype=np.uint32, count=1)[0])
+        ids = np.fromfile(f, dtype=np.int32, count=n * k).reshape(n, k)
+    out = np.memmap(
+        dst,
+        dtype=np.dtype([("dim", "<i4"), ("vec", "<i4", (k,))]),
+        mode="w+",
+        shape=(n,),
+    )
+    out["dim"][:] = k
+    out["vec"][:] = ids
+    out.flush()
 
-cp /tmp/bigann_gnd_extract/gnd/idx_50M.ivecs \
-  vector/bench/data/bigann/bigann_groundtruth_50M.ivecs
+u8bin_to_bvecs(root / "bigann_base.u8bin", root / "bigann_base.bvecs")
+u8bin_to_bvecs(root / "bigann_query.u8bin", root / "bigann_query.bvecs")
+ann_gt_to_ivecs(root / "bigann-10M.bin", root / "bigann_groundtruth_10M.ivecs")
+ann_gt_to_ivecs(root / "bigann-100M.bin", root / "bigann_groundtruth_100M.ivecs")
+ann_gt_to_ivecs(root / "bigann-1B.bin", root / "bigann_groundtruth_1B.ivecs")
+PY
 
-cp /tmp/bigann_gnd_extract/gnd/idx_100M.ivecs \
-  vector/bench/data/bigann/bigann_groundtruth_100M.ivecs
-
-cp /tmp/bigann_gnd_extract/gnd/idx_1000M.ivecs \
-  vector/bench/data/bigann/bigann_groundtruth_1B.ivecs
-
-ls -lh vector/bench/data/bigann
+ls -lh "$DATA_ROOT/bigann"
 ```
 
 Then choose whichever dataset you want in your benchmark config.
@@ -161,7 +207,10 @@ Notes:
 - `sift50m` ingests the first 50,000,000 vectors from `bigann_base.bvecs`.
 - `sift100m` ingests the first 100,000,000 vectors from `bigann_base.bvecs`.
 - `sift1b` ingests the full `bigann_base.bvecs`.
-- BIGANN is large. `bigann_base.bvecs.gz` is about 91 GB compressed on IRISA and expands substantially when decompressed.
+- BIGANN is large. The base file is ~128 GB on the FB mirror. After conversion to `bvecs`, `bigann_base.bvecs`
+  is ~129 GB (one extra dim prefix per vector).
+- `sift50m` ground truth is **not** published on the FB mirror; only 10M / 100M / 1B are. To run `sift50m`
+  you'd need to compute ground truth locally over the first 50M base vectors.
 
 ### DEEP10M and DEEP1B
 
@@ -571,37 +620,6 @@ with:
 ```toml
 [[params.recall]]
 dataset = "cohere_wiki_10m"
-```
-
-### BigANN / SIFT1B
-
-128 dimensions, L2 distance, bvecs format. From the [BigANN Benchmark](http://big-ann-benchmarks.com/). Several subsets
-are available — all share the same base and query files but use different ground truth files and vector counts.
-
-| Dataset  | Vectors | Ground truth file               |
-|----------|---------|---------------------------------|
-| sift10m  | 10M     | `bigann_groundtruth_10M.ivecs`  |
-| sift50m  | 50M     | `bigann_groundtruth_50M.ivecs`  |
-| sift100m | 100M    | `bigann_groundtruth_100M.ivecs` |
-| sift1b   | 1B      | `bigann_groundtruth_1B.ivecs`   |
-
-```bash
-mkdir -p vector/bench/data/bigann
-cd vector/bench/data/bigann
-
-# Base vectors (~128 GB for the full 1B set):
-wget https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/base.1B.u8bin.gz
-# Convert to bvecs format and rename to bigann_base.bvecs
-
-# Query vectors:
-wget https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/query.public.10K.u8bin
-# Convert to bvecs format and rename to bigann_query.bvecs
-
-# Ground truth files (generate with brute-force search for each subset size):
-#   bigann_groundtruth_10M.ivecs
-#   bigann_groundtruth_50M.ivecs
-#   bigann_groundtruth_100M.ivecs
-#   bigann_groundtruth_1B.ivecs
 ```
 
 ## Configuration

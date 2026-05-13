@@ -36,7 +36,7 @@ const DEFAULT_NUM_QUERIES: usize = 100;
 const BASE_VECTOR_CHUNK_SIZE: usize = 1_000_000;
 const INGEST_WRITE_BATCH_SIZE: usize = 10;
 /// Default number of concurrent queries during the warm query phase.
-const DEFAULT_QUERY_CONCURRENCY: usize = 8;
+const DEFAULT_QUERY_CONCURRENCY: usize = 1;
 /// Default ceiling on queries-per-second during the warm query phase.
 const DEFAULT_QUERY_QPS_LIMIT: usize = 32;
 
@@ -1109,6 +1109,14 @@ impl Benchmark for RecallBenchmark {
         let mut runtime = StorageReaderRuntime::default();
         if let Some(object_store) = object_store {
             runtime = runtime.with_object_store(object_store);
+        }
+        if let Some(bytes) = dataset.block_cache_bytes {
+                let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+                    max_capacity: bytes,
+                    ..Default::default()
+                });
+                runtime = runtime.with_block_cache(Arc::new(cache));
+                println!("  Block cache: {} bytes", bytes);
         }
         for query in queries.iter().take(10) {
             let reader =
