@@ -135,9 +135,7 @@ async fn main() {
                 std::process::exit(1);
             });
         tracing::info!("Storage created successfully");
-        let tsdb = Tsdb::new(storage);
-        tsdb.start_background_tasks();
-        Arc::new(Arc::new(tsdb).into())
+        Arc::new(Arc::new(Tsdb::new(storage)).into())
     };
 
     // Create server configuration

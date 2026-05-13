@@ -1,10 +1,13 @@
 //! Best-effort cardinality estimator for "active series in the last 15 minutes".
 //!
-//! Implemented as a ring of 15 small HyperLogLog sketches (~4 KB each). Each
-//! sketch holds inserts for one minute; the ring is advanced once per minute,
-//! resetting the bucket that rolls in. `estimate()` merges all sketches.
+//! Implemented as a ring of 15 small HyperLogLog sketches (~4 KB each). The
+//! "active" bucket is tagged with its minute-since-UNIX-epoch; inserts always
+//! land in `buckets[active_minute % 15]`. The window is advanced by calls to
+//! [`ActiveSeriesTracker::refresh`] (driven by the flusher) — there is no
+//! background task; if no flushes happen the gauge simply goes stale.
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Number of HLL sketches in the ring. With one rotation per minute this
 /// covers a ~15-minute sliding window (the bucket currently filling plus
@@ -48,35 +51,46 @@ impl Hll {
 
 pub(crate) struct ActiveSeriesTracker {
     buckets: Vec<Hll>,
-    current: AtomicUsize,
+    /// Minute-since-UNIX-epoch of the currently-active bucket. Inserts target
+    /// `buckets[active_minute % BUCKET_COUNT]`. Updated by `refresh`.
+    active_minute: AtomicU64,
 }
 
 impl ActiveSeriesTracker {
-    pub(crate) fn new() -> Self {
+    /// Create a tracker with `now_minute` as the initial active minute. Pass
+    /// [`current_unix_minute`] in production; tests can pass any baseline.
+    pub(crate) fn new(now_minute: u64) -> Self {
         Self {
             buckets: (0..BUCKET_COUNT).map(|_| Hll::new()).collect(),
-            current: AtomicUsize::new(0),
+            active_minute: AtomicU64::new(now_minute),
         }
     }
 
     pub(crate) fn record(&self, fingerprint: u128) {
         let h = hash_fingerprint(fingerprint);
-        let idx = self.current.load(Ordering::Acquire);
-        self.buckets[idx].insert(h);
+        let m = self.active_minute.load(Ordering::Acquire);
+        self.buckets[(m as usize) % BUCKET_COUNT].insert(h);
     }
 
-    /// Reset the next bucket and make it the active one. Inserts racing with
-    /// this call may land in the *old* bucket — that's fine since the old
-    /// bucket remains part of the window for another BUCKET_COUNT-1 ticks.
-    pub(crate) fn rotate(&self) {
-        let cur = self.current.load(Ordering::Relaxed);
-        let next = (cur + 1) % BUCKET_COUNT;
-        self.buckets[next].reset();
-        self.current.store(next, Ordering::Release);
+    /// Catch the ring up to `now_minute` and return the merged cardinality
+    /// estimate. Each elapsed minute advances `active_minute` by one and resets
+    /// the bucket rolling in. Inserts that race a reset may land in the bucket
+    /// just rotated out — that's fine, it stays in the window for another
+    /// `BUCKET_COUNT - 1` ticks.
+    pub(crate) fn refresh(&self, now_minute: u64) -> u64 {
+        let prev = self.active_minute.load(Ordering::Relaxed);
+        if now_minute > prev {
+            let advance = (now_minute - prev).min(BUCKET_COUNT as u64);
+            for step in 1..=advance {
+                let target = ((prev + step) as usize) % BUCKET_COUNT;
+                self.buckets[target].reset();
+            }
+            self.active_minute.store(now_minute, Ordering::Release);
+        }
+        self.estimate()
     }
 
-    /// Merge all sketches in the ring and return the estimated cardinality.
-    pub(crate) fn estimate(&self) -> u64 {
+    fn estimate(&self) -> u64 {
         let mut sum = 0.0f64;
         let mut zeros = 0u32;
         for j in 0..M {
@@ -121,6 +135,15 @@ impl ActiveSeriesTracker {
     }
 }
 
+/// Wall-clock minutes since the UNIX epoch. Returns 0 if the system clock is
+/// before the epoch (pre-1970), which is impossible in practice.
+pub(crate) fn current_unix_minute() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0)
+}
+
 /// Fold a 128-bit blake3 fingerprint into 64 uniformly-random bits.
 fn hash_fingerprint(fp: u128) -> u64 {
     (fp as u64) ^ ((fp >> 64) as u64)
@@ -144,7 +167,7 @@ mod tests {
     #[test]
     fn should_estimate_cardinality_within_error_bound() {
         // given
-        let tracker = ActiveSeriesTracker::new();
+        let tracker = ActiveSeriesTracker::new(0);
         let n: u64 = 50_000;
 
         // when
@@ -153,7 +176,7 @@ mod tests {
         }
 
         // then: HLL with 4096 registers gives ~1.6% std error; allow 5%.
-        let est = tracker.estimate();
+        let est = tracker.refresh(0);
         let rel_err = (est as i64 - n as i64).unsigned_abs() as f64 / n as f64;
         assert!(
             rel_err < 0.05,
@@ -167,67 +190,77 @@ mod tests {
     #[test]
     fn should_estimate_one_for_small_cardinality() {
         // given
-        let tracker = ActiveSeriesTracker::new();
+        let tracker = ActiveSeriesTracker::new(0);
 
         // when
         tracker.record(fingerprint(42));
 
         // then: linear counting kicks in for tiny cardinalities
-        assert_eq!(tracker.estimate(), 1);
+        assert_eq!(tracker.refresh(0), 1);
     }
 
     #[test]
-    fn should_forget_series_after_full_rotation() {
+    fn should_forget_series_after_full_window() {
         // given
-        let tracker = ActiveSeriesTracker::new();
+        let tracker = ActiveSeriesTracker::new(0);
         for i in 0..10_000u128 {
             tracker.record(fingerprint(i));
         }
-        assert!(tracker.estimate() > 5_000);
+        assert!(tracker.refresh(0) > 5_000);
 
-        // when: rotate enough times to reset every bucket
-        for _ in 0..BUCKET_COUNT {
-            tracker.rotate();
-        }
+        // when: advance by an entire window — every bucket gets reset
+        let est = tracker.refresh(BUCKET_COUNT as u64);
 
         // then
-        assert_eq!(tracker.estimate(), 0);
+        assert_eq!(est, 0);
     }
 
     #[test]
     fn should_count_recurring_series_once_across_rotations() {
         // given
-        let tracker = ActiveSeriesTracker::new();
+        let tracker = ActiveSeriesTracker::new(0);
         let fp = fingerprint(42);
 
         // when: insert the same fingerprint into every bucket
-        for _ in 0..BUCKET_COUNT {
+        for m in 0..BUCKET_COUNT as u64 {
             tracker.record(fp);
-            tracker.rotate();
+            tracker.refresh(m + 1);
         }
 
         // then: merged estimate is ~1, not BUCKET_COUNT
-        let est = tracker.estimate();
+        let est = tracker.refresh(BUCKET_COUNT as u64);
         assert!(est <= 2, "expected ~1, got {}", est);
     }
 
     #[test]
     fn should_retain_series_within_window() {
         // given
-        let tracker = ActiveSeriesTracker::new();
+        let tracker = ActiveSeriesTracker::new(0);
         for i in 0..5_000u128 {
             tracker.record(fingerprint(i));
         }
 
-        // when: rotate fewer than BUCKET_COUNT times — original data still
-        // sits in the oldest bucket
-        for _ in 0..(BUCKET_COUNT - 1) {
-            tracker.rotate();
-        }
+        // when: advance fewer than BUCKET_COUNT minutes — original data still
+        // sits in one of the remaining buckets
+        let est = tracker.refresh(BUCKET_COUNT as u64 - 1);
 
-        // then: estimate is still close to 5000
-        let est = tracker.estimate();
+        // then
         let rel_err = (est as i64 - 5_000).unsigned_abs() as f64 / 5_000.0;
         assert!(rel_err < 0.05, "estimate {} drifted: {:.3}", est, rel_err);
+    }
+
+    #[test]
+    fn should_clamp_advance_to_bucket_count() {
+        // given
+        let tracker = ActiveSeriesTracker::new(0);
+        for i in 0..5_000u128 {
+            tracker.record(fingerprint(i));
+        }
+
+        // when: advance by far more than BUCKET_COUNT minutes (long idle)
+        let est = tracker.refresh(1_000_000);
+
+        // then: every bucket gets reset exactly once and the estimate is 0
+        assert_eq!(est, 0);
     }
 }
