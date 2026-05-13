@@ -905,7 +905,6 @@ mod tests {
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
-            chunk_target: 4096,
             metadata_fields: vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
                 MetadataFieldSpec::new("price", FieldType::Int64, true),

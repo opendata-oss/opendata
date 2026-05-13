@@ -216,20 +216,6 @@ pub struct Config {
     /// Number of neighboring centroids to scan for reassignment candidates after a split.
     pub split_search_neighbourhood: usize,
 
-    /// The maximum number of centroids that require rebalancing before which backpressure
-    /// is applied by pausing ingestion of new vector writes.
-    pub max_pending_and_running_rebalance_tasks: usize,
-
-    /// After backpressure is applied, ingestion resumes after the total number of centroids
-    /// requiring rebalance drops below this value.
-    pub rebalance_backpressure_resume_threshold: usize,
-
-    /// The maximum number of rebalance tasks that the rebalancer will run concurrently.
-    pub max_rebalance_tasks: usize,
-
-    /// Target number of centroids per chunk.
-    pub chunk_target: u16,
-
     /// Query-aware dynamic pruning epsilon (ε₂ from SPANN paper).
     ///
     /// When set, a posting list is searched only if its centroid's distance
@@ -262,13 +248,9 @@ impl Default for Config {
             dimensions: 0, // Must be set explicitly
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
-            split_threshold_vectors: 2_000,
-            merge_threshold_vectors: 500,
+            split_threshold_vectors: 150,
+            merge_threshold_vectors: 50,
             split_search_neighbourhood: 0,
-            max_pending_and_running_rebalance_tasks: 16,
-            rebalance_backpressure_resume_threshold: 8,
-            max_rebalance_tasks: 8,
-            chunk_target: 4096,
             query_pruning_factor: None,
             metadata_fields: Vec::new(),
             #[cfg(feature = "buffer")]
