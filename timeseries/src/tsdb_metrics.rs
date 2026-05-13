@@ -10,6 +10,7 @@ pub(crate) const TSDB_SERIES_CREATED: &str = "tsdb_series_created_total";
 pub(crate) const TSDB_FLUSH_DURATION_SECONDS: &str = "tsdb_flush_duration_seconds";
 pub(crate) const TSDB_FLUSH_TOTAL: &str = "tsdb_flush_total";
 pub(crate) const TSDB_BACKPRESSURE: &str = "tsdb_backpressure_total";
+pub(crate) const TSDB_ACTIVE_SERIES: &str = "tsdb_active_series";
 
 // ── Flusher phases ──
 //
@@ -61,6 +62,11 @@ pub(crate) fn describe_engine_metrics() {
     metrics::describe_counter!(
         TSDB_BACKPRESSURE,
         "Total writes rejected due to backpressure"
+    );
+    metrics::describe_gauge!(
+        TSDB_ACTIVE_SERIES,
+        "Estimated number of unique series that have received data in the last ~15 minutes \
+         (HyperLogLog-based, ~1.6% standard error)"
     );
     metrics::describe_histogram!(
         TSDB_FLUSH_BUCKET_LIST_LOOKUP_DURATION_SECONDS,

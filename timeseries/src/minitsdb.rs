@@ -9,6 +9,7 @@ use common::{Storage, StorageRead};
 
 const WRITE_CHANNEL: &str = "write";
 
+use crate::active_series::ActiveSeriesTracker;
 use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
@@ -199,6 +200,7 @@ impl MiniTsdb {
         bucket: TimeBucket,
         storage: Arc<dyn Storage>,
         retention: Option<Duration>,
+        active_series: Arc<ActiveSeriesTracker>,
     ) -> Result<Self> {
         let snapshot = storage.snapshot().await?;
 
@@ -213,11 +215,13 @@ impl MiniTsdb {
             bucket,
             series_dict: Arc::new(series_dict),
             next_series_id,
+            active_series: active_series.clone(),
         };
 
         let flusher = TsdbFlusher {
             storage: storage.clone(),
             retention,
+            active_series,
         };
 
         let initial_snapshot: Arc<dyn StorageSnapshot> = storage
@@ -361,15 +365,18 @@ mod tests {
             .await
             .unwrap();
 
+        let active_series = Arc::new(ActiveSeriesTracker::new(0));
         let context = TsdbContext {
             bucket,
             series_dict: Arc::new(series_dict),
             next_series_id,
+            active_series: active_series.clone(),
         };
 
         let flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series,
         };
 
         let initial_snapshot: Arc<dyn StorageSnapshot> = storage.snapshot().await.unwrap();
