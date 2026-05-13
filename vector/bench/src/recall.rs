@@ -24,7 +24,7 @@ use bencher::{Bench, Benchmark, Params, Summary};
 use chrono::{DateTime, Local};
 use common::{StorageConfig, StorageError};
 use common::storage::config::SlateDbStorageConfig;
-use common::storage::factory::{CachedEntry, CachedKey, FoyerCache, FoyerCacheOptions};
+use common::storage::factory::{CachedEntry, CachedKey, FoyerCache, FoyerCacheOptions, FoyerHybridCache};
 use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
 use tokio::sync::{mpsc, oneshot};
 use vector::{
@@ -1028,6 +1028,7 @@ impl Benchmark for RecallBenchmark {
                 .map_err(|e| {
                     StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
                 })?;
+            let cache = FoyerHybridCache::new_with_cache(cache);
             /*let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
                 max_capacity: bytes,
                 shards: 16,
