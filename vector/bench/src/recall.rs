@@ -1018,7 +1018,7 @@ impl Benchmark for RecallBenchmark {
                             .build()
                             .unwrap(),
                     )
-                        .with_block_size(64 * 1024)
+                        .with_block_size(16 * 1024 * 1024)
                         .with_flushers(4)
                         .with_buffer_pool_size(256 * 1024 * 1024)
                         .with_submit_queue_size_threshold(1024 * 1024 * 1024),
