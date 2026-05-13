@@ -15,7 +15,7 @@ use slatedb::config::Settings;
 pub use slatedb::db_cache::{CachedKey, CachedEntry};
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
-use slatedb::db_cache::{CachedKey, DbCache};
+use slatedb::db_cache::{DbCache};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
