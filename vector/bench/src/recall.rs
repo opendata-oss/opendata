@@ -997,10 +997,10 @@ impl Benchmark for RecallBenchmark {
                     bytes,
                 ))
             })?;
-            let disk_capacity = usize::try_from(1024u64 * 1024 * 1024 * 500).map_err(|_| {
+            let disk_capacity = usize::try_from(1024u64 * 1024 * 1024 * 250).map_err(|_| {
                 StorageError::Storage(format!(
                     "disk_capacity {} exceeds usize::MAX on this platform",
-                    1024u64 * 1024 * 1024 * 500
+                    1024u64 * 1024 * 1024 * 250
                 ))
             })?;
 
