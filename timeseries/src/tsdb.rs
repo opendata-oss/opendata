@@ -10,8 +10,10 @@ use futures::{StreamExt, TryStreamExt};
 use moka::future::Cache;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
+use crate::active_series::ActiveSeriesTracker;
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::{MiniQueryReader, MiniTsdb};
@@ -22,7 +24,10 @@ use crate::model::{
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
 use crate::tsdb_metrics;
-use crate::util::Result;
+use crate::util::{Fingerprint, Result};
+
+/// How often the active-series ring is rotated and its gauge republished.
+const ACTIVE_SERIES_TICK: Duration = Duration::from_secs(60);
 
 /// Compute the disjoint preload ranges (seconds) a query touches after
 /// applying `offset`/`@` modifiers. Falls back to
@@ -981,6 +986,13 @@ pub(crate) struct Tsdb {
 
     // Metadata catalog (keyed by metric name)
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
+
+    /// Rolling HLL ring estimating unique series seen in the last ~15 min.
+    active_series: Arc<ActiveSeriesTracker>,
+
+    /// Cancels the background task that rotates `active_series` and
+    /// publishes the gauge. Triggered on `close()` and on `drop()`.
+    active_series_cancel: CancellationToken,
 }
 
 impl Tsdb {
@@ -994,11 +1006,16 @@ impl Tsdb {
             .time_to_idle(Duration::from_secs(15 * 60))
             .build();
 
+        let active_series = Arc::new(ActiveSeriesTracker::new());
+        let active_series_cancel = CancellationToken::new();
+
         Self {
             storage,
             ingest_cache,
             retention,
             metadata_catalog: RwLock::new(HashMap::new()),
+            active_series,
+            active_series_cancel,
         }
     }
 
@@ -1006,6 +1023,17 @@ impl Tsdb {
     /// like the cache warmer.
     pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
         self.storage.clone() as Arc<dyn StorageRead>
+    }
+
+    /// Spawn long-running background tasks (rotating the active-series ring
+    /// and publishing the gauge). Must be called from within a tokio runtime.
+    /// Construction is split from spawning so unit tests that build a `Tsdb`
+    /// in a synchronous context don't fail with "no reactor running".
+    pub(crate) fn start_background_tasks(&self) {
+        spawn_active_series_task(
+            self.active_series.clone(),
+            self.active_series_cancel.clone(),
+        );
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
@@ -1115,6 +1143,7 @@ impl Tsdb {
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
+        self.active_series_cancel.cancel();
         self.flush().await?;
         self.storage.close().await?;
         Ok(())
@@ -1147,6 +1176,14 @@ impl Tsdb {
         for series in series_list {
             let series_sample_count = series.samples.len();
             total_samples += series_sample_count;
+
+            // Record the series fingerprint into the rolling HLL. Computed
+            // here (rather than in delta.rs) so the cost is paid once per
+            // batch entry; the bucket-splitting loop below would otherwise
+            // call us multiple times for a single series.
+            let mut fp_labels = series.labels.clone();
+            fp_labels.sort_by(|a, b| a.name.cmp(&b.name));
+            self.active_series.record(fp_labels.fingerprint());
 
             if let Some(metric_name) = series
                 .labels
@@ -1254,6 +1291,36 @@ impl Tsdb {
 
         Ok(entries)
     }
+}
+
+impl Drop for Tsdb {
+    fn drop(&mut self) {
+        // Cancellation is idempotent — safe to call even when `close()` was
+        // invoked first. Without this, tests that don't call `close()` would
+        // leak the rotation task until the tokio runtime is dropped.
+        self.active_series_cancel.cancel();
+    }
+}
+
+/// Periodically estimate the active-series cardinality, publish it to the
+/// `tsdb_active_series` gauge, and rotate the HLL ring forward by one slot.
+fn spawn_active_series_task(tracker: Arc<ActiveSeriesTracker>, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ACTIVE_SERIES_TICK);
+        // Consume the immediate first tick — there's nothing to publish yet
+        // and we don't want to rotate away the bucket we just created.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    metrics::gauge!(tsdb_metrics::TSDB_ACTIVE_SERIES)
+                        .set(tracker.estimate() as f64);
+                    tracker.rotate();
+                }
+            }
+        }
+    });
 }
 
 #[async_trait]

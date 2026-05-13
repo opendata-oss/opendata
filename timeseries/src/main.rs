@@ -4,6 +4,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod active_series;
 mod config;
 mod delta;
 mod error;
@@ -134,7 +135,9 @@ async fn main() {
                 std::process::exit(1);
             });
         tracing::info!("Storage created successfully");
-        Arc::new(Arc::new(Tsdb::new(storage)).into())
+        let tsdb = Tsdb::new(storage);
+        tsdb.start_background_tasks();
+        Arc::new(Arc::new(tsdb).into())
     };
 
     // Create server configuration

@@ -89,6 +89,7 @@ impl TimeSeriesDb {
         // writer is started, so no concurrent merges can race the Put.
         coalesce_bucket_list(storage.as_ref()).await?;
         let tsdb = Tsdb::with_retention(storage, config.retention);
+        tsdb.start_background_tasks();
         Ok(Self { tsdb })
     }
 
