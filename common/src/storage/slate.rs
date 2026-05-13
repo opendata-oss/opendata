@@ -70,6 +70,18 @@ fn default_scan_options() -> ScanOptions {
     }
 }
 
+fn short_scan_options() -> ScanOptions {
+    ScanOptions {
+        durability_filter: Default::default(),
+        dirty: false,
+        read_ahead_bytes: 1,
+        cache_blocks: true,
+        max_fetch_tasks: 4,
+        order: IterationOrder::Ascending,
+        ..ScanOptions::default()
+    }
+}
+
 /// SlateDB-backed implementation of the Storage trait.
 ///
 /// SlateDB is an embedded key-value store built on object storage, providing
@@ -171,6 +183,15 @@ impl StorageRead for SlateDbStorage {
         Ok(Box::new(SlateDbIterator { iter }))
     }
 
+    async fn short_scan_iter(&self, range: BytesRange) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let iter = self
+            .db
+            .scan_with_options(range, &short_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
     async fn close(&self) -> StorageResult<()> {
         // Stop durable bridge first so no status subscriber outlives DB close.
         self.durable_bridge_abort.abort();
@@ -234,6 +255,19 @@ impl StorageRead for SlateDbStorageSnapshot {
         let iter = self
             .snapshot
             .scan_with_options(range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn short_scan_iter(
+        &self,
+        range: BytesRange,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let iter = self
+            .snapshot
+            .scan_with_options(range, &short_scan_options())
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -443,6 +477,18 @@ impl StorageRead for SlateDbStorageReader {
         let iter = self
             .reader
             .scan_with_options(range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    async fn short_scan_iter(
+        &self,
+        range: BytesRange,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let iter = self
+            .reader
+            .scan_with_options(range, &short_scan_options())
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))

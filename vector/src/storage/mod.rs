@@ -118,7 +118,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         let key_next = key_next.freeze();
         assert!(key < key_next);
         let record = self
-            .scan(BytesRange::new(Included(key.clone()), Included(key_next)))
+            .short_scan(BytesRange::new(Included(key.clone()), Included(key_next)))
             .await?;
         match record.first() {
             Some(record) => {
