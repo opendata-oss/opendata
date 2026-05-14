@@ -21,6 +21,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arc-swap = "1"
 async-trait = "0.1"
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["query", "form"] }

@@ -5,12 +5,13 @@ use crate::write::indexer::tree::centroids::{
 };
 use crate::write::indexer::tree::{IndexUpdateResults, Indexer};
 use crate::{Config, DistanceMetric};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use common::Storage;
 use common::coordinator::Flusher;
 use common::storage::StorageSnapshot;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct VectorDbFlusherOpts {
     dimensions: u16,
@@ -23,7 +24,7 @@ pub(crate) struct VectorDbFlusher {
     last_snapshot: Arc<dyn StorageSnapshot>,
     last_snapshot_epoch: u64,
     indexer: Indexer,
-    last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
+    last_applied_snapshot: Arc<ArcSwap<LastAppliedSnapshot>>,
     /// Set after update_index succeeds but a subsequent storage operation fails.
     /// Once set, the in-memory index state is out of sync with storage and the
     /// flusher is no longer usable.
@@ -37,7 +38,7 @@ impl VectorDbFlusher {
         initial_snapshot: Arc<dyn StorageSnapshot>,
         initial_snapshot_epoch: u64,
         indexer: Indexer,
-        last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
+        last_applied_snapshot: Arc<ArcSwap<LastAppliedSnapshot>>,
     ) -> Self {
         Self {
             opts: VectorDbFlusherOpts {
@@ -127,12 +128,13 @@ impl VectorDbFlusher {
             self.opts.distance_metric,
             Arc::new(cached_reader),
         );
-        *self.last_applied_snapshot.lock().expect("lock poisoned") = LastAppliedSnapshot {
-            snapshot: snapshot.clone(),
-            centroid_cache: index_outputs.centroid_cache,
-            centroid_index: Arc::new(query_centroid_index),
-            centroid_count: index_outputs.leaf_centroids,
-        };
+        self.last_applied_snapshot
+            .store(Arc::new(LastAppliedSnapshot {
+                snapshot: snapshot.clone(),
+                centroid_cache: index_outputs.centroid_cache,
+                centroid_index: Arc::new(query_centroid_index),
+                centroid_count: index_outputs.leaf_centroids,
+            }));
         self.last_snapshot = snapshot.clone();
         self.last_snapshot_epoch = snapshot_epoch;
         Ok(snapshot)
@@ -167,11 +169,11 @@ mod tests {
     };
     use crate::write::indexer::tree::posting_list::{Posting, PostingList};
     use crate::write::indexer::tree::state::VectorIndexState;
+    use arc_swap::ArcSwap;
     use common::coordinator::Flusher;
     use common::storage::in_memory::{FailingStorage, InMemoryStorage};
     use common::{Record, SequenceAllocator, Storage};
     use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
 
     const DIMS: usize = 3;
 
@@ -291,7 +293,7 @@ mod tests {
             snapshot.clone(),
             0,
             indexer,
-            Arc::new(Mutex::new(LastAppliedSnapshot {
+            Arc::new(ArcSwap::from_pointee(LastAppliedSnapshot {
                 snapshot,
                 centroid_cache: cache,
                 centroid_index: query_centroid_index,

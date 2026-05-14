@@ -29,6 +29,7 @@ avx512 = []
 
 [dependencies]
 anyhow.workspace = true
+arc-swap.workspace = true
 async-trait.workspace = true
 common.workspace = true
 bytemuck.workspace = true

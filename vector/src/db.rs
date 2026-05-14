@@ -48,7 +48,9 @@ use common::storage::{Storage, StorageRead, StorageSnapshot};
 use common::{StorageBuilder, StorageSemantics};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use std::time::Duration;
 
 pub(crate) const WRITE_CHANNEL: &str = "write";
@@ -135,8 +137,17 @@ pub struct VectorDb {
     /// The WriteCoordinator itself (stored to keep it alive).
     write_coordinator: WriteCoordinator<VectorDbOpDelta, VectorDbFlusher>,
 
-    /// snapshot state for queries
-    last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
+    /// snapshot state for queries.
+    ///
+    /// `ArcSwap<LastAppliedSnapshot>` lets concurrent query threads
+    /// observe the current snapshot without taking a lock — reads are
+    /// a single atomic load plus an Arc-clone. The flusher publishes a
+    /// new snapshot via `store(Arc::new(new))` which replaces the
+    /// pointer atomically. In-flight queries holding a Guard against
+    /// the previous snapshot observe the complete prior view through
+    /// to completion (ArcSwap defers drop until the last Guard
+    /// releases).
+    last_applied_snapshot: Arc<ArcSwap<LastAppliedSnapshot>>,
 }
 
 impl VectorDb {
@@ -240,7 +251,7 @@ impl VectorDb {
             config.distance_metric,
         )
         .await?;
-        let last_applied_snapshot = Arc::new(Mutex::new(LastAppliedSnapshot {
+        let last_applied_snapshot = Arc::new(ArcSwap::from_pointee(LastAppliedSnapshot {
             snapshot: snapshot.clone(),
             centroid_cache: Arc::new(loaded_tree.centroid_cache.cache()),
             centroid_index: loaded_tree.query_centroid_index,
@@ -814,20 +825,13 @@ impl VectorDb {
     }
 
     pub fn num_centroids(&self) -> usize {
-        self.last_applied_snapshot
-            .lock()
-            .expect("lock_poisoned")
-            .centroid_count
+        self.last_applied_snapshot.load().centroid_count
     }
 
     pub async fn validate_cache(&self) {
-        let las = self
-            .last_applied_snapshot
-            .lock()
-            .expect("lock_poisoned")
-            .clone();
+        let guard = self.last_applied_snapshot.load();
         crate::write::indexer::tree::validator::validate_state_and_storage_consistent(
-            &las,
+            &guard,
             self.config.dimensions as usize,
         )
         .await
@@ -836,10 +840,9 @@ impl VectorDb {
 
     /// Create a QueryEngine from the current snapshot for executing queries.
     pub(crate) fn query_engine(&self) -> QueryEngine {
-        let (snapshot, centroid_index) = {
-            let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
-            (guard.snapshot.clone(), guard.centroid_index.clone())
-        };
+        let guard = self.last_applied_snapshot.load();
+        let snapshot = guard.snapshot.clone();
+        let centroid_index = guard.centroid_index.clone();
         let options = QueryEngineOptions {
             dimensions: self.config.dimensions,
             distance_metric: self.config.distance_metric,
@@ -890,6 +893,7 @@ mod tests {
     use crate::serde::vector_id::VectorId;
     use common::StorageConfig;
     use opendata_macros::storage_test;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn create_test_config() -> Config {
@@ -1767,5 +1771,114 @@ mod tests {
         db.delete(["c"]).await.unwrap();
         // Vec<String>
         db.delete(vec!["d".to_string()]).await.unwrap();
+    }
+
+    /// Concurrent readers must succeed without serializing on a snapshot
+    /// lock. With the previous `Mutex<LastAppliedSnapshot>`, every query
+    /// acquired the same lock; with `ArcSwap<LastAppliedSnapshot>` reads
+    /// are lock-free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn should_serve_concurrent_readers_against_snapshot() {
+        // given
+        let config = create_test_config();
+        let db = Arc::new(VectorDb::open(config).await.unwrap());
+        let vectors: Vec<Vector> = (0..50)
+            .map(|i| {
+                let f = i as f32 / 50.0;
+                Vector::new(format!("v-{i}"), vec![f, 1.0 - f, 0.0])
+            })
+            .collect();
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        let mut handles = Vec::new();
+        for worker in 0..16u64 {
+            let db = Arc::clone(&db);
+            handles.push(tokio::spawn(async move {
+                for q in 0..25u64 {
+                    let f = ((worker * 25 + q) % 50) as f32 / 50.0;
+                    let query = Query::new(vec![f, 1.0 - f, 0.0]).with_limit(10);
+                    let results = db
+                        .search(&query)
+                        .await
+                        .expect("search ok under concurrent readers");
+                    assert!(
+                        !results.is_empty(),
+                        "concurrent reader {worker} query {q} returned no hits",
+                    );
+                }
+            }));
+        }
+
+        // then
+        for h in handles {
+            h.await.expect("reader task should not panic");
+        }
+    }
+
+    /// Readers must not block (or be blocked by) concurrent flushes. The
+    /// flusher publishes a new snapshot via `ArcSwap::store`; in-flight
+    /// reads holding a Guard against the previous snapshot observe the
+    /// complete prior view through to completion. After the swap,
+    /// subsequent reads observe the new snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn should_not_block_readers_during_concurrent_flush() {
+        // given
+        let config = create_test_config();
+        let db = Arc::new(VectorDb::open(config).await.unwrap());
+        db.write(vec![
+            Vector::new("seed-a", vec![1.0, 0.0, 0.0]),
+            Vector::new("seed-b", vec![0.0, 1.0, 0.0]),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            readers.push(tokio::spawn(async move {
+                let mut count = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let query = Query::new(vec![0.5, 0.5, 0.0]).with_limit(10);
+                    let results = db
+                        .search(&query)
+                        .await
+                        .expect("search ok during concurrent flush");
+                    assert!(
+                        !results.is_empty(),
+                        "reader observed empty result during flush window",
+                    );
+                    count += 1;
+                }
+                count
+            }));
+        }
+
+        // when
+        for batch in 1..=4u64 {
+            let base = batch * 10;
+            let batch_vectors: Vec<Vector> = (0..5u64)
+                .map(|i| {
+                    let f = (base + i) as f32 / 50.0;
+                    Vector::new(format!("b{batch}-{i}"), vec![f, 0.5, 0.0])
+                })
+                .collect();
+            db.write(batch_vectors).await.unwrap();
+            db.flush().await.unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        // then
+        let mut total = 0u64;
+        for h in readers {
+            total += h.await.expect("reader task should not panic");
+        }
+        assert!(
+            total > 0,
+            "readers should complete at least one search during flush window",
+        );
     }
 }
