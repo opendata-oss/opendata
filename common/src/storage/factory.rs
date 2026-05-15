@@ -383,8 +383,8 @@ async fn create_block_cache_from_config(
     match config {
         BlockCacheConfig::FoyerHybrid(foyer_config) => {
             use foyer::{
-                DirectFsDeviceOptions, Engine, HybridCacheBuilder, HybridCachePolicy,
-                LargeEngineOptions,
+                BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder,
+                HybridCachePolicy, PsyncIoEngineConfig,
             };
 
             let memory_capacity = usize::try_from(foyer_config.memory_capacity).map_err(|_| {
@@ -424,21 +424,32 @@ async fn create_block_cache_from_config(
                 }
             };
 
+            let device = {
+                #[cfg(target_os = "linux")]
+                let builder = FsDeviceBuilder::new(&foyer_config.disk_path)
+                    .with_capacity(disk_capacity)
+                    .with_direct(true);
+                #[cfg(not(target_os = "linux"))]
+                let builder =
+                    FsDeviceBuilder::new(&foyer_config.disk_path).with_capacity(disk_capacity);
+                builder.build().map_err(|e| {
+                    StorageError::Storage(format!("Failed to build foyer device: {}", e))
+                })?
+            };
+
             let cache = HybridCacheBuilder::new()
                 .with_name("slatedb_block_cache")
                 .with_metrics_registry(Box::new(MetricsRsRegistry))
                 .with_policy(policy)
                 .memory(memory_capacity)
                 .with_weighter(|_, v: &CachedEntry| v.size())
-                .storage(Engine::Large(
-                    LargeEngineOptions::new()
+                .storage()
+                .with_io_engine_config(PsyncIoEngineConfig::new())
+                .with_engine_config(
+                    BlockEngineConfig::new(device)
                         .with_flushers(foyer_config.flushers)
                         .with_buffer_pool_size(buffer_pool_size)
                         .with_submit_queue_size_threshold(submit_queue_size_threshold),
-                ))
-                .with_device_options(
-                    DirectFsDeviceOptions::new(&foyer_config.disk_path)
-                        .with_capacity(disk_capacity),
                 )
                 .build()
                 .await
