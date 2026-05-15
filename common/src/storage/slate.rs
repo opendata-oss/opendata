@@ -66,6 +66,7 @@ fn default_scan_options() -> ScanOptions {
         cache_blocks: true,
         max_fetch_tasks: 4,
         order: IterationOrder::Ascending,
+        filter_context: None,
     }
 }
 
@@ -263,6 +264,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -285,6 +287,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -307,6 +310,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
