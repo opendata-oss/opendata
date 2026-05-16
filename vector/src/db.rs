@@ -829,9 +829,16 @@ impl VectorDb {
     }
 
     pub async fn validate_cache(&self) {
-        let guard = self.last_applied_snapshot.load();
+        // Use `load_full` (returns `Arc<LastAppliedSnapshot>`) rather than
+        // `load` (returns a short-lived `Guard`): the validator awaits
+        // storage I/O, so the snapshot ref is held across `.await`. Holding
+        // an arc-swap `Guard` across an await would defer the writer's
+        // reclamation of the prior `Arc` after a concurrent `store`; the
+        // extra refcount bump from `load_full` is negligible because
+        // `validate_cache` is only invoked from diagnostic / test paths.
+        let snapshot = self.last_applied_snapshot.load_full();
         crate::write::indexer::tree::validator::validate_state_and_storage_consistent(
-            &guard,
+            &snapshot,
             self.config.dimensions as usize,
         )
         .await
@@ -1880,5 +1887,68 @@ mod tests {
             total > 0,
             "readers should complete at least one search during flush window",
         );
+    }
+
+    /// `validate_cache` must remain correct when the writer is publishing
+    /// new snapshots concurrently. The function holds a snapshot reference
+    /// across an `await` for storage I/O; this test runs several
+    /// validate_cache invocations interleaved with writes + flushes.
+    ///
+    /// This is a correctness guard. The impl uses `load_full()` (returns
+    /// an owned `Arc<LastAppliedSnapshot>`) rather than `load()` (returns
+    /// a short-lived `Guard`) precisely because the reference is held
+    /// across the async boundary — holding a `Guard` across `await` would
+    /// defer the writer's reclamation of retired Arcs after concurrent
+    /// `store`s. With `load_full` the snapshot is a refcounted Arc clone
+    /// that the writer can publish past freely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_validate_cache_under_concurrent_flush() {
+        // given
+        let config = create_test_config();
+        let db = Arc::new(VectorDb::open(config).await.unwrap());
+        db.write(vec![
+            Vector::new("seed-a", vec![1.0, 0.0, 0.0]),
+            Vector::new("seed-b", vec![0.0, 1.0, 0.0]),
+            Vector::new("seed-c", vec![0.0, 0.0, 1.0]),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // when — validator loop concurrent with writer loop
+        let stop = Arc::new(AtomicBool::new(false));
+        let validator_db = Arc::clone(&db);
+        let validator_stop = Arc::clone(&stop);
+        let validator = tokio::spawn(async move {
+            let mut runs = 0u64;
+            while !validator_stop.load(Ordering::Relaxed) {
+                validator_db.validate_cache().await;
+                runs += 1;
+            }
+            runs
+        });
+        for batch in 1..=3u64 {
+            let base = batch * 10;
+            let batch_vectors: Vec<Vector> = (0..4u64)
+                .map(|i| {
+                    let f = (base + i) as f32 / 50.0;
+                    Vector::new(format!("v-{batch}-{i}"), vec![f, 0.5, 0.0])
+                })
+                .collect();
+            db.write(batch_vectors).await.unwrap();
+            db.flush().await.unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        // then
+        let runs = validator.await.expect("validator must not panic");
+        assert!(
+            runs >= 1,
+            "validate_cache should complete at least once during the flush window",
+        );
+        // sanity: db is still usable after the concurrent dance
+        let q = Query::new(vec![0.5, 0.5, 0.0]).with_limit(5);
+        let results = db.search(&q).await.expect("post-stress search");
+        assert!(!results.is_empty(), "db remained queryable after stress");
     }
 }
