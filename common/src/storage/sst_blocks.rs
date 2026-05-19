@@ -27,12 +27,16 @@
 //!
 //! ## Why the back-scan
 //!
-//! SlateDB's index returns separator keys, not first keys: `sep[i] <=
-//! first_key(block i)`. So a block's separator can place it "inside" the
-//! query while every real key in the block sits above `query.end`. Picking
-//! the highest *overlapping-by-separator* block as the witness can yield a
-//! block with zero in-query rows. The back-scan tolerates this by
-//! continuing downward until a block actually contributes.
+//! SlateDB's index stores separators, not first keys. A separator is the
+//! shortest prefix of `first_key(block i)` that is still strictly greater
+//! than `last_key(block i-1)` — so `sep[i] <= first_key(block i)`, often
+//! strict (e.g. for blocks ending at `k230` and starting at `k280`, the
+//! separator is `k28`). A block's separator can therefore place it
+//! "inside" the query while every real key in the block sits above
+//! `query.end`. Picking the highest *overlapping-by-separator* block as
+//! the witness can yield a block with zero in-query rows. The back-scan
+//! tolerates this by continuing downward until a block actually
+//! contributes.
 //!
 //! ## Known gap
 //!
@@ -141,16 +145,11 @@ async fn count_view(
         .filter(|i| ranges_overlap(query, &block_key_range(&index, *i, last_entry.as_ref())))
         .collect();
 
-    // Back-scan: walk overlapping blocks high-to-low, reading each, until we
-    // find one with actual in-query rows. SlateDB's index returns separator
-    // keys rather than first keys (`sep[i] <= first_key(block i)`), so a
-    // block's separator can place it inside the query while its real keys
-    // all sit above `query.end`. See the module-level "Why the back-scan"
-    // section for the full rationale. The witness block — first one with
-    // non-empty in-query content from the top — pins down `covered_to`.
-    // Blocks scanned above the witness held nothing in query (already
-    // accounted for as zero); blocks below get the cheap stats path on the
-    // second pass.
+    // Back-scan: walk overlapping blocks high-to-low, reading each, until
+    // we find one with in-query rows (see the module-level "Why the
+    // back-scan" section for the rationale). That witness pins down
+    // `covered_to`; blocks above contributed nothing (counted as zero),
+    // blocks below get the cheap stats path on the second pass.
     let mut witness_pos: Option<usize> = None;
     for pos in (0..overlapping.len()).rev() {
         let i = overlapping[pos];
