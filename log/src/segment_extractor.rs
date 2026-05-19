@@ -260,7 +260,9 @@ mod integration_tests {
     use bytes::Bytes;
     use common::StorageConfig;
     use common::clock::MockClock;
-    use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+    use common::storage::config::{
+        LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+    };
     use common::storage::factory::create_object_store;
     use slatedb::DbReader;
     use tempfile::TempDir;
