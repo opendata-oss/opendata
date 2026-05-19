@@ -210,11 +210,7 @@ pub trait LogRead {
 /// segments come back ordered, and each segment owns sequences up to the
 /// next segment's `start_seq`. The last segment in the covering set has no
 /// successor, so its upper bound is taken from `query.end`.
-fn segment_window(
-    segments: &[LogSegment],
-    i: usize,
-    query: &Range<Sequence>,
-) -> Range<Sequence> {
+fn segment_window(segments: &[LogSegment], i: usize, query: &Range<Sequence>) -> Range<Sequence> {
     let next_start = segments
         .get(i + 1)
         .map(|s| s.meta().start_seq)
@@ -325,11 +321,9 @@ impl LogReadView {
         let mut total = result.counts.num_puts;
 
         let scan_lo = match result.covered_to {
-            Some(covered_key) => {
-                LogEntryKey::deserialize(&covered_key, segment.meta().start_seq)?
-                    .sequence
-                    .saturating_add(1)
-            }
+            Some(covered_key) => LogEntryKey::deserialize(&covered_key, segment.meta().start_seq)?
+                .sequence
+                .saturating_add(1),
             None => window.start,
         };
         if scan_lo < window.end {

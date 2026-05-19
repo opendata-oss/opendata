@@ -142,13 +142,15 @@ async fn count_view(
         .collect();
 
     // Back-scan: walk overlapping blocks high-to-low, reading each, until we
-    // find one with actual in-query rows. SlateDB's index returns truncated
-    // separators (`sep[i] <= first_key(block i)`), so a block's separator can
-    // place it inside the query while its real keys all sit above `query.end`.
-    // The witness block — first one with non-empty in-query content from the
-    // top — pins down `covered_to`. Blocks scanned above the witness held
-    // nothing in query (already accounted for as zero); blocks below get the
-    // cheap stats path on the second pass.
+    // find one with actual in-query rows. SlateDB's index returns separator
+    // keys rather than first keys (`sep[i] <= first_key(block i)`), so a
+    // block's separator can place it inside the query while its real keys
+    // all sit above `query.end`. See the module-level "Why the back-scan"
+    // section for the full rationale. The witness block — first one with
+    // non-empty in-query content from the top — pins down `covered_to`.
+    // Blocks scanned above the witness held nothing in query (already
+    // accounted for as zero); blocks below get the cheap stats path on the
+    // second pass.
     let mut witness_pos: Option<usize> = None;
     for pos in (0..overlapping.len()).rev() {
         let i = overlapping[pos];

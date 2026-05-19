@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use common::storage::config::{SlateDbStorageConfig, StorageConfig};
+use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use common::storage::factory::create_object_store;
 use common::{BytesRange, StorageError, StorageResult, storage::sst_blocks};
 use slatedb::DbReader;
@@ -55,13 +55,21 @@ impl LogDirect {
         })
     }
 
-    /// Builds a `LogDirect` only when `config` is slatedb-backed. Returns
-    /// `Ok(None)` for in-memory configs.
+    /// Builds a `LogDirect` only when `config` is slatedb-backed by a
+    /// persistent object store. Returns `Ok(None)` for in-memory configs
+    /// and for slatedb configs whose object store is `InMemory` —
+    /// `InMemory` instances are process-local, so a fresh one built here
+    /// would never see the writer's data (and `DbReader::build` would
+    /// fail outright on the empty store). Count falls back to scanning
+    /// the writer's storage in that case.
     pub(crate) async fn maybe_from_storage_config(
         config: &StorageConfig,
     ) -> StorageResult<Option<Self>> {
         match config {
-            StorageConfig::SlateDb(slate) => Ok(Some(Self::from_config(slate, None).await?)),
+            StorageConfig::SlateDb(slate) => match slate.object_store {
+                ObjectStoreConfig::InMemory => Ok(None),
+                _ => Ok(Some(Self::from_config(slate, None).await?)),
+            },
             StorageConfig::InMemory => Ok(None),
         }
     }
