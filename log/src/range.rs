@@ -14,6 +14,7 @@
 use std::ops::{Bound, Range, RangeBounds};
 
 use crate::model::{SegmentId, Sequence};
+use crate::serde::FIRST_USER_SEGMENT_ID;
 
 /// Converts any `RangeBounds<Sequence>` to a normalized `Range<Sequence>`.
 pub(crate) fn normalize_sequence<R: RangeBounds<Sequence>>(range: &R) -> Range<Sequence> {
@@ -31,11 +32,14 @@ pub(crate) fn normalize_sequence<R: RangeBounds<Sequence>>(range: &R) -> Range<S
 }
 
 /// Converts any `RangeBounds<SegmentId>` to a normalized `Range<SegmentId>`.
+///
+/// An unbounded start resolves to [`FIRST_USER_SEGMENT_ID`] (1), skipping the
+/// reserved system segment (id `0`).
 pub(crate) fn normalize_segment_id<R: RangeBounds<SegmentId>>(range: &R) -> Range<SegmentId> {
     let start = match range.start_bound() {
         Bound::Included(&s) => s,
         Bound::Excluded(&s) => s.saturating_add(1),
-        Bound::Unbounded => 0,
+        Bound::Unbounded => FIRST_USER_SEGMENT_ID,
     };
     let end = match range.end_bound() {
         Bound::Included(&e) => e.saturating_add(1),
@@ -100,12 +104,12 @@ mod tests {
     }
 
     #[test]
-    fn should_normalize_segment_id_full_range() {
+    fn should_normalize_segment_id_full_range_skips_system_segment() {
         // given/when
         let range = normalize_segment_id(&(..));
 
-        // then
-        assert_eq!(range, 0..u32::MAX);
+        // then — unbounded start resolves to FIRST_USER_SEGMENT_ID (1)
+        assert_eq!(range, FIRST_USER_SEGMENT_ID..u32::MAX);
     }
 
     #[test]
@@ -118,12 +122,12 @@ mod tests {
     }
 
     #[test]
-    fn should_normalize_segment_id_range_to() {
+    fn should_normalize_segment_id_range_to_skips_system_segment() {
         // given/when
         let range = normalize_segment_id(&(..100u32));
 
-        // then
-        assert_eq!(range, 0..100);
+        // then — unbounded start resolves to FIRST_USER_SEGMENT_ID (1)
+        assert_eq!(range, FIRST_USER_SEGMENT_ID..100);
     }
 
     #[test]
@@ -149,13 +153,14 @@ mod tests {
         // given/when
         let range = normalize_segment_id(&(..=10u32));
 
-        // then
-        assert_eq!(range, 0..11);
+        // then — unbounded start resolves to FIRST_USER_SEGMENT_ID (1)
+        assert_eq!(range, FIRST_USER_SEGMENT_ID..11);
     }
 
     #[test]
     fn should_normalize_segment_id_handle_max_value_inclusive() {
-        // given/when
+        // given/when — explicit start of 0 is preserved (callers can opt in
+        // to scanning the system segment by passing it explicitly)
         let range = normalize_segment_id(&(0..=u32::MAX));
 
         // then - saturating_add prevents overflow

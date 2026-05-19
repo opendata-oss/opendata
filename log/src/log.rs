@@ -319,6 +319,7 @@ impl LogDb {
             None,
             SegmentConfig::default(),
             ReadVisibility::Memory,
+            Arc::new(SystemClock),
         )
         .await
     }
@@ -335,6 +336,7 @@ impl LogDb {
             Some(direct),
             SegmentConfig::default(),
             ReadVisibility::Memory,
+            Arc::new(SystemClock),
         )
         .await
     }
@@ -347,6 +349,7 @@ impl LogDb {
             None,
             SegmentConfig::default(),
             ReadVisibility::Remote,
+            Arc::new(SystemClock),
         )
         .await
     }
@@ -357,9 +360,8 @@ impl LogDb {
         direct: Option<Arc<crate::direct::LogDirect>>,
         segment_config: SegmentConfig,
         read_visibility: ReadVisibility,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = common::SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
@@ -493,6 +495,7 @@ impl LogRead for LogDb {
 pub struct LogDbBuilder {
     config: crate::config::Config,
     storage_builder: Option<StorageBuilder>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl LogDbBuilder {
@@ -501,6 +504,7 @@ impl LogDbBuilder {
         Self {
             config,
             storage_builder: None,
+            clock: None,
         }
     }
 
@@ -513,6 +517,18 @@ impl LogDbBuilder {
         self
     }
 
+    /// Overrides the wall-clock source. Test-only — production callers always
+    /// use the default [`common::clock::SystemClock`].
+    ///
+    /// LogDb consults this clock to timestamp segment metadata and to decide
+    /// when the configured `seal_interval` has elapsed. Tests pass a
+    /// [`common::clock::MockClock`] to drive segment rolls deterministically.
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
         let sb = match self.storage_builder {
@@ -521,6 +537,13 @@ impl LogDbBuilder {
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?,
         };
+        // Route every log record to a SlateDB segment keyed by the 6-byte
+        // routing prefix `[subsystem, version, segment_id]`. No-op for the
+        // in-memory backend; for slatedb-backed storage this installs the
+        // extractor on the underlying `DbBuilder` (see RFC 0024).
+        let sb = sb.map_slatedb(|db| {
+            db.with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
+        });
         let storage = sb
             .build()
             .await
@@ -531,11 +554,14 @@ impl LogDbBuilder {
             .map_err(|e| Error::Storage(e.to_string()))?
             .map(Arc::new);
 
+        let clock: Arc<dyn Clock> = self.clock.unwrap_or_else(|| Arc::new(SystemClock));
+
         LogDb::from_storage(
             storage,
             direct,
             self.config.segmentation,
             self.config.read_visibility,
+            clock,
         )
         .await
     }
@@ -1534,24 +1560,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_list_keys_respects_segment_range() {
-        // given - entries in different segments
+        // given - entries in different segments. First user segment is id 1.
         let log = LogDb::open(test_config()).await.unwrap();
-
-        // segment 0
-        log.try_append(vec![
-            Record {
-                key: Bytes::from("key-seg0"),
-                value: Bytes::from("value"),
-            },
-            Record {
-                key: Bytes::from("key-seg0-b"),
-                value: Bytes::from("value"),
-            },
-        ])
-        .await
-        .unwrap();
-
-        log.seal_segment().await.unwrap();
 
         // segment 1
         log.try_append(vec![
@@ -1583,17 +1593,33 @@ mod tests {
         .await
         .unwrap();
 
-        // when - list only keys from segment 1
-        let mut iter = log.list_keys(1..2).await.unwrap();
+        log.seal_segment().await.unwrap();
+
+        // segment 3
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("key-seg3"),
+                value: Bytes::from("value"),
+            },
+            Record {
+                key: Bytes::from("key-seg3-b"),
+                value: Bytes::from("value"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - list only keys from segment 2
+        let mut iter = log.list_keys(2..3).await.unwrap();
         let mut keys = vec![];
         while let Some(key) = iter.next().await.unwrap() {
             keys.push(key.key);
         }
 
-        // then - only keys from segment 1
+        // then - only keys from segment 2
         assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0], Bytes::from("key-seg1"));
-        assert_eq!(keys[1], Bytes::from("key-seg1-b"));
+        assert_eq!(keys[0], Bytes::from("key-seg2"));
+        assert_eq!(keys[1], Bytes::from("key-seg2-b"));
     }
 
     #[tokio::test]
@@ -1622,9 +1648,9 @@ mod tests {
         // when
         let segments = log.list_segments(..).await.unwrap();
 
-        // then
+        // then — first user segment is id 1 (id 0 is reserved system segment)
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].id, 1);
         assert_eq!(segments[0].start_seq, 0);
     }
 
@@ -1633,7 +1659,7 @@ mod tests {
         // given
         let log = LogDb::open(test_config()).await.unwrap();
 
-        // segment 0
+        // first user segment (id 1)
         log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-0"),
@@ -1643,7 +1669,7 @@ mod tests {
 
         log.seal_segment().await.unwrap();
 
-        // segment 1
+        // segment 2
         log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-1"),
@@ -1653,7 +1679,7 @@ mod tests {
 
         log.seal_segment().await.unwrap();
 
-        // segment 2
+        // segment 3
         log.try_append(vec![Record {
             key: Bytes::from("key"),
             value: Bytes::from("value-2"),
@@ -1666,11 +1692,11 @@ mod tests {
 
         // then
         assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].id, 1);
         assert_eq!(segments[0].start_seq, 0);
-        assert_eq!(segments[1].id, 1);
+        assert_eq!(segments[1].id, 2);
         assert_eq!(segments[1].start_seq, 1);
-        assert_eq!(segments[2].id, 2);
+        assert_eq!(segments[2].id, 3);
         assert_eq!(segments[2].start_seq, 2);
     }
 
@@ -1725,12 +1751,12 @@ mod tests {
         .await
         .unwrap();
 
-        // when - query range that spans segment 1
+        // when - query range that spans the middle segment (id 2)
         let segments = log.list_segments(2..4).await.unwrap();
 
-        // then - only segment 1 matches
+        // then - only segment 2 matches
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].id, 1);
+        assert_eq!(segments[0].id, 2);
         assert_eq!(segments[0].start_seq, 2);
     }
 
@@ -1768,8 +1794,8 @@ mod tests {
 
         // then
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id, 0);
-        assert_eq!(segments[1].id, 1);
+        assert_eq!(segments[0].id, 1);
+        assert_eq!(segments[1].id, 2);
     }
 
     #[tokio::test]
@@ -1927,7 +1953,7 @@ mod tests {
         // when/then - reads see unflushed data via sync_to_flushed
         let segments = log.list_segments(..).await.unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].id, 0);
+        assert_eq!(segments[0].id, 1);
         assert_eq!(segments[0].start_seq, 0);
     }
 
@@ -2103,6 +2129,7 @@ mod tests {
                 seal_interval: Some(Duration::from_nanos(1)),
             },
             ReadVisibility::Memory,
+            Arc::new(SystemClock),
         )
         .await
         .unwrap();

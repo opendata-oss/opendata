@@ -521,26 +521,26 @@ mod tests {
         let (writer, mut handle, storage) = create_writer().await;
         let _task = handle.spawn(writer);
 
-        // Append something to create segment 0
+        // Append something to create the first user segment (id 1)
         handle
             .try_append(make_write(&["key1"], 1000))
             .await
             .unwrap();
         assert_eq!(handle.written_epoch(), 1);
 
-        // Force seal — should create segment 1
+        // Force seal — should create segment 2
         handle.force_seal(2000).await.unwrap();
         assert_eq!(handle.written_epoch(), 2);
 
-        // Verify two segments exist in storage
+        // Verify two user segments exist in storage
         handle.flush().await.unwrap();
         use crate::storage::LogStorageRead as _;
-        let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
+        let segments = storage.scan_segments(1..u32::MAX).await.unwrap();
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
+        assert_eq!(segments[0].id(), 1);
+        assert_eq!(segments[1].id(), 2);
 
-        // Subsequent append goes to segment 1
+        // Subsequent append goes to segment 2
         let result = handle
             .try_append(make_write(&["key2"], 3000))
             .await
@@ -562,7 +562,7 @@ mod tests {
 
         // Verify entries are readable from storage
         use crate::storage::LogStorageRead as _;
-        let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
+        let segments = storage.scan_segments(1..u32::MAX).await.unwrap();
         assert_eq!(segments.len(), 1);
 
         let key = Bytes::from("mykey");
