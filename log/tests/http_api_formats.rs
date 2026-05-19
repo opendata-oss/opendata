@@ -257,8 +257,8 @@ async fn test_list_segments_json_response() {
     let segments = json["segments"].as_array().unwrap();
     assert_eq!(segments.len(), 1);
 
-    // Check camelCase field names
-    assert_eq!(segments[0]["id"], 0);
+    // Check camelCase field names — first user segment is id 1 (id 0 is reserved system segment)
+    assert_eq!(segments[0]["id"], 1);
     assert_eq!(segments[0]["startSeq"], 0);
     assert!(segments[0]["startTimeMs"].as_i64().unwrap() > 0);
 }
@@ -492,7 +492,8 @@ async fn test_list_segments_protobuf_response() {
 
     assert_eq!(proto_response.status, "success");
     assert_eq!(proto_response.segments.len(), 1);
-    assert_eq!(proto_response.segments[0].id, 0);
+    // First user segment is id 1; id 0 is the reserved system segment.
+    assert_eq!(proto_response.segments[0].id, 1);
     assert_eq!(proto_response.segments[0].start_seq, 0);
     assert!(proto_response.segments[0].start_time_ms > 0);
 }

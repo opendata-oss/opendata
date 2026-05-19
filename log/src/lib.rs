@@ -55,6 +55,7 @@ mod model;
 mod range;
 mod reader;
 mod segment;
+mod segment_extractor;
 mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;

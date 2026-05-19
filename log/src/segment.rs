@@ -14,7 +14,7 @@ use crate::config::SegmentConfig;
 use crate::error::Result;
 use crate::model::Segment;
 use crate::model::SegmentId;
-use crate::serde::{SegmentMeta, SegmentMetaKey};
+use crate::serde::{FIRST_USER_SEGMENT_ID, SegmentMeta, SegmentMetaKey};
 use crate::storage::LogStorageRead as _;
 use common::storage::PutOptions;
 use common::{PutRecordOp, Record, StorageRead, Ttl};
@@ -84,7 +84,9 @@ pub(crate) struct SegmentCache {
 impl SegmentCache {
     /// Creates a new cache by loading all segments from storage.
     pub(crate) async fn open(storage: &dyn StorageRead, config: SegmentConfig) -> Result<Self> {
-        let loaded = storage.scan_segments(0..u32::MAX).await?;
+        let loaded = storage
+            .scan_segments(FIRST_USER_SEGMENT_ID..SegmentId::MAX)
+            .await?;
 
         let mut segments = BTreeMap::new();
         for segment in loaded {
@@ -153,14 +155,11 @@ impl SegmentCache {
         storage: &dyn StorageRead,
         after_segment_id: Option<SegmentId>,
     ) -> Result<()> {
-        let loaded = match after_segment_id {
-            Some(id) => {
-                storage
-                    .scan_segments(id.saturating_add(1)..u32::MAX)
-                    .await?
-            }
-            None => storage.scan_segments(0..u32::MAX).await?,
+        let scan_start = match after_segment_id {
+            Some(id) => id.saturating_add(1).max(FIRST_USER_SEGMENT_ID),
+            None => FIRST_USER_SEGMENT_ID,
         };
+        let loaded = storage.scan_segments(scan_start..SegmentId::MAX).await?;
 
         if after_segment_id.is_none() {
             self.segments.clear();
@@ -190,7 +189,7 @@ impl SegmentCache {
             || Self::should_roll(self.config.seal_interval, current_time_ms, latest.as_ref());
 
         if needs_new_segment {
-            let segment_id = latest.map(|s| s.id + 1).unwrap_or(0);
+            let segment_id = latest.map(|s| s.id + 1).unwrap_or(FIRST_USER_SEGMENT_ID);
             let meta = SegmentMeta::new(start_seq, current_time_ms);
             let key = SegmentMetaKey::new(segment_id).serialize();
             let value = meta.serialize();
@@ -243,7 +242,8 @@ mod tests {
     use common::Storage;
     use opendata_macros::storage_test;
 
-    // Helper to create a segment and write it to storage + cache
+    // Helper to create a segment and write it to storage + cache. Segment ids
+    // start at [`FIRST_USER_SEGMENT_ID`] (1) — segment 0 is the system segment.
     async fn write_segment(
         storage: &dyn common::Storage,
         cache: &mut SegmentCache,
@@ -251,7 +251,7 @@ mod tests {
     ) -> LogSegment {
         let segment_id = match cache.latest() {
             Some(latest) => latest.id + 1,
-            None => 0,
+            None => FIRST_USER_SEGMENT_ID,
         };
         let segment = LogSegment::new(segment_id, meta);
         storage.write_segment(&segment).await.unwrap();
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[storage_test]
-    async fn should_write_first_segment_with_id_zero(storage: Arc<dyn Storage>) {
+    async fn should_write_first_segment_with_first_user_id(storage: Arc<dyn Storage>) {
         // given
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
@@ -284,8 +284,8 @@ mod tests {
         // when
         let segment = write_segment(storage.as_ref(), &mut cache, meta.clone()).await;
 
-        // then
-        assert_eq!(segment.id(), 0);
+        // then — segment 0 is reserved (system), first user segment is 1
+        assert_eq!(segment.id(), FIRST_USER_SEGMENT_ID);
         assert_eq!(segment.meta(), &meta);
     }
 
@@ -297,14 +297,14 @@ mod tests {
             .unwrap();
 
         // when
-        let seg0 = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
-        let seg1 = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
-        let seg2 = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
+        let seg_a = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        let seg_b = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        let seg_c = write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
         // then
-        assert_eq!(seg0.id(), 0);
-        assert_eq!(seg1.id(), 1);
-        assert_eq!(seg2.id(), 2);
+        assert_eq!(seg_a.id(), 1);
+        assert_eq!(seg_b.id(), 2);
+        assert_eq!(seg_c.id(), 3);
     }
 
     #[storage_test]
@@ -320,7 +320,7 @@ mod tests {
         let latest = cache.latest();
 
         // then
-        assert_eq!(latest.unwrap().id(), 1);
+        assert_eq!(latest.unwrap().id(), 2);
     }
 
     #[storage_test]
@@ -338,9 +338,9 @@ mod tests {
 
         // then
         assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
-        assert_eq!(segments[2].id(), 2);
+        assert_eq!(segments[0].id(), 1);
+        assert_eq!(segments[1].id(), 2);
+        assert_eq!(segments[2].id(), 3);
     }
 
     #[storage_test]
@@ -360,9 +360,9 @@ mod tests {
 
         // then
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id(), 0);
+        assert_eq!(segments[0].id(), 1);
         assert_eq!(segments[0].meta().start_seq, 0);
-        assert_eq!(segments[1].id(), 1);
+        assert_eq!(segments[1].id(), 2);
         assert_eq!(segments[1].meta().start_seq, 100);
     }
 
@@ -385,7 +385,7 @@ mod tests {
 
     #[storage_test]
     async fn should_find_segments_by_seq_range_single(storage: Arc<dyn Storage>) {
-        // given: segments at seq 0, 100, 200
+        // given: segments at seq 0, 100, 200 (ids 1, 2, 3)
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -398,12 +398,12 @@ mod tests {
 
         // then: only first segment matches
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].id(), 0);
+        assert_eq!(segments[0].id(), 1);
     }
 
     #[storage_test]
     async fn should_find_segments_by_seq_range_spanning(storage: Arc<dyn Storage>) {
-        // given: segments at seq 0, 100, 200
+        // given: segments at seq 0, 100, 200 (ids 1, 2, 3)
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -416,13 +416,13 @@ mod tests {
 
         // then: first two segments match
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
+        assert_eq!(segments[0].id(), 1);
+        assert_eq!(segments[1].id(), 2);
     }
 
     #[storage_test]
     async fn should_find_segments_by_seq_range_unbounded_end(storage: Arc<dyn Storage>) {
-        // given: segments at seq 0, 100, 200
+        // given: segments at seq 0, 100, 200 (ids 1, 2, 3)
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -435,8 +435,8 @@ mod tests {
 
         // then: second and third segments match
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id(), 1);
-        assert_eq!(segments[1].id(), 2);
+        assert_eq!(segments[0].id(), 2);
+        assert_eq!(segments[1].id(), 3);
     }
 
     #[storage_test]
@@ -470,7 +470,7 @@ mod tests {
 
     #[storage_test]
     async fn should_find_last_segment_when_range_after_all(storage: Arc<dyn Storage>) {
-        // given: segments at seq 0, 100, 200
+        // given: segments at seq 0, 100, 200 (ids 1, 2, 3)
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -483,12 +483,12 @@ mod tests {
 
         // then: last segment matches (it could contain seqs 200+)
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].id(), 2);
+        assert_eq!(segments[0].id(), 3);
     }
 
     #[storage_test]
     async fn should_find_segment_when_query_starts_at_boundary(storage: Arc<dyn Storage>) {
-        // given: segments at seq 0, 100, 200
+        // given: segments at seq 0, 100, 200 (ids 1, 2, 3)
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -501,12 +501,12 @@ mod tests {
 
         // then: only the segment starting at 100 matches
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].id(), 1);
+        assert_eq!(segments[0].id(), 2);
     }
 
     #[storage_test]
     async fn should_find_segments_with_unbounded_start(storage: Arc<dyn Storage>) {
-        // given: segments at seq 0, 100, 200
+        // given: segments at seq 0, 100, 200 (ids 1, 2, 3)
         let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
@@ -519,8 +519,8 @@ mod tests {
 
         // then: first two segments match
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
+        assert_eq!(segments[0].id(), 1);
+        assert_eq!(segments[1].id(), 2);
     }
 
     #[tokio::test]
@@ -548,7 +548,7 @@ mod tests {
     async fn should_roll_returns_false_when_within_interval() {
         // given: segment created at time 1000, seal interval 1 hour
         let seal_interval = Some(Duration::from_secs(3600));
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
 
         // when: current time is 1000 + 30 minutes
         let current_time_ms = 1000 + 30 * 60 * 1000;
@@ -562,7 +562,7 @@ mod tests {
     async fn should_roll_returns_true_when_interval_exceeded() {
         // given: segment created at time 1000, seal interval 1 hour
         let seal_interval = Some(Duration::from_secs(3600));
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
 
         // when: current time is 1000 + 2 hours
         let current_time_ms = 1000 + 2 * 60 * 60 * 1000;
@@ -576,7 +576,7 @@ mod tests {
     async fn should_roll_returns_true_when_exactly_at_interval() {
         // given: segment created at time 1000, seal interval 1 hour
         let seal_interval = Some(Duration::from_secs(3600));
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
 
         // when: current time is exactly at the interval boundary
         let current_time_ms = 1000 + 60 * 60 * 1000;
@@ -589,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn should_roll_returns_false_without_seal_interval_when_segment_exists() {
         // given: no seal interval, segment exists
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
 
         // when
         let should_roll = SegmentCache::should_roll(None, 999999999, Some(&segment));
@@ -609,14 +609,14 @@ mod tests {
         // when
         let assignment = cache.assign_segment(1000, 0, &mut records, false);
 
-        // then
+        // then — first user segment is FIRST_USER_SEGMENT_ID (1), not 0
         assert!(assignment.is_new);
-        assert_eq!(assignment.segment.id(), 0);
+        assert_eq!(assignment.segment.id(), FIRST_USER_SEGMENT_ID);
         assert_eq!(assignment.segment.meta().start_seq, 0);
         assert_eq!(assignment.segment.meta().start_time_ms, 1000);
         assert_eq!(records.len(), 1); // segment meta record added
         // cache is updated
-        assert_eq!(cache.latest().unwrap().id(), 0);
+        assert_eq!(cache.latest().unwrap().id(), FIRST_USER_SEGMENT_ID);
     }
 
     #[storage_test]
@@ -637,7 +637,7 @@ mod tests {
 
         // then: returns existing segment, no new record
         assert!(!assignment.is_new);
-        assert_eq!(assignment.segment.id(), 0);
+        assert_eq!(assignment.segment.id(), FIRST_USER_SEGMENT_ID);
         assert_eq!(records.len(), 0);
         // still only one segment in cache
         assert_eq!(cache.all().len(), 1);
@@ -659,7 +659,7 @@ mod tests {
 
         // then: creates new segment and updates cache
         assert!(assignment.is_new);
-        assert_eq!(assignment.segment.id(), 1);
+        assert_eq!(assignment.segment.id(), FIRST_USER_SEGMENT_ID + 1);
         assert_eq!(assignment.segment.meta().start_seq, 100);
         assert_eq!(records.len(), 1);
         assert_eq!(cache.all().len(), 2);
@@ -681,7 +681,7 @@ mod tests {
 
         // then: new segment created despite being within interval
         assert!(assignment.is_new);
-        assert_eq!(assignment.segment.id(), 1);
+        assert_eq!(assignment.segment.id(), FIRST_USER_SEGMENT_ID + 1);
         assert_eq!(cache.all().len(), 2);
     }
 
@@ -724,8 +724,8 @@ mod tests {
 
         fresh.refresh(storage.as_ref(), None).await.unwrap();
         assert_eq!(fresh.all().len(), 2);
-        assert_eq!(fresh.all()[0].id(), 0);
-        assert_eq!(fresh.all()[1].id(), 1);
+        assert_eq!(fresh.all()[0].id(), 1);
+        assert_eq!(fresh.all()[1].id(), 2);
     }
 
     #[storage_test]
@@ -737,21 +737,21 @@ mod tests {
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
 
-        // Start a cache that only knows about segment 0
+        // Start a cache that only knows about segment 1 (the first user segment)
         let mut partial = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
             .await
             .unwrap();
-        partial.segments.retain(|_, seg| seg.id() == 0);
+        partial.segments.retain(|_, seg| seg.id() == 1);
         assert_eq!(partial.all().len(), 1);
 
-        // Refresh loading only segments after id 0
-        partial.refresh(storage.as_ref(), Some(0)).await.unwrap();
+        // Refresh loading only segments after id 1
+        partial.refresh(storage.as_ref(), Some(1)).await.unwrap();
 
         // Should now have all 3 segments
         assert_eq!(partial.all().len(), 3);
-        assert_eq!(partial.all()[0].id(), 0);
-        assert_eq!(partial.all()[1].id(), 1);
-        assert_eq!(partial.all()[2].id(), 2);
+        assert_eq!(partial.all()[0].id(), 1);
+        assert_eq!(partial.all()[1].id(), 2);
+        assert_eq!(partial.all()[2].id(), 3);
     }
 
     #[storage_test]
@@ -763,7 +763,7 @@ mod tests {
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
 
         // Refresh after the latest segment — nothing new
-        cache.refresh(storage.as_ref(), Some(1)).await.unwrap();
+        cache.refresh(storage.as_ref(), Some(2)).await.unwrap();
         assert_eq!(cache.all().len(), 2);
     }
 
@@ -781,7 +781,7 @@ mod tests {
         // Full refresh should clear the bogus entry
         cache.refresh(storage.as_ref(), None).await.unwrap();
         assert_eq!(cache.all().len(), 1);
-        assert_eq!(cache.all()[0].id(), 0);
+        assert_eq!(cache.all()[0].id(), 1);
     }
 
     #[storage_test]
@@ -796,7 +796,7 @@ mod tests {
         cache.insert(LogSegment::new(99, SegmentMeta::new(9999, 9999)));
         assert_eq!(cache.all().len(), 3);
 
-        cache.refresh(storage.as_ref(), Some(1)).await.unwrap();
+        cache.refresh(storage.as_ref(), Some(2)).await.unwrap();
         // Bogus entry persists because incremental refresh only appends
         assert_eq!(cache.all().len(), 3);
     }
