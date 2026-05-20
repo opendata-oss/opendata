@@ -255,16 +255,123 @@ Notes:
 
 ### Cohere1M
 
-1M vectors, 768 dimensions, cosine distance. Uses Cohere's `embed-english-v3.0` embeddings from
-the [Cohere Wikipedia dataset](https://huggingface.co/datasets/Cohere/wikipedia-2023-11-embed-multilingual-v3).
+1M vectors, 768 dimensions, cosine distance. Cohere Wikipedia embeddings, distributed as a
+pre-converted parquet snapshot by [VectorDBBench](https://github.com/zilliztech/VectorDBBench)
+at `s3://assets.zilliz.com/benchmark/cohere_medium_1m/`. The snapshot ships its own ground
+truth, so no brute-force step is needed locally.
+
+Expected layout:
+
+```text
+$DATA_ROOT/cohere/
+├── cohere_base.fvecs        (1M x 768 float32, ~3 GB)
+├── cohere_query.fvecs       (~1K x 768 float32, ~3 MB)
+└── cohere_groundtruth.ivecs (~1K x 100 int32)
+```
+
+#### Copy-paste setup
+
+The bucket is public — `aws s3 cp --no-sign-request` works without AWS credentials. The
+parquet files store neighbour pointers as the parquet's `id` column, but the bench keys
+vectors by their row index in `cohere_base.fvecs`, so the conversion below remaps each
+neighbour `id` to a row index before writing ground truth.
 
 ```bash
 DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
-mkdir -p "$DATA_ROOT/cohere"
-# Download and convert the dataset to fvecs format under "$DATA_ROOT/cohere":
-#   cohere_base.fvecs        — 1M base vectors
-#   cohere_query.fvecs       — query vectors
-#   cohere_groundtruth.ivecs — ground truth nearest neighbors
+mkdir -p "$DATA_ROOT/cohere/.parquet"
+
+python3 -m venv .venv-cohere
+source .venv-cohere/bin/activate
+pip install -U pip
+pip install pyarrow numpy
+
+# Download the three parquet shards (~3 GB total). Requires the AWS CLI.
+for f in train.parquet test.parquet neighbors.parquet; do
+  dest="$DATA_ROOT/cohere/.parquet/$f"
+  if [ -f "$dest" ]; then
+    echo "  $f already present, skipping"
+    continue
+  fi
+  aws s3 cp \
+    "s3://assets.zilliz.com/benchmark/cohere_medium_1m/$f" \
+    "$dest" \
+    --region us-west-2 --no-sign-request
+done
+
+DATA_ROOT="$DATA_ROOT" python3 - <<'PY'
+import os
+import struct
+from pathlib import Path
+import numpy as np
+import pyarrow.parquet as pq
+
+OUT = Path(os.environ["DATA_ROOT"]) / "cohere"
+SRC = OUT / ".parquet"
+
+
+def write_fvecs(path, rows):
+    with open(path, "wb") as f:
+        for vec in rows:
+            f.write(struct.pack("<i", len(vec)))
+            f.write(np.asarray(vec, dtype=np.float32).tobytes())
+
+
+def write_ivecs(path, rows):
+    with open(path, "wb") as f:
+        for vec in rows:
+            f.write(struct.pack("<i", len(vec)))
+            f.write(np.asarray(vec, dtype=np.int32).tobytes())
+
+
+# Base vectors. Remember the parquet `id` -> row-index mapping so we can
+# rewrite ground-truth neighbours below.
+train = pq.read_table(SRC / "train.parquet")
+ids = train.column("id").to_pylist()
+id_to_idx = {v: i for i, v in enumerate(ids)}
+embs = train.column("emb")
+print(f"Converting {len(embs)} base vectors -> cohere_base.fvecs")
+write_fvecs(
+    OUT / "cohere_base.fvecs",
+    (embs[i].as_py() for i in range(len(embs))),
+)
+
+# Query vectors.
+test = pq.read_table(SRC / "test.parquet")
+q_embs = test.column("emb")
+print(f"Converting {len(q_embs)} query vectors -> cohere_query.fvecs")
+write_fvecs(
+    OUT / "cohere_query.fvecs",
+    (q_embs[i].as_py() for i in range(len(q_embs))),
+)
+
+# Ground truth — parquet stores neighbour `id` values; remap to row indices.
+neighbors = pq.read_table(SRC / "neighbors.parquet").column("neighbors_id")
+K = 100
+print(f"Converting {len(neighbors)} ground-truth rows (k={K}) -> cohere_groundtruth.ivecs")
+write_ivecs(
+    OUT / "cohere_groundtruth.ivecs",
+    (
+        [id_to_idx[nid] for nid in neighbors[i].as_py()[:K]]
+        for i in range(len(neighbors))
+    ),
+)
+PY
+
+ls -lh "$DATA_ROOT/cohere"
+```
+
+The `.parquet/` cache directory can be deleted once the conversion finishes; the bench only
+reads the three top-level `.fvecs` / `.ivecs` files.
+
+If you've already run `vector/tests/data/cohere/download_and_convert.py` for the integration
+tests, you can skip the steps above and just copy the resulting `cohere_*.{fvecs,ivecs}` into
+`$DATA_ROOT/cohere/`.
+
+#### Run the benchmark
+
+```toml
+[[params.recall]]
+dataset = "cohere1m"
 ```
 
 ### Cohere Wikipedia 10M
