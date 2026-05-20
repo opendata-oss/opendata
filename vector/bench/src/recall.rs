@@ -28,6 +28,9 @@ use tokio::sync::mpsc;
 use vector::{Config, DistanceMetric, ReaderConfig, VectorDb};
 
 const DEFAULT_NUM_QUERIES: usize = 100;
+/// Default number of queries to run during the cold phase. Queries are
+/// cycled if the dataset has fewer loaded queries than this.
+const DEFAULT_NUM_COLD_QUERIES: usize = 1000;
 /// Default number of concurrent queries during the warm query phase.
 const DEFAULT_QUERY_CONCURRENCY: usize = 1;
 /// Default ceiling on queries-per-second during the warm query phase.
@@ -321,6 +324,10 @@ pub(crate) struct Dataset {
     pub query_pruning_factor: Option<f32>,
     pub nprobe: usize,
     pub num_queries: usize,
+    /// Number of queries to run during the cold phase. Defaults to
+    /// [`DEFAULT_NUM_COLD_QUERIES`]. Queries are cycled when this exceeds
+    /// the number of loaded queries.
+    pub num_cold_queries: usize,
     /// In-memory block-cache size in bytes. `None` disables the block
     /// cache entirely. When `Some` and [`block_cache_disk_bytes`] is
     /// `None`, this controls the capacity of a memory-only foyer cache.
@@ -521,6 +528,7 @@ impl From<&Dataset> for Params {
         p.insert("merge_threshold", d.merge_threshold.to_string());
         p.insert("nprobe", d.nprobe.to_string());
         p.insert("num_queries", d.num_queries.to_string());
+        p.insert("num_cold_queries", d.num_cold_queries.to_string());
         p.insert("query_concurrency", d.query_concurrency.to_string());
         p.insert("query_qps_limit", d.query_qps_limit.to_string());
         p.insert("format", format_to_str(d.format));
@@ -615,6 +623,9 @@ impl From<Params> for Dataset {
             query_pruning_factor,
             nprobe: p.get_parse("nprobe").unwrap_or(default.nprobe),
             num_queries: p.get_parse("num_queries").unwrap_or(default.num_queries),
+            num_cold_queries: p
+                .get_parse("num_cold_queries")
+                .unwrap_or(default.num_cold_queries),
             query_concurrency: p
                 .get_parse("query_concurrency")
                 .unwrap_or(default.query_concurrency),
@@ -656,6 +667,7 @@ const SIFT1M: Dataset = Dataset {
     nprobe: 15,
     query_pruning_factor: Some(7.0),
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: Some(1073741824),
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -690,6 +702,7 @@ const SIFT100K: Dataset = Dataset {
     nprobe: 15,
     query_pruning_factor: Some(7.0),
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -716,6 +729,7 @@ const COHERE1M: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -742,6 +756,7 @@ const DEEP10M: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -768,6 +783,7 @@ const DEEP1B: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -794,6 +810,7 @@ const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -820,6 +837,7 @@ const COHERE_WIKI_10M: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: 1000,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -849,6 +867,7 @@ const SIFT10M: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -875,6 +894,7 @@ const SIFT50M: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -901,6 +921,7 @@ const SIFT100M: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
@@ -927,6 +948,7 @@ const SIFT1B: Dataset = Dataset {
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
     block_cache_disk_bytes: None,
     block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,

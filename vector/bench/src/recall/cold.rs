@@ -1,15 +1,16 @@
 //! COLD phase: measure query latency against repeatedly re-opened
 //! `VectorDbReader`s with empty caches.
 //!
-//! Runs [`COLD_NUM_QUERIES`] queries in groups of [`COLD_QUERIES_PER_READER`].
-//! Each group opens a fresh `VectorDbReader` with a freshly allocated
-//! **memory-only** block cache so the first query in every group pays the
-//! full open + cold-cache cost, and later queries in the group see whatever
-//! the first few queries warmed up. A disk tier would persist across the
-//! per-group reader teardown and defeat the cold measurement, so the cold
-//! phase always forces a memory-only cache regardless of the dataset's
-//! `block_cache_disk_bytes` setting. If the dataset has fewer loaded
-//! queries than `COLD_NUM_QUERIES`, queries are cycled.
+//! Runs [`Dataset::num_cold_queries`] queries in groups of
+//! [`COLD_QUERIES_PER_READER`]. Each group opens a fresh `VectorDbReader`
+//! with a freshly allocated **memory-only** block cache so the first
+//! query in every group pays the full open + cold-cache cost, and later
+//! queries in the group see whatever the first few queries warmed up. A
+//! disk tier would persist across the per-group reader teardown and
+//! defeat the cold measurement, so the cold phase always forces a
+//! memory-only cache regardless of the dataset's `block_cache_disk_bytes`
+//! setting. If the dataset has fewer loaded queries than
+//! `num_cold_queries`, queries are cycled.
 
 use std::time::Instant;
 
@@ -18,8 +19,6 @@ use vector::{Query, ReaderConfig, SearchOptions, VectorDbRead, VectorDbReader};
 
 use crate::recall::{Dataset, build_cold_reader_runtime, percentile};
 
-/// Total number of queries to run during the cold phase.
-const COLD_NUM_QUERIES: usize = 1000;
 /// Number of queries per fresh reader. After this many queries, the reader
 /// is dropped and re-opened with a fresh cache.
 const COLD_QUERIES_PER_READER: usize = 10;
@@ -42,19 +41,20 @@ pub async fn run(
         anyhow::bail!("cold phase requires at least one query vector");
     }
 
+    let num_cold_queries = dataset.num_cold_queries;
     println!("start cold reader phase");
     println!(
         "  running {} queries in groups of {} (reader re-opened between groups to clear cache)",
-        COLD_NUM_QUERIES, COLD_QUERIES_PER_READER
+        num_cold_queries, COLD_QUERIES_PER_READER
     );
 
     let cold_query_latency = bench.histogram("cold_query_latency_us");
-    let mut latencies_us = Vec::with_capacity(COLD_NUM_QUERIES);
+    let mut latencies_us = Vec::with_capacity(num_cold_queries);
 
     // Cycle through loaded queries if the dataset has fewer than
-    // COLD_NUM_QUERIES (e.g. sift100k loads 100, we want 1000).
+    // `num_cold_queries` (e.g. sift100k loads 100, default cold count is 1000).
     let mut query_iter = queries.iter().cycle();
-    let mut remaining = COLD_NUM_QUERIES;
+    let mut remaining = num_cold_queries;
 
     while remaining > 0 {
         // Fresh runtime → fresh (memory-only) block cache for this group.
@@ -84,6 +84,7 @@ pub async fn run(
         drop(reader);
         if let Some(cache) = cache {
             cache.close().await?;
+            drop(cache);
         }
     }
 

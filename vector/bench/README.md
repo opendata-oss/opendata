@@ -454,7 +454,8 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 | `split_threshold`   | usize  | Centroid split threshold (default: from dataset)                   |
 | `merge_threshold`   | usize  | Centroid merge threshold (default: from dataset)                   |
 | `nprobe`            | usize  | Number of centroids to probe at query time (default: from dataset) |
-| `num_queries`       | usize  | Number of queries to run (default: 100)                            |
+| `num_queries`       | usize  | Number of queries to run in the warm phase (default: 100)          |
+| `num_cold_queries`  | usize  | Number of queries to run in the cold phase (default: 1000). Queries are cycled when this exceeds the number of loaded warm queries. |
 | `query_concurrency` | usize  | Concurrent in-flight queries during the warm query phase (default: 8) |
 | `query_qps_limit`   | usize  | Rate cap on warm-phase query submissions, in QPS (default: 32)     |
 | `block_cache_bytes` | u64    | In-memory block cache size in bytes. `None` (default) disables the cache. With only this set, the bench uses a memory-only foyer cache. |
