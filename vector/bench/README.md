@@ -13,6 +13,9 @@ Reported metrics:
 
 ## Running
 
+To run the benchmarks, first pull the datasets you wish to test. See the [Datasets](#datasets) 
+section below for details. Then, you can run the benchmarks using:
+
 ```bash
 # Run with default settings (in-memory storage, sift1M):
 cargo run -p vector-bench --release
@@ -24,34 +27,76 @@ cargo run -p vector-bench --release -- --config bench.toml
 cargo run -p vector-bench --release -- --no-cleanup
 ```
 
-### Skipping ingestion
+### Phases
 
-Set `VECTOR_BENCH_SKIP_INGEST=1` to skip the ingest phase and query an existing database. This requires persistent
-storage (SlateDB) so the database survives across runs, and `--no-cleanup` on the initial ingest run.
+The benchmark runs as an ordered sequence of phases:
+
+- **`INGEST`** — opens a `VectorDb` and writes the dataset's base vectors.
+- **`COLD`** — repeatedly opens a `VectorDbReader` with an empty block cache and measures
+  cold-start query latency. Runs 1,000 queries in groups of 10; the reader is re-opened between
+  groups so the first query in each group pays the full cold-cache cost.
+- **`WARM`** — opens a `VectorDb`, runs a warmup pass over the queries, then runs the
+  rate-limited concurrent query workload that produces the headline recall@k and latency metrics.
+
+Phases are configured per-dataset and default to `INGEST,COLD,WARM`. Override the list in
+the bench config via the `phases` parameter (comma-separated, in execution order):
+
+```toml
+# Query-only re-run against an already-ingested database
+[[params.recall]]
+dataset = "sift1m"
+phases = "COLD,WARM"
+```
+
+Skipping `INGEST` requires persistent storage (SlateDB) and `--no-cleanup` on the initial ingest
+run so the database survives across invocations:
 
 ```bash
 # First run: ingest and keep the data
 cargo run -p vector-bench --release -- --config bench.toml --no-cleanup
 
-# Subsequent runs: query only
-VECTOR_BENCH_SKIP_INGEST=1 cargo run -p vector-bench --release -- --config bench.toml --no-cleanup
+# Subsequent runs: query only (set phases = "COLD,WARM" in bench.toml)
+cargo run -p vector-bench --release -- --config bench.toml --no-cleanup
 ```
 
 ## Datasets
 
-By default, the benchmark looks for dataset files under a data directory resolved from the crate's manifest path (
-`vector/bench/data/`). This can be overridden per-dataset with the `data_dir` parameter in the config file.
+### Conventions
+
+All dataset setup snippets below resolve their output location from a shell variable named
+`DATA_ROOT`, which defaults to `vector/bench/data` (the path the benchmark uses when no
+`data_dir` is set in the bench config). To stage data somewhere else — say, a large external
+disk — export `DATA_ROOT` before running the snippet and point the bench at it from your config:
+
+```bash
+export DATA_ROOT=/mnt/nvme/vector-bench-data
+```
+
+```toml
+[[params.recall]]
+dataset = "sift1m"
+data_dir = "/mnt/nvme/vector-bench-data"
+```
+
+The bench resolves each dataset's files relative to `data_dir/<dataset-subdir>/` (e.g.
+`data_dir/sift/sift_base.fvecs`, `data_dir/bigann/bigann_base.bvecs`). Snippets always pass
+`-L` to `curl` and use absolute output paths so they work from any working directory.
+
+The bundled `sift100k` smoke-test dataset is an exception: its files ship in the repo at
+`vector/tests/data/sift100k/` and the dataset definition pins absolute paths at compile time,
+so it ignores `data_dir` / `DATA_ROOT`. See [`sift100k.toml`](sift100k.toml) for a ready-to-run
+config.
 
 ### SIFT1M
 
 1M vectors, 128 dimensions, L2 distance. From the [ANN Benchmarks SIFT1M dataset](http://corpus-texmex.irisa.fr/).
 
 ```bash
-mkdir -p vector/bench/data/sift
-cd vector/bench/data/sift
-wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
-tar xzf sift.tar.gz --strip-components=1
-# Expected files: sift_base.fvecs, sift_query.fvecs, sift_groundtruth.ivecs
+DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
+mkdir -p "$DATA_ROOT/sift"
+curl -L ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz \
+  | tar xz -C "$DATA_ROOT/sift" --strip-components=1
+# Expected files: $DATA_ROOT/sift/{sift_base.fvecs,sift_query.fvecs,sift_groundtruth.ivecs}
 ```
 
 ### SIFT10M, SIFT50M, SIFT100M, and SIFT1B
@@ -79,7 +124,7 @@ it to `bvecs` in one step.
 Expected layout:
 
 ```text
-vector/bench/data/bigann/
+$DATA_ROOT/bigann/
 ├── bigann_base.bvecs
 ├── bigann_query.bvecs
 ├── bigann_groundtruth_10M.ivecs
@@ -91,10 +136,6 @@ vector/bench/data/bigann/
 The original IRISA FTP mirror (`ftp.irisa.fr`) is frequently unreachable. The instructions below use the Facebook
 `big-ann-benchmarks` mirror over HTTPS instead. That mirror publishes vectors as `u8bin` and ground truth as the
 big-ann `.bin` format, so a short conversion step turns them into the `bvecs` / `ivecs` layout the benchmark reads.
-
-Run these commands from the **workspace root**. If you want the data somewhere other than `vector/bench/data/`
-(e.g. a large external disk), set `DATA_ROOT` to the parent directory and pass `data_dir = "$DATA_ROOT"` in your
-bench config — the benchmark resolves dataset files relative to `data_dir/bigann/`.
 
 ```bash
 DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
@@ -217,10 +258,10 @@ Notes:
 96 dimensions, L2 distance, `fvecs` format. These benchmark entries expect local DEEP vectors converted into the same
 `fvecs` / `ivecs` file layout as the other benchmarks.
 
-Create this directory layout under `vector/bench/data/deep/`:
+Expected layout:
 
 ```text
-vector/bench/data/deep/
+$DATA_ROOT/deep/
 ├── deep_base.fvecs
 ├── deep_query.fvecs
 ├── deep_groundtruth_10M.ivecs
@@ -243,8 +284,6 @@ The benchmark expects **all vectors in `fvecs` format** and **ground truth in `i
 
 #### Copy-paste setup for `deep10m`
 
-Run these commands from the **workspace root**. Do not `cd` into `vector/bench/data/deep` first.
-
 This setup intentionally uses:
 
 - `base.10M.fbin` from Yandex for the base vectors
@@ -254,19 +293,21 @@ This setup intentionally uses:
 That avoids relying on a questionable prepublished `deep10m` ground-truth pairing.
 
 ```bash
-mkdir -p vector/bench/data/deep
+DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
+mkdir -p "$DATA_ROOT/deep"
 
-curl -L -o vector/bench/data/deep/base.10M.fbin \
+curl -L -o "$DATA_ROOT/deep/base.10M.fbin" \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.10M.fbin
 
-curl -L -o vector/bench/data/deep/query.public.10K.fbin \
+curl -L -o "$DATA_ROOT/deep/query.public.10K.fbin" \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin
 
-python3 - <<'PY'
+DATA_ROOT="$DATA_ROOT" python3 - <<'PY'
+import os
 from pathlib import Path
 import numpy as np
 
-root = Path("vector/bench/data/deep")
+root = Path(os.environ["DATA_ROOT"]) / "deep"
 
 def fbin_to_fvecs(src: Path, dst: Path) -> None:
     with src.open("rb") as f:
@@ -291,13 +332,13 @@ fbin_to_fvecs(root / "query.public.10K.fbin", root / "deep_query.fvecs")
 PY
 
 cargo run -p opendata-vector --release --bin gen_deep_groundtruth -- \
-  --base-fbin vector/bench/data/deep/base.10M.fbin \
-  --query-fbin vector/bench/data/deep/query.public.10K.fbin \
-  --output-ivecs vector/bench/data/deep/deep_groundtruth_10M.ivecs \
+  --base-fbin "$DATA_ROOT/deep/base.10M.fbin" \
+  --query-fbin "$DATA_ROOT/deep/query.public.10K.fbin" \
+  --output-ivecs "$DATA_ROOT/deep/deep_groundtruth_10M.ivecs" \
   --top-k 100 \
   --distance-metric l2
 
-ls -lh vector/bench/data/deep
+ls -lh "$DATA_ROOT/deep"
 ```
 
 Then run:
@@ -323,7 +364,7 @@ before ingestion starts.
 
 #### Copy-paste setup for `deep1b`
 
-Run these commands from the **workspace root**. `base.1B.fbin` alone is around 388 GB.
+`base.1B.fbin` alone is around 388 GB — point `DATA_ROOT` at a disk with room before running.
 
 This setup intentionally uses:
 
@@ -332,22 +373,24 @@ This setup intentionally uses:
 - `groundtruth.public.10K.ibin` from Yandex for the ground truth
 
 ```bash
-mkdir -p vector/bench/data/deep
+DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
+mkdir -p "$DATA_ROOT/deep"
 
-curl -L -o vector/bench/data/deep/base.1B.fbin \
+curl -L -o "$DATA_ROOT/deep/base.1B.fbin" \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/base.1B.fbin
 
-curl -L -o vector/bench/data/deep/query.public.10K.fbin \
+curl -L -o "$DATA_ROOT/deep/query.public.10K.fbin" \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/query.public.10K.fbin
 
-curl -L -o vector/bench/data/deep/groundtruth.public.10K.ibin \
+curl -L -o "$DATA_ROOT/deep/groundtruth.public.10K.ibin" \
   https://storage.yandexcloud.net/yandex-research/ann-datasets/DEEP/groundtruth.public.10K.ibin
 
-python3 - <<'PY'
+DATA_ROOT="$DATA_ROOT" python3 - <<'PY'
+import os
 from pathlib import Path
 import numpy as np
 
-root = Path("vector/bench/data/deep")
+root = Path(os.environ["DATA_ROOT"]) / "deep"
 
 def fbin_to_fvecs(src: Path, dst: Path) -> None:
     with src.open("rb") as f:
@@ -390,7 +433,7 @@ fbin_to_fvecs(root / "query.public.10K.fbin", root / "deep_query.fvecs")
 ibin_to_ivecs(root / "groundtruth.public.10K.ibin", root / "deep_groundtruth_1B.ivecs")
 PY
 
-ls -lh vector/bench/data/deep
+ls -lh "$DATA_ROOT/deep"
 ```
 
 #### Smaller DEEP subset for a quick smoke test
@@ -417,10 +460,10 @@ smoke-test-sized subset I found.
 
 The benchmark includes an English Wikipedia BGE-M3 dataset entry named `wikipedia_bge_m3_en`.
 
-Expected local layout:
+Expected layout:
 
 ```text
-vector/bench/data/wikipedia-bge-m3/en/
+$DATA_ROOT/wikipedia-bge-m3/en/
 ├── base.fvecs
 ├── query.fvecs
 └── groundtruth.ivecs
@@ -453,20 +496,23 @@ This example builds a runnable benchmark dataset from the first 1,000,000 Englis
 embeddings as queries.
 
 ```bash
+DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
+
 python3 -m venv .venv-vector-bench
 source .venv-vector-bench/bin/activate
 pip install -U pip
 pip install datasets numpy faiss-cpu
 
-mkdir -p vector/bench/data/wikipedia-bge-m3/en
+mkdir -p "$DATA_ROOT/wikipedia-bge-m3/en"
 
-python3 - <<'PY'
+DATA_ROOT="$DATA_ROOT" python3 - <<'PY'
+import os
 from pathlib import Path
 import numpy as np
 import faiss
 from datasets import load_dataset
 
-OUT = Path("vector/bench/data/wikipedia-bge-m3/en")
+OUT = Path(os.environ["DATA_ROOT"]) / "wikipedia-bge-m3" / "en"
 BASE_COUNT = 1_000_000
 QUERY_COUNT = 1_000
 TOPK = 100
@@ -547,10 +593,11 @@ dataset = "wikipedia_bge_m3_en"
 the [Cohere Wikipedia dataset](https://huggingface.co/datasets/Cohere/wikipedia-2023-11-embed-multilingual-v3).
 
 ```bash
-mkdir -p vector/bench/data/cohere
-# Download and convert the dataset to fvecs format:
-#   cohere_base.fvecs   — 1M base vectors
-#   cohere_query.fvecs  — query vectors
+DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
+mkdir -p "$DATA_ROOT/cohere"
+# Download and convert the dataset to fvecs format under "$DATA_ROOT/cohere":
+#   cohere_base.fvecs        — 1M base vectors
+#   cohere_query.fvecs       — query vectors
 #   cohere_groundtruth.ivecs — ground truth nearest neighbors
 ```
 
@@ -560,10 +607,10 @@ mkdir -p vector/bench/data/cohere
 the [Cohere Wikipedia dataset](https://huggingface.co/datasets/Cohere/wikipedia-2023-11-embed-multilingual-v3).
 This dataset mirrors the [turbopuffer vector-10m-hot benchmark](https://github.com/turbopuffer/tpuf-benchmark/blob/main/benchmarks/website/vector-10m-hot.toml).
 
-Expected local layout:
+Expected layout:
 
 ```text
-vector/bench/data/cohere-wiki/
+$DATA_ROOT/cohere-wiki/
 ├── base.fvecs         (10M x 1024 float32, ~41 GB)
 ├── query.fvecs        (1K x 1024 float32, ~4 MB)
 └── groundtruth.ivecs  (1K x 100 int32)
@@ -575,23 +622,16 @@ The download script streams the English split from HuggingFace, writes the first
 as base vectors and the next 1K as query vectors.
 
 ```bash
+DATA_ROOT="${DATA_ROOT:-vector/bench/data}"
+mkdir -p "$DATA_ROOT/cohere-wiki"
+
 python3 -m venv .venv-cohere-wiki
 source .venv-cohere-wiki/bin/activate
 pip install -U pip
 pip install datasets numpy
 
-python3 vector/bench/data/cohere-wiki/download.py
+python3 vector/bench/data/cohere-wiki/download.py --output-dir "$DATA_ROOT/cohere-wiki"
 ```
-
-By default, output is written next to the script (`vector/bench/data/cohere-wiki/`). Pass
-`--output-dir` to write somewhere else (useful for the ~41 GB base file):
-
-```bash
-python3 vector/bench/data/cohere-wiki/download.py --output-dir /mnt/data/cohere-wiki
-```
-
-When using a non-default directory, point the benchmark at it via the `data_dir` parameter
-(which should be the parent of `cohere-wiki/`, see Step 3).
 
 This takes a while (the base file is ~41 GB). Progress is printed every 1M vectors.
 
@@ -602,9 +642,9 @@ This streams the base vectors in chunks and uses all available cores.
 
 ```bash
 cargo run -p opendata-vector --release --bin gen_groundtruth -- \
-  --base-fvecs vector/bench/data/cohere-wiki/base.fvecs \
-  --query-fvecs vector/bench/data/cohere-wiki/query.fvecs \
-  --output-ivecs vector/bench/data/cohere-wiki/groundtruth.ivecs \
+  --base-fvecs "$DATA_ROOT/cohere-wiki/base.fvecs" \
+  --query-fvecs "$DATA_ROOT/cohere-wiki/query.fvecs" \
+  --output-ivecs "$DATA_ROOT/cohere-wiki/groundtruth.ivecs" \
   --top-k 100 \
   --distance-metric cosine
 ```
@@ -647,6 +687,7 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 | `block_cache_bytes` | u64    | Block cache size in bytes (default: none)                          |
 | `data_dir`          | string | Directory containing dataset files (default: `vector/bench/data/`) |
 | `vector_config`     | string | Path to a YAML file with vector `Config` overrides                 |
+| `phases`            | string | Comma-separated phases to run, in order (default: `INGEST,COLD,WARM`). Allowed values: `INGEST`, `COLD`, `WARM`. See [Phases](#phases). |
 
 ### Example: SlateDB with S3
 

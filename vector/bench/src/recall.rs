@@ -961,7 +961,6 @@ pub(crate) fn build_reader_runtime(
 ) -> anyhow::Result<StorageReaderRuntime> {
     let object_store = match &reader_config.storage {
         StorageConfig::SlateDb(slate_config) => {
-            println!("CREATE STATIC OBJECT STORE");
             Some(create_object_store(&slate_config.object_store)?)
         }
         _ => None,
@@ -976,7 +975,6 @@ pub(crate) fn build_reader_runtime(
             ..Default::default()
         });
         runtime = runtime.with_block_cache(Arc::new(cache));
-        println!("  Block cache: {} bytes", bytes);
     }
     Ok(runtime)
 }
