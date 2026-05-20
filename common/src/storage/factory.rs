@@ -192,6 +192,10 @@ impl StorageReaderRuntime {
         Self::default()
     }
 
+    pub fn block_cache(&self) -> Option<Arc<dyn DbCache>> {
+        self.block_cache.clone()
+    }
+
     /// Sets a block cache for SlateDB reads.
     ///
     /// When provided, the `DbReader` will use this cache for SST block lookups,

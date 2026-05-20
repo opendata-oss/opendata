@@ -56,6 +56,7 @@ pub async fn run(
     while remaining > 0 {
         // Fresh runtime → fresh block cache for this group.
         let runtime = build_reader_runtime(reader_config, dataset).await?;
+        let cache = runtime.block_cache();
         let reader = VectorDbReader::open_with_runtime(reader_config.clone(), runtime).await?;
 
         let group_size = remaining.min(COLD_QUERIES_PER_READER);
@@ -78,6 +79,9 @@ pub async fn run(
         remaining -= group_size;
 
         drop(reader);
+        if let Some(cache) = cache {
+            cache.close().await?;
+        }
     }
 
     latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
