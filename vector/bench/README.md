@@ -457,7 +457,9 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 | `num_queries`       | usize  | Number of queries to run (default: 100)                            |
 | `query_concurrency` | usize  | Concurrent in-flight queries during the warm query phase (default: 8) |
 | `query_qps_limit`   | usize  | Rate cap on warm-phase query submissions, in QPS (default: 32)     |
-| `block_cache_bytes` | u64    | Block cache size in bytes (default: none)                          |
+| `block_cache_bytes` | u64    | In-memory block cache size in bytes. `None` (default) disables the cache. With only this set, the bench uses a memory-only foyer cache. |
+| `block_cache_disk_bytes` | u64 | On-disk block-cache size in bytes. When set together with `block_cache_bytes`, the bench builds a hybrid foyer cache: `block_cache_bytes` becomes the memory tier and this becomes the disk tier. Ignored if `block_cache_bytes` is unset. |
+| `block_cache_disk_path` | string | Filesystem path for the hybrid cache's disk tier (default: `/mnt/cache/foyer`). Only used when `block_cache_disk_bytes` is set. |
 | `data_dir`          | string | Directory containing dataset files (default: `vector/bench/data/`) |
 | `vector_config`     | string | Path to a YAML file with vector `Config` overrides                 |
 | `phases`            | string | Comma-separated phases to run, in order (default: `INGEST,COLD,WARM`). Allowed values: `INGEST`, `COLD`, `WARM`. See [Phases](#phases). |

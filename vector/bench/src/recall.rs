@@ -19,7 +19,7 @@ use std::thread;
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{
-    CachedEntry, CachedKey, FoyerCache, FoyerCacheOptions, FoyerHybridCache,
+    CachedEntry, CachedKey, DbCache, FoyerCache, FoyerCacheOptions, FoyerHybridCache,
 };
 use common::{
     StorageBuilder, StorageConfig, StorageError, StorageReaderRuntime, create_object_store,
@@ -35,6 +35,10 @@ const DEFAULT_QUERY_QPS_LIMIT: usize = 32;
 
 /// Default phase list when a dataset doesn't specify otherwise.
 const DEFAULT_PHASES: &[Phase] = &[Phase::Ingest, Phase::Cold, Phase::Warm];
+
+/// Default on-disk path for the hybrid-cache disk tier. Only used when
+/// `block_cache_disk_bytes` is set.
+const DEFAULT_BLOCK_CACHE_DISK_PATH: &str = "/mnt/cache/foyer";
 
 fn load_vector_config(path: &str) -> Config {
     let contents =
@@ -317,8 +321,20 @@ pub(crate) struct Dataset {
     pub query_pruning_factor: Option<f32>,
     pub nprobe: usize,
     pub num_queries: usize,
-    /// Block cache size in bytes. `None` = no cache.
+    /// In-memory block-cache size in bytes. `None` disables the block
+    /// cache entirely. When `Some` and [`block_cache_disk_bytes`] is
+    /// `None`, this controls the capacity of a memory-only foyer cache.
+    /// When both are `Some`, this is the memory tier of a hybrid cache.
     pub block_cache_bytes: Option<u64>,
+    /// On-disk block-cache size in bytes. `Some` opts into the hybrid
+    /// (memory + disk) foyer cache, with this controlling the disk tier
+    /// capacity and [`block_cache_disk_path`] controlling its location.
+    /// Ignored unless [`block_cache_bytes`] is also `Some`.
+    pub block_cache_disk_bytes: Option<u64>,
+    /// On-disk path for the hybrid cache's disk tier. Defaults to
+    /// [`DEFAULT_BLOCK_CACHE_DISK_PATH`]. Unused unless
+    /// [`block_cache_disk_bytes`] is `Some`.
+    pub block_cache_disk_path: &'static str,
     /// Directory containing the dataset files. When `None`, falls back to
     /// the default data directory resolved from `CARGO_MANIFEST_DIR`.
     pub data_dir: Option<String>,
@@ -515,6 +531,12 @@ impl From<&Dataset> for Params {
         if let Some(bytes) = d.block_cache_bytes {
             p.insert("block_cache_bytes", bytes.to_string());
         }
+        if let Some(bytes) = d.block_cache_disk_bytes {
+            p.insert("block_cache_disk_bytes", bytes.to_string());
+        }
+        if d.block_cache_disk_path != DEFAULT_BLOCK_CACHE_DISK_PATH {
+            p.insert("block_cache_disk_path", d.block_cache_disk_path);
+        }
         if let Some(ref dir) = d.data_dir {
             p.insert("data_dir", dir.clone());
         }
@@ -547,6 +569,20 @@ impl From<Params> for Dataset {
             .or(default.block_cache_bytes.map(|v| v as i64))
             .filter(|b| *b > 0)
             .map(|b| b as u64);
+        let block_cache_disk_bytes = p
+            .get_parse::<i64>("block_cache_disk_bytes")
+            .ok()
+            .or(default.block_cache_disk_bytes.map(|v| v as i64))
+            .filter(|b| *b > 0)
+            .map(|b| b as u64);
+        // `block_cache_disk_path` is stored as `&'static str` for const
+        // initialisation, so user overrides are leaked the same way `phases`
+        // is. The default path is reused as the static slice when no override
+        // is set.
+        let block_cache_disk_path: &'static str = match p.get("block_cache_disk_path") {
+            Some(s) => Box::leak(s.to_string().into_boxed_str()),
+            None => default.block_cache_disk_path,
+        };
 
         // `phases` round-trips through Params as a comma-separated string,
         // but the Dataset struct stores `&'static [Phase]`. We allocate a
@@ -587,6 +623,8 @@ impl From<Params> for Dataset {
                 .unwrap_or(default.query_qps_limit),
             format: p.get("format").map(str_to_format).unwrap_or(default.format),
             block_cache_bytes,
+            block_cache_disk_bytes,
+            block_cache_disk_path,
             max_vectors: p.get_parse("max_vectors").ok().or(default.max_vectors),
             data_dir: p
                 .get("data_dir")
@@ -619,6 +657,8 @@ const SIFT1M: Dataset = Dataset {
     query_pruning_factor: Some(7.0),
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: Some(1073741824),
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -651,6 +691,8 @@ const SIFT100K: Dataset = Dataset {
     query_pruning_factor: Some(7.0),
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -675,6 +717,8 @@ const COHERE1M: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -699,6 +743,8 @@ const DEEP10M: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -723,6 +769,8 @@ const DEEP1B: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -747,6 +795,8 @@ const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -771,6 +821,8 @@ const COHERE_WIKI_10M: Dataset = Dataset {
     nprobe: 100,
     num_queries: 1000,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -798,6 +850,8 @@ const SIFT10M: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -822,6 +876,8 @@ const SIFT50M: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -846,6 +902,8 @@ const SIFT100M: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -870,6 +928,8 @@ const SIFT1B: Dataset = Dataset {
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
@@ -901,63 +961,108 @@ fn lookup_dataset(name: &str) -> Option<&'static Dataset> {
 
 // -- Storage helpers shared by phases -----------------------------------------
 
+/// Build the dataset's block cache, if any. Returns `None` when
+/// [`Dataset::block_cache_bytes`] is unset; returns a memory-only
+/// [`FoyerCache`] when only the memory size is set; returns a hybrid
+/// [`FoyerHybridCache`] backed by the disk path when both memory and
+/// disk sizes are set. The returned `Arc<dyn DbCache>` is suitable for
+/// both writer-side (`with_db_cache`) and reader-side
+/// (`StorageReaderRuntime::with_block_cache`) use.
+pub(crate) async fn build_block_cache(
+    dataset: &Dataset,
+) -> anyhow::Result<Option<Arc<dyn DbCache>>> {
+    let Some(memory_bytes) = dataset.block_cache_bytes else {
+        return Ok(None);
+    };
+    let memory_capacity = usize::try_from(memory_bytes).map_err(|_| {
+        StorageError::Storage(format!(
+            "block_cache_bytes {} exceeds usize::MAX on this platform",
+            memory_bytes,
+        ))
+    })?;
+
+    match dataset.block_cache_disk_bytes {
+        None => {
+            let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+                max_capacity: memory_bytes,
+                ..Default::default()
+            });
+            Ok(Some(Arc::new(cache) as Arc<dyn DbCache>))
+        }
+        Some(disk_bytes) => {
+            use foyer::{DeviceBuilder, HybridCacheBuilder};
+
+            let disk_capacity = usize::try_from(disk_bytes).map_err(|_| {
+                StorageError::Storage(format!(
+                    "block_cache_disk_bytes {} exceeds usize::MAX on this platform",
+                    disk_bytes,
+                ))
+            })?;
+
+            let device = foyer::FsDeviceBuilder::new(dataset.block_cache_disk_path)
+                .with_capacity(disk_capacity)
+                .build()
+                .map_err(|e| {
+                    StorageError::Storage(format!(
+                        "failed to build foyer disk device at {}: {}",
+                        dataset.block_cache_disk_path, e
+                    ))
+                })?;
+
+            let cache = HybridCacheBuilder::new()
+                .with_name("slatedb_block_cache")
+                .memory(memory_capacity)
+                .with_weighter(|_: &CachedKey, v: &CachedEntry| v.size())
+                .storage()
+                .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
+                .with_engine_config(
+                    foyer::BlockEngineConfig::new(device)
+                        .with_block_size(16 * 1024 * 1024)
+                        .with_flushers(4)
+                        .with_buffer_pool_size(256 * 1024 * 1024)
+                        .with_submit_queue_size_threshold(1024 * 1024 * 1024),
+                )
+                .build()
+                .await
+                .map_err(|e| {
+                    StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
+                })?;
+            Ok(Some(
+                Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>,
+            ))
+        }
+    }
+}
+
 /// Open a fresh `VectorDb` for the given `Config`, layering in the
 /// dataset's block cache if one is configured. Each phase that needs a
 /// writer-side db calls this to get a fully independent instance.
 pub(crate) async fn open_db(config: &Config, dataset: &Dataset) -> anyhow::Result<VectorDb> {
     let mut sb = StorageBuilder::new(&config.storage).await?;
-    if let Some(bytes) = dataset.block_cache_bytes {
-        use foyer::{DeviceBuilder, HybridCacheBuilder};
-
-        let memory_capacity = usize::try_from(bytes).map_err(|_| {
-            StorageError::Storage(format!(
-                "memory_capacity {} exceeds usize::MAX on this platform",
-                bytes,
-            ))
-        })?;
-        let disk_capacity = usize::try_from(1024u64 * 1024 * 1024 * 250).map_err(|_| {
-            StorageError::Storage(format!(
-                "disk_capacity {} exceeds usize::MAX on this platform",
-                1024u64 * 1024 * 1024 * 250
-            ))
-        })?;
-
-        let cache = HybridCacheBuilder::new()
-            .with_name("slatedb_block_cache")
-            .memory(memory_capacity)
-            .with_weighter(|_: &CachedKey, v: &CachedEntry| v.size())
-            .storage()
-            .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
-            .with_engine_config(
-                foyer::BlockEngineConfig::new(
-                    foyer::FsDeviceBuilder::new("/mnt/cache/foyer")
-                        .with_capacity(disk_capacity)
-                        .build()
-                        .unwrap(),
-                )
-                .with_block_size(16 * 1024 * 1024)
-                .with_flushers(4)
-                .with_buffer_pool_size(256 * 1024 * 1024)
-                .with_submit_queue_size_threshold(1024 * 1024 * 1024),
-            )
-            .build()
-            .await
-            .map_err(|e| {
-                StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
-            })?;
-        let cache = FoyerHybridCache::new_with_cache(cache);
-        sb = sb.map_slatedb(|db| db.with_db_cache(Arc::new(cache)));
-        println!("  Block cache: {} bytes", bytes);
+    if let Some(cache) = build_block_cache(dataset).await? {
+        println!("  {}", describe_block_cache(dataset));
+        sb = sb.map_slatedb(move |db| db.with_db_cache(cache));
     }
     Ok(VectorDb::open_with_storage(config.clone(), sb).await?)
 }
 
+fn describe_block_cache(dataset: &Dataset) -> String {
+    match (dataset.block_cache_bytes, dataset.block_cache_disk_bytes) {
+        (None, _) => "Block cache: disabled".to_string(),
+        (Some(mem), None) => format!("Block cache: memory-only, {} bytes", mem),
+        (Some(mem), Some(disk)) => format!(
+            "Block cache: hybrid, {} bytes memory + {} bytes disk at {}",
+            mem, disk, dataset.block_cache_disk_path,
+        ),
+    }
+}
+
 /// Build the `StorageReaderRuntime` used by the cold-reader phase. Sets up
-/// a static object store handle and an in-memory block cache when the
-/// dataset configures one.
-pub(crate) fn build_reader_runtime(
+/// a static object store handle and the dataset's block cache (memory-only
+/// or hybrid, per [`build_block_cache`]).
+pub(crate) async fn build_reader_runtime(
     reader_config: &ReaderConfig,
-    block_cache_bytes: Option<u64>,
+    dataset: &Dataset,
 ) -> anyhow::Result<StorageReaderRuntime> {
     let object_store = match &reader_config.storage {
         StorageConfig::SlateDb(slate_config) => {
@@ -969,12 +1074,8 @@ pub(crate) fn build_reader_runtime(
     if let Some(object_store) = object_store {
         runtime = runtime.with_object_store(object_store);
     }
-    if let Some(bytes) = block_cache_bytes {
-        let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: bytes,
-            ..Default::default()
-        });
-        runtime = runtime.with_block_cache(Arc::new(cache));
+    if let Some(cache) = build_block_cache(dataset).await? {
+        runtime = runtime.with_block_cache(cache);
     }
     Ok(runtime)
 }
