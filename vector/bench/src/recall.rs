@@ -15,14 +15,18 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use common::StorageConfig;
+use chrono::{DateTime, Local};
+use common::{StorageConfig, StorageError};
 use common::storage::config::SlateDbStorageConfig;
-use common::storage::factory::{FoyerCache, FoyerCacheOptions};
+use common::storage::factory::{CachedEntry, CachedKey, FoyerCache, FoyerCacheOptions, FoyerHybridCache};
 use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use vector::{
     Config, DistanceMetric, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorDb,
     VectorDbRead, VectorDbReader,
@@ -31,6 +35,10 @@ use vector::{
 const DEFAULT_NUM_QUERIES: usize = 100;
 const BASE_VECTOR_CHUNK_SIZE: usize = 1_000_000;
 const INGEST_WRITE_BATCH_SIZE: usize = 10;
+/// Default number of concurrent queries during the warm query phase.
+const DEFAULT_QUERY_CONCURRENCY: usize = 1;
+/// Default ceiling on queries-per-second during the warm query phase.
+const DEFAULT_QUERY_QPS_LIMIT: usize = 32;
 
 fn load_vector_config(path: &str) -> Config {
     let contents =
@@ -239,6 +247,119 @@ fn read_bvecs(path: &Path, limit: Option<usize>) -> Vec<Vec<f32>> {
     vectors
 }
 
+// -- Ingest throughput monitor ------------------------------------------------
+
+/// One sample produced by the ingest throughput monitor.
+struct IngestThroughputSample {
+    /// Wall-clock timestamp at which the sample was taken.
+    wall_time: DateTime<Local>,
+    /// Throughput (vectors/sec) over the preceding window (up to 5 min).
+    vec_per_sec: f64,
+    /// Length of the window the throughput was computed over, in seconds.
+    window_secs: f64,
+}
+
+/// Spawn a task that samples the ingest counter once per minute and reports
+/// the throughput over the preceding 5 minutes (or shorter, if ingest has been
+/// running for less than 5 minutes). Returns a join handle that yields the
+/// per-minute samples once `stop_rx` is signaled.
+fn spawn_ingest_throughput_monitor(
+    counter: Arc<AtomicU64>,
+    ingest_start: Instant,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<Vec<IngestThroughputSample>> {
+    const SAMPLE_PERIOD: Duration = Duration::from_secs(60);
+    const WINDOW: Duration = Duration::from_secs(300);
+
+    tokio::spawn(async move {
+        // Ring of (sampled_at, cumulative_count) anchored at ingest start so
+        // the first ~5 windows can fall back to the start point.
+        let mut history: Vec<(Instant, u64)> = vec![(ingest_start, 0)];
+        let mut samples: Vec<IngestThroughputSample> = Vec::new();
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + SAMPLE_PERIOD, SAMPLE_PERIOD);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let now = Instant::now();
+                    let count = counter.load(Ordering::Relaxed);
+                    history.push((now, count));
+
+                    // Pick the oldest history entry within the 5-minute window.
+                    let cutoff = now.checked_sub(WINDOW);
+                    let baseline = match cutoff {
+                        Some(cutoff) => history
+                            .iter()
+                            .find(|(t, _)| *t >= cutoff)
+                            .copied()
+                            .unwrap_or(history[0]),
+                        None => history[0],
+                    };
+                    let window_secs = now.duration_since(baseline.0).as_secs_f64();
+                    let delta = count.saturating_sub(baseline.1);
+                    let vec_per_sec = if window_secs > 0.0 {
+                        delta as f64 / window_secs
+                    } else {
+                        0.0
+                    };
+                    let wall_time = Local::now();
+
+                    println!(
+                        "  [ingest throughput] {} | {:>10.1} vec/s (preceding {:.0}s, {} vectors)",
+                        wall_time.format("%Y-%m-%d %H:%M:%S"),
+                        vec_per_sec,
+                        window_secs,
+                        delta,
+                    );
+
+                    samples.push(IngestThroughputSample {
+                        wall_time,
+                        vec_per_sec,
+                        window_secs,
+                    });
+
+                    // Trim history older than the window (keep one entry just
+                    // outside so the next sample can still measure correctly).
+                    if let Some(cutoff) = cutoff {
+                        let mut keep_from = 0;
+                        for (i, (t, _)) in history.iter().enumerate() {
+                            if *t >= cutoff {
+                                keep_from = i.saturating_sub(1);
+                                break;
+                            }
+                        }
+                        if keep_from > 0 {
+                            history.drain(0..keep_from);
+                        }
+                    }
+                }
+                _ = &mut stop_rx => break,
+            }
+        }
+        samples
+    })
+}
+
+fn print_ingest_throughput_table(samples: &[IngestThroughputSample]) {
+    if samples.is_empty() {
+        println!("\n  Ingest throughput table: (no samples — ingest finished in under 60s)");
+        return;
+    }
+    println!("\n  Ingest throughput (5-minute trailing window, sampled every minute):");
+    println!("  | timestamp           | throughput (vectors/sec) | window (s) |");
+    println!("  |---------------------|--------------------------|------------|");
+    for s in samples {
+        println!(
+            "  | {} | {:>24.1} | {:>10.0} |",
+            s.wall_time.format("%Y-%m-%d %H:%M:%S"),
+            s.vec_per_sec,
+            s.window_secs,
+        );
+    }
+}
+
 // -- Recall / percentile helpers ----------------------------------------------
 
 fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 {
@@ -304,6 +425,13 @@ struct Dataset {
     /// Maximum number of base vectors to ingest. `None` = all.
     max_vectors: Option<usize>,
     normalize: bool,
+    /// Number of queries allowed in flight concurrently during the warm
+    /// query phase. Default: `DEFAULT_QUERY_CONCURRENCY`.
+    query_concurrency: usize,
+    /// Ceiling on queries-per-second during the warm query phase. The bench
+    /// paces new query submissions to stay at or below this rate.
+    /// Default: `DEFAULT_QUERY_QPS_LIMIT`.
+    query_qps_limit: usize,
 }
 
 impl Dataset {
@@ -467,6 +595,8 @@ impl From<&Dataset> for Params {
         p.insert("merge_threshold", d.merge_threshold.to_string());
         p.insert("nprobe", d.nprobe.to_string());
         p.insert("num_queries", d.num_queries.to_string());
+        p.insert("query_concurrency", d.query_concurrency.to_string());
+        p.insert("query_qps_limit", d.query_qps_limit.to_string());
         p.insert("format", format_to_str(d.format));
         if let Some(max) = d.max_vectors {
             p.insert("max_vectors", max.to_string());
@@ -526,6 +656,12 @@ impl From<Params> for Dataset {
             query_pruning_factor,
             nprobe: p.get_parse("nprobe").unwrap_or(default.nprobe),
             num_queries: p.get_parse("num_queries").unwrap_or(default.num_queries),
+            query_concurrency: p
+                .get_parse("query_concurrency")
+                .unwrap_or(default.query_concurrency),
+            query_qps_limit: p
+                .get_parse("query_qps_limit")
+                .unwrap_or(default.query_qps_limit),
             format: p.get("format").map(str_to_format).unwrap_or(default.format),
             block_cache_bytes,
             max_vectors: p.get_parse("max_vectors").ok().or(default.max_vectors),
@@ -565,6 +701,8 @@ const SIFT1M: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const COHERE1M: Dataset = Dataset {
@@ -586,6 +724,8 @@ const COHERE1M: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const DEEP10M: Dataset = Dataset {
@@ -607,6 +747,8 @@ const DEEP10M: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const DEEP1B: Dataset = Dataset {
@@ -628,6 +770,8 @@ const DEEP1B: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
@@ -649,6 +793,31 @@ const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+};
+
+const COHERE_WIKI_10M: Dataset = Dataset {
+    name: "cohere_wiki_10m",
+    dimensions: 1024,
+    distance_metric: DistanceMetric::Cosine,
+    base_file: "cohere-wiki/base.fvecs",
+    query_file: "cohere-wiki/query.fvecs",
+    ground_truth_file: "cohere-wiki/groundtruth.ivecs",
+    split_threshold: 1500,
+    merge_threshold: 500,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: 1000,
+    block_cache_bytes: None,
+    data_dir: None,
+    vector_config: None,
+    reader_storage_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: Some(10_000_000),
+    normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 // BigANN / SIFT1B variants — all share the same base and query files but
@@ -673,6 +842,8 @@ const SIFT10M: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const SIFT50M: Dataset = Dataset {
@@ -694,6 +865,8 @@ const SIFT50M: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: Some(50_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const SIFT100M: Dataset = Dataset {
@@ -715,6 +888,8 @@ const SIFT100M: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: Some(100_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const SIFT1B: Dataset = Dataset {
@@ -736,11 +911,14 @@ const SIFT1B: Dataset = Dataset {
     format: VecFormat::Bvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
 };
 
 const ALL_DATASETS: &[&Dataset] = &[
     &SIFT1M,
     &COHERE1M,
+    &COHERE_WIKI_10M,
     &DEEP10M,
     &DEEP1B,
     &WIKIPEDIA_BGE_M3_EN,
@@ -809,10 +987,52 @@ impl Benchmark for RecallBenchmark {
         };
         let mut sb = StorageBuilder::new(&config.storage).await?;
         if let Some(bytes) = dataset.block_cache_bytes {
-            let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+            use foyer::{
+                Engine, HybridCacheBuilder, HybridCachePolicy, DeviceBuilder,
+            };
+
+            let memory_capacity = usize::try_from(bytes).map_err(|_| {
+                StorageError::Storage(format!(
+                    "memory_capacity {} exceeds usize::MAX on this platform",
+                    bytes,
+                ))
+            })?;
+            let disk_capacity = usize::try_from(1024u64 * 1024 * 1024 * 250).map_err(|_| {
+                StorageError::Storage(format!(
+                    "disk_capacity {} exceeds usize::MAX on this platform",
+                    1024u64 * 1024 * 1024 * 250
+                ))
+            })?;
+
+            let cache = HybridCacheBuilder::new()
+                .with_name("slatedb_block_cache")
+                //.with_policy(policy)
+                .memory(memory_capacity)
+                .with_weighter(|_: &CachedKey, v: &CachedEntry| v.size())
+                .storage()
+                .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
+                .with_engine_config(
+                    foyer::BlockEngineConfig::new(
+                        foyer::FsDeviceBuilder::new("/mnt/cache/foyer")
+                            .with_capacity(disk_capacity)
+                            .build()
+                            .unwrap(),
+                    )
+                        .with_block_size(16 * 1024 * 1024)
+                        .with_flushers(4)
+                        .with_buffer_pool_size(256 * 1024 * 1024)
+                        .with_submit_queue_size_threshold(1024 * 1024 * 1024),
+                )
+                .build()
+                .await
+                .map_err(|e| {
+                    StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
+                })?;
+            let cache = FoyerHybridCache::new_with_cache(cache);
+            /*let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
                 max_capacity: bytes,
-                ..Default::default()
-            });
+                shards: 16,
+            });*/
             sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
             println!("  Block cache: {} bytes", bytes);
         }
@@ -847,7 +1067,12 @@ impl Benchmark for RecallBenchmark {
                 anyhow::bail!("dataset {} has no base vectors to ingest", dataset.name);
             };
 
-            let ingest_start = std::time::Instant::now();
+            let ingest_start = Instant::now();
+            let ingested_counter = Arc::new(AtomicU64::new(0));
+            let (stop_tx, stop_rx) = oneshot::channel::<()>();
+            let monitor_handle =
+                spawn_ingest_throughput_monitor(ingested_counter.clone(), ingest_start, stop_rx);
+
             let num_batches = (num_vectors as usize).div_ceil(INGEST_WRITE_BATCH_SIZE);
             let mut batch_idx = 0usize;
             let mut vector_offset = 0usize;
@@ -867,7 +1092,9 @@ impl Benchmark for RecallBenchmark {
                             Vector::new(index.to_string(), values.clone())
                         })
                         .collect();
+                    let written = batch.len() as u64;
                     db.write(batch).await?;
+                    ingested_counter.fetch_add(written, Ordering::Relaxed);
                     batch_idx += 1;
                     if batch_idx.is_multiple_of(10_000) {
                         println!("  Written batch {}/{}", batch_idx, num_batches);
@@ -894,6 +1121,13 @@ impl Benchmark for RecallBenchmark {
             }
             db.flush().await?;
             ingest_secs = Some(ingest_start.elapsed().as_secs_f64());
+
+            let _ = stop_tx.send(());
+            let throughput_table = monitor_handle
+                .await
+                .map_err(|e| anyhow::anyhow!("ingest throughput monitor panicked: {e}"))?;
+            print_ingest_throughput_table(&throughput_table);
+
             println!(
                 "  Ingested {} vectors in {:.1}s ({:.0} vec/s)",
                 num_vectors,
@@ -917,6 +1151,14 @@ impl Benchmark for RecallBenchmark {
         let mut runtime = StorageReaderRuntime::default();
         if let Some(object_store) = object_store {
             runtime = runtime.with_object_store(object_store);
+        }
+        if let Some(bytes) = dataset.block_cache_bytes {
+                let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+                    max_capacity: bytes,
+                    ..Default::default()
+                });
+                runtime = runtime.with_block_cache(Arc::new(cache));
+                println!("  Block cache: {} bytes", bytes);
         }
         for query in queries.iter().take(10) {
             let reader =
@@ -973,24 +1215,86 @@ impl Benchmark for RecallBenchmark {
 
         let query_latency = bench.histogram("query_latency_us");
 
+        let concurrency = dataset.query_concurrency.max(1);
+        let qps_limit = dataset.query_qps_limit.max(1);
+        let tick_period = std::time::Duration::from_secs_f64(1.0 / qps_limit as f64);
+        println!(
+            "  warm query phase: concurrency = {}, qps_limit = {}",
+            concurrency, qps_limit,
+        );
+
         let query_start = std::time::Instant::now();
         let mut total_recall = 0.0;
         let mut latencies_us = Vec::with_capacity(queries.len());
-        for (i, query) in queries.iter().enumerate() {
-            let t = std::time::Instant::now();
-            let q = Query::new(query.clone()).with_limit(k);
-            let results = db
-                .search_with_options(
-                    &q,
-                    SearchOptions {
-                        nprobe: Some(dataset.nprobe),
-                    },
-                )
-                .await?;
-            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-            query_latency.record(elapsed_us);
-            latencies_us.push(elapsed_us);
-            total_recall += recall_at_k(&results, &ground_truth[i], k);
+
+        // Producer/consumer rate limiter:
+        //   - One producer pushes a (index, vector) into the channel every
+        //     `tick_period` (1/qps_limit), then closes the channel when the
+        //     input is exhausted.
+        //   - `concurrency` consumers pull from the channel. Each consumer
+        //     loops calling `rx.recv().await` and issues the query; the
+        //     `async_channel` MPMC receiver lets them compete for work
+        //     without a shared lock.
+        //
+        // Channel is bounded to `concurrency` so a slow DB back-pressures
+        // the producer rather than letting the pending-query queue grow.
+        let (tx, rx) = async_channel::bounded::<(usize, Vec<f32>)>(concurrency);
+
+        let producer = async {
+            let mut ticker = tokio::time::interval(tick_period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            for (i, query) in queries.iter().enumerate() {
+                ticker.tick().await;
+                // send() only errors when every receiver has dropped — that
+                // only happens at shutdown, so treat it as a shutdown signal.
+                if tx.send((i, query.clone())).await.is_err() {
+                    break;
+                }
+            }
+            drop(tx);
+        };
+
+        let nprobe = dataset.nprobe;
+        let db_ref = &db;
+        let consumers: Vec<_> = (0..concurrency)
+            .map(|_| {
+                let rx = rx.clone();
+                async move {
+                    let mut results = Vec::new();
+                    while let Ok((i, query)) = rx.recv().await {
+                        let q = Query::new(query).with_limit(k);
+                        let t = std::time::Instant::now();
+                        let search_results = db_ref
+                            .search_with_options(
+                                &q,
+                                SearchOptions {
+                                    nprobe: Some(nprobe),
+                                },
+                            )
+                            .await?;
+                        let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
+                        results.push((i, elapsed_us, search_results));
+                    }
+                    anyhow::Ok::<Vec<(usize, f64, Vec<SearchResult>)>>(results)
+                }
+            })
+            .collect();
+        // `rx` is kept alive in this scope but never consumed here; that's
+        // fine — `async_channel` closes the channel when the last sender
+        // drops (the producer), so consumers break out of `recv().await`
+        // regardless.
+        drop(rx);
+
+        let (_, consumer_results) =
+            tokio::join!(producer, futures::future::try_join_all(consumers));
+        let consumer_results = consumer_results?;
+
+        for batch in consumer_results {
+            for (i, elapsed_us, results) in batch {
+                query_latency.record(elapsed_us);
+                latencies_us.push(elapsed_us);
+                total_recall += recall_at_k(&results, &ground_truth[i], k);
+            }
         }
         let query_secs = query_start.elapsed().as_secs_f64();
         let avg_recall = total_recall / queries.len() as f64;
