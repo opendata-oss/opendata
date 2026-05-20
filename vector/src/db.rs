@@ -467,9 +467,7 @@ impl VectorDb {
     ) -> Result<HashMap<String, VectorId>> {
         // Create prefix for all IdDictionary records
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::IdDictionary
-            .prefix()
-            .write_to(&mut prefix_buf);
+        crate::serde::RecordType::IdDictionary.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         // Scan all IdDictionary records

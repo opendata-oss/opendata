@@ -52,6 +52,7 @@ use std::ops::{Bound, Range};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
+use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
 use common::serde::record_tag::RecordTag;
 use common::serde::terminated_bytes;
 use common::serde::varint::var_u64;
@@ -69,8 +70,8 @@ impl From<common::serde::DeserializeError> for Error {
 /// Key format version (currently 0x02 — segment_id precedes record_type).
 pub const KEY_VERSION: u8 = 0x02;
 
-/// Subsystem-specific key prefix for log storage.
-pub const SUBSYSTEM: u8 = 0x03;
+/// Subsystem byte for log storage (see [`common::serde::subsystem`]).
+pub const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
 
 /// Reserved segment id for system records (sequence block, per-segment
 /// metadata describing other segments). User log segments start at `1`.
@@ -136,14 +137,20 @@ impl RecordType {
     }
 }
 
+/// Offset of the segment id (u32 BE) inside a log key, immediately after the
+/// 2-byte common prefix.
+const SEGMENT_ID_OFFSET: usize = KEY_PREFIX_LEN;
+
+/// Offset of the record-type tag byte inside a log key, after the segment id.
+const RECORD_TYPE_OFFSET: usize = SEGMENT_ID_OFFSET + 4;
+
 /// Length of the v2 segmented key prefix: `[subsystem, version, seg_id(4), record_type]`.
-const SEGMENTED_PREFIX_LEN: usize = 7;
+const SEGMENTED_PREFIX_LEN: usize = RECORD_TYPE_OFFSET + 1;
 
 /// Writes the v2 segmented prefix into `buf`:
 /// `[subsystem, version, seg_id BE, record_type]`.
 fn write_segmented_prefix(buf: &mut BytesMut, segment_id: SegmentId, record_type: u8) {
-    buf.put_u8(SUBSYSTEM);
-    buf.put_u8(KEY_VERSION);
+    KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
     buf.put_u32(segment_id);
     buf.put_u8(record_type);
 }
@@ -151,6 +158,7 @@ fn write_segmented_prefix(buf: &mut BytesMut, segment_id: SegmentId, record_type
 /// Parses a v2 segmented prefix, validating the subsystem/version/tag.
 /// Returns the segment id along with the remaining (post-prefix) bytes.
 fn parse_segmented_prefix(data: &[u8], expected_tag: u8) -> Result<(SegmentId, &[u8]), Error> {
+    KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
     if data.len() < SEGMENTED_PREFIX_LEN {
         return Err(Error::Encoding(format!(
             "buffer too short for log key: need {} bytes, got {}",
@@ -158,23 +166,16 @@ fn parse_segmented_prefix(data: &[u8], expected_tag: u8) -> Result<(SegmentId, &
             data.len()
         )));
     }
-    if data[0] != SUBSYSTEM {
-        return Err(Error::Encoding(format!(
-            "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
-            SUBSYSTEM, data[0]
-        )));
-    }
-    if data[1] != KEY_VERSION {
-        return Err(Error::Encoding(format!(
-            "invalid key version: expected 0x{:02x}, got 0x{:02x}",
-            KEY_VERSION, data[1]
-        )));
-    }
-    let segment_id = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
-    if data[6] != expected_tag {
+    let segment_id = u32::from_be_bytes([
+        data[SEGMENT_ID_OFFSET],
+        data[SEGMENT_ID_OFFSET + 1],
+        data[SEGMENT_ID_OFFSET + 2],
+        data[SEGMENT_ID_OFFSET + 3],
+    ]);
+    if data[RECORD_TYPE_OFFSET] != expected_tag {
         return Err(Error::Encoding(format!(
             "invalid record tag: expected 0x{:02x}, got 0x{:02x}",
-            expected_tag, data[6]
+            expected_tag, data[RECORD_TYPE_OFFSET]
         )));
     }
     Ok((segment_id, &data[SEGMENTED_PREFIX_LEN..]))
