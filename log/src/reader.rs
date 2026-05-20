@@ -4,6 +4,7 @@
 //! - [`LogRead`]: The trait defining read operations on the log.
 //! - [`LogDbReader`]: A read-only view of the log that implements `LogRead`.
 
+use std::collections::BTreeSet;
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
 use std::time::Duration;
@@ -337,11 +338,22 @@ impl LogReadView {
     }
 
     /// Lists distinct keys within a segment range.
+    ///
+    /// Stitches per-segment scans together by walking the segment cache —
+    /// the v2 key layout interleaves listings with log entries across
+    /// segment boundaries, so a single wide-range storage scan is not safe.
     pub(crate) async fn list_keys(
         &self,
         segment_range: Range<SegmentId>,
     ) -> Result<LogKeyIterator> {
-        let keys = self.storage.list_keys(segment_range).await?;
+        let mut keys = BTreeSet::new();
+        for segment in self.segments.all() {
+            if !segment_range.contains(&segment.id()) {
+                continue;
+            }
+            let per_segment = self.storage.list_keys_in_segment(segment.id()).await?;
+            keys.extend(per_segment);
+        }
         Ok(LogKeyIterator::from_keys(keys))
     }
 

@@ -46,11 +46,22 @@ Key properties of segments:
 
 ### Key Encoding with Segments
 
-The log entry key format is extended to include the segment ID:
+Every log storage key — log entries, listings, segment metadata, and the
+global sequence block — shares a 7-byte segmented prefix:
+
+```
+| subsystem (u8) | version (u8) | segment_id (u32 BE) | record_type (u8) | ... record-specific fields ... |
+```
+
+Placing `segment_id` before `record_type` keeps every record for a given
+segment contiguous in storage regardless of record type. This is the
+property a SlateDB segment extractor relies on: with a fixed 6-byte prefix
+`[subsystem, version, segment_id]`, all records for a segment land in the
+same SlateDB segment.
 
 ```
 Log Entry:
-  | version (u8) | type (u8) | segment_id (u32 BE) | key (TerminatedBytes) | relative_seq (varint u64) |
+  | sub | ver | segment_id (u32 BE) | record_type=0x10 | key (TerminatedBytes) | relative_seq (varint u64) |
 ```
 
 The `segment_id` is a 32-bit identifier, allowing up to ~4 billion segments. Future versions can expand this to 64 bits if needed.
@@ -64,13 +75,33 @@ This encoding ensures:
 - Within a key, entries are ordered by sequence number
 - Prefix scans can be constrained to specific segments
 
+### The system segment
+
+Segment id `0` is reserved as the **system segment**: it never holds user
+log entries. The records that aren't bound to a specific user segment live
+there, sharing the same 7-byte prefix layout (with `segment_id = 0`):
+
+- **`SeqBlock`** (`record_type = 0x20`): the global block-based sequence
+  allocator's persisted state. There is exactly one record.
+- **`SegmentMeta`** (`record_type = 0x30`): per-segment metadata describing
+  user segments. The described segment id is encoded as a 4-byte suffix
+  after `record_type`, so all `SegmentMeta` records sit in a contiguous
+  range and can be scanned with a single prefix scan.
+
+User log segments are numbered from `1`. A custom SlateDB compactor can
+recognize the system segment by its `segment_id = 0` prefix and exempt it
+from any retention-driven drains, while still allowing regular user
+segments to be retired via `CompactionSpec::DrainSegment` and pruned from
+the manifest.
+
 ### Segment Metadata
 
-Each segment has associated metadata stored in a separate record:
+Each user segment has associated metadata stored as a single record in the
+system segment. The described segment's id is the suffix:
 
 ```
 SegmentMeta Record:
-  Key:   | version (u8) | type (u8=0x03) | segment_id (u32 BE) |
+  Key:   | sub | ver | segment_id=0 (u32 BE) | record_type=0x30 | described_segment_id (u32 BE) |
   Value: | start_seq (u64 BE) | start_time_ms (i64 BE) |
 ```
 
@@ -79,6 +110,14 @@ The metadata tracks:
 - **start_time_ms**: Wall-clock time when the segment was created
 
 End boundaries (end sequence, end time) are derived from the next segment's start values, or from the current log state for the active segment.
+
+Living in the system segment decouples metadata from the per-segment
+SlateDB lifecycle: when a user segment is drained and pruned from the
+SlateDB manifest, the `SegmentMeta` record for it is not automatically
+removed and must be deleted by the writer as it observes the manifest
+update. The exact cleanup mechanism is out of scope for this RFC and is
+called out under [Segment-Based Deletion](#segment-based-deletion) as
+future work.
 
 #### Metadata Lifecycle
 
@@ -196,3 +235,4 @@ This would enable use cases such as:
 |------------|-------------|
 | 2026-01-07 | Initial draft |
 | 2026-01-12 | Added link to varint implementation |
+| 2026-05-19 | Key format v2: `segment_id` precedes `record_type`; system segment (id 0) reserved for `SeqBlock` and `SegmentMeta` records; user segments start at id 1. Enables a fixed 6-byte SlateDB segment-extractor prefix that routes every per-segment record (entries + listings) to the same SlateDB segment. |
