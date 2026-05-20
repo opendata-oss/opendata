@@ -2,18 +2,21 @@
 //! `VectorDbReader`s with empty caches.
 //!
 //! Runs [`COLD_NUM_QUERIES`] queries in groups of [`COLD_QUERIES_PER_READER`].
-//! Each group opens a fresh `VectorDbReader` with a freshly allocated block
-//! cache so the first query in every group pays the full open + cold-cache
-//! cost, and later queries in the group see whatever the first few queries
-//! warmed up. If the dataset has fewer loaded queries than
-//! `COLD_NUM_QUERIES`, queries are cycled.
+//! Each group opens a fresh `VectorDbReader` with a freshly allocated
+//! **memory-only** block cache so the first query in every group pays the
+//! full open + cold-cache cost, and later queries in the group see whatever
+//! the first few queries warmed up. A disk tier would persist across the
+//! per-group reader teardown and defeat the cold measurement, so the cold
+//! phase always forces a memory-only cache regardless of the dataset's
+//! `block_cache_disk_bytes` setting. If the dataset has fewer loaded
+//! queries than `COLD_NUM_QUERIES`, queries are cycled.
 
 use std::time::Instant;
 
 use bencher::Bench;
 use vector::{Query, ReaderConfig, SearchOptions, VectorDbRead, VectorDbReader};
 
-use crate::recall::{Dataset, build_reader_runtime, percentile};
+use crate::recall::{Dataset, build_cold_reader_runtime, percentile};
 
 /// Total number of queries to run during the cold phase.
 const COLD_NUM_QUERIES: usize = 1000;
@@ -54,8 +57,8 @@ pub async fn run(
     let mut remaining = COLD_NUM_QUERIES;
 
     while remaining > 0 {
-        // Fresh runtime → fresh block cache for this group.
-        let runtime = build_reader_runtime(reader_config, dataset).await?;
+        // Fresh runtime → fresh (memory-only) block cache for this group.
+        let runtime = build_cold_reader_runtime(reader_config, dataset)?;
         let cache = runtime.block_cache();
         let reader = VectorDbReader::open_with_runtime(reader_config.clone(), runtime).await?;
 

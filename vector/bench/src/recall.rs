@@ -15,7 +15,7 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-
+use foyer::HybridCachePolicy;
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{
@@ -961,6 +961,66 @@ fn lookup_dataset(name: &str) -> Option<&'static Dataset> {
 
 // -- Storage helpers shared by phases -----------------------------------------
 
+/// Build a memory-only foyer block cache of the given capacity.
+fn memory_only_block_cache(memory_bytes: u64) -> Arc<dyn DbCache> {
+    let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: memory_bytes,
+        ..Default::default()
+    });
+    Arc::new(cache) as Arc<dyn DbCache>
+}
+
+/// Build a hybrid memory+disk foyer block cache.
+async fn hybrid_block_cache(
+    memory_bytes: u64,
+    disk_bytes: u64,
+    disk_path: &str,
+) -> anyhow::Result<Arc<dyn DbCache>> {
+    use foyer::{DeviceBuilder, HybridCacheBuilder};
+
+    let memory_capacity = usize::try_from(memory_bytes).map_err(|_| {
+        StorageError::Storage(format!(
+            "block_cache_bytes {} exceeds usize::MAX on this platform",
+            memory_bytes,
+        ))
+    })?;
+    let disk_capacity = usize::try_from(disk_bytes).map_err(|_| {
+        StorageError::Storage(format!(
+            "block_cache_disk_bytes {} exceeds usize::MAX on this platform",
+            disk_bytes,
+        ))
+    })?;
+
+    let device = foyer::FsDeviceBuilder::new(disk_path)
+        .with_capacity(disk_capacity)
+        .build()
+        .map_err(|e| {
+            StorageError::Storage(format!(
+                "failed to build foyer disk device at {}: {}",
+                disk_path, e
+            ))
+        })?;
+
+    let cache = HybridCacheBuilder::new()
+        .with_name("slatedb_block_cache")
+        .with_policy(HybridCachePolicy::WriteOnInsertion)
+        .memory(memory_capacity)
+        .with_weighter(|_: &CachedKey, v: &CachedEntry| v.size())
+        .storage()
+        .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
+        .with_engine_config(
+            foyer::BlockEngineConfig::new(device)
+                .with_block_size(16 * 1024 * 1024)
+                .with_flushers(4)
+                .with_buffer_pool_size(256 * 1024 * 1024)
+                .with_submit_queue_size_threshold(1024 * 1024 * 1024),
+        )
+        .build()
+        .await
+        .map_err(|e| StorageError::Storage(format!("Failed to create hybrid cache: {}", e)))?;
+    Ok(Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>)
+}
+
 /// Build the dataset's block cache, if any. Returns `None` when
 /// [`Dataset::block_cache_bytes`] is unset; returns a memory-only
 /// [`FoyerCache`] when only the memory size is set; returns a hybrid
@@ -974,63 +1034,11 @@ pub(crate) async fn build_block_cache(
     let Some(memory_bytes) = dataset.block_cache_bytes else {
         return Ok(None);
     };
-    let memory_capacity = usize::try_from(memory_bytes).map_err(|_| {
-        StorageError::Storage(format!(
-            "block_cache_bytes {} exceeds usize::MAX on this platform",
-            memory_bytes,
-        ))
-    })?;
-
     match dataset.block_cache_disk_bytes {
-        None => {
-            let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
-                max_capacity: memory_bytes,
-                ..Default::default()
-            });
-            Ok(Some(Arc::new(cache) as Arc<dyn DbCache>))
-        }
-        Some(disk_bytes) => {
-            use foyer::{DeviceBuilder, HybridCacheBuilder};
-
-            let disk_capacity = usize::try_from(disk_bytes).map_err(|_| {
-                StorageError::Storage(format!(
-                    "block_cache_disk_bytes {} exceeds usize::MAX on this platform",
-                    disk_bytes,
-                ))
-            })?;
-
-            let device = foyer::FsDeviceBuilder::new(dataset.block_cache_disk_path)
-                .with_capacity(disk_capacity)
-                .build()
-                .map_err(|e| {
-                    StorageError::Storage(format!(
-                        "failed to build foyer disk device at {}: {}",
-                        dataset.block_cache_disk_path, e
-                    ))
-                })?;
-
-            let cache = HybridCacheBuilder::new()
-                .with_name("slatedb_block_cache")
-                .memory(memory_capacity)
-                .with_weighter(|_: &CachedKey, v: &CachedEntry| v.size())
-                .storage()
-                .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
-                .with_engine_config(
-                    foyer::BlockEngineConfig::new(device)
-                        .with_block_size(16 * 1024 * 1024)
-                        .with_flushers(4)
-                        .with_buffer_pool_size(256 * 1024 * 1024)
-                        .with_submit_queue_size_threshold(1024 * 1024 * 1024),
-                )
-                .build()
-                .await
-                .map_err(|e| {
-                    StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
-                })?;
-            Ok(Some(
-                Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>,
-            ))
-        }
+        None => Ok(Some(memory_only_block_cache(memory_bytes))),
+        Some(disk_bytes) => Ok(Some(
+            hybrid_block_cache(memory_bytes, disk_bytes, dataset.block_cache_disk_path).await?,
+        )),
     }
 }
 
@@ -1057,10 +1065,14 @@ fn describe_block_cache(dataset: &Dataset) -> String {
     }
 }
 
-/// Build the `StorageReaderRuntime` used by the cold-reader phase. Sets up
-/// a static object store handle and the dataset's block cache (memory-only
-/// or hybrid, per [`build_block_cache`]).
-pub(crate) async fn build_reader_runtime(
+/// Build a `StorageReaderRuntime` for the cold phase. Always attaches a
+/// **memory-only** foyer cache (sized by [`Dataset::block_cache_bytes`]),
+/// regardless of whether the dataset configures a hybrid cache for the
+/// writer side. The cold phase tears down and rebuilds this runtime
+/// between query groups to clear the cache; a disk tier would survive
+/// that teardown and defeat the cold measurement, so we force the
+/// memory-only configuration here.
+pub(crate) fn build_cold_reader_runtime(
     reader_config: &ReaderConfig,
     dataset: &Dataset,
 ) -> anyhow::Result<StorageReaderRuntime> {
@@ -1074,8 +1086,8 @@ pub(crate) async fn build_reader_runtime(
     if let Some(object_store) = object_store {
         runtime = runtime.with_object_store(object_store);
     }
-    if let Some(cache) = build_block_cache(dataset).await? {
-        runtime = runtime.with_block_cache(cache);
+    if let Some(memory_bytes) = dataset.block_cache_bytes {
+        runtime = runtime.with_block_cache(memory_only_block_cache(memory_bytes));
     }
     Ok(runtime)
 }
