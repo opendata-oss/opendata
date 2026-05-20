@@ -13,7 +13,7 @@ Reported metrics:
 
 ## Running
 
-To run the benchmarks, first pull the datasets you wish to test. See the [Datasets](#datasets) 
+To run the benchmarks, first pull the datasets you wish to test. See the [Datasets](#datasets)
 section below for details. Then, you can run the benchmarks using:
 
 ```bash
