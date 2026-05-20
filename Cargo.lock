@@ -4725,8 +4725,12 @@ name = "vector-bench"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "bencher",
+ "chrono",
+ "foyer",
+ "futures",
  "opendata-common",
  "opendata-vector",
  "serde_yaml",
