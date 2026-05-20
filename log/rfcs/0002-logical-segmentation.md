@@ -115,7 +115,9 @@ Living in the system segment decouples metadata from the per-segment
 SlateDB lifecycle: when a user segment is drained and pruned from the
 SlateDB manifest, the `SegmentMeta` record for it is not automatically
 removed and must be deleted by the writer as it observes the manifest
-update. See [Retention](#segment-retention-future) below.
+update. The exact cleanup mechanism is out of scope for this RFC and is
+called out under [Segment-Based Deletion](#segment-based-deletion) as
+future work.
 
 #### Metadata Lifecycle
 

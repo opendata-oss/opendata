@@ -41,11 +41,19 @@ const EXTRACTOR_NAME: &str = "opendata-log/v2";
 
 /// Prefix extractor routing log records to per-segment SlateDB segments.
 ///
-/// Returns `Some(6)` for any key whose first two bytes are `[SUBSYSTEM,
-/// KEY_VERSION]` and whose total length is at least 6 bytes — i.e. every
-/// well-formed log key. Returns `None` otherwise, so unrelated keys
-/// (shouldn't occur in a LogDb-owned database, but treated defensively)
-/// stay in the root tree.
+/// Every well-formed log key has the shape `[SUBSYSTEM, KEY_VERSION,
+/// segment_id(4 BE), ...]` by construction, so this extractor returns
+/// `Some(6)` for any well-formed `PrefixTarget::Point` and for any 6+ byte
+/// `PrefixTarget::Prefix` matching the same leading two bytes.
+///
+/// **Point inputs that don't match are a bug.** SlateDB rejects writes whose
+/// segment extractor returns `None` (or `Some(0)`) with
+/// `SlateDBError::EmptySegmentPrefix` at write time, so a malformed key
+/// would surface as a confusing downstream error rather than a clear
+/// failure at the origin. We panic on mismatched `Point` inputs to make
+/// the bug obvious. Short or non-conforming `Prefix` scan inputs are
+/// permitted to return `None` — the trait contract allows it and slatedb
+/// simply skips prefix-based filtering in that case.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct LogSegmentExtractor;
 
@@ -63,19 +71,39 @@ impl PrefixExtractor for LogSegmentExtractor {
     }
 
     fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
-        // The `Point` and `Prefix` variants share the same answer here: the
-        // extracted bytes are determined entirely by positions 0..6, which
-        // both variants observe directly.
-        let bytes: &[u8] = match target {
-            PrefixTarget::Point(b) | PrefixTarget::Prefix(b) => b.as_ref(),
-        };
-        if bytes.len() < ROUTING_PREFIX_LEN {
-            return None;
+        match target {
+            // Stored keys and point-read targets must be well-formed log
+            // keys. A mismatch is a LogDb bug; panic with the offending bytes
+            // rather than letting slatedb reject the write later with an
+            // opaque EmptySegmentPrefix error.
+            PrefixTarget::Point(b) => {
+                let bytes = b.as_ref();
+                assert!(
+                    bytes.len() >= ROUTING_PREFIX_LEN
+                        && bytes[0] == SUBSYSTEM
+                        && bytes[1] == KEY_VERSION,
+                    "LogSegmentExtractor: malformed log key (subsystem/version mismatch \
+                     or under {} bytes): {:02x?}",
+                    ROUTING_PREFIX_LEN,
+                    bytes
+                );
+                Some(ROUTING_PREFIX_LEN)
+            }
+            // Scan prefixes are caller-supplied; a too-short or non-matching
+            // prefix is benign — return `None` so any prefix-based filter is
+            // skipped (no false negatives, per the trait contract).
+            PrefixTarget::Prefix(b) => {
+                let bytes = b.as_ref();
+                if bytes.len() < ROUTING_PREFIX_LEN
+                    || bytes[0] != SUBSYSTEM
+                    || bytes[1] != KEY_VERSION
+                {
+                    None
+                } else {
+                    Some(ROUTING_PREFIX_LEN)
+                }
+            }
         }
-        if bytes[0] != SUBSYSTEM || bytes[1] != KEY_VERSION {
-            return None;
-        }
-        Some(ROUTING_PREFIX_LEN)
     }
 }
 
@@ -178,44 +206,85 @@ mod tests {
     }
 
     #[test]
-    fn should_return_none_for_keys_shorter_than_routing_prefix() {
-        // given
+    fn should_return_none_for_prefix_shorter_than_routing_prefix() {
+        // given — a 5-byte scan prefix
         let extractor = LogSegmentExtractor;
-        let short = [SUBSYSTEM, KEY_VERSION, 0, 0, 0]; // 5 bytes
+        let short = [SUBSYSTEM, KEY_VERSION, 0, 0, 0];
 
-        // when / then
-        assert_eq!(extractor.prefix_len(&point(&short)), None);
+        // when / then — short Prefix returns None (scan-side, benign)
         assert_eq!(extractor.prefix_len(&prefix(&short)), None);
     }
 
     #[test]
-    fn should_return_none_for_keys_with_wrong_subsystem() {
+    fn should_return_none_for_prefix_with_wrong_subsystem() {
+        // given
+        let extractor = LogSegmentExtractor;
+        let bad = [0xFF, KEY_VERSION, 0, 0, 0, 1, 0x10];
+
+        // when / then — non-log Prefix returns None
+        assert_eq!(extractor.prefix_len(&prefix(&bad)), None);
+    }
+
+    #[test]
+    fn should_return_none_for_prefix_with_wrong_version() {
+        // given
+        let extractor = LogSegmentExtractor;
+        let bad = [SUBSYSTEM, 0xFF, 0, 0, 0, 1, 0x10];
+
+        // when / then — Prefix with wrong version returns None
+        assert_eq!(extractor.prefix_len(&prefix(&bad)), None);
+    }
+
+    #[test]
+    fn should_return_none_for_empty_prefix() {
+        // given
+        let extractor = LogSegmentExtractor;
+
+        // when / then — empty Prefix returns None (scan-side, benign)
+        assert_eq!(extractor.prefix_len(&prefix(&[])), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed log key")]
+    fn should_panic_on_point_shorter_than_routing_prefix() {
+        // given
+        let extractor = LogSegmentExtractor;
+        let short = [SUBSYSTEM, KEY_VERSION, 0, 0, 0];
+
+        // when / then — short Point is a LogDb bug; panic
+        let _ = extractor.prefix_len(&point(&short));
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed log key")]
+    fn should_panic_on_point_with_wrong_subsystem() {
         // given
         let extractor = LogSegmentExtractor;
         let bad = [0xFF, KEY_VERSION, 0, 0, 0, 1, 0x10];
 
         // when / then
-        assert_eq!(extractor.prefix_len(&point(&bad)), None);
+        let _ = extractor.prefix_len(&point(&bad));
     }
 
     #[test]
-    fn should_return_none_for_keys_with_wrong_version() {
+    #[should_panic(expected = "malformed log key")]
+    fn should_panic_on_point_with_wrong_version() {
         // given
         let extractor = LogSegmentExtractor;
         let bad = [SUBSYSTEM, 0xFF, 0, 0, 0, 1, 0x10];
 
         // when / then
-        assert_eq!(extractor.prefix_len(&point(&bad)), None);
+        let _ = extractor.prefix_len(&point(&bad));
     }
 
     #[test]
-    fn should_return_none_for_empty_key() {
+    #[should_panic(expected = "malformed log key")]
+    fn should_panic_on_empty_point() {
         // given
         let extractor = LogSegmentExtractor;
 
         // when / then
-        assert_eq!(extractor.prefix_len(&point(&[])), None);
-        assert_eq!(extractor.prefix_len(&prefix(&[])), None);
+        let _ = extractor.prefix_len(&point(&[]));
     }
 
     #[test]
