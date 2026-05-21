@@ -137,4 +137,5 @@ None at this time.
 |------------|--------------------------------------------|
 | 2026-01-09 | Initial draft                              |
 | 2026-03-18 | Simplify record tag and add subsystem byte |
-| 2026-05-19 | Drop the record_tag mandate from the common prefix. The common prefix is now `[subsystem, version]` (2 bytes); record-type discrimination is subsystem-defined. `common::serde::key_prefix::KeyPrefix` still ships the legacy 3-byte shape used by timeseries/vector/keyvalue; updating those callers and slimming the common codec is deferred to a follow-up. |
+| 2026-05-19 | Drop the record_tag mandate from the common prefix. The common prefix is now `[subsystem, version]` (2 bytes); record-type discrimination is subsystem-defined. |
+| 2026-05-20 | Slim `common::serde::key_prefix::KeyPrefix` to the new 2-byte shape and move tag-byte handling into the timeseries/vector subsystems. `common::serde::record_tag::RecordTag` remains as an opt-in 4+4 bit tag-byte utility for subsystems that want it. |

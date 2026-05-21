@@ -15,20 +15,24 @@ pub mod vector_data;
 pub(crate) mod vector_id;
 pub mod vector_index_data;
 
-use bytes::BytesMut;
+use bytes::{BufMut, Bytes, BytesMut};
 
 // Re-export encoding utilities from common
 pub use common::serde::encoding::{
     EncodingError, decode_optional_utf8, decode_utf8, encode_optional_utf8, encode_utf8,
 };
-use common::serde::key_prefix::KeyPrefix;
+use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
 use common::serde::record_tag::RecordTag;
+
+/// Offset of the first subsystem-defined field after the 2-byte common prefix
+/// plus the 1-byte vector tag.
+pub const PREFIX_AND_TAG_LEN: usize = KEY_PREFIX_LEN + 1;
 
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
-/// Subsystem-specific key prefix for vector storage.
-pub const SUBSYSTEM: u8 = 0x02;
+/// Subsystem byte for vector storage (see [`common::serde::subsystem`]).
+pub const SUBSYSTEM: u8 = common::serde::subsystem::VECTOR;
 
 /// Record type enumeration for vector database records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,17 +77,11 @@ impl RecordType {
         }
     }
 
-    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, EncodingError> {
-        if prefix.subsystem() != SUBSYSTEM {
-            return Err(EncodingError {
-                message: format!(
-                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
-                    SUBSYSTEM,
-                    prefix.subsystem()
-                ),
-            });
-        }
-        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
+    /// Decodes the record type from the tag byte that follows the 2-byte key
+    /// prefix in a vector key.
+    pub fn from_tag_byte(byte: u8) -> Result<Self, EncodingError> {
+        let tag = RecordTag::from_byte(byte)?;
+        RecordType::from_id(tag.record_type())
     }
 
     /// Creates a RecordTag for this record type (reserved bits = 0).
@@ -91,10 +89,30 @@ impl RecordType {
         RecordTag::new(self.id(), 0)
     }
 
-    /// Creates a KeyPrefix with the current version for this record type.
-    pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
+    /// Writes the 3-byte vector record prefix `[subsystem, version, tag]`.
+    pub fn write_prefix(&self, buf: &mut BytesMut) {
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
+        buf.put_u8(self.tag().as_byte());
     }
+
+    /// Encodes the 3-byte vector record prefix into a fresh `Bytes`.
+    pub fn encode_prefix(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
+        self.write_prefix(&mut buf);
+        buf.freeze()
+    }
+}
+
+/// Reads the tag byte that follows the 2-byte key prefix, validating that the
+/// preceding 2 bytes are the vector subsystem and current key version.
+pub fn parse_record_tag(buf: &[u8]) -> Result<RecordTag, EncodingError> {
+    KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
+    if buf.len() < PREFIX_AND_TAG_LEN {
+        return Err(EncodingError {
+            message: "Buffer too short for record tag".to_string(),
+        });
+    }
+    Ok(RecordTag::from_byte(buf[KEY_PREFIX_LEN])?)
 }
 
 /// Trait for record keys that have a record type.

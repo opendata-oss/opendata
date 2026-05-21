@@ -6,9 +6,8 @@
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::merge_batch_posting_list;
-use crate::serde::{EncodingError, KEY_VERSION, RecordType, SUBSYSTEM};
+use crate::serde::{EncodingError, RecordType, parse_record_tag};
 use bytes::Bytes;
-use common::serde::key_prefix::KeyPrefix;
 use common::storage::default_merge_batch;
 
 /// Merge operator for vector database that handles merging of different record types.
@@ -29,10 +28,9 @@ impl VectorDbMergeOperator {
 
 impl common::storage::MergeOperator for VectorDbMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        let prefix = KeyPrefix::from_bytes_with_validation(key, SUBSYSTEM, KEY_VERSION)
-            .expect("Failed to decode key prefix");
+        let tag = parse_record_tag(key).expect("Failed to parse key prefix");
         let record_type =
-            RecordType::from_prefix(prefix).expect("Failed to get record type from record tag");
+            RecordType::from_id(tag.record_type()).expect("Failed to decode record type");
 
         match record_type {
             RecordType::MetadataIndex => merge_batch_metadata_index(existing_value, operands)
