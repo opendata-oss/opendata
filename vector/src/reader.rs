@@ -17,6 +17,7 @@ use crate::write::indexer::tree::centroids::{
 };
 use async_trait::async_trait;
 use common::StorageSemantics;
+use common::storage::StorageRead;
 use common::storage::factory::{StorageReaderRuntime, create_storage_read};
 use std::sync::Arc;
 
@@ -27,8 +28,11 @@ use std::sync::Arc;
 ///       have a mechanism for refreshing the centroid graph. This is deferred to
 ///       a later improvement. In the interim we'll first add support for creating
 ///       a reader from a checkpoint.
+///
 pub struct VectorDbReader {
-    query_engine: QueryEngine,
+    options: QueryEngineOptions,
+    centroid_index: Arc<LeveledCentroidIndex<'static>>,
+    storage: Arc<dyn StorageRead>,
 }
 
 impl VectorDbReader {
@@ -75,12 +79,39 @@ impl VectorDbReader {
             query_pruning_factor: config.query_pruning_factor,
         };
 
-        let query_engine = QueryEngine::new(options, centroid_index, storage);
-        Ok(Self::new(query_engine))
+        Ok(Self::new(options, centroid_index, storage))
     }
 
-    pub(crate) fn new(query_engine: QueryEngine) -> Self {
-        Self { query_engine }
+    pub(crate) fn new(
+        options: QueryEngineOptions,
+        centroid_index: Arc<LeveledCentroidIndex<'static>>,
+        storage: Arc<dyn StorageRead>,
+    ) -> Self {
+        Self {
+            options,
+            centroid_index,
+            storage,
+        }
+    }
+
+    /// Close the reader, releasing any storage-side resources.
+    ///
+    /// For SlateDB-backed storage this releases the reader handle and
+    /// flushes the SlateDB reader runtime; for in-memory storage this is
+    /// a no-op. Prefer calling `close` over relying on `Drop` so the
+    /// shutdown happens deterministically while the async runtime is
+    /// still alive.
+    pub async fn close(&self) -> Result<()> {
+        self.storage.close().await?;
+        Ok(())
+    }
+
+    fn query_engine(&self) -> QueryEngine {
+        QueryEngine::new(
+            self.options.clone(),
+            self.centroid_index.clone(),
+            self.storage.clone(),
+        )
     }
 }
 
@@ -91,11 +122,13 @@ impl VectorDbRead for VectorDbReader {
         query: &Query,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        self.query_engine.search_with_options(query, options).await
+        self.query_engine()
+            .search_with_options(query, options)
+            .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Vector>> {
-        self.query_engine.get(id).await
+        self.query_engine().get(id).await
     }
 }
 

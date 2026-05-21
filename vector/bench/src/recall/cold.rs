@@ -81,6 +81,7 @@ pub async fn run(
         }
         remaining -= group_size;
 
+        reader.close().await?;
         drop(reader);
         if let Some(cache) = cache {
             cache.close().await?;
