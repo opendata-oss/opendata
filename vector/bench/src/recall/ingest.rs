@@ -13,7 +13,7 @@ use vector::{Vector, VectorDb};
 
 use crate::recall::{Dataset, open_db};
 
-const BASE_VECTOR_CHUNK_SIZE: usize = 1_000_000;
+const BASE_VECTOR_CHUNK_SIZE: usize = 15_000;
 const INGEST_WRITE_BATCH_SIZE: usize = 10;
 
 /// Metrics produced by the ingest phase.
