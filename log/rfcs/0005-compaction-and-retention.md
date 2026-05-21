@@ -508,6 +508,33 @@ long-running consumers. That is compatible with this design because
 retention's primary purpose is to bound dataset growth, not to provide
 an instantaneous visibility cutoff.
 
+### Implications for clone and projection
+
+This layout composes naturally with full-database clone: the system
+segment is just part of the SlateDB keyspace, so a standard clone
+preserves `SeqBlock`, `SegmentMeta`, and all user segments without any
+LogDb-specific handling.
+
+Partial projection is more nuanced. Any projected LogDb must include a
+rewritten system segment, because `SegmentMeta` defines the projected
+segment set, and a writable projection may also need a fresh `SeqBlock`.
+That metadata is tiny, so the extra work is in planning the projection,
+not in copying metadata.
+
+Two projection shapes are plausible:
+
+- **Sequence-oriented projection** keeps some contiguous portion of the
+  log, such as a head or tail segment range.
+- **Key-oriented projection** keeps some logical key range. Because user
+  data is segmented, this would be planned by deriving a projected range
+  within each selected segment prefix.
+
+The current SlateDB clone/projection surface is narrower than that: it
+accepts a simple range. But the underlying manifest/view model is rich
+enough to support finer-grained LogDb projection in a future SlateDB RFC
+and implementation. The main added API surface would be a projection
+form that can derive per-segment ranges from a logical LogDb request.
+
 ### Metrics
 
 The implementation exposes the following Prometheus metrics:
