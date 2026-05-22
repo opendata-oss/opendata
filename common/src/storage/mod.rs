@@ -219,6 +219,18 @@ pub trait StorageIterator {
     async fn next(&mut self) -> StorageResult<Option<Record>>;
 }
 
+/// Routing-prefix view of a SlateDB segment in the manifest.
+///
+/// SlateDB partitions the LSM by a configurable [`slatedb::PrefixExtractor`];
+/// each resulting segment is identified by its routing prefix. Subsystems use
+/// this to derive logical entities (e.g. timeseries buckets, log segments)
+/// from the current manifest without scanning record keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentInfo {
+    /// The segment's routing prefix.
+    pub prefix: Bytes,
+}
+
 /// Common read operations supported by both Storage and StorageSnapshot.
 ///
 /// This trait provides the core read methods that are shared between full storage
@@ -239,6 +251,22 @@ pub trait StorageRead: Send + Sync {
         &self,
         range: BytesRange,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>>;
+
+    /// Lists the segments currently visible to this handle.
+    ///
+    /// For SlateDB-backed live storage this is projected from `Db::manifest()`
+    /// on each call. `StorageSnapshot` implementations capture the list at
+    /// snapshot creation. Backends without a real segment concept return an
+    /// empty list.
+    ///
+    /// SlateDB does not let us pin a `DbSnapshot` to a specific sequence
+    /// number, so a snapshot's segment list is an upper bound: it always
+    /// covers every prefix of every flushed record the snapshot can read, but
+    /// may include extra segments registered between `Db::snapshot()` and the
+    /// manifest read. In-memtable writes visible to the snapshot have no
+    /// corresponding segment yet (segments are manifest-level); callers
+    /// needing complete in-memtable coverage must augment separately.
+    fn list_segments(&self) -> Vec<SegmentInfo>;
 
     /// Collects all records in the range into a Vec.
     #[tracing::instrument(level = "trace", skip_all)]

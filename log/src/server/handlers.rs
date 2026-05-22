@@ -344,6 +344,10 @@ mod tests {
                 self.check_failure()?;
                 Ok(Box::new(EmptyIterator))
             }
+
+            fn list_segments(&self) -> Vec<common::storage::SegmentInfo> {
+                Vec::new()
+            }
         }
 
         impl StorageSnapshot for ToggleFailStorage {}

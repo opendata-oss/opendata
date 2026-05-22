@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::storage::factory::OwnedHybridCache;
-use crate::storage::{MergeOptions, PutOptions};
+use crate::storage::{MergeOptions, PutOptions, SegmentInfo};
 use crate::{
     BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
     Ttl,
@@ -68,6 +68,18 @@ fn default_scan_options() -> ScanOptions {
         order: IterationOrder::Ascending,
         filter_context: None,
     }
+}
+
+/// Projects the segment list from a SlateDB `VersionedManifest` into the
+/// `common` `SegmentInfo` shape.
+fn manifest_segments(manifest: &slatedb::manifest::VersionedManifest) -> Vec<SegmentInfo> {
+    manifest
+        .segments()
+        .iter()
+        .map(|s| SegmentInfo {
+            prefix: s.prefix().clone(),
+        })
+        .collect()
 }
 
 /// SlateDB-backed implementation of the Storage trait.
@@ -171,6 +183,10 @@ impl StorageRead for SlateDbStorage {
         Ok(Box::new(SlateDbIterator { iter }))
     }
 
+    fn list_segments(&self) -> Vec<SegmentInfo> {
+        manifest_segments(&self.db.manifest())
+    }
+
     async fn close(&self) -> StorageResult<()> {
         // Stop durable bridge first so no status subscriber outlives DB close.
         self.durable_bridge_abort.abort();
@@ -205,9 +221,12 @@ impl StorageIterator for SlateDbIterator {
 
 /// SlateDB snapshot wrapper that implements StorageSnapshot.
 ///
-/// Provides a consistent read-only view of the database at the time the snapshot was created.
+/// Provides a consistent read-only view of the database at the time the
+/// snapshot was created. `segments` is captured at snapshot creation and
+/// returned by [`StorageRead::list_segments`] for the snapshot's lifetime.
 pub struct SlateDbStorageSnapshot {
     snapshot: Arc<DbSnapshot>,
+    segments: Arc<Vec<SegmentInfo>>,
 }
 
 #[async_trait]
@@ -237,6 +256,10 @@ impl StorageRead for SlateDbStorageSnapshot {
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    fn list_segments(&self) -> Vec<SegmentInfo> {
+        (*self.segments).clone()
     }
 }
 
@@ -341,7 +364,8 @@ impl Storage for SlateDbStorage {
             .snapshot()
             .await
             .map_err(StorageError::from_storage)?;
-        Ok(Arc::new(SlateDbStorageSnapshot { snapshot }))
+        let segments = Arc::new(manifest_segments(&self.db.manifest()));
+        Ok(Arc::new(SlateDbStorageSnapshot { snapshot, segments }))
     }
 
     async fn flush(&self) -> StorageResult<()> {
@@ -448,6 +472,10 @@ impl StorageRead for SlateDbStorageReader {
         Ok(Box::new(SlateDbIterator { iter }))
     }
 
+    fn list_segments(&self) -> Vec<SegmentInfo> {
+        manifest_segments(&self.reader.manifest())
+    }
+
     async fn close(&self) -> StorageResult<()> {
         self.reader
             .close()
@@ -469,7 +497,7 @@ mod tests {
     use super::*;
     use crate::BytesRange;
     use slatedb::DbBuilder;
-    use slatedb::config::Settings;
+    use slatedb::config::{FlushOptions, FlushType, Settings};
     use slatedb::object_store::memory::InMemory;
     use slatedb_common::clock::MockSystemClock;
 
@@ -919,6 +947,109 @@ mod tests {
         assert!(
             reader_can_see_with_merge_op(path, object_store.clone(), "k1", Some(reader_merge_op),)
                 .await
+        );
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_segments_returns_empty_for_unsegmented_db() {
+        // given
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/segments_empty";
+        let db = DbBuilder::new(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+
+        // when
+        let initial = storage.list_segments();
+
+        // then
+        assert!(initial.is_empty());
+
+        storage.close().await.unwrap();
+    }
+
+    /// 2-byte prefix extractor for snapshot-contract tests.
+    #[derive(Debug)]
+    struct TwoBytePrefixExtractor;
+
+    impl slatedb::PrefixExtractor for TwoBytePrefixExtractor {
+        fn name(&self) -> &str {
+            "test-two-byte"
+        }
+
+        fn prefix_len(&self, target: &slatedb::PrefixTarget) -> Option<usize> {
+            let bytes: &[u8] = match target {
+                slatedb::PrefixTarget::Point(b) => b.as_ref(),
+                slatedb::PrefixTarget::Prefix(b) => b.as_ref(),
+            };
+            if bytes.len() >= 2 { Some(2) } else { None }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_segments_cover_flushed_visible_data_across_concurrent_writes() {
+        // given
+        let object_store = Arc::new(InMemory::new());
+        let path = "/test/segments_race";
+        let db = DbBuilder::new(path, object_store.clone())
+            .with_segment_extractor(Arc::new(TwoBytePrefixExtractor))
+            .build()
+            .await
+            .unwrap();
+        let storage = SlateDbStorage::new(Arc::new(db));
+        storage
+            .put(vec![
+                Record::new(Bytes::from_static(b"AA_one"), Bytes::from("v1")).into(),
+            ])
+            .await
+            .unwrap();
+        storage
+            .db
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+
+        // when
+        let snapshot = storage.snapshot().await.unwrap();
+        storage
+            .put(vec![
+                Record::new(Bytes::from_static(b"BB_two"), Bytes::from("v2")).into(),
+            ])
+            .await
+            .unwrap();
+        storage
+            .db
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+
+        // then
+        let visible = snapshot
+            .get(Bytes::from_static(b"AA_one"))
+            .await
+            .unwrap()
+            .expect("snapshot must see pre-snapshot record");
+        assert_eq!(visible.value, Bytes::from("v1"));
+        assert!(
+            snapshot
+                .get(Bytes::from_static(b"BB_two"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let segments = snapshot.list_segments();
+        let prefixes: Vec<&[u8]> = segments.iter().map(|s| s.prefix.as_ref()).collect();
+        assert!(
+            prefixes.contains(&b"AA".as_ref()),
+            "snapshot segments must cover the prefix of visible flushed data; got {prefixes:?}"
         );
 
         storage.close().await.unwrap();

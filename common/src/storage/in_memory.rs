@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeBounds;
 use std::sync::{Arc, RwLock};
 
@@ -8,11 +8,12 @@ use bytes::Bytes;
 use super::{
     MergeOperator, MergeRecordOp, PutRecordOp, Storage, StorageSnapshot, WriteOptions, WriteResult,
 };
-use crate::storage::RecordOp;
+use crate::storage::{RecordOp, SegmentInfo};
 use crate::{
     BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
     Ttl,
 };
+use slatedb::{PrefixExtractor, PrefixTarget};
 
 /// Trait for providing the current time.
 pub trait Clock: Send + Sync {
@@ -69,6 +70,8 @@ pub struct InMemoryStorage {
     written_seq: std::sync::atomic::AtomicU64,
     durable_seq: std::sync::atomic::AtomicU64,
     durable_tx: tokio::sync::watch::Sender<u64>,
+    prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
+    segments: Arc<RwLock<BTreeSet<Bytes>>>,
     defer_durability: bool,
 }
 
@@ -84,6 +87,8 @@ impl InMemoryStorage {
             written_seq: std::sync::atomic::AtomicU64::new(0),
             durable_seq: std::sync::atomic::AtomicU64::new(0),
             durable_tx,
+            prefix_extractor: None,
+            segments: Arc::new(RwLock::new(BTreeSet::new())),
             defer_durability: false,
         }
     }
@@ -103,6 +108,8 @@ impl InMemoryStorage {
             written_seq: std::sync::atomic::AtomicU64::new(0),
             durable_seq: std::sync::atomic::AtomicU64::new(0),
             durable_tx,
+            prefix_extractor: None,
+            segments: Arc::new(RwLock::new(BTreeSet::new())),
             defer_durability: false,
         }
     }
@@ -117,6 +124,43 @@ impl InMemoryStorage {
     pub fn with_default_ttl(mut self, ttl: u64) -> Self {
         self.default_ttl = Some(ttl);
         self
+    }
+
+    /// Installs a prefix extractor used to populate the segment list returned
+    /// by [`StorageRead::list_segments`]. Used by tests that exercise
+    /// segment-based bucket discovery without a real SlateDB manifest.
+    pub fn with_prefix_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
+        self.prefix_extractor = Some(extractor);
+        self
+    }
+
+    /// Records `key`'s routing prefix in the segment set, if a prefix
+    /// extractor is configured and accepts the key.
+    fn update_segments(&self, key: &Bytes) {
+        let Some(extractor) = self.prefix_extractor.as_ref() else {
+            return;
+        };
+        let target = PrefixTarget::Point(key.clone());
+        let Some(len) = extractor.prefix_len(&target) else {
+            return;
+        };
+        if len == 0 || len > key.len() {
+            return;
+        }
+        let prefix = key.slice(..len);
+        self.segments
+            .write()
+            .expect("segments lock poisoned")
+            .insert(prefix);
+    }
+
+    fn list_segments(&self) -> Vec<SegmentInfo> {
+        self.segments
+            .read()
+            .expect("segments lock poisoned")
+            .iter()
+            .map(|p| SegmentInfo { prefix: p.clone() })
+            .collect()
     }
 
     /// Enables deferred durability mode.
@@ -215,6 +259,10 @@ impl StorageRead for InMemoryStorage {
 
         Ok(Box::new(InMemoryIterator { records, index: 0 }))
     }
+
+    fn list_segments(&self) -> Vec<SegmentInfo> {
+        InMemoryStorage::list_segments(self)
+    }
 }
 
 struct InMemoryIterator {
@@ -243,6 +291,7 @@ impl StorageIterator for InMemoryIterator {
 pub struct InMemoryStorageSnapshot {
     data: Arc<BTreeMap<Bytes, StoredValue>>,
     clock: Arc<dyn Clock>,
+    segments: Arc<Vec<SegmentInfo>>,
 }
 
 #[async_trait]
@@ -272,6 +321,10 @@ impl StorageRead for InMemoryStorageSnapshot {
 
         Ok(Box::new(InMemoryIterator { records, index: 0 }))
     }
+
+    fn list_segments(&self) -> Vec<SegmentInfo> {
+        (*self.segments).clone()
+    }
 }
 
 #[async_trait]
@@ -290,10 +343,12 @@ impl Storage for InMemoryStorage {
             .map_err(|e| StorageError::Internal(format!("Failed to acquire write lock: {}", e)))?;
 
         let now = self.clock.now();
+        let mut observed_keys: Vec<Bytes> = Vec::new();
         for record in records {
             match record {
                 RecordOp::Put(op) => {
                     let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+                    observed_keys.push(op.record.key.clone());
                     data.insert(
                         op.record.key,
                         StoredValue {
@@ -313,6 +368,7 @@ impl Storage for InMemoryStorage {
                         &[op.record.value],
                     );
                     let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+                    observed_keys.push(op.record.key.clone());
                     data.insert(
                         op.record.key,
                         StoredValue {
@@ -325,6 +381,10 @@ impl Storage for InMemoryStorage {
                     data.remove(&key);
                 }
             }
+        }
+        drop(data);
+        for key in &observed_keys {
+            self.update_segments(key);
         }
 
         Ok(WriteResult {
@@ -348,8 +408,10 @@ impl Storage for InMemoryStorage {
             .map_err(|e| StorageError::Internal(format!("Failed to acquire write lock: {}", e)))?;
 
         let now = self.clock.now();
+        let mut observed_keys: Vec<Bytes> = Vec::with_capacity(records.len());
         for op in records {
             let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+            observed_keys.push(op.record.key.clone());
             data.insert(
                 op.record.key,
                 StoredValue {
@@ -357,6 +419,10 @@ impl Storage for InMemoryStorage {
                     expire_ts,
                 },
             );
+        }
+        drop(data);
+        for key in &observed_keys {
+            self.update_segments(key);
         }
 
         Ok(WriteResult {
@@ -394,6 +460,7 @@ impl Storage for InMemoryStorage {
             .map_err(|e| StorageError::Internal(format!("Failed to acquire write lock: {}", e)))?;
 
         let now = self.clock.now();
+        let mut observed_keys: Vec<Bytes> = Vec::with_capacity(records.len());
         for op in records {
             let existing_value = data
                 .get(&op.record.key)
@@ -402,6 +469,7 @@ impl Storage for InMemoryStorage {
             let merged_value =
                 merge_op.merge_batch(&op.record.key, existing_value, &[op.record.value]);
             let expire_ts = compute_expire_ts(now, op.options.ttl, self.default_ttl);
+            observed_keys.push(op.record.key.clone());
             data.insert(
                 op.record.key,
                 StoredValue {
@@ -409,6 +477,10 @@ impl Storage for InMemoryStorage {
                     expire_ts,
                 },
             );
+        }
+        drop(data);
+        for key in &observed_keys {
+            self.update_segments(key);
         }
 
         Ok(WriteResult {
@@ -428,10 +500,11 @@ impl Storage for InMemoryStorage {
             .map_err(|e| StorageError::Internal(format!("Failed to acquire read lock: {}", e)))?;
 
         let snapshot_data = Arc::new(data.clone());
-
+        let segments = Arc::new(InMemoryStorage::list_segments(self));
         Ok(Arc::new(InMemoryStorageSnapshot {
             data: snapshot_data,
             clock: self.clock.clone(),
+            segments,
         }))
     }
 
@@ -595,6 +668,10 @@ impl super::StorageRead for FailingStorage {
     ) -> super::StorageResult<Box<dyn super::StorageIterator + Send + 'static>> {
         self.inner.scan_iter(range).await
     }
+
+    fn list_segments(&self) -> Vec<SegmentInfo> {
+        self.inner.list_segments()
+    }
 }
 
 #[cfg(feature = "test-utils")]
@@ -672,6 +749,109 @@ mod tests {
                     result.freeze()
                 })
         }
+    }
+
+    #[tokio::test]
+    async fn list_segments_returns_empty_list() {
+        // given
+        let storage = InMemoryStorage::new();
+
+        // when
+        let live = storage.list_segments();
+        let snapshot = storage.snapshot().await.unwrap();
+        let frozen = snapshot.list_segments();
+
+        // then
+        assert!(live.is_empty());
+        assert!(frozen.is_empty());
+    }
+
+    /// 4-byte prefix extractor used by the segment-tracking tests below.
+    #[derive(Debug)]
+    struct FirstFourBytesExtractor;
+
+    impl PrefixExtractor for FirstFourBytesExtractor {
+        fn name(&self) -> &str {
+            "test-first-four"
+        }
+
+        fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+            let bytes: &[u8] = match target {
+                PrefixTarget::Point(b) => b.as_ref(),
+                PrefixTarget::Prefix(b) => b.as_ref(),
+            };
+            if bytes.len() >= 4 { Some(4) } else { None }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_segments_tracks_distinct_written_prefixes() {
+        // given
+        let storage =
+            InMemoryStorage::new().with_prefix_extractor(Arc::new(FirstFourBytesExtractor));
+
+        // when
+        storage
+            .put(vec![
+                Record::new(Bytes::from_static(b"AAAA_one"), Bytes::from("v1")).into(),
+                Record::new(Bytes::from_static(b"AAAA_two"), Bytes::from("v2")).into(),
+                Record::new(Bytes::from_static(b"BBBB_one"), Bytes::from("v3")).into(),
+            ])
+            .await
+            .unwrap();
+
+        // then
+        let segments = storage.list_segments();
+        let prefixes: Vec<&[u8]> = segments.iter().map(|s| s.prefix.as_ref()).collect();
+        assert_eq!(prefixes, vec![b"AAAA".as_ref(), b"BBBB".as_ref()]);
+        let snapshot = storage.snapshot().await.unwrap();
+        assert_eq!(snapshot.list_segments().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn snapshot_segment_view_is_frozen_at_creation() {
+        // given
+        let storage =
+            InMemoryStorage::new().with_prefix_extractor(Arc::new(FirstFourBytesExtractor));
+        storage
+            .put(vec![
+                Record::new(Bytes::from_static(b"AAAA_one"), Bytes::from("v")).into(),
+            ])
+            .await
+            .unwrap();
+
+        // when
+        let snapshot = storage.snapshot().await.unwrap();
+        storage
+            .put(vec![
+                Record::new(Bytes::from_static(b"BBBB_one"), Bytes::from("v")).into(),
+            ])
+            .await
+            .unwrap();
+
+        // then
+        assert_eq!(storage.list_segments().len(), 2);
+        let frozen = snapshot.list_segments();
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen[0].prefix.as_ref(), b"AAAA");
+    }
+
+    #[tokio::test]
+    async fn list_segments_ignores_keys_without_extracted_prefix() {
+        // given
+        let storage =
+            InMemoryStorage::new().with_prefix_extractor(Arc::new(FirstFourBytesExtractor));
+
+        // when
+        storage
+            .put(vec![
+                Record::new(Bytes::from_static(b"abc"), Bytes::from("short")).into(),
+            ])
+            .await
+            .unwrap();
+
+        // then
+        assert!(storage.list_segments().is_empty());
     }
 
     #[tokio::test]
