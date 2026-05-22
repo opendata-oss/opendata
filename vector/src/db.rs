@@ -867,8 +867,7 @@ impl VectorDb {
             distance_metric: self.config.distance_metric,
             query_pruning_factor: self.config.query_pruning_factor,
         };
-        Box::new(VectorDbReader::new(options, centroid_index, snapshot))
-            as Box<dyn VectorDbRead>
+        Box::new(VectorDbReader::new(options, centroid_index, snapshot)) as Box<dyn VectorDbRead>
     }
 }
 

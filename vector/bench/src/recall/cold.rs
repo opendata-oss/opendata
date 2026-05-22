@@ -69,7 +69,9 @@ pub async fn run(
 
         let group_size = remaining.min(COLD_QUERIES_PER_READER);
         for _ in 0..group_size {
-            let query = query_iter.next().expect("queries.iter().cycle() is infinite");
+            let query = query_iter
+                .next()
+                .expect("queries.iter().cycle() is infinite");
             let t = Instant::now();
             let q = Query::new(query.clone()).with_limit(k);
             let _ = reader

@@ -135,8 +135,7 @@ async fn warm(
         .collect();
     drop(rx);
 
-    let (_, consumer_results) =
-        tokio::join!(producer, futures::future::try_join_all(consumers));
+    let (_, consumer_results) = tokio::join!(producer, futures::future::try_join_all(consumers));
     let consumer_results = consumer_results?;
 
     for batch in consumer_results {

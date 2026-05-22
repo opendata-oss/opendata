@@ -10,12 +10,6 @@ mod cold;
 mod ingest;
 mod warm;
 
-use std::fs::File;
-use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread;
-use foyer::HybridCachePolicy;
 use bencher::{Bench, Benchmark, Params, Summary};
 use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{
@@ -24,6 +18,12 @@ use common::storage::factory::{
 use common::{
     StorageBuilder, StorageConfig, StorageError, StorageReaderRuntime, create_object_store,
 };
+use foyer::HybridCachePolicy;
+use std::fs::File;
+use std::io::{self, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 use tokio::sync::mpsc;
 use vector::{Config, DistanceMetric, ReaderConfig, VectorDb};
 
@@ -714,8 +714,14 @@ const SIFT100K: Dataset = Dataset {
     name: "sift100k",
     dimensions: 128,
     distance_metric: DistanceMetric::L2,
-    base_file: concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/data/sift100k/base.fvecs"),
-    query_file: concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/data/sift100k/query.fvecs"),
+    base_file: concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/data/sift100k/base.fvecs"
+    ),
+    query_file: concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/data/sift100k/query.fvecs"
+    ),
     ground_truth_file: concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../tests/data/sift100k/groundtruth.ivecs"
@@ -1071,10 +1077,7 @@ async fn hybrid_block_cache(
 /// - `None` → use `default_memory_bytes` (the phase's computed default).
 /// - `Some(n)` with `n < 0` → cache disabled (returns `None`).
 /// - `Some(n)` with `n >= 0` → use `n` bytes exactly (no cap).
-fn resolve_block_cache_memory(
-    configured: Option<i64>,
-    default_memory_bytes: u64,
-) -> Option<u64> {
+fn resolve_block_cache_memory(configured: Option<i64>, default_memory_bytes: u64) -> Option<u64> {
     match configured {
         None => Some(default_memory_bytes),
         Some(n) if n < 0 => None,
@@ -1266,10 +1269,7 @@ impl Benchmark for RecallBenchmark {
                     summary = summary
                         .add("num_vectors", s.num_vectors as f64)
                         .add("ingest_secs", s.ingest_secs)
-                        .add(
-                            "ingest_vec_per_sec",
-                            s.num_vectors as f64 / s.ingest_secs,
-                        );
+                        .add("ingest_vec_per_sec", s.num_vectors as f64 / s.ingest_secs);
                 }
                 Phase::Cold => {
                     let s = cold::run(&dataset, &reader_config, &queries, k, &bench).await?;
@@ -1279,8 +1279,8 @@ impl Benchmark for RecallBenchmark {
                         .add("cold_p99_latency_us", s.p99);
                 }
                 Phase::Warm => {
-                    let s = warm::run(&dataset, &config, &queries, &ground_truth, k, &bench)
-                        .await?;
+                    let s =
+                        warm::run(&dataset, &config, &queries, &ground_truth, k, &bench).await?;
                     summary = summary
                         .add("recall_at_k", s.recall_at_k)
                         .add("k", k as f64)
