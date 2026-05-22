@@ -540,17 +540,14 @@ impl LogDbBuilder {
         // Route every log record to a SlateDB segment keyed by the 6-byte
         // routing prefix `[subsystem, version, segment_id]`. No-op for the
         // in-memory backend; for slatedb-backed storage this installs the
-        // extractor on the underlying `DbBuilder` (see RFC 0024). The
-        // prefix bloom policy is independent of the segment extractor: it
-        // hashes the logical key (segment + user key, without sequence)
-        // into per-SST bloom filters so `db.scan_prefix` can skip SSTs
-        // that contain no matching (segment, user_key). `bits_per_key=10`
-        // matches slatedb's default. `whole_key_filtering=false` because
-        // for LogEntry keys the prefix subsumes any per-sequence hash
-        // (slatedb's consecutive-prefix dedup collapses N entries per
-        // user key down to one stored hash), and for the fixed-length /
-        // whole-key record types the extracted prefix already is the
-        // full key.
+        // extractor on the underlying `DbBuilder` (see RFC 0024).
+        //
+        // The bloom filter policy is an orthogonal slatedb axis: the
+        // `LogKeyPrefixExtractor` hashes only the logical `(segment,
+        // user_key)` prefix into per-SST bloom filters (see its module
+        // doc for the contract). `whole_key_filtering=false` because the
+        // extracted prefix already discriminates everything we need to
+        // probe — adding per-key hashes would only inflate the filter.
         let sb =
             sb.map_slatedb(|db| {
                 db.with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
