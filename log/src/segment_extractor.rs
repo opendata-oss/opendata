@@ -1,6 +1,6 @@
 //! SlateDB segment extractor for the log subsystem.
 //!
-//! Implements [`slatedb::PrefixExtractor`] over the v2 log key layout, mapping
+//! Implements [`slatedb::PrefixExtractor`] over the log key layout, mapping
 //! every record to the 6-byte routing prefix `[subsystem, version, segment_id]`.
 //! When configured on the `slatedb::DbBuilder`, the extractor causes SlateDB
 //! to route writes for each LogDb segment into its own SlateDB segment, so the
@@ -37,7 +37,7 @@ pub(crate) const ROUTING_PREFIX_LEN: usize = 6;
 /// Stable, persisted identifier for this extractor's routing rules.
 /// Bump whenever the routing logic changes in a way that would re-route
 /// existing keys (e.g. a new `KEY_VERSION` with a different prefix shape).
-const EXTRACTOR_NAME: &str = "opendata-log/v2";
+const EXTRACTOR_NAME: &str = "opendata-log/v1";
 
 /// Prefix extractor routing log records to per-segment SlateDB segments.
 ///
@@ -128,7 +128,7 @@ mod tests {
         let extractor = LogSegmentExtractor;
 
         // when / then — must match the persisted manifest value
-        assert_eq!(extractor.name(), "opendata-log/v2");
+        assert_eq!(extractor.name(), "opendata-log/v1");
     }
 
     #[test]
@@ -341,9 +341,9 @@ mod integration_tests {
     use crate::model::Record;
     use crate::reader::LogRead;
 
-    const EXPECTED_EXTRACTOR_NAME: &str = "opendata-log/v2";
+    const EXPECTED_EXTRACTOR_NAME: &str = "opendata-log/v1";
     const LOG_SUBSYSTEM: u8 = 0x03;
-    const LOG_KEY_VERSION: u8 = 0x02;
+    const LOG_KEY_VERSION: u8 = 0x01;
     const SYSTEM_SEGMENT_ID: u32 = 0;
 
     fn slatedb_storage_config(temp_dir: &TempDir) -> (StorageConfig, SlateDbStorageConfig) {
