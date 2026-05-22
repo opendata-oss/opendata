@@ -50,7 +50,7 @@ mod compaction;
 mod config;
 mod direct;
 mod error;
-mod key_extractor;
+mod filter_prefix;
 mod listing;
 mod log;
 mod model;

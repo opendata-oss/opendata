@@ -53,7 +53,7 @@
 use std::sync::Arc;
 
 use common::serde::terminated_bytes;
-use slatedb::{PrefixExtractor, PrefixTarget};
+use slatedb::{BloomFilterPolicy, FilterPolicy, PrefixExtractor, PrefixTarget};
 
 use crate::serde::{
     KEY_VERSION, RECORD_TYPE_OFFSET, RecordType, SEGMENT_META_KEY_LEN, SEGMENTED_PREFIX_LEN,
@@ -91,6 +91,16 @@ impl LogKeyPrefixExtractor {
     pub(crate) fn shared() -> Arc<dyn PrefixExtractor> {
         Arc::new(Self)
     }
+}
+
+/// Returns the filter policy set that must be shared by LogDb writers,
+/// compactors, and standalone readers.
+pub(crate) fn bloom_filter_policies() -> Vec<Arc<dyn FilterPolicy>> {
+    vec![Arc::new(
+        BloomFilterPolicy::new(10)
+            .with_prefix_extractor(LogKeyPrefixExtractor::shared())
+            .with_whole_key_filtering(false),
+    )]
 }
 
 /// Returns true if the buffer is a syntactically well-formed log key

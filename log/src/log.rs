@@ -16,7 +16,7 @@ use bytes::Bytes;
 use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
 use common::storage::config::StorageConfig;
-use common::{CompactorBuilder, StorageBuilder, create_object_store};
+use common::{CompactorBuilder, StorageBuilder, StorageSemantics, create_object_store};
 use slatedb::SstBlockSize;
 use slatedb::compactor::CompactionSchedulerSupplier;
 use tokio::sync::RwLock;
@@ -579,7 +579,11 @@ impl LogDbBuilder {
         self.config.validate_compaction()?;
         let sb = StorageBuilder::new(&self.config.storage)
             .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .with_semantics(
+                StorageSemantics::new()
+                    .with_filter_policies(crate::filter_prefix::bloom_filter_policies()),
+            );
         // Route every log record to a SlateDB segment keyed by the 6-byte
         // routing prefix `[subsystem, version, segment_id]`. No-op for the
         // in-memory backend; for slatedb-backed storage this installs the
@@ -593,11 +597,6 @@ impl LogDbBuilder {
         // probe — adding per-key hashes would only inflate the filter.
         let sb = sb.map_slatedb(|db| {
             db.with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
-                .with_filter_policies(vec![Arc::new(
-                    slatedb::BloomFilterPolicy::new(10)
-                        .with_prefix_extractor(crate::key_extractor::LogKeyPrefixExtractor::shared())
-                        .with_whole_key_filtering(false),
-                )])
         });
         // Install the LogDb compaction scheduler for every SlateDB-backed log.
         let compactor_view_cell: CompactorViewCell =
@@ -616,7 +615,9 @@ impl LogDbBuilder {
                 });
             sb.map_slatedb(move |db| {
                 db.with_compactor_builder(
-                    CompactorBuilder::new(path, object_store).with_scheduler_supplier(supplier),
+                    CompactorBuilder::new(path, object_store)
+                        .with_scheduler_supplier(supplier)
+                        .with_filter_policies(crate::filter_prefix::bloom_filter_policies()),
                 )
             })
         } else {
