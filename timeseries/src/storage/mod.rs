@@ -15,6 +15,7 @@
 //! - [`factory`] — the in-memory test storage helper.
 pub(crate) mod factory;
 pub(crate) mod merge_operator;
+pub(crate) mod segment_extractor;
 pub(crate) mod slate;
 
 pub(crate) use slate::{
