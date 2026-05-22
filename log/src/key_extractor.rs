@@ -70,20 +70,15 @@ const EXTRACTOR_NAME: &str = "opendata-log/v2/key-prefix";
 /// Dispatches on the record-type byte at offset 6:
 ///
 /// - `LogEntry (0x10)` — variable region is `[terminated_user_key,
-///   var_u64(relative_seq)]`. The extractor finds the first unescaped
-///   `0x00` (the terminator that closes the user key) starting at offset
-///   `SEGMENTED_PREFIX_LEN` and returns its position + 1. Removing the
-///   sequence varint from the hashed prefix lets the SST builder dedupe
-///   all entries for a given `(segment, user_key)` down to a single
-///   stored hash.
-/// - `SeqBlock (0x20)` — fixed 7-byte key, no variable suffix; the prefix
-///   *is* the whole key.
+///   var_u64(relative_seq)]`. Returns the position one past the first
+///   unescaped `0x00` (the terminator that closes the user key),
+///   excluding the sequence varint.
+/// - `SeqBlock (0x20)` — fixed 7-byte key, no variable suffix; whole key.
 /// - `SegmentMeta (0x30)` — fixed 11-byte key (segmented prefix + 4-byte
 ///   described-segment-id suffix); whole key.
 /// - `ListingEntry (0x40)` — variable suffix without a terminator. Whole
 ///   key for `Point`; `None` for `Prefix` (truncation-unsafe — any
-///   extension is a strictly longer key with a longer extracted length,
-///   violating the trait's prefix-extension invariant).
+///   extension is a longer key with a longer extracted length).
 ///
 /// Unknown or malformed inputs panic for `Point` (LogDb bug) and return
 /// `None` for `Prefix` (caller-supplied, benign).
@@ -149,11 +144,9 @@ fn prefix_len_for_point(bytes: &[u8]) -> usize {
     }
 }
 
-/// Computes the prefix length for a `Prefix` target — a caller-supplied
-/// scan prefix. Returns `None` for any case where the truncation invariant
-/// (`prefix_len(Prefix(p)) = Some(n)` ⇒ every extension `q` has
-/// `prefix_len(Point(q)) = Some(n)` and `q[..n] == p[..n]`) cannot be
-/// guaranteed.
+/// Computes the prefix length for a caller-supplied scan prefix. Returns
+/// `None` when this impl cannot guarantee the truncation invariant
+/// described in the module doc.
 fn prefix_len_for_prefix(bytes: &[u8]) -> Option<usize> {
     if !has_segmented_prefix(bytes) {
         return None;
@@ -161,22 +154,19 @@ fn prefix_len_for_prefix(bytes: &[u8]) -> Option<usize> {
 
     let tag = bytes[RECORD_TYPE_OFFSET];
     match decode_record_type(tag)? {
-        // Terminator-bounded variable region. Returning `Some(pos+1)` only
-        // when the terminator is present in `bytes` means every extension
-        // `q` of `p` has its terminator at the same position (the encoding
-        // can't move it) — invariant satisfied.
+        // Terminator at a fixed position once seen; the encoding can't
+        // move it under extension, so returning `Some(pos+1)` is
+        // truncation-safe.
         RecordType::LogEntry => terminated_bytes::find_terminator_end(bytes, SEGMENTED_PREFIX_LEN),
-        // Fixed-length keys: extracted length is constant for every valid
-        // extension. Safe to return as long as the prefix already contains
-        // the full key.
+        // Fixed-length keys: only safe to answer once `bytes` already
+        // contains the full key, otherwise extensions would extract a
+        // longer prefix than what we report here.
         RecordType::SeqBlock => Some(SEGMENTED_PREFIX_LEN),
         RecordType::SegmentMeta => {
             (bytes.len() >= SEGMENT_META_KEY_LEN).then_some(SEGMENT_META_KEY_LEN)
         }
-        // Variable suffix with no delimiter. For any candidate `n`, an
-        // extension `q` longer than `p` would extract `q.len() != n`, so
-        // returning `Some(_)` would lie about future extensions and could
-        // produce false negatives. Disable the filter for these scans.
+        // Variable suffix with no delimiter: every extension would extract
+        // a strictly longer prefix, so no `Some(_)` answer is truncation-safe.
         RecordType::ListingEntry => None,
     }
 }
