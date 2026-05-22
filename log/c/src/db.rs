@@ -2,8 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::storage::config::StorageConfig;
-use log::{LogDbBuilder, LogRead};
+use log::{LogDb, LogRead};
 
 use crate::ffi::*;
 
@@ -30,58 +29,12 @@ pub unsafe extern "C" fn opendata_log_open(
         Err(e) => return e,
     };
 
-    // Separate compaction runtime to prevent block_on deadlock
-    let compaction_runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("od-compaction")
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return error_result(
-                opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INTERNAL,
-                &format!("failed to create compaction runtime: {e}"),
-            );
-        }
-    };
-
-    let log = match runtime.block_on(async {
-        let sb = match common::StorageBuilder::new(&rust_config.storage).await {
-            Ok(sb) => sb,
-            Err(e) => {
-                return Err(log::Error::Storage(format!(
-                    "failed to create storage builder: {e}"
-                )));
-            }
-        };
-        let sb = sb.map_slatedb(|db| {
-            // Re-extract SlateDB config fields for the CompactorBuilder.
-            // Called inside block_on because CompactorBuilder::new requires a Tokio runtime.
-            if let StorageConfig::SlateDb(ref slate_config) = rust_config.storage {
-                let obj_store = common::create_object_store(&slate_config.object_store).unwrap();
-                db.with_compactor_builder(
-                    common::CompactorBuilder::new(slate_config.path.clone(), obj_store)
-                        .with_runtime(compaction_runtime.handle().clone()),
-                )
-            } else {
-                db
-            }
-        });
-        LogDbBuilder::new(rust_config)
-            .with_storage_builder(sb)
-            .build()
-            .await
-    }) {
+    let log = match runtime.block_on(LogDb::open(rust_config)) {
         Ok(log) => log,
         Err(e) => return error_from_log_error(&e),
     };
 
-    *out_log = Box::into_raw(Box::new(opendata_log_t {
-        log,
-        runtime,
-        _compaction_runtime: compaction_runtime,
-    }));
+    *out_log = Box::into_raw(Box::new(opendata_log_t { log, runtime }));
     success_result()
 }
 

@@ -32,7 +32,7 @@ use crate::serde::{KEY_VERSION, SUBSYSTEM};
 /// extracted prefix so all record types for a given segment (entries,
 /// listings, and — for the system segment — metadata and the seq block)
 /// share one routing prefix and land in the same SlateDB segment.
-const ROUTING_PREFIX_LEN: usize = 6;
+pub(crate) const ROUTING_PREFIX_LEN: usize = 6;
 
 /// Stable, persisted identifier for this extractor's routing rules.
 /// Bump whenever the routing logic changes in a way that would re-route
