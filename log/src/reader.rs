@@ -250,11 +250,12 @@ impl LogReadView {
         self.storage = snapshot;
     }
 
-    /// Incrementally loads new segments from the current storage snapshot.
+    /// Reloads segments from the current storage snapshot.
     ///
-    /// Only loads segments with ID > `after_segment_id`. This is used by
-    /// subscriber tasks to refresh segments without needing segments propagated
-    /// through the watch channel.
+    /// When `after_segment_id` is `Some`, only newer segments are appended.
+    /// When `None`, the segment cache is fully replaced from storage. The
+    /// standalone reader uses the full-reload path so it converges on both
+    /// newly-created and deleted segments.
     pub(crate) async fn refresh_segments(
         &mut self,
         after_segment_id: Option<SegmentId>,
@@ -262,6 +263,12 @@ impl LogReadView {
         self.segments
             .refresh(self.storage.as_ref(), after_segment_id)
             .await
+    }
+
+    /// Drops every cached segment with id `<= through_id`. Used by subscriber
+    /// tasks to converge to the writer's published deletion watermark.
+    pub(crate) fn drop_segments_through(&mut self, through_id: SegmentId) {
+        self.segments.drop_through(through_id);
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
@@ -502,6 +509,10 @@ impl LogDbReader {
     }
 
     /// Spawns a background task that periodically refreshes the segment cache.
+    ///
+    /// This path fully reloads segments from storage on each tick so a
+    /// standalone reader observes retention-driven `SegmentMeta` deletes as
+    /// well as newly created segments.
     fn spawn_refresh_task(
         read_view: Arc<RwLock<LogReadView>>,
         interval: Duration,
@@ -515,16 +526,9 @@ impl LogDbReader {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        // Get the latest segment ID for incremental refresh
-                        let after_segment_id = {
-                            let view = read_view.read().await;
-                            view.segments.latest().map(|s| s.id())
-                        };
-
-                        // Refresh the cache
                         let mut view = read_view.write().await;
                         let storage = Arc::clone(&view.storage);
-                        if let Err(e) = view.segments.refresh(storage.as_ref(), after_segment_id).await {
+                        if let Err(e) = view.segments.refresh(storage.as_ref(), None).await {
                             tracing::warn!("Failed to refresh segment cache: {}", e);
                         }
                     }
