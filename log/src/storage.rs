@@ -71,14 +71,21 @@ pub(crate) trait LogStorageRead: StorageRead {
     /// Scans log entries for a key within a segment and sequence range.
     ///
     /// Returns an iterator that yields `LogEntry` values in sequence order.
+    ///
+    /// Issues a prefix scan over the `(segment, key)` prefix rather than a
+    /// bounded range so that backends with prefix-aware bloom filters
+    /// (slatedb's `BloomFilterPolicy` with `LogKeyPrefixExtractor`) can skip
+    /// SSTs that contain no entries for this `(segment, key)`. The seq range
+    /// is enforced client-side by [`SegmentIterator`], which early-exits
+    /// once `sequence >= seq_range.end`.
     async fn scan_entries(
         &self,
         segment: &LogSegment,
         key: &Bytes,
         seq_range: Range<u64>,
     ) -> Result<SegmentIterator> {
-        let scan_range = LogEntryKey::scan_range(segment, key, seq_range.clone());
-        let inner = self.scan_iter(scan_range).await?;
+        let prefix = LogEntryKey::scan_prefix(segment, key);
+        let inner = self.scan_prefix_iter(prefix).await?;
         Ok(SegmentIterator::new(
             inner,
             seq_range,

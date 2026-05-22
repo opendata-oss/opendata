@@ -49,6 +49,7 @@
 mod config;
 mod direct;
 mod error;
+mod key_extractor;
 mod listing;
 mod log;
 mod model;
