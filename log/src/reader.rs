@@ -340,7 +340,7 @@ impl LogReadView {
     /// Lists distinct keys within a segment range.
     ///
     /// Stitches per-segment scans together by walking the segment cache —
-    /// the v2 key layout interleaves listings with log entries across
+    /// the key layout interleaves listings with log entries across
     /// segment boundaries, so a single wide-range storage scan is not safe.
     pub(crate) async fn list_keys(
         &self,
