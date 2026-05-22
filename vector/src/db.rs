@@ -856,7 +856,16 @@ impl VectorDb {
     }
 
     pub async fn snapshot(&self) -> Box<dyn VectorDbRead> {
-        Box::new(VectorDbReader::new(self.query_engine())) as Box<dyn VectorDbRead>
+        let (snapshot, centroid_index) = {
+            let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
+            (guard.snapshot.clone(), guard.centroid_index.clone())
+        };
+        let options = QueryEngineOptions {
+            dimensions: self.config.dimensions,
+            distance_metric: self.config.distance_metric,
+            query_pruning_factor: self.config.query_pruning_factor,
+        };
+        Box::new(VectorDbReader::new(options, centroid_index, snapshot)) as Box<dyn VectorDbRead>
     }
 }
 

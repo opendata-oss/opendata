@@ -1,36 +1,61 @@
 //! Recall benchmark for the vector database.
 //!
-//! Ingests a dataset, then runs queries and measures recall@k against ground truth.
-//!
-//! All benchmark parameters (dataset, nprobe, num_queries, block_cache_bytes, etc.)
-//! are configured via the bencher config file's `[params.recall]` section. When no
-//! config-level params are provided, `default_params` runs all datasets whose data
-//! files are present.
-//!
-//! Environment variables:
-//! - `VECTOR_BENCH_SKIP_INGEST`: Set to `1` to skip the ingest phase and query
-//!   an existing database (requires persistent storage via `vector_config`).
+//! Splits work into three phases — [`Phase::Ingest`], [`Phase::Cold`], and
+//! [`Phase::Warm`]. The phases to run are configured per-dataset via the
+//! [`Dataset::phases`] field and can be overridden through the bencher
+//! config's `[params.recall]` section. Each phase opens its own fresh
+//! `VectorDb` or `VectorDbReader` and closes it before the next phase starts.
 
-use std::collections::HashSet;
+mod cold;
+mod ingest;
+mod warm;
+
+use bencher::{Bench, Benchmark, Params, Summary};
+use common::storage::config::SlateDbStorageConfig;
+use common::storage::factory::{
+    CachedEntry, CachedKey, DbCache, FoyerCache, FoyerCacheOptions, FoyerHybridCache,
+};
+use common::{
+    StorageBuilder, StorageConfig, StorageError, StorageReaderRuntime, create_object_store,
+};
+use foyer::HybridCachePolicy;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
-
-use bencher::{Bench, Benchmark, Params, Summary};
-use common::StorageConfig;
-use common::storage::config::SlateDbStorageConfig;
-use common::storage::factory::{FoyerCache, FoyerCacheOptions};
-use common::{StorageBuilder, StorageReaderRuntime, create_object_store};
 use tokio::sync::mpsc;
-use vector::{
-    Config, DistanceMetric, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorDb,
-    VectorDbRead, VectorDbReader,
-};
+use vector::{Config, DistanceMetric, ReaderConfig, VectorDb};
 
 const DEFAULT_NUM_QUERIES: usize = 100;
-const BASE_VECTOR_CHUNK_SIZE: usize = 1_000_000;
-const INGEST_WRITE_BATCH_SIZE: usize = 10;
+/// Default number of queries to run during the cold phase. Queries are
+/// cycled if the dataset has fewer loaded queries than this.
+const DEFAULT_NUM_COLD_QUERIES: usize = 1000;
+/// Default number of concurrent queries during the warm query phase.
+const DEFAULT_QUERY_CONCURRENCY: usize = 1;
+/// Default ceiling on queries-per-second during the warm query phase.
+const DEFAULT_QUERY_QPS_LIMIT: usize = 32;
+
+/// Default phase list when a dataset doesn't specify otherwise.
+const DEFAULT_PHASES: &[Phase] = &[Phase::Ingest, Phase::Warm, Phase::Cold];
+
+/// Default on-disk path for the hybrid-cache disk tier. Only used when
+/// `block_cache_disk_bytes` is set.
+const DEFAULT_BLOCK_CACHE_DISK_PATH: &str = "/mnt/cache/foyer";
+
+/// Default fraction of total system memory used to size the in-memory
+/// block cache during the [`Phase::Ingest`] phase when
+/// [`Dataset::block_cache_bytes`] is not explicitly set. Ingest needs
+/// headroom for write-side state (write coordinator delta + frozen views,
+/// slatedb memtables, centroid index updates), so the default is
+/// relatively low.
+const INGEST_BLOCK_CACHE_MEMORY_FRACTION: f64 = 0.25;
+
+/// Default fraction of total system memory used to size the in-memory
+/// block cache during the [`Phase::Warm`] (and [`Phase::Cold`]) phase
+/// when [`Dataset::block_cache_bytes`] is not explicitly set. The
+/// read-only paths can claim the majority of memory.
+const WARM_BLOCK_CACHE_MEMORY_FRACTION: f64 = 2.0 / 3.0;
 
 fn load_vector_config(path: &str) -> Config {
     let contents =
@@ -47,13 +72,6 @@ fn load_storage_config(path: &str) -> StorageConfig {
     serde_yaml::from_str(&contents).unwrap_or_else(|e| panic!("failed to parse {}: {}", path, e))
 }
 
-fn skip_ingest() -> bool {
-    std::env::var("VECTOR_BENCH_SKIP_INGEST")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 fn data_dir() -> PathBuf {
     // When running from workspace root via `cargo run -p vector-bench`,
     // CARGO_MANIFEST_DIR points to vector/bench. Data is at vector/bench/data.
@@ -63,7 +81,7 @@ fn data_dir() -> PathBuf {
         .join("bench/data")
 }
 
-/// normalize a vector to the unit hypersphere
+/// Normalize a vector to the unit hypersphere.
 fn normalize_vec(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -71,9 +89,58 @@ fn normalize_vec(v: &mut [f32]) {
     }
 }
 
+// -- Phases -------------------------------------------------------------------
+
+/// A single phase of the recall benchmark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Ingest a dataset's base vectors into a fresh `VectorDb`.
+    Ingest,
+    /// Run a small number of queries against a fresh `VectorDbReader` to
+    /// measure cold-start latency.
+    Cold,
+    /// Warm up a `VectorDb` and then run the rate-limited concurrent query
+    /// workload that produces the headline recall/latency metrics.
+    Warm,
+}
+
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Phase::Ingest => "INGEST",
+            Phase::Cold => "COLD",
+            Phase::Warm => "WARM",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "INGEST" => Phase::Ingest,
+            "COLD" => Phase::Cold,
+            "WARM" => Phase::Warm,
+            _ => panic!("unknown phase: {}", s),
+        }
+    }
+}
+
+fn phases_to_param(phases: &[Phase]) -> String {
+    phases
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn param_to_phases(s: &str) -> Vec<Phase> {
+    s.split(',')
+        .filter(|s| !s.is_empty())
+        .map(Phase::parse)
+        .collect()
+}
+
 // -- Vector file readers ------------------------------------------------------
 
-struct VectorFileBatchReader {
+pub(crate) struct VectorFileBatchReader {
     reader: BufReader<File>,
     format: VecFormat,
     dimensions: usize,
@@ -211,9 +278,9 @@ fn read_ivecs(path: &Path) -> Vec<Vec<i32>> {
     vectors
 }
 
-/// Read bvecs format (BigANN). Each record: 4-byte dimension (i32 LE) followed
-/// by `dim` unsigned bytes. Values are converted to f32.
-/// If `limit` is `Some(n)`, stops after reading `n` vectors.
+/// Read bvecs format (BigANN). Each record: 4-byte dimension (i32 LE)
+/// followed by `dim` unsigned bytes. Values are converted to f32. If
+/// `limit` is `Some(n)`, stops after reading `n` vectors.
 fn read_bvecs(path: &Path, limit: Option<usize>) -> Vec<Vec<f32>> {
     let file =
         File::open(path).unwrap_or_else(|e| panic!("failed to open {}: {}", path.display(), e));
@@ -239,25 +306,9 @@ fn read_bvecs(path: &Path, limit: Option<usize>) -> Vec<Vec<f32>> {
     vectors
 }
 
-// -- Recall / percentile helpers ----------------------------------------------
+// -- Percentile helper --------------------------------------------------------
 
-fn recall_at_k(results: &[SearchResult], ground_truth: &[i32], k: usize) -> f64 {
-    let gt_set: HashSet<i32> = ground_truth.iter().take(k).copied().collect();
-    let found = results
-        .iter()
-        .take(k)
-        .filter(|r| {
-            r.vector
-                .id
-                .parse::<i32>()
-                .map(|id| gt_set.contains(&id))
-                .unwrap_or(false)
-        })
-        .count();
-    found as f64 / k as f64
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
+pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
@@ -268,42 +319,74 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 // -- Dataset descriptors ------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum VecFormat {
+pub(crate) enum VecFormat {
     Fvecs,
     Bvecs,
 }
 
 /// Dataset descriptor.
 #[derive(Clone)]
-struct Dataset {
-    name: &'static str,
-    dimensions: u16,
-    distance_metric: DistanceMetric,
-    base_file: &'static str,
-    query_file: &'static str,
-    ground_truth_file: &'static str,
-    split_threshold: usize,
-    merge_threshold: usize,
-    query_pruning_factor: Option<f32>,
-    nprobe: usize,
-    num_queries: usize,
-    /// Block cache size in bytes. `None` = no cache.
-    block_cache_bytes: Option<u64>,
+pub(crate) struct Dataset {
+    pub name: &'static str,
+    pub dimensions: u16,
+    pub distance_metric: DistanceMetric,
+    pub base_file: &'static str,
+    pub query_file: &'static str,
+    pub ground_truth_file: &'static str,
+    pub split_threshold: usize,
+    pub merge_threshold: usize,
+    pub query_pruning_factor: Option<f32>,
+    pub nprobe: usize,
+    pub num_queries: usize,
+    /// Number of queries to run during the cold phase. Defaults to
+    /// [`DEFAULT_NUM_COLD_QUERIES`]. Queries are cycled when this exceeds
+    /// the number of loaded queries.
+    pub num_cold_queries: usize,
+    /// In-memory block-cache size in bytes.
+    /// - `None`: derive from the phase-specific default (e.g.,
+    ///   [`INGEST_BLOCK_CACHE_MEMORY_FRACTION`] of total system memory for
+    ///   ingest, [`WARM_BLOCK_CACHE_MEMORY_FRACTION`] for warm/cold).
+    /// - `Some(-1)` (or any negative value): disable the block cache.
+    /// - `Some(n)` with `n >= 0`: use `n` bytes for the memory tier.
+    ///
+    /// When the cache is enabled and [`Dataset::block_cache_disk_bytes`]
+    /// is `None`, the bench uses a memory-only foyer cache; when both
+    /// are set the bench uses a hybrid memory + disk cache.
+    pub block_cache_bytes: Option<i64>,
+    /// On-disk block-cache size in bytes. `Some` opts into the hybrid
+    /// (memory + disk) foyer cache, with this controlling the disk tier
+    /// capacity and [`Dataset::block_cache_disk_path`] controlling its
+    /// location. Ignored unless [`Dataset::block_cache_bytes`] is also
+    /// `Some`.
+    pub block_cache_disk_bytes: Option<u64>,
+    /// On-disk path for the hybrid cache's disk tier. Defaults to
+    /// [`DEFAULT_BLOCK_CACHE_DISK_PATH`]. Unused unless
+    /// [`Dataset::block_cache_disk_bytes`] is `Some`.
+    pub block_cache_disk_path: &'static str,
     /// Directory containing the dataset files. When `None`, falls back to
     /// the default data directory resolved from `CARGO_MANIFEST_DIR`.
-    data_dir: Option<String>,
-    /// Path to a YAML file with vector `Config` overrides. When set, the config
-    /// from this file is used instead of constructing one from dataset fields.
-    vector_config: Option<String>,
-    /// Optional path to a YAML file with a separate StorageConfig for cold-reader
-    /// queries. When both writer and reader storage are SlateDb, the reader uses
-    /// the writer's data path/object store and the override's settings/cache.
-    reader_storage_config: Option<String>,
+    pub data_dir: Option<String>,
+    /// Path to a YAML file with vector `Config` overrides.
+    pub vector_config: Option<String>,
+    /// Optional path to a YAML file with a separate StorageConfig for the
+    /// cold-reader phase. When both writer and reader storage are SlateDb,
+    /// the reader uses the writer's data path/object store and the
+    /// override's settings/cache.
+    pub reader_storage_config: Option<String>,
     /// File format for base and query vectors.
-    format: VecFormat,
+    pub format: VecFormat,
     /// Maximum number of base vectors to ingest. `None` = all.
-    max_vectors: Option<usize>,
-    normalize: bool,
+    pub max_vectors: Option<usize>,
+    pub normalize: bool,
+    /// Number of queries allowed in flight concurrently during the warm
+    /// query phase. Default: `DEFAULT_QUERY_CONCURRENCY`.
+    pub query_concurrency: usize,
+    /// Ceiling on queries-per-second during the warm query phase.
+    /// Default: `DEFAULT_QUERY_QPS_LIMIT`.
+    pub query_qps_limit: usize,
+    /// Phases to run, in order. Each phase opens a fresh `VectorDb` /
+    /// `VectorDbReader` and closes it before the next phase starts.
+    pub phases: &'static [Phase],
 }
 
 impl Dataset {
@@ -315,7 +398,7 @@ impl Dataset {
         data_dir.join(self.query_file)
     }
 
-    fn estimated_base_vector_count(&self, data_dir: &Path) -> anyhow::Result<usize> {
+    pub(crate) fn estimated_base_vector_count(&self, data_dir: &Path) -> anyhow::Result<usize> {
         let path = self.base_path(data_dir);
         let bytes = std::fs::metadata(&path)?.len() as usize;
         let record_size = match self.format {
@@ -335,7 +418,7 @@ impl Dataset {
     }
 
     #[allow(clippy::type_complexity)]
-    fn spawn_base_vector_stream(
+    pub(crate) fn spawn_base_vector_stream(
         &self,
         data_dir: &Path,
         batch_size: usize,
@@ -409,7 +492,6 @@ impl Dataset {
         }
     }
 
-    /// Load query vectors, respecting `format`.
     fn load_query_vectors(&self, data_dir: &Path) -> Vec<Vec<f32>> {
         let path = self.query_path(data_dir);
         match self.format {
@@ -467,12 +549,24 @@ impl From<&Dataset> for Params {
         p.insert("merge_threshold", d.merge_threshold.to_string());
         p.insert("nprobe", d.nprobe.to_string());
         p.insert("num_queries", d.num_queries.to_string());
+        p.insert("num_cold_queries", d.num_cold_queries.to_string());
+        p.insert("query_concurrency", d.query_concurrency.to_string());
+        p.insert("query_qps_limit", d.query_qps_limit.to_string());
         p.insert("format", format_to_str(d.format));
+        p.insert("phases", phases_to_param(d.phases));
         if let Some(max) = d.max_vectors {
             p.insert("max_vectors", max.to_string());
         }
         if let Some(bytes) = d.block_cache_bytes {
             p.insert("block_cache_bytes", bytes.to_string());
+        }
+        // No insertion when None — Params absence carries the "use phase
+        // default" meaning; `-1` is the explicit "disabled" sentinel.
+        if let Some(bytes) = d.block_cache_disk_bytes {
+            p.insert("block_cache_disk_bytes", bytes.to_string());
+        }
+        if d.block_cache_disk_path != DEFAULT_BLOCK_CACHE_DISK_PATH {
+            p.insert("block_cache_disk_path", d.block_cache_disk_path);
         }
         if let Some(ref dir) = d.data_dir {
             p.insert("data_dir", dir.clone());
@@ -500,12 +594,39 @@ impl From<Params> for Dataset {
             .ok()
             .or(default.query_pruning_factor)
             .filter(|f| *f > 0.0);
+        // `block_cache_bytes` is now `Option<i64>` where `None` means
+        // "use the phase default", `Some(-1)` (or any negative) means
+        // "disabled", and `Some(n >= 0)` is an explicit byte count.
         let block_cache_bytes = p
             .get_parse::<i64>("block_cache_bytes")
             .ok()
-            .or(default.block_cache_bytes.map(|v| v as i64))
+            .or(default.block_cache_bytes);
+        let block_cache_disk_bytes = p
+            .get_parse::<i64>("block_cache_disk_bytes")
+            .ok()
+            .or(default.block_cache_disk_bytes.map(|v| v as i64))
             .filter(|b| *b > 0)
             .map(|b| b as u64);
+        // `block_cache_disk_path` is stored as `&'static str` for const
+        // initialisation, so user overrides are leaked the same way `phases`
+        // is. The default path is reused as the static slice when no override
+        // is set.
+        let block_cache_disk_path: &'static str = match p.get("block_cache_disk_path") {
+            Some(s) => Box::leak(s.to_string().into_boxed_str()),
+            None => default.block_cache_disk_path,
+        };
+
+        // `phases` round-trips through Params as a comma-separated string,
+        // but the Dataset struct stores `&'static [Phase]`. We allocate a
+        // leaked slice when the user overrides the default; otherwise we
+        // reuse the default dataset's static slice.
+        let phases: &'static [Phase] = match p.get("phases") {
+            Some(s) => {
+                let parsed = param_to_phases(s);
+                Box::leak(parsed.into_boxed_slice())
+            }
+            None => default.phases,
+        };
 
         Dataset {
             name: default.name,
@@ -526,8 +647,19 @@ impl From<Params> for Dataset {
             query_pruning_factor,
             nprobe: p.get_parse("nprobe").unwrap_or(default.nprobe),
             num_queries: p.get_parse("num_queries").unwrap_or(default.num_queries),
+            num_cold_queries: p
+                .get_parse("num_cold_queries")
+                .unwrap_or(default.num_cold_queries),
+            query_concurrency: p
+                .get_parse("query_concurrency")
+                .unwrap_or(default.query_concurrency),
+            query_qps_limit: p
+                .get_parse("query_qps_limit")
+                .unwrap_or(default.query_qps_limit),
             format: p.get("format").map(str_to_format).unwrap_or(default.format),
             block_cache_bytes,
+            block_cache_disk_bytes,
+            block_cache_disk_path,
             max_vectors: p.get_parse("max_vectors").ok().or(default.max_vectors),
             data_dir: p
                 .get("data_dir")
@@ -542,6 +674,7 @@ impl From<Params> for Dataset {
                 .map(|s| s.to_string())
                 .or_else(|| default.reader_storage_config.clone()),
             normalize: default.normalize,
+            phases,
         }
     }
 }
@@ -553,18 +686,65 @@ const SIFT1M: Dataset = Dataset {
     base_file: "sift/sift_base.fvecs",
     query_file: "sift/sift_query.fvecs",
     ground_truth_file: "sift/sift_groundtruth.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     nprobe: 15,
     query_pruning_factor: Some(7.0),
     num_queries: DEFAULT_NUM_QUERIES,
-    block_cache_bytes: Some(1073741824),
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
+    block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
+};
+
+// 100K-vector subset of SIFT1M generated by `gen_sift100k_groundtruth`. The
+// files live under `vector/tests/data/sift100k` so this dataset is suitable as
+// a fast smoke test that doesn't require downloading SIFT1M. The file paths
+// are absolute (resolved at compile time via `CARGO_MANIFEST_DIR`) so they
+// work regardless of the bench's default data directory.
+const SIFT100K: Dataset = Dataset {
+    name: "sift100k",
+    dimensions: 128,
+    distance_metric: DistanceMetric::L2,
+    base_file: concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/data/sift100k/base.fvecs"
+    ),
+    query_file: concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/data/sift100k/query.fvecs"
+    ),
+    ground_truth_file: concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/data/sift100k/groundtruth.ivecs"
+    ),
+    split_threshold: 150,
+    merge_threshold: 50,
+    nprobe: 15,
+    query_pruning_factor: Some(7.0),
+    num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
+    block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
+    data_dir: None,
+    vector_config: None,
+    reader_storage_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: None,
+    normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const COHERE1M: Dataset = Dataset {
@@ -574,18 +754,24 @@ const COHERE1M: Dataset = Dataset {
     base_file: "cohere/cohere_base.fvecs",
     query_file: "cohere/cohere_query.fvecs",
     ground_truth_file: "cohere/cohere_groundtruth.ivecs",
-    split_threshold: 200,
+    split_threshold: 150,
     merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const DEEP10M: Dataset = Dataset {
@@ -595,18 +781,24 @@ const DEEP10M: Dataset = Dataset {
     base_file: "deep/deep_base.fvecs",
     query_file: "deep/deep_query.fvecs",
     ground_truth_file: "deep/deep_groundtruth_10M.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const DEEP1B: Dataset = Dataset {
@@ -616,18 +808,24 @@ const DEEP1B: Dataset = Dataset {
     base_file: "deep/deep_base.fvecs",
     query_file: "deep/deep_query.fvecs",
     ground_truth_file: "deep/deep_groundtruth_1B.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
@@ -637,18 +835,51 @@ const WIKIPEDIA_BGE_M3_EN: Dataset = Dataset {
     base_file: "wikipedia-bge-m3/en/base.fvecs",
     query_file: "wikipedia-bge-m3/en/query.fvecs",
     ground_truth_file: "wikipedia-bge-m3/en/groundtruth.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Fvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
+};
+
+const COHERE_WIKI_10M: Dataset = Dataset {
+    name: "cohere_wiki_10m",
+    dimensions: 1024,
+    distance_metric: DistanceMetric::Cosine,
+    base_file: "cohere-wiki/base.fvecs",
+    query_file: "cohere-wiki/query.fvecs",
+    ground_truth_file: "cohere-wiki/groundtruth.ivecs",
+    split_threshold: 150,
+    merge_threshold: 50,
+    query_pruning_factor: Some(0.5),
+    nprobe: 100,
+    num_queries: 1000,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
+    block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
+    data_dir: None,
+    vector_config: None,
+    reader_storage_config: None,
+    format: VecFormat::Fvecs,
+    max_vectors: Some(10_000_000),
+    normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 // BigANN / SIFT1B variants — all share the same base and query files but
@@ -661,18 +892,24 @@ const SIFT10M: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_10M.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(10_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const SIFT50M: Dataset = Dataset {
@@ -682,18 +919,24 @@ const SIFT50M: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_50M.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(50_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const SIFT100M: Dataset = Dataset {
@@ -703,18 +946,24 @@ const SIFT100M: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_100M.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: Some(100_000_000),
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const SIFT1B: Dataset = Dataset {
@@ -724,23 +973,31 @@ const SIFT1B: Dataset = Dataset {
     base_file: "bigann/bigann_base.bvecs",
     query_file: "bigann/bigann_query.bvecs",
     ground_truth_file: "bigann/bigann_groundtruth_1B.ivecs",
-    split_threshold: 1500,
-    merge_threshold: 500,
+    split_threshold: 150,
+    merge_threshold: 50,
     query_pruning_factor: Some(0.5),
     nprobe: 100,
     num_queries: DEFAULT_NUM_QUERIES,
+    num_cold_queries: DEFAULT_NUM_COLD_QUERIES,
     block_cache_bytes: None,
+    block_cache_disk_bytes: None,
+    block_cache_disk_path: DEFAULT_BLOCK_CACHE_DISK_PATH,
     data_dir: None,
     vector_config: None,
     reader_storage_config: None,
     format: VecFormat::Bvecs,
     max_vectors: None,
     normalize: false,
+    query_concurrency: DEFAULT_QUERY_CONCURRENCY,
+    query_qps_limit: DEFAULT_QUERY_QPS_LIMIT,
+    phases: DEFAULT_PHASES,
 };
 
 const ALL_DATASETS: &[&Dataset] = &[
     &SIFT1M,
+    &SIFT100K,
     &COHERE1M,
+    &COHERE_WIKI_10M,
     &DEEP10M,
     &DEEP1B,
     &WIKIPEDIA_BGE_M3_EN,
@@ -752,6 +1009,194 @@ const ALL_DATASETS: &[&Dataset] = &[
 
 fn lookup_dataset(name: &str) -> Option<&'static Dataset> {
     ALL_DATASETS.iter().find(|d| d.name == name).copied()
+}
+
+// -- Storage helpers shared by phases -----------------------------------------
+
+/// Build a memory-only foyer block cache of the given capacity.
+fn memory_only_block_cache(memory_bytes: u64) -> Arc<dyn DbCache> {
+    let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: memory_bytes,
+        ..Default::default()
+    });
+    Arc::new(cache) as Arc<dyn DbCache>
+}
+
+/// Build a hybrid memory+disk foyer block cache.
+async fn hybrid_block_cache(
+    memory_bytes: u64,
+    disk_bytes: u64,
+    disk_path: &str,
+) -> anyhow::Result<Arc<dyn DbCache>> {
+    use foyer::{DeviceBuilder, HybridCacheBuilder};
+
+    let memory_capacity = usize::try_from(memory_bytes).map_err(|_| {
+        StorageError::Storage(format!(
+            "block_cache_bytes {} exceeds usize::MAX on this platform",
+            memory_bytes,
+        ))
+    })?;
+    let disk_capacity = usize::try_from(disk_bytes).map_err(|_| {
+        StorageError::Storage(format!(
+            "block_cache_disk_bytes {} exceeds usize::MAX on this platform",
+            disk_bytes,
+        ))
+    })?;
+
+    let device = foyer::FsDeviceBuilder::new(disk_path)
+        .with_capacity(disk_capacity)
+        .build()
+        .map_err(|e| {
+            StorageError::Storage(format!(
+                "failed to build foyer disk device at {}: {}",
+                disk_path, e
+            ))
+        })?;
+
+    let cache = HybridCacheBuilder::new()
+        .with_name("slatedb_block_cache")
+        .with_policy(HybridCachePolicy::WriteOnInsertion)
+        .memory(memory_capacity)
+        .with_weighter(|_: &CachedKey, v: &CachedEntry| v.size())
+        .storage()
+        .with_io_engine_config(foyer::PsyncIoEngineConfig::new())
+        .with_engine_config(
+            foyer::BlockEngineConfig::new(device)
+                .with_block_size(16 * 1024 * 1024)
+                .with_flushers(4)
+                .with_buffer_pool_size(256 * 1024 * 1024)
+                .with_submit_queue_size_threshold(1024 * 1024 * 1024),
+        )
+        .build()
+        .await
+        .map_err(|e| StorageError::Storage(format!("Failed to create hybrid cache: {}", e)))?;
+    Ok(Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>)
+}
+
+/// Resolve the effective memory-tier byte count for the block cache,
+/// applying the user-facing convention:
+/// - `None` → use `default_memory_bytes` (the phase's computed default).
+/// - `Some(n)` with `n < 0` → cache disabled (returns `None`).
+/// - `Some(n)` with `n >= 0` → use `n` bytes exactly (no cap).
+fn resolve_block_cache_memory(configured: Option<i64>, default_memory_bytes: u64) -> Option<u64> {
+    match configured {
+        None => Some(default_memory_bytes),
+        Some(n) if n < 0 => None,
+        Some(n) => Some(n as u64),
+    }
+}
+
+/// Build the dataset's block cache.
+///
+/// The memory tier is sized from [`Dataset::block_cache_bytes`] (the
+/// explicit value when set, or `default_memory_bytes` when unset; `-1`
+/// disables the cache entirely — see [`resolve_block_cache_memory`]).
+/// If [`Dataset::block_cache_disk_bytes`] is also set, the cache is a
+/// hybrid memory + disk foyer cache; otherwise it is memory-only.
+pub(crate) async fn build_block_cache(
+    dataset: &Dataset,
+    default_memory_bytes: u64,
+) -> anyhow::Result<Option<Arc<dyn DbCache>>> {
+    let Some(memory_bytes) =
+        resolve_block_cache_memory(dataset.block_cache_bytes, default_memory_bytes)
+    else {
+        return Ok(None);
+    };
+    if memory_bytes == 0 {
+        return Ok(None);
+    }
+    match dataset.block_cache_disk_bytes {
+        None => Ok(Some(memory_only_block_cache(memory_bytes))),
+        Some(disk_bytes) => Ok(Some(
+            hybrid_block_cache(memory_bytes, disk_bytes, dataset.block_cache_disk_path).await?,
+        )),
+    }
+}
+
+/// Open a fresh `VectorDb` for the given `Config`, layering in the
+/// dataset's block cache if one is configured. The `default_memory_bytes`
+/// argument supplies the cache size used when the dataset doesn't set
+/// `block_cache_bytes` explicitly (see [`ingest_default_memory_bytes`]
+/// and [`warm_default_memory_bytes`]).
+pub(crate) async fn open_db(
+    config: &Config,
+    dataset: &Dataset,
+    default_memory_bytes: u64,
+) -> anyhow::Result<VectorDb> {
+    let mut sb = StorageBuilder::new(&config.storage).await?;
+    println!("  {}", describe_block_cache(dataset, default_memory_bytes));
+    if let Some(cache) = build_block_cache(dataset, default_memory_bytes).await? {
+        sb = sb.map_slatedb(move |db| db.with_db_cache(cache));
+    }
+    Ok(VectorDb::open_with_storage(config.clone(), sb).await?)
+}
+
+fn describe_block_cache(dataset: &Dataset, default_memory_bytes: u64) -> String {
+    let effective = resolve_block_cache_memory(dataset.block_cache_bytes, default_memory_bytes);
+    let source = match dataset.block_cache_bytes {
+        None => " (default)",
+        Some(_) => "",
+    };
+    match (effective, dataset.block_cache_disk_bytes) {
+        (None, _) => "Block cache: disabled".to_string(),
+        (Some(mem), None) => format!("Block cache: memory-only, {} bytes{}", mem, source),
+        (Some(mem), Some(disk)) => format!(
+            "Block cache: hybrid, {} bytes memory{} + {} bytes disk at {}",
+            mem, source, disk, dataset.block_cache_disk_path,
+        ),
+    }
+}
+
+/// Returns total physical memory in bytes, queried via `sysinfo`.
+fn total_system_memory_bytes() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.total_memory()
+}
+
+/// Default memory-tier size for the block cache when the dataset does
+/// not set [`Dataset::block_cache_bytes`] during the ingest phase
+/// ([`INGEST_BLOCK_CACHE_MEMORY_FRACTION`] of total system memory).
+pub(crate) fn ingest_default_memory_bytes() -> u64 {
+    (total_system_memory_bytes() as f64 * INGEST_BLOCK_CACHE_MEMORY_FRACTION) as u64
+}
+
+/// Default memory-tier size for the block cache when the dataset does
+/// not set [`Dataset::block_cache_bytes`] during the warm (and cold)
+/// phases ([`WARM_BLOCK_CACHE_MEMORY_FRACTION`] of total system memory).
+pub(crate) fn warm_default_memory_bytes() -> u64 {
+    (total_system_memory_bytes() as f64 * WARM_BLOCK_CACHE_MEMORY_FRACTION) as u64
+}
+
+/// Build a `StorageReaderRuntime` for the cold phase. Always attaches a
+/// **memory-only** foyer cache (sized by [`Dataset::block_cache_bytes`]),
+/// regardless of whether the dataset configures a hybrid cache for the
+/// writer side. The cold phase tears down and rebuilds this runtime
+/// between query groups to clear the cache; a disk tier would survive
+/// that teardown and defeat the cold measurement, so we force the
+/// memory-only configuration here.
+pub(crate) fn build_cold_reader_runtime(
+    reader_config: &ReaderConfig,
+    dataset: &Dataset,
+    default_memory_bytes: u64,
+) -> anyhow::Result<StorageReaderRuntime> {
+    let object_store = match &reader_config.storage {
+        StorageConfig::SlateDb(slate_config) => {
+            Some(create_object_store(&slate_config.object_store)?)
+        }
+        _ => None,
+    };
+    let mut runtime = StorageReaderRuntime::default();
+    if let Some(object_store) = object_store {
+        runtime = runtime.with_object_store(object_store);
+    }
+    if let Some(memory_bytes) =
+        resolve_block_cache_memory(dataset.block_cache_bytes, default_memory_bytes)
+        && memory_bytes > 0
+    {
+        runtime = runtime.with_block_cache(memory_only_block_cache(memory_bytes));
+    }
+    Ok(runtime)
 }
 
 // -- Benchmark ----------------------------------------------------------------
@@ -783,9 +1228,8 @@ impl Benchmark for RecallBenchmark {
             .map(PathBuf::from)
             .unwrap_or_else(data_dir);
         let k = 10;
-        let skip = skip_ingest();
 
-        // -- Load query data --------------------------------------------------
+        // -- Load query / ground-truth data, used by COLD and WARM ---------
         let queries = dataset.load_query_vectors(&data);
         let ground_truth = read_ivecs(&data.join(dataset.ground_truth_file));
         println!(
@@ -794,7 +1238,7 @@ impl Benchmark for RecallBenchmark {
             ground_truth.len()
         );
 
-        // -- Open database ----------------------------------------------------
+        // -- Build the per-phase Config / ReaderConfig once ----------------
         let config = match &dataset.vector_config {
             Some(path) => load_vector_config(path),
             None => Config {
@@ -807,15 +1251,6 @@ impl Benchmark for RecallBenchmark {
                 ..Default::default()
             },
         };
-        let mut sb = StorageBuilder::new(&config.storage).await?;
-        if let Some(bytes) = dataset.block_cache_bytes {
-            let cache = FoyerCache::new_with_opts(FoyerCacheOptions {
-                max_capacity: bytes,
-                ..Default::default()
-            });
-            sb = sb.map_slatedb(|db| db.with_db_cache(std::sync::Arc::new(cache)));
-            println!("  Block cache: {} bytes", bytes);
-        }
         let reader_storage = dataset.resolve_reader_storage_config(&config.storage)?;
         let reader_config = ReaderConfig {
             storage: reader_storage,
@@ -824,214 +1259,43 @@ impl Benchmark for RecallBenchmark {
             query_pruning_factor: config.query_pruning_factor,
             metadata_fields: config.metadata_fields.clone(),
         };
-        let db = VectorDb::open_with_storage(config, sb).await?;
 
-        // -- Ingest -----------------------------------------------------------
-        let mut ingest_secs = None;
-        let mut num_vectors = 0u64;
-
-        if skip {
-            println!("  Skipping ingest (VECTOR_BENCH_SKIP_INGEST=1)");
-        } else {
-            num_vectors = dataset.estimated_base_vector_count(&data)? as u64;
-            println!(
-                "  Streaming {} base vectors for {} (dim={}) in chunks of {}",
-                num_vectors, dataset.name, dataset.dimensions, BASE_VECTOR_CHUNK_SIZE
-            );
-            let (mut stream, reader_thread) =
-                dataset.spawn_base_vector_stream(&data, BASE_VECTOR_CHUNK_SIZE)?;
-            let Some(first_message) = stream.recv().await else {
-                anyhow::bail!("base vector stream closed before yielding any data");
-            };
-            let Some(mut base_vectors) = first_message? else {
-                anyhow::bail!("dataset {} has no base vectors to ingest", dataset.name);
-            };
-
-            let ingest_start = std::time::Instant::now();
-            let num_batches = (num_vectors as usize).div_ceil(INGEST_WRITE_BATCH_SIZE);
-            let mut batch_idx = 0usize;
-            let mut vector_offset = 0usize;
-            loop {
-                println!(
-                    "  Loaded chunk: {} vectors ({} / {})",
-                    base_vectors.len(),
-                    vector_offset + base_vectors.len(),
-                    num_vectors
-                );
-                for (chunk_idx, chunk) in base_vectors.chunks(INGEST_WRITE_BATCH_SIZE).enumerate() {
-                    let batch: Vec<Vector> = chunk
-                        .iter()
-                        .enumerate()
-                        .map(|(i, values)| {
-                            let index = vector_offset + chunk_idx * INGEST_WRITE_BATCH_SIZE + i;
-                            Vector::new(index.to_string(), values.clone())
-                        })
-                        .collect();
-                    db.write(batch).await?;
-                    batch_idx += 1;
-                    if batch_idx.is_multiple_of(10_000) {
-                        println!("  Written batch {}/{}", batch_idx, num_batches);
-                    }
+        // -- Dispatch each configured phase --------------------------------
+        let mut summary = Summary::new();
+        for phase in dataset.phases.iter().copied() {
+            println!("\n=== phase: {} ===", phase.as_str());
+            match phase {
+                Phase::Ingest => {
+                    let s = ingest::run(&dataset, &data, &config).await?;
+                    summary = summary
+                        .add("num_vectors", s.num_vectors as f64)
+                        .add("ingest_secs", s.ingest_secs)
+                        .add("ingest_vec_per_sec", s.num_vectors as f64 / s.ingest_secs);
                 }
-                vector_offset += base_vectors.len();
-                let Some(message) = stream.recv().await else {
-                    break;
-                };
-                let Some(next_batch) = message? else {
-                    break;
-                };
-                base_vectors = next_batch;
+                Phase::Cold => {
+                    let s = cold::run(&dataset, &reader_config, &queries, k, &bench).await?;
+                    summary = summary
+                        .add("cold_p50_latency_us", s.p50)
+                        .add("cold_p90_latency_us", s.p90)
+                        .add("cold_p99_latency_us", s.p99);
+                }
+                Phase::Warm => {
+                    let s =
+                        warm::run(&dataset, &config, &queries, &ground_truth, k, &bench).await?;
+                    summary = summary
+                        .add("recall_at_k", s.recall_at_k)
+                        .add("k", k as f64)
+                        .add("qps", s.qps)
+                        .add("num_queries", queries.len() as f64)
+                        .add("num_centroids", s.num_centroids as f64)
+                        .add("p50_latency_us", s.p50)
+                        .add("p90_latency_us", s.p90)
+                        .add("p99_latency_us", s.p99);
+                }
             }
-            reader_thread
-                .join()
-                .map_err(|_| anyhow::anyhow!("base vector streaming thread panicked"))?;
-            if vector_offset != num_vectors as usize {
-                anyhow::bail!(
-                    "streamed {} vectors but expected {}",
-                    vector_offset,
-                    num_vectors
-                );
-            }
-            db.flush().await?;
-            ingest_secs = Some(ingest_start.elapsed().as_secs_f64());
-            println!(
-                "  Ingested {} vectors in {:.1}s ({:.0} vec/s)",
-                num_vectors,
-                ingest_secs.unwrap(),
-                num_vectors as f64 / ingest_secs.unwrap(),
-            );
         }
-        println!("  Num centroids: {}", db.num_centroids());
 
-        // -- Cold reader queries ----------------------------------------------
-        println!("start cold reader phase");
-        let cold_query_latency = bench.histogram("cold_query_latency_us");
-        let mut cold_latencies_us = Vec::with_capacity(queries.len());
-        let object_store = match &reader_config.storage {
-            StorageConfig::SlateDb(slate_config) => {
-                println!("CREATE STATIC OBJECT STORE");
-                Some(create_object_store(&slate_config.object_store)?)
-            }
-            _ => None,
-        };
-        let mut runtime = StorageReaderRuntime::default();
-        if let Some(object_store) = object_store {
-            runtime = runtime.with_object_store(object_store);
-        }
-        for query in queries.iter().take(10) {
-            let reader =
-                VectorDbReader::open_with_runtime(reader_config.clone(), runtime.clone()).await?;
-            let t = std::time::Instant::now();
-            let q = Query::new(query.clone()).with_limit(k);
-            let _ = reader
-                .search_with_options(
-                    &q,
-                    SearchOptions {
-                        nprobe: Some(dataset.nprobe),
-                    },
-                )
-                .await?;
-            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-            cold_query_latency.record(elapsed_us);
-            cold_latencies_us.push(elapsed_us);
-        }
-        cold_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let cold_p50 = percentile(&cold_latencies_us, 50.0);
-        let cold_p90 = percentile(&cold_latencies_us, 90.0);
-        let cold_p99 = percentile(&cold_latencies_us, 99.0);
-        println!(
-            "  cold reader p50 = {:.2} ms, p90 = {:.2} ms, p99 = {:.2} ms",
-            cold_p50 / 1000.0,
-            cold_p90 / 1000.0,
-            cold_p99 / 1000.0
-        );
-        println!("end cold reader phase");
-
-        // -- Warmup -----------------------------------------------------------
-        println!("start warmup");
-        let warm_query_latency = bench.histogram("warm_query_latency_us");
-        let mut warm_latencies_us = Vec::with_capacity(queries.len());
-        for query in queries.iter() {
-            let t = std::time::Instant::now();
-            let q = Query::new(query.clone()).with_limit(k);
-            let _ = db
-                .search_with_options(
-                    &q,
-                    SearchOptions {
-                        nprobe: Some(dataset.nprobe),
-                    },
-                )
-                .await?;
-            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-            warm_query_latency.record(elapsed_us);
-            warm_latencies_us.push(elapsed_us);
-        }
-        warm_latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let warm_p90 = percentile(&warm_latencies_us, 90.0);
-        println!("warm p90 = {:.2}", warm_p90 / 1000.0);
-        println!("end warmup");
-
-        let query_latency = bench.histogram("query_latency_us");
-
-        let query_start = std::time::Instant::now();
-        let mut total_recall = 0.0;
-        let mut latencies_us = Vec::with_capacity(queries.len());
-        for (i, query) in queries.iter().enumerate() {
-            let t = std::time::Instant::now();
-            let q = Query::new(query.clone()).with_limit(k);
-            let results = db
-                .search_with_options(
-                    &q,
-                    SearchOptions {
-                        nprobe: Some(dataset.nprobe),
-                    },
-                )
-                .await?;
-            let elapsed_us = t.elapsed().as_secs_f64() * 1_000_000.0;
-            query_latency.record(elapsed_us);
-            latencies_us.push(elapsed_us);
-            total_recall += recall_at_k(&results, &ground_truth[i], k);
-        }
-        let query_secs = query_start.elapsed().as_secs_f64();
-        let avg_recall = total_recall / queries.len() as f64;
-        let qps = queries.len() as f64 / query_secs;
-
-        latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p50 = percentile(&latencies_us, 50.0);
-        let p90 = percentile(&latencies_us, 90.0);
-        let p99 = percentile(&latencies_us, 99.0);
-
-        println!(
-            "  recall@{} = {:.4}, QPS = {:.1}, avg = {:.2} ms, p50 = {:.2} ms, p90 = {:.2} ms, p99 = {:.2} ms",
-            k,
-            avg_recall,
-            qps,
-            (query_secs / queries.len() as f64) * 1000.0,
-            p50 / 1000.0,
-            p90 / 1000.0,
-            p99 / 1000.0,
-        );
-
-        let mut summary = Summary::new()
-            .add("recall_at_k", avg_recall)
-            .add("k", k as f64)
-            .add("qps", qps)
-            .add("num_queries", queries.len() as f64)
-            .add("num_centroids", db.num_centroids() as f64)
-            .add("cold_p50_latency_us", cold_p50)
-            .add("cold_p90_latency_us", cold_p90)
-            .add("cold_p99_latency_us", cold_p99)
-            .add("p50_latency_us", p50)
-            .add("p90_latency_us", p90)
-            .add("p99_latency_us", p99);
-        if let Some(secs) = ingest_secs {
-            summary = summary
-                .add("num_vectors", num_vectors as f64)
-                .add("ingest_secs", secs)
-                .add("ingest_vec_per_sec", num_vectors as f64 / secs);
-        }
         bench.summarize(summary).await?;
-
         bench.close().await?;
         Ok(())
     }

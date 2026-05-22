@@ -27,7 +27,7 @@ pub(crate) trait LogStorageRead: StorageRead {
     /// Returns the keys present in a single segment.
     ///
     /// Listing records are interleaved with log entries across segment
-    /// boundaries in the v2 layout, so cross-segment listing scans aren't
+    /// boundaries in the key layout, so cross-segment listing scans aren't
     /// safe at the storage layer. Callers wanting to enumerate keys across
     /// multiple segments stitch per-segment results together using the
     /// segment cache. See [`crate::reader::LogReadView::list_keys`].
