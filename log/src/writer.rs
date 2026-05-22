@@ -325,7 +325,13 @@ impl LogWriter {
         let ops = vec![RecordOp::Delete(key)];
         let write_result = self.apply(ops).await?;
         self.segment_cache.remove(segment_id);
-        // Deletion watermark is monotonic — only advance.
+        // Deletion watermark is monotonic — only advance. Advancing here is
+        // safe even though `apply` doesn't tell us whether the key existed:
+        // SlateDB transitions to a terminal error state on any write failure
+        // (see `Db::check_closed`), so a successful `apply` implies every
+        // prior `apply` on this writer also succeeded. Retention's caller
+        // (`tick_retention`) iterates expired ids in ascending order, so
+        // successful advances are contiguous from the low end.
         if self
             .last_deleted_segment_id
             .is_none_or(|prev| prev < segment_id)
