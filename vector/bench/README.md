@@ -458,8 +458,8 @@ The benchmark is configured via a TOML config file passed with `--config`. The c
 | `num_cold_queries`  | usize  | Number of queries to run in the cold phase (default: 1000). Queries are cycled when this exceeds the number of loaded warm queries. |
 | `query_concurrency` | usize  | Concurrent in-flight queries during the warm query phase (default: 8) |
 | `query_qps_limit`   | usize  | Rate cap on warm-phase query submissions, in QPS (default: 32)     |
-| `block_cache_bytes` | u64    | In-memory block cache size in bytes. `None` (default) disables the cache. With only this set, the bench uses a memory-only foyer cache. |
-| `block_cache_disk_bytes` | u64 | On-disk block-cache size in bytes. When set together with `block_cache_bytes`, the bench builds a hybrid foyer cache: `block_cache_bytes` becomes the memory tier and this becomes the disk tier. Ignored if `block_cache_bytes` is unset. |
+| `block_cache_bytes` | i64    | In-memory block cache size in bytes. **Unset**: derive from a phase-specific default (25% of system memory for ingest, ~67% for cold/warm). **`-1`**: disable the cache entirely. **`n >= 0`**: use exactly `n` bytes. |
+| `block_cache_disk_bytes` | u64 | On-disk block-cache size in bytes. When set, the cache becomes a hybrid memory + disk foyer cache (memory tier sized by `block_cache_bytes`). When unset, the cache is memory-only. Ignored when `block_cache_bytes = -1`. |
 | `block_cache_disk_path` | string | Filesystem path for the hybrid cache's disk tier (default: `/mnt/cache/foyer`). Only used when `block_cache_disk_bytes` is set. |
 | `data_dir`          | string | Directory containing dataset files (default: `vector/bench/data/`) |
 | `vector_config`     | string | Path to a YAML file with vector `Config` overrides                 |

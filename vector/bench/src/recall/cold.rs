@@ -17,7 +17,7 @@ use std::time::Instant;
 use bencher::Bench;
 use vector::{Query, ReaderConfig, SearchOptions, VectorDbRead, VectorDbReader};
 
-use crate::recall::{Dataset, build_cold_reader_runtime, percentile};
+use crate::recall::{Dataset, build_cold_reader_runtime, percentile, warm_default_memory_bytes};
 
 /// Number of queries per fresh reader. After this many queries, the reader
 /// is dropped and re-opened with a fresh cache.
@@ -51,6 +51,11 @@ pub async fn run(
     let cold_query_latency = bench.histogram("cold_query_latency_us");
     let mut latencies_us = Vec::with_capacity(num_cold_queries);
 
+    // Cold is a read-only phase, so we use the warm-phase default for the
+    // (memory-only) cache sizing when the dataset hasn't set
+    // `block_cache_bytes` explicitly.
+    let default_memory_bytes = warm_default_memory_bytes();
+
     // Cycle through loaded queries if the dataset has fewer than
     // `num_cold_queries` (e.g. sift100k loads 100, default cold count is 1000).
     let mut query_iter = queries.iter().cycle();
@@ -58,7 +63,7 @@ pub async fn run(
 
     while remaining > 0 {
         // Fresh runtime → fresh (memory-only) block cache for this group.
-        let runtime = build_cold_reader_runtime(reader_config, dataset)?;
+        let runtime = build_cold_reader_runtime(reader_config, dataset, default_memory_bytes)?;
         let cache = runtime.block_cache();
         let reader = VectorDbReader::open_with_runtime(reader_config.clone(), runtime).await?;
 

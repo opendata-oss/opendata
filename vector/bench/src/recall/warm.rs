@@ -8,7 +8,7 @@ use std::time::Instant;
 use bencher::Bench;
 use vector::{Config, Query, SearchOptions, SearchResult, VectorDb, VectorDbRead};
 
-use crate::recall::{Dataset, open_db, percentile};
+use crate::recall::{Dataset, open_db, percentile, warm_default_memory_bytes};
 
 /// Metrics produced by the warm phase.
 pub struct WarmSummary {
@@ -28,7 +28,7 @@ pub async fn run(
     k: usize,
     bench: &Bench,
 ) -> anyhow::Result<WarmSummary> {
-    let db = open_db(config, dataset).await?;
+    let db = open_db(config, dataset, warm_default_memory_bytes()).await?;
     let summary = warm(dataset, &db, queries, ground_truth, k, bench).await?;
     db.close().await?;
     Ok(summary)

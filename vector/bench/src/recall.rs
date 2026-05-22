@@ -43,6 +43,20 @@ const DEFAULT_PHASES: &[Phase] = &[Phase::Ingest, Phase::Cold, Phase::Warm];
 /// `block_cache_disk_bytes` is set.
 const DEFAULT_BLOCK_CACHE_DISK_PATH: &str = "/mnt/cache/foyer";
 
+/// Default fraction of total system memory used to size the in-memory
+/// block cache during the [`Phase::Ingest`] phase when
+/// [`Dataset::block_cache_bytes`] is not explicitly set. Ingest needs
+/// headroom for write-side state (write coordinator delta + frozen views,
+/// slatedb memtables, centroid index updates), so the default is
+/// relatively low.
+const INGEST_BLOCK_CACHE_MEMORY_FRACTION: f64 = 0.25;
+
+/// Default fraction of total system memory used to size the in-memory
+/// block cache during the [`Phase::Warm`] (and [`Phase::Cold`]) phase
+/// when [`Dataset::block_cache_bytes`] is not explicitly set. The
+/// read-only paths can claim the majority of memory.
+const WARM_BLOCK_CACHE_MEMORY_FRACTION: f64 = 2.0 / 3.0;
+
 fn load_vector_config(path: &str) -> Config {
     let contents =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {}", path, e));
@@ -328,11 +342,17 @@ pub(crate) struct Dataset {
     /// [`DEFAULT_NUM_COLD_QUERIES`]. Queries are cycled when this exceeds
     /// the number of loaded queries.
     pub num_cold_queries: usize,
-    /// In-memory block-cache size in bytes. `None` disables the block
-    /// cache entirely. When `Some` and [`block_cache_disk_bytes`] is
-    /// `None`, this controls the capacity of a memory-only foyer cache.
-    /// When both are `Some`, this is the memory tier of a hybrid cache.
-    pub block_cache_bytes: Option<u64>,
+    /// In-memory block-cache size in bytes.
+    /// - `None`: derive from the phase-specific default (e.g.,
+    ///   [`INGEST_BLOCK_CACHE_MEMORY_FRACTION`] of total system memory for
+    ///   ingest, [`WARM_BLOCK_CACHE_MEMORY_FRACTION`] for warm/cold).
+    /// - `Some(-1)` (or any negative value): disable the block cache.
+    /// - `Some(n)` with `n >= 0`: use `n` bytes for the memory tier.
+    ///
+    /// When the cache is enabled and [`block_cache_disk_bytes`] is
+    /// `None`, the bench uses a memory-only foyer cache; when both are
+    /// set the bench uses a hybrid memory + disk cache.
+    pub block_cache_bytes: Option<i64>,
     /// On-disk block-cache size in bytes. `Some` opts into the hybrid
     /// (memory + disk) foyer cache, with this controlling the disk tier
     /// capacity and [`block_cache_disk_path`] controlling its location.
@@ -539,6 +559,8 @@ impl From<&Dataset> for Params {
         if let Some(bytes) = d.block_cache_bytes {
             p.insert("block_cache_bytes", bytes.to_string());
         }
+        // No insertion when None — Params absence carries the "use phase
+        // default" meaning; `-1` is the explicit "disabled" sentinel.
         if let Some(bytes) = d.block_cache_disk_bytes {
             p.insert("block_cache_disk_bytes", bytes.to_string());
         }
@@ -571,12 +593,13 @@ impl From<Params> for Dataset {
             .ok()
             .or(default.query_pruning_factor)
             .filter(|f| *f > 0.0);
+        // `block_cache_bytes` is now `Option<i64>` where `None` means
+        // "use the phase default", `Some(-1)` (or any negative) means
+        // "disabled", and `Some(n >= 0)` is an explicit byte count.
         let block_cache_bytes = p
             .get_parse::<i64>("block_cache_bytes")
             .ok()
-            .or(default.block_cache_bytes.map(|v| v as i64))
-            .filter(|b| *b > 0)
-            .map(|b| b as u64);
+            .or(default.block_cache_bytes);
         let block_cache_disk_bytes = p
             .get_parse::<i64>("block_cache_disk_bytes")
             .ok()
@@ -1043,19 +1066,41 @@ async fn hybrid_block_cache(
     Ok(Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>)
 }
 
-/// Build the dataset's block cache, if any. Returns `None` when
-/// [`Dataset::block_cache_bytes`] is unset; returns a memory-only
-/// [`FoyerCache`] when only the memory size is set; returns a hybrid
-/// [`FoyerHybridCache`] backed by the disk path when both memory and
-/// disk sizes are set. The returned `Arc<dyn DbCache>` is suitable for
-/// both writer-side (`with_db_cache`) and reader-side
-/// (`StorageReaderRuntime::with_block_cache`) use.
+/// Resolve the effective memory-tier byte count for the block cache,
+/// applying the user-facing convention:
+/// - `None` → use `default_memory_bytes` (the phase's computed default).
+/// - `Some(n)` with `n < 0` → cache disabled (returns `None`).
+/// - `Some(n)` with `n >= 0` → use `n` bytes exactly (no cap).
+fn resolve_block_cache_memory(
+    configured: Option<i64>,
+    default_memory_bytes: u64,
+) -> Option<u64> {
+    match configured {
+        None => Some(default_memory_bytes),
+        Some(n) if n < 0 => None,
+        Some(n) => Some(n as u64),
+    }
+}
+
+/// Build the dataset's block cache.
+///
+/// The memory tier is sized from [`Dataset::block_cache_bytes`] (the
+/// explicit value when set, or `default_memory_bytes` when unset; `-1`
+/// disables the cache entirely — see [`resolve_block_cache_memory`]).
+/// If [`Dataset::block_cache_disk_bytes`] is also set, the cache is a
+/// hybrid memory + disk foyer cache; otherwise it is memory-only.
 pub(crate) async fn build_block_cache(
     dataset: &Dataset,
+    default_memory_bytes: u64,
 ) -> anyhow::Result<Option<Arc<dyn DbCache>>> {
-    let Some(memory_bytes) = dataset.block_cache_bytes else {
+    let Some(memory_bytes) =
+        resolve_block_cache_memory(dataset.block_cache_bytes, default_memory_bytes)
+    else {
         return Ok(None);
     };
+    if memory_bytes == 0 {
+        return Ok(None);
+    }
     match dataset.block_cache_disk_bytes {
         None => Ok(Some(memory_only_block_cache(memory_bytes))),
         Some(disk_bytes) => Ok(Some(
@@ -1065,26 +1110,58 @@ pub(crate) async fn build_block_cache(
 }
 
 /// Open a fresh `VectorDb` for the given `Config`, layering in the
-/// dataset's block cache if one is configured. Each phase that needs a
-/// writer-side db calls this to get a fully independent instance.
-pub(crate) async fn open_db(config: &Config, dataset: &Dataset) -> anyhow::Result<VectorDb> {
+/// dataset's block cache if one is configured. The `default_memory_bytes`
+/// argument supplies the cache size used when the dataset doesn't set
+/// `block_cache_bytes` explicitly (see [`ingest_default_memory_bytes`]
+/// and [`warm_default_memory_bytes`]).
+pub(crate) async fn open_db(
+    config: &Config,
+    dataset: &Dataset,
+    default_memory_bytes: u64,
+) -> anyhow::Result<VectorDb> {
     let mut sb = StorageBuilder::new(&config.storage).await?;
-    if let Some(cache) = build_block_cache(dataset).await? {
-        println!("  {}", describe_block_cache(dataset));
+    println!("  {}", describe_block_cache(dataset, default_memory_bytes));
+    if let Some(cache) = build_block_cache(dataset, default_memory_bytes).await? {
         sb = sb.map_slatedb(move |db| db.with_db_cache(cache));
     }
     Ok(VectorDb::open_with_storage(config.clone(), sb).await?)
 }
 
-fn describe_block_cache(dataset: &Dataset) -> String {
-    match (dataset.block_cache_bytes, dataset.block_cache_disk_bytes) {
+fn describe_block_cache(dataset: &Dataset, default_memory_bytes: u64) -> String {
+    let effective = resolve_block_cache_memory(dataset.block_cache_bytes, default_memory_bytes);
+    let source = match dataset.block_cache_bytes {
+        None => " (default)",
+        Some(_) => "",
+    };
+    match (effective, dataset.block_cache_disk_bytes) {
         (None, _) => "Block cache: disabled".to_string(),
-        (Some(mem), None) => format!("Block cache: memory-only, {} bytes", mem),
+        (Some(mem), None) => format!("Block cache: memory-only, {} bytes{}", mem, source),
         (Some(mem), Some(disk)) => format!(
-            "Block cache: hybrid, {} bytes memory + {} bytes disk at {}",
-            mem, disk, dataset.block_cache_disk_path,
+            "Block cache: hybrid, {} bytes memory{} + {} bytes disk at {}",
+            mem, source, disk, dataset.block_cache_disk_path,
         ),
     }
+}
+
+/// Returns total physical memory in bytes, queried via `sysinfo`.
+fn total_system_memory_bytes() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.total_memory()
+}
+
+/// Default memory-tier size for the block cache when the dataset does
+/// not set [`Dataset::block_cache_bytes`] during the ingest phase
+/// ([`INGEST_BLOCK_CACHE_MEMORY_FRACTION`] of total system memory).
+pub(crate) fn ingest_default_memory_bytes() -> u64 {
+    (total_system_memory_bytes() as f64 * INGEST_BLOCK_CACHE_MEMORY_FRACTION) as u64
+}
+
+/// Default memory-tier size for the block cache when the dataset does
+/// not set [`Dataset::block_cache_bytes`] during the warm (and cold)
+/// phases ([`WARM_BLOCK_CACHE_MEMORY_FRACTION`] of total system memory).
+pub(crate) fn warm_default_memory_bytes() -> u64 {
+    (total_system_memory_bytes() as f64 * WARM_BLOCK_CACHE_MEMORY_FRACTION) as u64
 }
 
 /// Build a `StorageReaderRuntime` for the cold phase. Always attaches a
@@ -1097,6 +1174,7 @@ fn describe_block_cache(dataset: &Dataset) -> String {
 pub(crate) fn build_cold_reader_runtime(
     reader_config: &ReaderConfig,
     dataset: &Dataset,
+    default_memory_bytes: u64,
 ) -> anyhow::Result<StorageReaderRuntime> {
     let object_store = match &reader_config.storage {
         StorageConfig::SlateDb(slate_config) => {
@@ -1108,7 +1186,10 @@ pub(crate) fn build_cold_reader_runtime(
     if let Some(object_store) = object_store {
         runtime = runtime.with_object_store(object_store);
     }
-    if let Some(memory_bytes) = dataset.block_cache_bytes {
+    if let Some(memory_bytes) =
+        resolve_block_cache_memory(dataset.block_cache_bytes, default_memory_bytes)
+        && memory_bytes > 0
+    {
         runtime = runtime.with_block_cache(memory_only_block_cache(memory_bytes));
     }
     Ok(runtime)

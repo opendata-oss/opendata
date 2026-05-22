@@ -11,7 +11,7 @@ use chrono::{DateTime, Local};
 use tokio::sync::oneshot;
 use vector::{Vector, VectorDb};
 
-use crate::recall::{Dataset, open_db};
+use crate::recall::{Dataset, ingest_default_memory_bytes, open_db};
 
 const BASE_VECTOR_CHUNK_SIZE: usize = 15_000;
 const INGEST_WRITE_BATCH_SIZE: usize = 10;
@@ -27,7 +27,7 @@ pub async fn run(
     data_dir: &std::path::Path,
     config: &vector::Config,
 ) -> anyhow::Result<IngestSummary> {
-    let db = open_db(config, dataset).await?;
+    let db = open_db(config, dataset, ingest_default_memory_bytes()).await?;
     let summary = ingest(dataset, data_dir, &db).await?;
     db.close().await?;
     Ok(summary)
