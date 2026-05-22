@@ -159,8 +159,10 @@ Benefits:
                   │                                          │
                   │  LogCompactionScheduler                  │
                   │      │                                   │
-                  │      ├─ background refresh: scan         │
-                  │      │   SegmentMeta → live_set cache    │
+                  │      ├─ tracks the current live segment  │
+                  │      │   set (sourced from the writer    │
+                  │      │   in-process; from storage in     │
+                  │      │   a future standalone compactor)  │
                   │      │                                   │
                   │      └─ propose():                       │
                   │           active: L0→fresh SR on         │
@@ -168,7 +170,7 @@ Benefits:
                   │           sealed: one-shot final         │
                   │             compaction to single SR      │
                   │           orphaned: drain (segment in    │
-                  │             manifest but not in cache)   │
+                  │             manifest but not in live set)│
                   └──────────────────────────────────────────┘
 ```
 
@@ -176,9 +178,10 @@ Two components: a writer-side `RetentionTask` that decides when segments
 have expired and asks the single writer task to delete their
 `SegmentMeta` records, and a `LogCompactionScheduler` inside SlateDB's
 compactor that proposes active/sealed compactions plus drains for any
-segment in the manifest but not in the live set. The scheduler owns a
-background refresh task that re-reads the live set from storage on a
-coarse cadence.
+segment in the manifest but not in the live set. How the scheduler
+learns the current live set depends on whether the compactor is
+in-process with the writer or runs standalone — see
+[Live set propagation](#live-set-propagation).
 
 ### Configuration
 
@@ -216,20 +219,19 @@ struct LogCompactionOptions {
     /// L0 SST count at which the active-segment policy proposes an L0
     /// compaction. Sized as a fraction of SlateDB's `l0_max_ssts` so
     /// the scheduler triggers before backpressure hits.
-    pub l0_high_water: usize,
+    pub min_l0_per_compaction: usize,
 
     /// Maximum number of L0 SSTs to roll into one fresh SR per
     /// active-segment compaction.
     pub max_l0_per_compaction: usize,
-
-    /// How often the live-set cache is refreshed by scanning
-    /// `SegmentMeta` records. Coarse cadence is fine; the live set
-    /// changes slowly and staleness only delays drains.
-    ///
-    /// Default: 30 seconds.
-    pub live_set_refresh_interval: Duration,
 }
 ```
+
+In the embedded case, the scheduler subscribes to the writer's
+`WrittenView` watch channel and derives the live segment range from
+the two segment-id watermarks already published there, so no polling
+cadence is configured here. A future standalone-compactor RFC will
+introduce a polling interval for the read side it owns.
 
 #### Granularity and precision
 
@@ -320,15 +322,15 @@ therefore the canonical seal moment of its predecessor.
 Compaction work is bounded by ~2× ingest under sustained load: a byte
 flushed to L0 is rewritten at most once during the active phase
 (L0-relief into a fresh SR) and once at seal (final compaction). Light
-loads that never cross the L0 high-water do only the seal-time
+loads that never reach `min_l0_per_compaction` do only the seal-time
 rewrite. Either way, there's no per-tier write amplification.
 
 #### Active segment
 
-**Backpressure-only**: when L0 SST count rises above an L0 high-water
-mark (a configurable fraction of SlateDB's `l0_max_ssts`), merge some L0
-SSTs into a fresh SR. Otherwise do nothing — no SR-to-SR merging, no
-read-amp work.
+**Backpressure-only**: when L0 SST count reaches `min_l0_per_compaction`
+(a configurable fraction of SlateDB's `l0_max_ssts`), merge some L0 SSTs
+into a fresh SR. Otherwise do nothing — no SR-to-SR merging, no read-amp
+work.
 
 SR count grows linearly with active-segment age. We accept this because
 tip reads are served from memory and sealed-segment compaction repairs
@@ -396,7 +398,7 @@ On each `propose()` tick, for every segment in the manifest:
   `drain_segment`. Skipped entirely while the live set is `None`,
   otherwise an empty cache at startup would orphan every segment.
 - **Active** (largest segment id that's both in the manifest and in
-  the live set): emit an L0 compaction when L0 ≥ `l0_high_water`.
+  the live set): emit an L0 compaction when L0 ≥ `min_l0_per_compaction`.
 - **Sealed** (any other segment in the live set): emit a one-shot
   final compaction unless it's already in single-SR steady state
   (L0 = 0 and at most one SR).
@@ -424,15 +426,25 @@ Standard hygiene applies throughout: skip any segment with an
 already-active compaction or drain in `CompactorStateView` to avoid
 duplicate proposals.
 
-#### Background refresh
+#### Live set propagation
 
-A background refresh mechanism periodically scans `SegmentMeta` and
-publishes a new live-set view when a scan succeeds. Until the first
-successful refresh, the live set remains uninitialized and orphan
-drains stay suppressed.
+The scheduler needs an up-to-date view of the live segment set to
+classify manifest segments correctly. How that view reaches the
+scheduler depends on the deployment shape:
 
-The scan is cheap, and a coarse refresh cadence is sufficient because
-staleness only delays drain.
+- **Embedded with the writer (initial release).** The writer is the
+  authoritative source for the live set — it owns the `SegmentMeta`
+  records — and it runs in the same process as the compactor. It
+  notifies the in-process scheduler whenever the live set changes (on
+  segment roll and on retention deletes). No storage scan is needed.
+- **Standalone compactor (future).** A standalone process can't observe
+  the writer's in-memory state, so the scheduler maintains the live set
+  by periodically scanning `SegmentMeta` records from storage. The scan
+  is cheap and a coarse cadence is sufficient because staleness only
+  delays drain.
+
+Either way, until the scheduler has observed a live set at least once,
+it leaves it uninitialized and orphan drains stay suppressed.
 
 ### RetentionTask
 
@@ -476,11 +488,12 @@ The exact startup sequencing is an implementation detail, but two
 requirements are part of the design:
 
 - The scheduler must not act on an uninitialized live-set view.
-- Orphan drains remain suppressed until the first successful live-set
-  refresh from `SegmentMeta`.
+- Orphan drains remain suppressed until the scheduler has observed the
+  live set at least once (see [Live set propagation](#live-set-propagation)).
 
-For a future standalone compactor, the scheduler's read side can be
-backed by a `DbReader` opened by the standalone process; the retention
+For a future standalone compactor, the scheduler's read side would be
+backed by a `DbReader` opened by the standalone process and a polling
+task that refreshes the live set from `SegmentMeta`; the retention
 protocol itself does not change.
 
 If `retention` is `None`, no `RetentionTask` runs, no `SegmentMeta`
@@ -546,7 +559,6 @@ The implementation exposes the following Prometheus metrics:
 | `logdb_segment_oldest_age_seconds`           | gauge   | Age of the oldest live segment's start time                     |
 | `logdb_retention_meta_deletes_total`         | counter | `SegmentMeta` records deleted by the `RetentionTask`            |
 | `logdb_retention_meta_delete_errors_total`   | counter | Failed `SegmentMeta` deletes by the `RetentionTask`             |
-| `logdb_compaction_live_set_refresh_errors_total` | counter | Failed live-set refresh scans in the scheduler              |
 
 ## Alternatives
 
@@ -576,3 +588,4 @@ compactor rather than keeping them with the writer.
 | Date       | Description |
 |------------|-------------|
 | 2026-05-20 | Initial draft. SegmentMeta-as-source-of-truth protocol: writer deletes SegmentMeta on expiry, compactor garbage-collects orphaned SlateDB segments. |
+| 2026-05-22 | Implementation: rename `l0_high_water` → `min_l0_per_compaction`; drop `live_set_refresh_interval` (deferred to standalone-compactor RFC); restate live-set propagation as a shape-dependent concern (in-process notification for embedded, storage polling for future standalone). |

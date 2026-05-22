@@ -10,8 +10,6 @@ use tokio::runtime::Runtime;
 pub struct opendata_log_t {
     pub(crate) log: log::LogDb,
     pub(crate) runtime: Arc<Runtime>,
-    // Kept alive so compaction tasks continue running; never read directly.
-    pub(crate) _compaction_runtime: Runtime,
 }
 
 pub struct opendata_log_reader_t {
@@ -306,6 +304,8 @@ pub(crate) unsafe fn build_config(
                 ));
             }
         },
+        retention: Default::default(),
+        compaction: Default::default(),
     })
 }
 

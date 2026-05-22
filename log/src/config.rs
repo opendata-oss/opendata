@@ -9,6 +9,8 @@ use common::StorageConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
+use crate::error::Error;
+
 /// Configuration for opening a [`LogDb`](crate::LogDb).
 ///
 /// This struct holds all the settings needed to initialize a log instance,
@@ -60,6 +62,55 @@ pub struct Config {
         deserialize_with = "deserialize_read_visibility"
     )]
     pub read_visibility: ReadVisibility,
+
+    /// Retention policy; see [`RetentionConfig`] and RFC 0005.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+
+    /// Compaction policy; see [`LogCompactionOptions`] and RFC 0005.
+    #[serde(default)]
+    pub compaction: LogCompactionOptions,
+}
+
+impl Config {
+    /// Validates the retention/segmentation relationship per RFC 0005.
+    ///
+    /// Returns `Err(Error::InvalidInput)` if `retention` is set without a
+    /// `seal_interval`, or if `retention` is smaller than `seal_interval`.
+    pub fn validate_retention(&self) -> crate::error::Result<()> {
+        let Some(retention) = self.retention.retention else {
+            return Ok(());
+        };
+        let Some(seal_interval) = self.segmentation.seal_interval else {
+            return Err(Error::InvalidInput(
+                "retention requires segmentation.seal_interval to be set.".into(),
+            ));
+        };
+        if retention < seal_interval {
+            return Err(Error::InvalidInput(format!(
+                "retention ({retention:?}) must be at least as large as \
+                 segmentation.seal_interval ({seal_interval:?}).",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates that compaction thresholds are internally consistent.
+    ///
+    /// Returns `Err(Error::InvalidInput)` if `min_l0_per_compaction` exceeds
+    /// `max_l0_per_compaction` — a config that would silently disable L0
+    /// compactions on active segments.
+    pub fn validate_compaction(&self) -> crate::error::Result<()> {
+        let min = self.compaction.min_l0_per_compaction;
+        let max = self.compaction.max_l0_per_compaction;
+        if min > max {
+            return Err(Error::InvalidInput(format!(
+                "compaction.min_l0_per_compaction ({min}) must be \
+                 <= compaction.max_l0_per_compaction ({max}).",
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Read visibility levels.
@@ -129,6 +180,90 @@ pub struct SegmentConfig {
     #[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
     #[serde(default)]
     pub seal_interval: Option<Duration>,
+}
+
+/// Retention policy configuration.
+///
+/// Retention is enforced at segment granularity: a sealed segment becomes
+/// eligible for reclamation when its end time (its successor's
+/// `start_time_ms`) is older than `now() - retention`. See RFC 0005 for the
+/// full protocol.
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Segment retention duration.
+    ///
+    /// Segments whose end time is older than `now() - retention` are eligible
+    /// for deletion. `None` disables retention (segments live forever).
+    ///
+    /// When set, [`SegmentConfig::seal_interval`] must also be set and must
+    /// be `<= retention`; otherwise [`Config::validate_retention`] fails.
+    #[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
+    #[serde(default)]
+    pub retention: Option<Duration>,
+
+    /// How often the writer's retention task re-evaluates segment expiry and
+    /// deletes any `SegmentMeta` records past the retention bound.
+    ///
+    /// Smaller values reduce the lag between expiry and the segment becoming
+    /// invisible to readers. Defaults to 60 seconds.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    #[serde(default = "default_retention_check_interval")]
+    pub check_interval: Duration,
+}
+
+fn default_retention_check_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            retention: None,
+            check_interval: default_retention_check_interval(),
+        }
+    }
+}
+
+/// Compaction policy configuration.
+///
+/// Tunes the compaction scheduler that operates on LogDb's per-segment
+/// SlateDB layout. See RFC 0005 for the policy this configures.
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogCompactionOptions {
+    /// Minimum number of L0 SSTs required to trigger an active-segment
+    /// compaction.
+    ///
+    /// Should be a fraction of SlateDB's `l0_max_ssts` so the scheduler
+    /// triggers before backpressure hits. Defaults to 4 (half of SlateDB's
+    /// default `l0_max_ssts` of 8).
+    #[serde(default = "default_min_l0_per_compaction")]
+    pub min_l0_per_compaction: usize,
+
+    /// Maximum number of L0 SSTs to roll into one fresh SR per active-segment
+    /// compaction.
+    ///
+    /// Defaults to 8.
+    #[serde(default = "default_max_l0_per_compaction")]
+    pub max_l0_per_compaction: usize,
+}
+
+fn default_min_l0_per_compaction() -> usize {
+    4
+}
+
+fn default_max_l0_per_compaction() -> usize {
+    8
+}
+
+impl Default for LogCompactionOptions {
+    fn default() -> Self {
+        Self {
+            min_l0_per_compaction: default_min_l0_per_compaction(),
+            max_l0_per_compaction: default_max_l0_per_compaction(),
+        }
+    }
 }
 
 /// Options for scan operations.
@@ -247,5 +382,160 @@ mod tests {
 
         // then
         assert_eq!(cfg.read_visibility, ReadVisibility::Remote);
+    }
+
+    fn config_with(retention: Option<Duration>, seal_interval: Option<Duration>) -> Config {
+        Config {
+            segmentation: SegmentConfig { seal_interval },
+            retention: RetentionConfig {
+                retention,
+                ..RetentionConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn should_accept_retention_disabled() {
+        // given
+        let cfg = config_with(None, None);
+
+        // when / then
+        cfg.validate_retention().unwrap();
+    }
+
+    #[test]
+    fn should_accept_retention_disabled_with_seal_interval() {
+        // given
+        let cfg = config_with(None, Some(Duration::from_secs(60)));
+
+        // when / then
+        cfg.validate_retention().unwrap();
+    }
+
+    #[test]
+    fn should_accept_retention_equal_to_seal_interval() {
+        // given
+        let cfg = config_with(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
+
+        // when / then
+        cfg.validate_retention().unwrap();
+    }
+
+    #[test]
+    fn should_reject_retention_without_seal_interval() {
+        // given
+        let cfg = config_with(Some(Duration::from_secs(60)), None);
+
+        // when
+        let err = cfg.validate_retention().unwrap_err();
+
+        // then
+        assert!(
+            matches!(&err, Error::InvalidInput(msg) if msg.contains("seal_interval")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_retention_smaller_than_seal_interval() {
+        // given
+        let cfg = config_with(Some(Duration::from_secs(30)), Some(Duration::from_secs(60)));
+
+        // when
+        let err = cfg.validate_retention().unwrap_err();
+
+        // then
+        assert!(
+            matches!(&err, Error::InvalidInput(msg) if msg.contains("at least as large")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_reject_min_l0_above_max_l0() {
+        // given
+        let cfg = Config {
+            compaction: LogCompactionOptions {
+                min_l0_per_compaction: 10,
+                max_l0_per_compaction: 5,
+            },
+            ..Config::default()
+        };
+
+        // when
+        let err = cfg.validate_compaction().unwrap_err();
+
+        // then
+        assert!(
+            matches!(&err, Error::InvalidInput(msg)
+                if msg.contains("min_l0_per_compaction") && msg.contains("max_l0_per_compaction")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_accept_min_l0_equal_to_max_l0() {
+        let cfg = Config {
+            compaction: LogCompactionOptions {
+                min_l0_per_compaction: 4,
+                max_l0_per_compaction: 4,
+            },
+            ..Config::default()
+        };
+        cfg.validate_compaction().unwrap();
+    }
+
+    #[test]
+    fn should_use_documented_defaults_for_retention_config() {
+        let cfg = RetentionConfig::default();
+        assert_eq!(cfg.retention, None);
+        assert_eq!(cfg.check_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn should_use_documented_defaults_for_compaction_options() {
+        let cfg = LogCompactionOptions::default();
+        assert_eq!(cfg.min_l0_per_compaction, 4);
+        assert_eq!(cfg.max_l0_per_compaction, 8);
+    }
+
+    #[test]
+    fn should_deserialize_retention_config_with_defaults() {
+        // given
+        let json = "{}";
+
+        // when
+        let cfg: RetentionConfig = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.retention, None);
+        assert_eq!(cfg.check_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn should_deserialize_retention_config_with_durations_in_ms() {
+        // given
+        let json = r#"{"retention": 3600000, "check_interval": 5000}"#;
+
+        // when
+        let cfg: RetentionConfig = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.retention, Some(Duration::from_secs(3600)));
+        assert_eq!(cfg.check_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn should_deserialize_compaction_options_with_defaults() {
+        // given
+        let json = "{}";
+
+        // when
+        let cfg: LogCompactionOptions = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.min_l0_per_compaction, 4);
+        assert_eq!(cfg.max_l0_per_compaction, 8);
     }
 }

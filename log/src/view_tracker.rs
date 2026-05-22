@@ -17,6 +17,7 @@ pub(crate) struct ViewEntry {
     pub epoch: u64,
     pub snapshot: Arc<dyn StorageSnapshot>,
     pub last_segment_id: Option<SegmentId>,
+    pub last_deleted_segment_id: Option<SegmentId>,
 }
 
 /// Buffers pending writes and produces read views when a watermark advances.
@@ -80,6 +81,7 @@ mod tests {
             epoch: 10,
             snapshot: snap.clone(),
             last_segment_id: Some(7),
+            last_deleted_segment_id: None,
         });
 
         let result = tracker.advance(1);
@@ -99,6 +101,7 @@ mod tests {
             epoch: 1,
             snapshot: snap,
             last_segment_id: Some(9),
+            last_deleted_segment_id: None,
         });
 
         let result = tracker.advance(3);
@@ -116,18 +119,21 @@ mod tests {
             epoch: 1,
             snapshot: make_snapshot().await,
             last_segment_id: Some(0),
+            last_deleted_segment_id: None,
         });
         tracker.push(ViewEntry {
             seqnum: 3,
             epoch: 2,
             snapshot: make_snapshot().await,
             last_segment_id: Some(1),
+            last_deleted_segment_id: None,
         });
         tracker.push(ViewEntry {
             seqnum: 5,
             epoch: 3,
             snapshot: make_snapshot().await,
             last_segment_id: Some(2),
+            last_deleted_segment_id: None,
         });
 
         let result = tracker.advance(3);
