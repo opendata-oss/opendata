@@ -349,18 +349,19 @@ pub(crate) struct Dataset {
     /// - `Some(-1)` (or any negative value): disable the block cache.
     /// - `Some(n)` with `n >= 0`: use `n` bytes for the memory tier.
     ///
-    /// When the cache is enabled and [`block_cache_disk_bytes`] is
-    /// `None`, the bench uses a memory-only foyer cache; when both are
-    /// set the bench uses a hybrid memory + disk cache.
+    /// When the cache is enabled and [`Dataset::block_cache_disk_bytes`]
+    /// is `None`, the bench uses a memory-only foyer cache; when both
+    /// are set the bench uses a hybrid memory + disk cache.
     pub block_cache_bytes: Option<i64>,
     /// On-disk block-cache size in bytes. `Some` opts into the hybrid
     /// (memory + disk) foyer cache, with this controlling the disk tier
-    /// capacity and [`block_cache_disk_path`] controlling its location.
-    /// Ignored unless [`block_cache_bytes`] is also `Some`.
+    /// capacity and [`Dataset::block_cache_disk_path`] controlling its
+    /// location. Ignored unless [`Dataset::block_cache_bytes`] is also
+    /// `Some`.
     pub block_cache_disk_bytes: Option<u64>,
     /// On-disk path for the hybrid cache's disk tier. Defaults to
     /// [`DEFAULT_BLOCK_CACHE_DISK_PATH`]. Unused unless
-    /// [`block_cache_disk_bytes`] is `Some`.
+    /// [`Dataset::block_cache_disk_bytes`] is `Some`.
     pub block_cache_disk_path: &'static str,
     /// Directory containing the dataset files. When `None`, falls back to
     /// the default data directory resolved from `CARGO_MANIFEST_DIR`.
