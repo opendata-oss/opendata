@@ -121,6 +121,41 @@ pub fn deserialize(buf: &mut &[u8]) -> Result<Bytes, DeserializeError> {
     })
 }
 
+/// Returns the position just past the terminator that closes a
+/// terminated-bytes-encoded segment within `bytes`, starting the scan at
+/// `start`.
+///
+/// Walks the encoded stream byte-by-byte, treating `ESCAPE_BYTE` (`0x01`)
+/// as an escape that consumes the following byte regardless of value, and
+/// stopping at the first `TERMINATOR_BYTE` (`0x00`) outside an escape
+/// sequence. Returns `None` if the input ends before the terminator is
+/// reached, including the case where the last byte is the start of an
+/// escape sequence (truncation-unsafe — the next byte could shift the
+/// terminator's position).
+///
+/// Unlike [`deserialize`], this function does not decode the payload — it
+/// only locates the boundary. Callers that need just the end offset (e.g.
+/// a prefix extractor sizing a hashable prefix) can use this without
+/// allocating.
+pub fn find_terminator_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            TERMINATOR_BYTE => return Some(i + 1),
+            ESCAPE_BYTE => {
+                // Escape byte consumes the next byte. If the stream ends
+                // mid-escape we cannot decide where the terminator lands.
+                i += 2;
+                if i > bytes.len() {
+                    return None;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Creates a [`BytesRange`] for scanning all keys with the given logical prefix.
 ///
 /// The prefix is first incremented using `lex_increment`, then both bounds
@@ -258,6 +293,83 @@ mod tests {
 
         assert_eq!(decoded.as_ref(), b"a");
         assert_eq!(slice, &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn should_find_terminator_end_on_simple_input() {
+        // given — serialize "abc" so we know exactly where the terminator lands
+        let mut buf = BytesMut::new();
+        serialize(b"abc", &mut buf);
+        // expected layout: 'a' 'b' 'c' 0x00 (4 bytes)
+
+        // when / then — the terminator end sits one byte past the terminator
+        assert_eq!(find_terminator_end(&buf, 0), Some(4));
+    }
+
+    #[test]
+    fn should_find_terminator_end_skipping_escaped_zero_byte() {
+        // given — payload contains 0x00 which encodes to 0x01 0x01, then "x",
+        // then the real terminator. The inner 0x01 must NOT be mistaken for
+        // the terminator.
+        let mut buf = BytesMut::new();
+        serialize(&[0x00, b'x'], &mut buf);
+        // layout: 0x01 0x01 'x' 0x00 (4 bytes)
+
+        // when / then
+        assert_eq!(find_terminator_end(&buf, 0), Some(4));
+    }
+
+    #[test]
+    fn should_find_terminator_end_skipping_escaped_escape_byte() {
+        // given — payload contains 0x01 which encodes to 0x01 0x02. The 0x02
+        // looks innocuous but the escape pair must be consumed atomically so
+        // the position is correctly tracked.
+        let mut buf = BytesMut::new();
+        serialize(&[0x01, b'x'], &mut buf);
+        // layout: 0x01 0x02 'x' 0x00 (4 bytes)
+
+        // when / then
+        assert_eq!(find_terminator_end(&buf, 0), Some(4));
+    }
+
+    #[test]
+    fn should_find_terminator_end_from_offset_start() {
+        // given — a synthetic header followed by an encoded payload. Searching
+        // from offset 3 skips past the header bytes (which may legally contain
+        // 0x00).
+        let mut buf = BytesMut::from(&[0x00, 0xFF, 0x42][..]);
+        serialize(b"key", &mut buf);
+        // layout: [00 FF 42] [k e y 00]; payload terminator at index 6, end at 7
+
+        // when / then
+        assert_eq!(find_terminator_end(&buf, 3), Some(7));
+    }
+
+    #[test]
+    fn should_return_none_when_terminator_absent() {
+        // given — bytes without a terminator
+        let bytes: &[u8] = b"abc";
+
+        // when / then
+        assert_eq!(find_terminator_end(bytes, 0), None);
+    }
+
+    #[test]
+    fn should_return_none_when_input_ends_mid_escape() {
+        // given — last byte is the escape byte itself
+        let bytes: &[u8] = &[b'a', ESCAPE_BYTE];
+
+        // when / then
+        assert_eq!(find_terminator_end(bytes, 0), None);
+    }
+
+    #[test]
+    fn should_return_none_when_start_is_past_end() {
+        // given
+        let bytes: &[u8] = &[0x00];
+
+        // when / then
+        assert_eq!(find_terminator_end(bytes, 5), None);
     }
 
     #[test]
