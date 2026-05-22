@@ -134,24 +134,23 @@ impl InMemoryStorage {
         self
     }
 
-    /// Records `key`'s routing prefix in the segment set, if a prefix
+    /// Records each key's routing prefix in the segment set, if a prefix
     /// extractor is configured and accepts the key.
-    fn update_segments(&self, key: &Bytes) {
+    fn update_segments(&self, keys: &[Bytes]) {
         let Some(extractor) = self.prefix_extractor.as_ref() else {
             return;
         };
-        let target = PrefixTarget::Point(key.clone());
-        let Some(len) = extractor.prefix_len(&target) else {
-            return;
-        };
-        if len == 0 || len > key.len() {
-            return;
+        let mut segments = self.segments.write().expect("segments lock poisoned");
+        for key in keys {
+            let target = PrefixTarget::Point(key.clone());
+            let Some(len) = extractor.prefix_len(&target) else {
+                continue;
+            };
+            if len == 0 || len > key.len() {
+                continue;
+            }
+            segments.insert(key.slice(..len));
         }
-        let prefix = key.slice(..len);
-        self.segments
-            .write()
-            .expect("segments lock poisoned")
-            .insert(prefix);
     }
 
     fn list_segments(&self) -> Vec<SegmentInfo> {
@@ -383,9 +382,7 @@ impl Storage for InMemoryStorage {
             }
         }
         drop(data);
-        for key in &observed_keys {
-            self.update_segments(key);
-        }
+        self.update_segments(&observed_keys);
 
         Ok(WriteResult {
             seqnum: self.next_seqnum(),
@@ -421,9 +418,7 @@ impl Storage for InMemoryStorage {
             );
         }
         drop(data);
-        for key in &observed_keys {
-            self.update_segments(key);
-        }
+        self.update_segments(&observed_keys);
 
         Ok(WriteResult {
             seqnum: self.next_seqnum(),
@@ -479,9 +474,7 @@ impl Storage for InMemoryStorage {
             );
         }
         drop(data);
-        for key in &observed_keys {
-            self.update_segments(key);
-        }
+        self.update_segments(&observed_keys);
 
         Ok(WriteResult {
             seqnum: self.next_seqnum(),
