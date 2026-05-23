@@ -903,7 +903,7 @@ mod tests {
         .unwrap();
 
         // then
-        assert_eq!(request.query.vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(request.query.ann_vector(), Some(&vec![1.0, 2.0, 3.0]));
         assert_eq!(request.query.limit, 10);
         assert_eq!(request.options.nprobe, Some(20));
         assert_eq!(
@@ -999,7 +999,7 @@ mod tests {
             SearchRequest::from_body(&protobuf_headers(), &body, &HashMap::new()).unwrap();
 
         // then
-        assert_eq!(request.query.vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(request.query.ann_vector(), Some(&vec![1.0, 2.0, 3.0]));
         assert_eq!(request.query.limit, 10);
         assert_eq!(
             request.query.filter,

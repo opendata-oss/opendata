@@ -1,6 +1,7 @@
 use crate::AttributeValue;
 use common::coordinator::Delta;
 use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -19,6 +20,18 @@ impl VectorDbOp {
     }
 }
 
+/// Summary of one `FieldType::Text` attribute computed at write time (RFC-0006).
+///
+/// Populated by `VectorDb::prepare_vector_write` using the shared tokenizer
+/// and consumed by the Indexer to update FTS postings and statistics.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TextAttributeSummary {
+    /// Maps each unique term to its frequency (count of occurrences) in the field.
+    pub(crate) terms: BTreeMap<String, usize>,
+    /// Number of tokens emitted by the tokenizer (the field's document length).
+    pub(crate) length: usize,
+}
+
 /// A vector write ready for the coordinator.
 ///
 /// The write path validates and enqueues this struct.
@@ -31,6 +44,8 @@ pub(crate) struct VectorWrite {
     pub(crate) values: Vec<f32>,
     /// All attributes including the vector field.
     pub(crate) attributes: Vec<(String, AttributeValue)>,
+    /// Summaries for every `FieldType::Text` attribute on this write.
+    pub(crate) text_attribute_summaries: HashMap<String, TextAttributeSummary>,
 }
 
 /// Mutable delta that accumulates writes as well as deletes and builds RecordOps.
@@ -106,6 +121,7 @@ mod tests {
             external_id: id.to_string(),
             values: values.clone(),
             attributes: vec![("vector".to_string(), AttributeValue::Vector(values))],
+            text_attribute_summaries: HashMap::new(),
         }
     }
 

@@ -449,7 +449,7 @@ reflect deletes after compacting the relevant postings.
 ┌────────────────────────────────────────────────────────────────┐
 │                     TermPostingsValue                          │
 ├────────────────────────────────────────────────────────────────┤
-│  blocks: FixedElementArray<TermPostingsBlock>                  │
+│  blocks: TermPostingsBlock written one after another to EOF    │
 │                                                                │
 │  TermPostingsBlock                                             │
 │  ┌──────────────────────────────────────────────────────────┐  │
@@ -459,9 +459,12 @@ reflect deletes after compacting the relevant postings.
 │  └──────────────────────────────────────────────────────────┘  │
 │  Postings                                                      │
 │  ┌──────────────────────────────────────────────────────────┐  │
-|  |  docs:       Bitpacked                                   |  |
-│  │  freqs:      Delta-Encoded                               │  │
-|  |  norms:      FixedElementArray<byte>                     |  |
+|  |  count:           u32 (entries actually used, <= 256)    |  |
+|  |  base_id:         u64 (highest doc id in the block)      |  |
+|  |  docs_encoding:   u8  (0 = bitpacked gaps, 1 = varint)   |  |
+|  |  docs:            Bitpacked | Varint                     |  |
+|  |  freqs:           Bitpacked                              |  |
+|  |  norms:           FixedElementArray<byte>                |  |
 │  └──────────────────────────────────────────────────────────┘  │
 │  Skip                                                          │
 │  ┌──────────────────────────────────────────────────────────┐  │
@@ -482,10 +485,23 @@ reverse-document ID order. So each `Posting` block holds ids strictly lower than
 `Posting` block. We'll target 256 postings per block.
 
 `Postings` stores:
-- `docs`: Document ids contained in the block. We'll encode these using the bitpacking crate 
-  (https://github.com/quickwit-oss/bitpacking)
-- `freqs`: delta-encoded frequencies for each document.
-- `norms`: The size norm of each document.
+- `count`: Number of entries actually populated in the block (1..=256). Recorded explicitly
+  because the encoded `docs` and `freqs` sections are always sized for a full 256-element
+  bitpacked block.
+- `base_id`: The highest doc id in the block (i.e. `doc_ids[0]`). The remaining doc ids are
+  reconstructed by subtracting successive gaps from `base_id`.
+- `docs_encoding`: Discriminator for the layout of `docs`. The encoder first materialises the
+  gap array `gap[0] = 0`, `gap[i] = doc_ids[i-1] - doc_ids[i]` and chooses the encoding from
+  the maximum gap:
+  - `0x00`: gaps fit in `u32`. Stored as a bitpacked 256-element block via the bitpacking
+    crate (https://github.com/quickwit-oss/bitpacking) using `BitPacker8x`. A `num_bits` byte
+    is followed by `num_bits * 32` packed bytes; the tail (entries beyond `count`) is padded
+    with zero so it never widens `num_bits`.
+  - `0x01`: at least one gap exceeds `u32::MAX`. Each gap is written as an unsigned LEB128
+    `u64` varint, in order, for `count` entries total.
+- `freqs`: Per-document term frequencies, bitpacked as `u32` using the same `BitPacker8x`
+  block layout (tail padded with zero).
+- `norms`: The size norm of each document, stored as a `count`-byte array.
 
 `Skips` stores skip data that can be used to efficiently find postings for a document in the list.
 It also contains max score stats for the skipped range.

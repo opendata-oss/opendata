@@ -4,8 +4,12 @@
 //! record type encoded in the key.
 
 use crate::serde::centroid_stats::CentroidStatsValue;
+use crate::serde::field_stats::merge_batch_field_stats;
+use crate::serde::key::{TERM_POSTINGS_DISCRIMINATOR, TERM_STATS_DISCRIMINATOR};
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::merge_batch_posting_list;
+use crate::serde::term_postings::merge_batch_term_postings;
+use crate::serde::term_stats::merge_batch_term_stats;
 use crate::serde::{EncodingError, RecordType, parse_record_tag};
 use bytes::Bytes;
 use common::storage::default_merge_batch;
@@ -39,6 +43,14 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 merge_batch_posting_list(existing_value, operands, self.dimensions)
             }
             RecordType::CentroidStats => merge_batch_centroid_stats(existing_value, operands),
+            RecordType::FtsTerm => match key.last().copied() {
+                Some(TERM_POSTINGS_DISCRIMINATOR) => {
+                    merge_batch_term_postings(existing_value, operands)
+                }
+                Some(TERM_STATS_DISCRIMINATOR) => merge_batch_term_stats(existing_value, operands),
+                _ => default_merge_batch(key, existing_value, operands, |_k, _e, v| v),
+            },
+            RecordType::FtsFieldStats => merge_batch_field_stats(existing_value, operands),
             _ => {
                 // For other record types (IdDictionary, VectorData, VectorMeta, etc.), just use new value
                 // for each pairwise merge. These should use Put, not Merge, but handle gracefully

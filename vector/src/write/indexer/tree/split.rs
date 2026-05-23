@@ -639,6 +639,7 @@ mod tests {
             split_threshold_vectors: SPLIT_THRESHOLD,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         })
     }
 
@@ -902,6 +903,7 @@ mod tests {
             split_threshold_vectors: SPLIT_THRESHOLD,
             split_search_neighbourhood: 1,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         });
         let id_b1 = h.storage.lookup_internal_id("b1").await.unwrap().unwrap();
         let depth = TreeDepth::of(h.state.centroids_meta().depth);
@@ -1088,6 +1090,7 @@ mod tests {
             split_threshold_vectors: 3,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         });
         let level = TreeLevel::inner(2, TreeDepth::of(4));
         let p0 = L2_CENTROID_A;

@@ -166,6 +166,7 @@ mod tests {
             split_threshold_vectors: usize::MAX,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         })
     }
 

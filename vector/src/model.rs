@@ -416,20 +416,38 @@ impl From<Vec<String>> for FieldSelection {
     }
 }
 
+/// Parameters for a BM25 full-text-search query (RFC-0006).
+#[derive(Debug, Clone)]
+pub struct Bm25Query {
+    /// Text field to search against. Must be declared as `FieldType::Text`.
+    pub field: String,
+    /// Query text. Tokenized with the same tokenizer used at write time.
+    pub query: String,
+}
+
+/// How a query should score documents.
+#[derive(Debug, Clone)]
+pub enum ScoreBy {
+    /// Approximate-nearest-neighbour search on the embedding vector.
+    Ann(Vec<f32>),
+    /// BM25 full-text search on a `FieldType::Text` field.
+    Bm25(Bm25Query),
+}
+
 /// Query specification for vector search.
 ///
 /// Constructed using the builder pattern:
 ///
 /// ```ignore
-/// let query = Query::new(embedding)
+/// let ann = Query::ann(embedding)
 ///     .with_limit(10)
-///     .with_filter(Filter::eq("category", "shoes"))
-///     .with_fields(vec!["category", "price"]);
+///     .with_filter(Filter::eq("category", "shoes"));
+/// let bm25 = Query::bm25("body", "fox jumps").with_limit(5);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Query {
-    /// Query vector (required).
-    pub vector: Vec<f32>,
+    /// Method used to score documents (ANN or BM25).
+    pub score_by: ScoreBy,
     /// Maximum number of results to return (default: 10).
     pub limit: usize,
     /// Optional metadata filter.
@@ -439,10 +457,31 @@ pub struct Query {
 }
 
 impl Query {
-    /// Creates a new query with the given vector.
+    /// Creates a new ANN query with the given vector.
+    ///
+    /// Alias for [`Query::ann`]; kept for ergonomics so existing call sites
+    /// that read as `Query::new(vec)` continue to work.
     pub fn new(vector: Vec<f32>) -> Self {
+        Self::ann(vector)
+    }
+
+    /// Creates a new ANN query with the given vector.
+    pub fn ann(vector: Vec<f32>) -> Self {
         Self {
-            vector,
+            score_by: ScoreBy::Ann(vector),
+            limit: 10,
+            filter: None,
+            include_fields: FieldSelection::All,
+        }
+    }
+
+    /// Creates a new BM25 query for the given text field.
+    pub fn bm25(field: impl Into<String>, query: impl Into<String>) -> Self {
+        Self {
+            score_by: ScoreBy::Bm25(Bm25Query {
+                field: field.into(),
+                query: query.into(),
+            }),
             limit: 10,
             filter: None,
             include_fields: FieldSelection::All,
@@ -467,6 +506,14 @@ impl Query {
     pub fn with_fields(mut self, fields: impl Into<FieldSelection>) -> Self {
         self.include_fields = fields.into();
         self
+    }
+
+    /// Returns the ANN query vector, if this query scores by ANN.
+    pub fn ann_vector(&self) -> Option<&Vec<f32>> {
+        match &self.score_by {
+            ScoreBy::Ann(v) => Some(v),
+            ScoreBy::Bm25(_) => None,
+        }
     }
 }
 
