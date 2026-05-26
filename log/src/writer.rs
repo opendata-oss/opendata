@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::AppendError;
 use crate::listing::ListingCache;
-use crate::model::{AppendOutput, Record as UserRecord, SegmentId};
+use crate::model::{AppendOutput, Record as UserRecord, SegmentId, Sequence};
 use crate::segment::{LogSegment, SegmentAssignment, SegmentCache};
 use crate::serde::{LogEntryKey, SegmentMetaKey};
 
@@ -43,6 +43,9 @@ pub(crate) struct WrittenView {
     pub snapshot: Arc<dyn common::storage::StorageSnapshot>,
     /// Storage engine sequence number for this write.
     pub seqnum: u64,
+    /// Exclusive upper bound of global sequences allocated as of this write.
+    /// Equals `SequenceAllocator::peek_next_sequence()` at broadcast time.
+    pub next_sequence: Sequence,
     /// Id of the largest user segment created so far. `None` before the first
     /// segment is created.
     pub last_segment_id: Option<SegmentId>,
@@ -137,10 +140,15 @@ impl LogWriter {
         let initial_snapshot = storage.snapshot().await.map_err(|e| e.to_string())?;
         let last_segment_id = segment_cache.latest().map(|s| s.id());
         let last_deleted_segment_id = segment_cache.initial_deleted_segment_id();
+        // Anything persisted before construction is already covered by the
+        // storage's initial durable watermark, so `peek_next_sequence` is the
+        // exclusive upper bound of already-durable global sequences.
+        let initial_next_sequence = sequence_allocator.peek_next_sequence();
         let initial_view = WrittenView {
             epoch: 0,
             snapshot: initial_snapshot,
             seqnum: 0,
+            next_sequence: initial_next_sequence,
             last_segment_id,
             last_deleted_segment_id,
         };
@@ -382,6 +390,7 @@ impl LogWriter {
             epoch: self.epoch,
             snapshot,
             seqnum,
+            next_sequence: self.sequence_allocator.peek_next_sequence(),
             last_segment_id: self.last_segment_id,
             last_deleted_segment_id: self.last_deleted_segment_id,
         });

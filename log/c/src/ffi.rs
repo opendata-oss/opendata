@@ -1,7 +1,9 @@
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::task::AbortHandle;
 
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use log::{Config, ReadVisibility, ReaderConfig, SegmentConfig};
@@ -30,6 +32,54 @@ pub struct opendata_log_key_iterator_t {
 pub struct opendata_log_object_store_t {
     pub(crate) config: ObjectStoreConfig,
 }
+
+/// Opaque handle representing a registered durable-sequence subscription.
+///
+/// Created by `opendata_log_subscribe_durable` and destroyed by
+/// `opendata_log_unsubscribe_durable`. Must be freed explicitly even if the
+/// log has been closed; closing the log aborts the task but does not free
+/// this handle.
+pub struct opendata_log_subscription_t {
+    pub(crate) abort_handle: AbortHandle,
+}
+
+/// Callback invoked when the durable-sequence watermark advances.
+///
+/// The first invocation carries the current value at subscription time; each
+/// subsequent invocation carries the latest observed value (intermediate
+/// values may be coalesced).
+///
+/// The callback is invoked on a tokio worker thread, not the caller's thread.
+/// It must not call other `opendata_log_*` functions on the same log handle
+/// (this would deadlock the runtime).
+pub type opendata_log_durable_callback_t =
+    extern "C" fn(durable_sequence: u64, user_data: *mut c_void);
+
+/// Wrapper that lets us send a raw pointer across the .await boundary in the
+/// spawned subscription task. Safety is the C caller's responsibility: they
+/// must ensure `user_data` is valid for the lifetime of the subscription and
+/// safe to access from worker threads.
+pub(crate) struct CallbackUserData(*mut c_void);
+
+impl CallbackUserData {
+    pub(crate) fn new(ptr: *mut c_void) -> Self {
+        Self(ptr)
+    }
+
+    /// Invokes the callback with the wrapped `user_data` pointer. Goes through
+    /// a method so the surrounding async block captures the whole
+    /// [`CallbackUserData`] (which is `Send`) rather than projecting the inner
+    /// `*mut c_void` field (which would not be `Send`).
+    pub(crate) fn invoke(&self, cb: opendata_log_durable_callback_t, sequence: u64) {
+        cb(sequence, self.0);
+    }
+}
+
+// SAFETY: the C caller owns `user_data` and is contractually required to
+// keep it valid for the subscription lifetime. We never deref the pointer
+// in Rust — we only pass it back to the C callback verbatim.
+unsafe impl Send for CallbackUserData {}
+unsafe impl Sync for CallbackUserData {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

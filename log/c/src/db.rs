@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -326,4 +327,104 @@ unsafe fn build_records(
         });
     }
     Ok(records)
+}
+
+/// Reads the current durable-sequence watermark.
+///
+/// `*out_sequence` is set to N such that all records with `sequence < N` are
+/// durably persisted. Initial value is 0; advances as the underlying storage
+/// confirms durability (no explicit flush required, though `opendata_log_flush`
+/// does force it).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn opendata_log_durable_sequence(
+    log: *const opendata_log_t,
+    out_sequence: *mut u64,
+) -> opendata_log_result_t {
+    if let Err(e) = require_handle(log, "log") {
+        return e;
+    }
+    if out_sequence.is_null() {
+        return error_result(
+            opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+            "out_sequence must not be null",
+        );
+    }
+    let handle = &*log;
+    *out_sequence = handle.log.durable_sequence();
+    success_result()
+}
+
+/// Subscribes to durable-sequence watermark changes.
+///
+/// `callback` is invoked once on registration with the current watermark, then
+/// on each subsequent advancement. The callback runs on a tokio worker thread
+/// (not the caller's thread) and **must not call other `opendata_log_*`
+/// functions on the same log handle** — doing so will deadlock the runtime.
+///
+/// Intermediate values may be coalesced; the callback always receives the
+/// latest observed value.
+///
+/// `user_data` is passed back verbatim to each callback invocation. The
+/// caller is responsible for ensuring it remains valid (and safe for
+/// concurrent access from worker threads) until the subscription is freed
+/// via `opendata_log_unsubscribe_durable`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn opendata_log_subscribe_durable(
+    log: *const opendata_log_t,
+    callback: Option<extern "C" fn(durable_sequence: u64, user_data: *mut c_void)>,
+    user_data: *mut c_void,
+    out_subscription: *mut *mut opendata_log_subscription_t,
+) -> opendata_log_result_t {
+    if let Err(e) = require_handle(log, "log") {
+        return e;
+    }
+    if let Err(e) = require_out_ptr(out_subscription, "out_subscription") {
+        return e;
+    }
+    let Some(callback) = callback else {
+        return error_result(
+            opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+            "callback must not be null",
+        );
+    };
+
+    let handle = &*log;
+    let mut rx = handle.log.subscribe_durable();
+    let ud = CallbackUserData::new(user_data);
+
+    let task = handle.runtime.spawn(async move {
+        // Initial fire with the current value to bootstrap the subscriber.
+        ud.invoke(callback, *rx.borrow_and_update());
+
+        while rx.changed().await.is_ok() {
+            ud.invoke(callback, *rx.borrow_and_update());
+        }
+    });
+
+    let subscription = Box::new(opendata_log_subscription_t {
+        abort_handle: task.abort_handle(),
+    });
+    *out_subscription = Box::into_raw(subscription);
+    success_result()
+}
+
+/// Cancels a durable-sequence subscription and frees the handle.
+///
+/// Best-effort: an in-flight callback may complete after this returns. After
+/// this call, no further callbacks for this subscription will be scheduled.
+/// Safe to call after `opendata_log_close` (the abort is a no-op once the
+/// runtime has been torn down).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn opendata_log_unsubscribe_durable(
+    subscription: *mut opendata_log_subscription_t,
+) -> opendata_log_result_t {
+    if subscription.is_null() {
+        return error_result(
+            opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+            "subscription must not be null",
+        );
+    }
+    let sub = Box::from_raw(subscription);
+    sub.abort_handle.abort();
+    success_result()
 }
