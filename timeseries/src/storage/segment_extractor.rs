@@ -26,10 +26,10 @@
 
 use std::sync::Arc;
 
-use common::serde::subsystem::TIMESERIES;
 use slatedb::{PrefixExtractor, PrefixTarget};
 
 use crate::model::{BucketSize, BucketStart, TimeBucket};
+use crate::serde::{KEY_VERSION, SUBSYSTEM};
 
 /// Routing prefix length: `[subsystem(1), version(1), time_bucket(4 BE),
 /// bucket_size(1)]`.
@@ -39,13 +39,6 @@ const ROUTING_PREFIX_LEN: usize = 7;
 /// whenever the routing logic changes in a way that would re-route existing
 /// keys (e.g. a new `KEY_VERSION` with a different prefix shape).
 const EXTRACTOR_NAME: &str = "opendata-timeseries/v2";
-
-/// Version byte the extractor expects in the routing prefix.
-///
-/// This is kept local to the extractor module until the timeseries serde
-/// module bumps its own `KEY_VERSION` to `0x02`. Once aligned, the two
-/// constants will collapse into a single import.
-const KEY_VERSION_V2: u8 = 0x02;
 
 /// Prefix extractor routing timeseries records to per-bucket SlateDB segments.
 ///
@@ -89,8 +82,8 @@ impl PrefixExtractor for TimeseriesSegmentExtractor {
                 let bytes = b.as_ref();
                 assert!(
                     bytes.len() >= ROUTING_PREFIX_LEN
-                        && bytes[0] == TIMESERIES
-                        && bytes[1] == KEY_VERSION_V2,
+                        && bytes[0] == SUBSYSTEM
+                        && bytes[1] == KEY_VERSION,
                     "TimeseriesSegmentExtractor: malformed timeseries key (subsystem/version \
                      mismatch or under {} bytes): {:02x?}",
                     ROUTING_PREFIX_LEN,
@@ -104,8 +97,8 @@ impl PrefixExtractor for TimeseriesSegmentExtractor {
             PrefixTarget::Prefix(b) => {
                 let bytes = b.as_ref();
                 if bytes.len() < ROUTING_PREFIX_LEN
-                    || bytes[0] != TIMESERIES
-                    || bytes[1] != KEY_VERSION_V2
+                    || bytes[0] != SUBSYSTEM
+                    || bytes[1] != KEY_VERSION
                 {
                     None
                 } else {
@@ -121,18 +114,14 @@ impl PrefixExtractor for TimeseriesSegmentExtractor {
 /// Used by the bucket-discovery path to project the segments list returned by
 /// `StorageRead::list_segments` into the set of buckets visible to a query.
 /// Returns `None` for any prefix that isn't a well-formed timeseries routing
-/// prefix.
-///
-/// While the timeseries database is restricted to 1-hour buckets, a routing
-/// prefix with `bucket_size != 1` is rejected as malformed; relax this when
-/// multi-size buckets land.
+/// prefix, including the reserved `bucket_size == 0`.
 pub(crate) fn parse_bucket(prefix: &[u8]) -> Option<TimeBucket> {
-    if prefix.len() < ROUTING_PREFIX_LEN || prefix[0] != TIMESERIES || prefix[1] != KEY_VERSION_V2 {
+    if prefix.len() < ROUTING_PREFIX_LEN || prefix[0] != SUBSYSTEM || prefix[1] != KEY_VERSION {
         return None;
     }
     let start = BucketStart::from_be_bytes([prefix[2], prefix[3], prefix[4], prefix[5]]);
     let size: BucketSize = prefix[6];
-    if size != 1 {
+    if size == 0 {
         return None;
     }
     Some(TimeBucket { start, size })
@@ -145,8 +134,8 @@ mod tests {
 
     fn make_key(bucket_start: u32, bucket_size: u8, record_type: u8, tail: &[u8]) -> Bytes {
         let mut buf = BytesMut::with_capacity(ROUTING_PREFIX_LEN + 1 + tail.len());
-        buf.put_u8(TIMESERIES);
-        buf.put_u8(KEY_VERSION_V2);
+        buf.put_u8(SUBSYSTEM);
+        buf.put_u8(KEY_VERSION);
         buf.put_u32(bucket_start);
         buf.put_u8(bucket_size);
         buf.put_u8(record_type);
@@ -183,8 +172,8 @@ mod tests {
         // then
         assert_eq!(n, Some(ROUTING_PREFIX_LEN));
         let extracted = &key[..n.unwrap()];
-        assert_eq!(extracted[0], TIMESERIES);
-        assert_eq!(extracted[1], KEY_VERSION_V2);
+        assert_eq!(extracted[0], SUBSYSTEM);
+        assert_eq!(extracted[1], KEY_VERSION);
         assert_eq!(&extracted[2..6], &12345u32.to_be_bytes());
         assert_eq!(extracted[6], 1);
     }
@@ -240,7 +229,7 @@ mod tests {
     fn should_return_none_for_prefix_shorter_than_routing_prefix() {
         // given
         let extractor = TimeseriesSegmentExtractor;
-        let short = [TIMESERIES, KEY_VERSION_V2, 0, 0, 0, 0];
+        let short = [SUBSYSTEM, KEY_VERSION, 0, 0, 0, 0];
 
         // when / then
         assert_eq!(extractor.prefix_len(&prefix(&short)), None);
@@ -250,7 +239,7 @@ mod tests {
     fn should_return_none_for_prefix_with_wrong_subsystem() {
         // given
         let extractor = TimeseriesSegmentExtractor;
-        let bad = [0xFF, KEY_VERSION_V2, 0, 0, 0, 0, 1];
+        let bad = [0xFF, KEY_VERSION, 0, 0, 0, 0, 1];
 
         // when / then
         assert_eq!(extractor.prefix_len(&prefix(&bad)), None);
@@ -260,7 +249,7 @@ mod tests {
     fn should_return_none_for_prefix_with_wrong_version() {
         // given
         let extractor = TimeseriesSegmentExtractor;
-        let bad = [TIMESERIES, 0xFF, 0, 0, 0, 0, 1];
+        let bad = [SUBSYSTEM, 0xFF, 0, 0, 0, 0, 1];
 
         // when / then
         assert_eq!(extractor.prefix_len(&prefix(&bad)), None);
@@ -280,7 +269,7 @@ mod tests {
     fn should_panic_on_point_shorter_than_routing_prefix() {
         // given
         let extractor = TimeseriesSegmentExtractor;
-        let short = [TIMESERIES, KEY_VERSION_V2, 0, 0, 0, 0];
+        let short = [SUBSYSTEM, KEY_VERSION, 0, 0, 0, 0];
 
         // when / then
         let _ = extractor.prefix_len(&point(&short));
@@ -291,7 +280,7 @@ mod tests {
     fn should_panic_on_point_with_wrong_subsystem() {
         // given
         let extractor = TimeseriesSegmentExtractor;
-        let bad = [0xFF, KEY_VERSION_V2, 0, 0, 0, 0, 1];
+        let bad = [0xFF, KEY_VERSION, 0, 0, 0, 0, 1];
 
         // when / then
         let _ = extractor.prefix_len(&point(&bad));
@@ -302,7 +291,7 @@ mod tests {
     fn should_panic_on_point_with_wrong_version() {
         // given
         let extractor = TimeseriesSegmentExtractor;
-        let bad = [TIMESERIES, 0xFF, 0, 0, 0, 0, 1];
+        let bad = [SUBSYSTEM, 0xFF, 0, 0, 0, 0, 1];
 
         // when / then
         let _ = extractor.prefix_len(&point(&bad));
@@ -322,7 +311,7 @@ mod tests {
     fn should_satisfy_prefix_extension_invariant_for_well_formed_prefix() {
         // given — a 7-byte scan prefix that targets bucket (start=42, size=1)
         let extractor = TimeseriesSegmentExtractor;
-        let mut scan_prefix = vec![TIMESERIES, KEY_VERSION_V2];
+        let mut scan_prefix = vec![SUBSYSTEM, KEY_VERSION];
         scan_prefix.extend_from_slice(&42u32.to_be_bytes());
         scan_prefix.push(1);
         assert_eq!(scan_prefix.len(), ROUTING_PREFIX_LEN);
@@ -362,15 +351,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_bucket_rejects_non_one_bucket_size() {
-        // given — bucket_size 2 is not yet supported
+    fn parse_bucket_accepts_non_one_bucket_size() {
+        // given
         let p = make_key(7777, 2, 0x05, b"");
 
         // when
         let bucket = parse_bucket(&p[..ROUTING_PREFIX_LEN]);
 
         // then
-        assert_eq!(bucket, None);
+        assert_eq!(
+            bucket,
+            Some(TimeBucket {
+                start: 7777,
+                size: 2
+            })
+        );
     }
 
     #[test]
@@ -388,7 +383,7 @@ mod tests {
     #[test]
     fn parse_bucket_rejects_short_prefix() {
         // given — 6 bytes, one short of the routing prefix
-        let p = [TIMESERIES, KEY_VERSION_V2, 0, 0, 0, 0];
+        let p = [SUBSYSTEM, KEY_VERSION, 0, 0, 0, 0];
 
         // when / then
         assert_eq!(parse_bucket(&p), None);
@@ -397,7 +392,7 @@ mod tests {
     #[test]
     fn parse_bucket_rejects_wrong_subsystem() {
         // given
-        let p = [0xFF, KEY_VERSION_V2, 0, 0, 0, 0, 1];
+        let p = [0xFF, KEY_VERSION, 0, 0, 0, 0, 1];
 
         // when / then
         assert_eq!(parse_bucket(&p), None);
@@ -406,7 +401,7 @@ mod tests {
     #[test]
     fn parse_bucket_rejects_wrong_version() {
         // given
-        let p = [TIMESERIES, 0xFF, 0, 0, 0, 0, 1];
+        let p = [SUBSYSTEM, 0xFF, 0, 0, 0, 0, 1];
 
         // when / then
         assert_eq!(parse_bucket(&p), None);

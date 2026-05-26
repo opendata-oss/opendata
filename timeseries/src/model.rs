@@ -21,9 +21,6 @@ pub(crate) type BucketStart = u32;
 /// Time bucket size (1-15, exponential: 1=1h, 2=2h, 3=4h, 4=8h, etc. = 2^(n-1) hours)
 pub(crate) type BucketSize = u8;
 
-// Re-export common RecordTag for internal use
-pub(crate) use common::serde::record_tag::RecordTag;
-
 /// NormalNaN is a quiet NaN (same as f64::NAN)
 pub const NORMAL_NAN: u64 = 0x7ff8000000000001;
 

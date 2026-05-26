@@ -122,8 +122,7 @@ impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
         let storage_key = TimeSeriesKey {
-            time_bucket: self.bucket.start,
-            bucket_size: self.bucket.size,
+            bucket: self.bucket,
             metric_name: metric_name.to_string(),
             series_id,
         };

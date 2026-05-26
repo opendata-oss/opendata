@@ -1,8 +1,9 @@
 use crate::serde::bucket_list::BucketListValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::timeseries::merge_batch_time_series;
-use crate::serde::{EncodingError, RecordType, parse_record_tag};
+use crate::serde::{EncodingError, RecordType, parse_bucket_record_type};
 use bytes::Bytes;
+use common::serde::key_prefix::KEY_PREFIX_LEN;
 use common::storage::default_merge_batch;
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
@@ -13,10 +14,7 @@ pub(crate) struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        // Decode record type from key
-        let tag = parse_record_tag(key.as_ref()).expect("Failed to parse key prefix");
-        let record_type =
-            RecordType::from_id(tag.record_type()).expect("Failed to decode record type");
+        let record_type = decode_record_type(key.as_ref()).expect("Failed to decode record type");
 
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)
@@ -31,6 +29,19 @@ impl common::storage::MergeOperator for OpenTsdbMergeOperator {
                 default_merge_batch(key, existing_value, operands, |_k, _e, v| v)
             }
         }
+    }
+}
+
+/// Returns the record type encoded in `key`, supporting both the 3-byte
+/// `BucketList` global-scoped layout and the 8-byte bucket-scoped header.
+/// Dispatch is by key length — `BucketList` is exactly the prefix, every
+/// other record starts with the full bucket-scoped header.
+fn decode_record_type(key: &[u8]) -> Result<RecordType, EncodingError> {
+    if key.len() == KEY_PREFIX_LEN + 1 {
+        RecordType::from_id(key[KEY_PREFIX_LEN])
+    } else {
+        let (_, record_type) = parse_bucket_record_type(key)?;
+        Ok(record_type)
     }
 }
 
@@ -96,11 +107,17 @@ mod tests {
     use roaring::RoaringBitmap;
     use rstest::rstest;
 
+    fn test_bucket() -> crate::model::TimeBucket {
+        crate::model::TimeBucket {
+            start: 1000,
+            size: 1,
+        }
+    }
+
     /// Helper to create a test key for InvertedIndex
     fn create_inverted_index_key() -> Bytes {
         InvertedIndexKey {
-            time_bucket: 1000,
-            bucket_size: 1,
+            bucket: test_bucket(),
             attribute: "env".to_string(),
             value: "prod".to_string(),
         }
@@ -110,8 +127,7 @@ mod tests {
     /// Helper to create a test key for TimeSeries
     fn create_time_series_key() -> Bytes {
         TimeSeriesKey {
-            time_bucket: 1000,
-            bucket_size: 1,
+            bucket: test_bucket(),
             metric_name: "test_metric".to_string(),
             series_id: 42,
         }
@@ -127,8 +143,7 @@ mod tests {
     fn create_other_record_type_key() -> Bytes {
         use crate::serde::key::SeriesDictionaryKey;
         SeriesDictionaryKey {
-            time_bucket: 1000,
-            bucket_size: 1,
+            bucket: test_bucket(),
             series_fingerprint: 123,
         }
         .encode()

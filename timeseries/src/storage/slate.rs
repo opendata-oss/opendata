@@ -470,8 +470,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         term: &Label,
     ) -> crate::util::Result<Option<RoaringBitmap>> {
         let key = InvertedIndexKey {
-            time_bucket: bucket.start,
-            bucket_size: bucket.size,
+            bucket: *bucket,
             attribute: term.name.clone(),
             value: term.value.clone(),
         }
@@ -518,8 +517,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         series_id: SeriesId,
     ) -> crate::util::Result<Option<SeriesSpec>> {
         let key = ForwardIndexKey {
-            time_bucket: bucket.start,
-            bucket_size: bucket.size,
+            bucket: *bucket,
             series_id,
         }
         .encode();
@@ -945,8 +943,7 @@ pub(crate) fn insert_series_id(
     ttl: Ttl,
 ) -> crate::util::Result<RecordOp> {
     let key = SeriesDictionaryKey {
-        time_bucket: bucket.start,
-        bucket_size: bucket.size,
+        bucket,
         series_fingerprint: fingerprint,
     }
     .encode();
@@ -963,12 +960,7 @@ pub(crate) fn insert_forward_index(
     series_spec: SeriesSpec,
     ttl: Ttl,
 ) -> crate::util::Result<RecordOp> {
-    let key = ForwardIndexKey {
-        time_bucket: bucket.start,
-        bucket_size: bucket.size,
-        series_id,
-    }
-    .encode();
+    let key = ForwardIndexKey { bucket, series_id }.encode();
     let value = ForwardIndexValue {
         metric_unit: series_spec.unit,
         metric_meta: series_spec.metric_type.into(),
@@ -989,8 +981,7 @@ pub(crate) fn merge_inverted_index(
     ttl: Ttl,
 ) -> crate::util::Result<RecordOp> {
     let key = InvertedIndexKey {
-        time_bucket: bucket.start,
-        bucket_size: bucket.size,
+        bucket,
         attribute: label.name,
         value: label.value,
     }
@@ -1010,8 +1001,7 @@ pub(crate) fn merge_samples(
     ttl: Ttl,
 ) -> crate::util::Result<RecordOp> {
     let key = TimeSeriesKey {
-        time_bucket: bucket.start,
-        bucket_size: bucket.size,
+        bucket,
         metric_name: metric_name.to_string(),
         series_id,
     }
