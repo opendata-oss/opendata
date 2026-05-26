@@ -9,9 +9,9 @@
 //!
 //! [`encode_length`] asserts inputs use at most [`MAX_INPUT_BITS`] bits, so
 //! the natural Lucene FP algorithm never reaches the top of the byte range.
-//! We compute [`MAX_NATURAL_CODE`] — the highest byte the unmodified
+//! We compute [`MAX_CODE`] — the highest byte the unmodified
 //! algorithm would emit for any input in our range — and use the resulting
-//! [`SHIFT`] of unused byte codes to extend the lossless prefix at the
+//! [`CODE_SHIFT`] of unused byte codes to extend the lossless prefix at the
 //! bottom of the byte range. For 30-bit inputs and a 3-bit mantissa we get
 //! 32 free codes, which grows the lossless range from `[0, 15]` to
 //! `[0, 63]`.
@@ -19,22 +19,28 @@
 /// Maximum number of bits inputs to [`encode_length`] may use.
 pub(crate) const MAX_INPUT_BITS: u32 = 30;
 
-const MANTISSA_BITS: u32 = 3;
-const MANTISSA_MASK: u32 = (1 << MANTISSA_BITS) - 1;
+/// The number of significant bits to retain
+const MANTISSA_BITS: u32 = 4;
+/// The encoding omits the most significant bit as it is implicitly 1
+const MANTISSA_CODE_BITS: u32 = MANTISSA_BITS - 1;
+const MANTISSA_MASK: u32 = (1 << MANTISSA_CODE_BITS) - 1; // 0b111
 
 /// Highest byte code the natural Lucene FP algorithm produces for any input
 /// fitting in [`MAX_INPUT_BITS`].
 ///
-/// For an input `i` with `bits = floor(log2(i))` the natural algorithm
-/// emits `((bits - 2) << MANTISSA_BITS) | low`. The max-bits input has
-/// `bits = MAX_INPUT_BITS - 1` and `low = MANTISSA_MASK`.
-const MAX_NATURAL_CODE: u32 = ((MAX_INPUT_BITS - 3) << MANTISSA_BITS) | MANTISSA_MASK;
+/// For an input `i` with `nsb` significant bits the natural algorithm emits
+/// `((nsb - MANTISSA_BITS + 1) << MANTISSA_CODE_BITS) | low`. The max-bits
+/// input has `nsb = MAX_INPUT_BITS` and `low = MANTISSA_MASK`, which folds
+/// to `((MAX_INPUT_BITS - MANTISSA_BITS + 1) << MANTISSA_CODE_BITS) |
+/// MANTISSA_MASK` — i.e. the `MAX_INPUT_BITS - 3` you see below for our
+/// 4-bit mantissa.
+const MAX_CODE: u32 = ((MAX_INPUT_BITS - 3) << MANTISSA_CODE_BITS) | MANTISSA_MASK;
 
 /// Byte codes at the top of `[0, 255]` that the natural algorithm never
 /// produces for inputs in our range. We shift the FP encoding up by this
 /// many bytes so those codes fall off the top, freeing up the same number
 /// of byte codes at the bottom for lossless direct encoding.
-const SHIFT: u32 = 255 - MAX_NATURAL_CODE;
+const CODE_SHIFT: u32 = 255 - MAX_CODE;
 
 /// Inputs strictly less than this are stored directly (`byte == i`).
 ///
@@ -46,10 +52,12 @@ const LOSSLESS_THRESHOLD: u32 = 64;
 
 // Compile-time consistency checks for the constants above.
 const _: () = {
-    assert!(MAX_NATURAL_CODE + SHIFT == 255);
-    let bits = LOSSLESS_THRESHOLD.trailing_zeros();
-    let natural = (bits - 2) << MANTISSA_BITS;
-    assert!(natural + SHIFT == LOSSLESS_THRESHOLD);
+    assert!(MAX_CODE + CODE_SHIFT == 255);
+    // Mirror `encode_length`: nsb = number of significant bits of the input.
+    let nsb = LOSSLESS_THRESHOLD.trailing_zeros() + 1;
+    let shift = nsb - MANTISSA_BITS;
+    let natural = (shift + 1) << MANTISSA_CODE_BITS;
+    assert!(natural + CODE_SHIFT == LOSSLESS_THRESHOLD);
 };
 
 /// Encode a non-negative document length into one byte.
@@ -70,10 +78,12 @@ pub(crate) fn encode_length(i: u32) -> u8 {
     if i < LOSSLESS_THRESHOLD {
         return i as u8;
     }
-    let bits = 31u32 - i.leading_zeros();
-    let low = (i >> (bits - MANTISSA_BITS)) & MANTISSA_MASK;
-    let natural = ((bits - 2) << MANTISSA_BITS) | low;
-    (natural + SHIFT) as u8
+    // the number of significant bits in the value
+    let nsb = 32u32 - i.leading_zeros();
+    let low = (i >> (nsb - MANTISSA_BITS)) & MANTISSA_MASK;
+    let shift = nsb - MANTISSA_BITS;
+    let natural = ((shift + 1) << MANTISSA_CODE_BITS) | low;
+    (natural + CODE_SHIFT) as u8
 }
 
 /// Decode a byte produced by [`encode_length`] back to its (approximate)
@@ -86,11 +96,11 @@ pub(crate) fn decode_norm(b: u8) -> u32 {
     if b < LOSSLESS_THRESHOLD {
         return b;
     }
-    let natural = b - SHIFT;
-    let bits = natural >> MANTISSA_BITS;
-    // bits >= 4 here: b >= LOSSLESS_THRESHOLD == 64 and SHIFT == 32 imply
-    // natural >= 32, so natural >> MANTISSA_BITS >= 4.
-    ((1 << MANTISSA_BITS) | (natural & MANTISSA_MASK)) << (bits - 1)
+    let natural = b - CODE_SHIFT;
+    let biased_shift = natural >> MANTISSA_CODE_BITS;
+    // biased_shift >= 4 here: b >= LOSSLESS_THRESHOLD == 64 and CODE_SHIFT
+    // == 32 imply natural >= 32, so natural >> MANTISSA_CODE_BITS >= 4.
+    ((1 << MANTISSA_CODE_BITS) | (natural & MANTISSA_MASK)) << (biased_shift - 1)
 }
 
 /// Clamp `length` to the largest value [`encode_length`] accepts, so callers
@@ -121,7 +131,7 @@ mod tests {
     fn encode_is_monotonic_non_decreasing() {
         // given - sweep across a representative range
         let mut prev = encode_length(0);
-        for i in 1u32..=10_000 {
+        for i in 1u32..=1_000_000 {
             // when
             let cur = encode_length(i);
 
