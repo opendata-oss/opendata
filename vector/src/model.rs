@@ -513,6 +513,26 @@ impl Filter {
     pub fn or(filters: Vec<Filter>) -> Self {
         Filter::Or(filters)
     }
+
+    /// Evaluate this filter against an attribute map (CPU-side reference
+    /// semantics). Useful for computing filtered ground truth without going
+    /// through the index.
+    ///
+    /// Semantics for well-formed metadata (every row carries the indexed
+    /// fields): `Eq` matches when the field is present and equal; `Neq`
+    /// matches when the field is absent or not equal; `In` matches when the
+    /// field is present and its value is in the set; `And`/`Or` combine.
+    pub fn matches(&self, attributes: &HashMap<String, AttributeValue>) -> bool {
+        match self {
+            Filter::Eq(field, value) => attributes.get(field) == Some(value),
+            Filter::Neq(field, value) => attributes.get(field) != Some(value),
+            Filter::In(field, values) => attributes
+                .get(field)
+                .is_some_and(|v| values.contains(v)),
+            Filter::And(filters) => filters.iter().all(|f| f.matches(attributes)),
+            Filter::Or(filters) => filters.iter().any(|f| f.matches(attributes)),
+        }
+    }
 }
 
 /// Helper to build a metadata map from attributes.

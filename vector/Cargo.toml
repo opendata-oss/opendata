@@ -68,10 +68,6 @@ reqwest = { workspace = true, optional = true, features = ["json"] }
 buffer = { workspace = true, optional = true }
 
 [[bin]]
-name = "gen_sift100k_groundtruth"
-path = "src/bin/gen_sift100k_groundtruth.rs"
-
-[[bin]]
 name = "embedded-reader"
 path = "src/bin/embedded_reader.rs"
 required-features = ["embedded-reader"]

@@ -3,19 +3,25 @@ name = "vector-bench"
 version.workspace = true
 edition.workspace = true
 publish = false
+default-run = "vector-bench"
 
 [dependencies]
 bencher.workspace = true
 common.workspace = true
 foyer.workspace = true
-vector = { path = "..", package = "opendata-vector" }
+vector = { path = "..", package = "opendata-vector", features = ["http-server"] }
 serde_yaml.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 async-channel = "2"
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
+arrow = "55"
+parquet = "55"
+rayon = "1.11.0"
 sysinfo = "0.32"
+toml = "0.8"
 tokio.workspace = true
 tracing-subscriber.workspace = true
 

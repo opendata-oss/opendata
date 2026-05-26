@@ -277,30 +277,35 @@ struct JsonVector {
     attributes: HashMap<String, Value>,
 }
 
+/// JSON representation of a query filter. Exactly one operator field must be
+/// set. Used by the HTTP API and re-exported for reuse (e.g. by the
+/// benchmark harness) so the wire format has a single definition.
 #[derive(Debug, Deserialize)]
-struct JsonFilter {
+pub struct JsonFilter {
     #[serde(default)]
-    eq: Option<JsonComparisonFilter>,
+    pub eq: Option<JsonComparisonFilter>,
     #[serde(default)]
-    neq: Option<JsonComparisonFilter>,
+    pub neq: Option<JsonComparisonFilter>,
     #[serde(default)]
-    r#in: Option<JsonInFilter>,
+    pub r#in: Option<JsonInFilter>,
     #[serde(default)]
-    and: Option<Vec<JsonFilter>>,
+    pub and: Option<Vec<JsonFilter>>,
     #[serde(default)]
-    or: Option<Vec<JsonFilter>>,
+    pub or: Option<Vec<JsonFilter>>,
 }
 
+/// A single `eq`/`neq` comparison: `field` against a JSON `value`.
 #[derive(Debug, Deserialize)]
-struct JsonComparisonFilter {
-    field: String,
-    value: Value,
+pub struct JsonComparisonFilter {
+    pub field: String,
+    pub value: Value,
 }
 
+/// An `in` filter: `field` against a set of JSON `values`.
 #[derive(Debug, Deserialize)]
-struct JsonInFilter {
-    field: String,
-    values: Vec<Value>,
+pub struct JsonInFilter {
+    pub field: String,
+    pub values: Vec<Value>,
 }
 
 fn proto_vector_to_vector(index: usize, doc: proto::Vector) -> Result<crate::Vector, Error> {

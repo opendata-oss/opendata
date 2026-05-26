@@ -72,9 +72,11 @@ async fn ingest(
             let batch: Vec<Vector> = chunk
                 .iter()
                 .enumerate()
-                .map(|(i, values)| {
+                .map(|(i, row)| {
                     let index = vector_offset + chunk_idx * INGEST_WRITE_BATCH_SIZE + i;
-                    Vector::new(index.to_string(), values.clone())
+                    let mut vector = Vector::new(index.to_string(), row.embedding.clone());
+                    vector.attributes.extend(row.attributes.iter().cloned());
+                    vector
                 })
                 .collect();
             let written = batch.len() as u64;

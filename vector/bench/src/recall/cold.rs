@@ -17,7 +17,9 @@ use std::time::Instant;
 use bencher::Bench;
 use vector::{Query, ReaderConfig, SearchOptions, VectorDbRead, VectorDbReader};
 
-use crate::recall::{Dataset, build_cold_reader_runtime, percentile, warm_default_memory_bytes};
+use crate::recall::{
+    BenchQuery, Dataset, build_cold_reader_runtime, percentile, warm_default_memory_bytes,
+};
 
 /// Number of queries per fresh reader. After this many queries, the reader
 /// is dropped and re-opened with a fresh cache.
@@ -33,7 +35,7 @@ pub struct ColdSummary {
 pub async fn run(
     dataset: &Dataset,
     reader_config: &ReaderConfig,
-    queries: &[Vec<f32>],
+    queries: &[BenchQuery],
     k: usize,
     bench: &Bench,
 ) -> anyhow::Result<ColdSummary> {
@@ -73,7 +75,10 @@ pub async fn run(
                 .next()
                 .expect("queries.iter().cycle() is infinite");
             let t = Instant::now();
-            let q = Query::new(query.clone()).with_limit(k);
+            let mut q = Query::new(query.embedding.clone()).with_limit(k);
+            if let Some(filter) = &query.filter {
+                q = q.with_filter(filter.clone());
+            }
             let _ = reader
                 .search_with_options(
                     &q,

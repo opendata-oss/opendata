@@ -18,5 +18,6 @@ mod vector_reader;
 
 pub use config::{VectorServerConfig, load_reader_config, load_vector_config};
 pub use metrics::MetricsState;
+pub use request::{JsonComparisonFilter, JsonFilter, JsonInFilter};
 pub use vector::VectorServer;
 pub use vector_reader::VectorReaderServer;

@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use bencher::Bench;
-use vector::{Config, Query, SearchOptions, SearchResult, VectorDb, VectorDbRead};
+use vector::{Config, Filter, Query, SearchOptions, SearchResult, VectorDb, VectorDbRead};
 
-use crate::recall::{Dataset, open_db, percentile, warm_default_memory_bytes};
+use crate::recall::{BenchQuery, Dataset, open_db, percentile, warm_default_memory_bytes};
 
 /// Metrics produced by the warm phase.
 pub struct WarmSummary {
@@ -23,7 +23,7 @@ pub struct WarmSummary {
 pub async fn run(
     dataset: &Dataset,
     config: &Config,
-    queries: &[Vec<f32>],
+    queries: &[BenchQuery],
     ground_truth: &[Vec<i32>],
     k: usize,
     bench: &Bench,
@@ -37,7 +37,7 @@ pub async fn run(
 async fn warm(
     dataset: &Dataset,
     db: &VectorDb,
-    queries: &[Vec<f32>],
+    queries: &[BenchQuery],
     ground_truth: &[Vec<i32>],
     k: usize,
     bench: &Bench,
@@ -50,7 +50,10 @@ async fn warm(
     let mut warm_latencies_us = Vec::with_capacity(queries.len());
     for query in queries.iter() {
         let t = Instant::now();
-        let q = Query::new(query.clone()).with_limit(k);
+        let mut q = Query::new(query.embedding.clone()).with_limit(k);
+        if let Some(filter) = &query.filter {
+            q = q.with_filter(filter.clone());
+        }
         let _ = db
             .search_with_options(
                 &q,
@@ -94,14 +97,18 @@ async fn warm(
     //
     // Channel is bounded to `concurrency` so a slow DB back-pressures
     // the producer rather than letting the pending-query queue grow.
-    let (tx, rx) = async_channel::bounded::<(usize, Vec<f32>)>(concurrency);
+    let (tx, rx) = async_channel::bounded::<(usize, Vec<f32>, Option<Filter>)>(concurrency);
 
     let producer = async {
         let mut ticker = tokio::time::interval(tick_period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         for (i, query) in queries.iter().enumerate() {
             ticker.tick().await;
-            if tx.send((i, query.clone())).await.is_err() {
+            if tx
+                .send((i, query.embedding.clone(), query.filter.clone()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -115,8 +122,11 @@ async fn warm(
             let rx = rx.clone();
             async move {
                 let mut results = Vec::new();
-                while let Ok((i, query)) = rx.recv().await {
-                    let q = Query::new(query).with_limit(k);
+                while let Ok((i, query, filter)) = rx.recv().await {
+                    let mut q = Query::new(query).with_limit(k);
+                    if let Some(filter) = filter {
+                        q = q.with_filter(filter);
+                    }
                     let t = Instant::now();
                     let search_results = db_ref
                         .search_with_options(
