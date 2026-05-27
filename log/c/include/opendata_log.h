@@ -237,6 +237,24 @@ struct opendata_log_result_t opendata_log_key_iterator_next(struct opendata_log_
 
 struct opendata_log_result_t opendata_log_key_iterator_close(struct opendata_log_key_iterator_t *iterator);
 
+/**
+ * Installs a global `tracing` subscriber that writes to stderr.
+ *
+ * `filter` is an `EnvFilter` directive string (same syntax as `RUST_LOG`),
+ * e.g. `"info"`, `"slatedb=debug"`, or `"slatedb=debug,opendata_log=info"`.
+ * Pass `NULL` to fall back to the `RUST_LOG` environment variable, or
+ * `"info"` if `RUST_LOG` is unset.
+ *
+ * Must be called at most once per process, before `opendata_log_open`. The
+ * underlying `tracing` global default can only be set once; if a subscriber
+ * is already installed (e.g. by another Rust component embedded in the same
+ * host), this returns `OPENDATA_LOG_ERROR_INTERNAL`.
+ *
+ * Hosts that already manage their own `tracing` subscriber should not call
+ * this function.
+ */
+struct opendata_log_result_t opendata_log_enable_logging(const char *filter);
+
 void opendata_log_result_free(struct opendata_log_result_t result);
 
 void opendata_log_bytes_free(uint8_t *data, uintptr_t len);
