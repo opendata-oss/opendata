@@ -187,30 +187,26 @@ impl Consumer {
 
     /// Read the next data batch from object storage.
     ///
-    /// Compatibility shim for pre-RFC-0003 callers. Behavior is
-    /// preserved: peeks the next manifest entry past the last
-    /// handed-out / fetched sequence, fetches the corresponding
-    /// object, and returns it. Returns `None` if no matching entry is
-    /// available.
+    /// Serial fetch of the next batch: peeks the next manifest entry
+    /// past the last handed-out / fetched sequence, fetches the
+    /// corresponding object, and returns it. Returns `None` if no
+    /// entry is available. May be called repeatedly to walk successive
+    /// batches; the read cursor is independent of the ack frontier.
     ///
     /// **Cancellation-safe and fetch-failure-safe.** The cursor
     /// (`last_handed_out_sequence`) advances **only after** a
     /// successful fetch. If the fetch fails, or if the future is
-    /// dropped mid-fetch (cancellation), the cursor is unchanged and
-    /// a subsequent `next_batch` re-fetches the same entry. This
-    /// preserves the legacy "fetch failure does not advance the
-    /// cursor" semantics that pre-RFC-0003 callers rely on.
+    /// dropped mid-fetch, the cursor is unchanged and a subsequent
+    /// `next_batch` re-fetches the same entry.
     ///
-    /// The implementation is a manual peek-fetch-advance flow rather
-    /// than a wrapper over [`Consumer::next_descriptors`] +
-    /// [`Consumer::fetch_descriptor`]: `next_descriptors` advances
-    /// the cursor at handout time per the
-    /// "Descriptor Handout Contract" (lost descriptors are not
-    /// reissued in-process), which is correct for the new-API
-    /// caller but is exactly the legacy regression this method must
-    /// avoid. Inlining keeps the cursor-advance after the
-    /// `fetch_descriptor` await, making cancellation safety a
-    /// structural invariant rather than a `Drop`-guard liability.
+    /// This is written as an inline peek-fetch-advance rather than a
+    /// wrapper over [`Consumer::next_descriptors`] +
+    /// [`Consumer::fetch_descriptor`] because `next_descriptors`
+    /// advances the cursor at handout time (a handed-out descriptor is
+    /// not reissued within a process; see the Descriptor Handout
+    /// Contract). Inlining keeps the cursor advance after the fetch
+    /// `await`, so a failed or dropped fetch leaves the cursor
+    /// untouched — the behavior `next_batch` callers expect.
     pub async fn next_batch(&mut self) -> Result<Option<ConsumedBatch>> {
         let entries = self
             .consumer
@@ -869,7 +865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_next_descriptors_max_zero_returns_empty_without_manifest_read() {
+    async fn should_next_descriptors_max_zero_return_empty_without_manifest_read() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
         enqueue_n(&store, &producer, 3).await;
@@ -884,7 +880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_next_descriptors_returns_contiguous_run_when_available() {
+    async fn should_next_descriptors_return_contiguous_run_when_available() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
         enqueue_n(&store, &producer, 5).await;
@@ -907,7 +903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_next_descriptors_returns_fewer_than_max_on_short_manifest() {
+    async fn should_next_descriptors_return_fewer_than_max_on_short_manifest() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
         enqueue_n(&store, &producer, 2).await;
@@ -1002,79 +998,80 @@ mod tests {
 
     #[tokio::test]
     async fn should_next_batch_not_advance_cursor_when_future_is_dropped() {
-        // Cancellation safety: a `next_batch` future dropped before it
-        // completes must not have advanced last_handed_out_sequence.
-        // The next next_batch must return the same entry.
-        //
-        // The structural property this verifies: last_handed_out_sequence
-        // is mutated *after* the fetch_descriptor await returns Ok.
-        // If the future is dropped before that line, the cursor is
-        // unchanged. (Earlier versions of next_batch advanced the
-        // cursor inside next_descriptors(1) before the fetch — that
-        // version was cancellation-unsafe even though the Err path
-        // rolled back.)
+        // Cancellation safety: constructing a `next_batch` future and
+        // dropping it before it completes must leave
+        // last_handed_out_sequence untouched, so the entry is not
+        // skipped. The structural property: last_handed_out_sequence is
+        // mutated *after* the fetch_descriptor await returns Ok, so a
+        // future dropped before that line leaves the cursor unchanged.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
         let entries = test_entries();
         write_batch(&store, "batches/cancel-a", &entries).await;
-        write_batch(&store, "batches/cancel-b", &entries).await;
         producer
             .enqueue("batches/cancel-a".to_string(), vec![])
-            .await
-            .unwrap();
-        producer
-            .enqueue("batches/cancel-b".to_string(), vec![])
             .await
             .unwrap();
 
         assert_eq!(collector.last_handed_out_sequence, None);
 
         // Construct the future and drop it without ever polling it.
-        // This is the cleanest test of "the body never runs" and
-        // exercises the no-side-effects-before-fetch invariant.
         {
             let fut = collector.next_batch();
             drop(fut);
         }
         assert_eq!(
             collector.last_handed_out_sequence, None,
-            "dropped (unpolled) next_batch future must not advance the cursor"
+            "dropped next_batch future must not advance the cursor"
         );
 
-        // Race a real next_batch against an immediate timeout. If the
-        // timeout wins, the future was cancelled mid-flight (after
-        // some polls) and the cursor must still not have advanced.
-        // If the future wins, the cursor advanced exactly to the
-        // returned batch's sequence.
-        let r = tokio::time::timeout(std::time::Duration::ZERO, collector.next_batch()).await;
-        match r {
-            Ok(Ok(Some(b))) => {
-                assert_eq!(b.sequence, 0);
-                assert_eq!(b.location, "batches/cancel-a");
-                assert_eq!(collector.last_handed_out_sequence, Some(0));
-            }
-            Ok(Ok(None)) => panic!("expected a batch"),
-            Ok(Err(e)) => panic!("unexpected error: {e:?}"),
-            Err(_elapsed) => {
-                // Cancellation path: cursor unchanged.
-                assert_eq!(collector.last_handed_out_sequence, None);
-            }
-        }
-
-        // Functional retry: regardless of which branch above executed,
-        // a normal next_batch now returns the next un-fetched entry.
-        // If we cancelled, that's A (sequence 0). If we succeeded,
-        // that's B (sequence 1).
-        let next = collector.next_batch().await.unwrap().unwrap();
-        assert!(
-            next.sequence == 0 || next.sequence == 1,
-            "after cancellation or success, next_batch must return one of the two enqueued entries"
-        );
+        // The entry was not consumed: a real next_batch still returns it.
+        let b = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b.sequence, 0);
+        assert_eq!(b.location, "batches/cancel-a");
+        assert_eq!(collector.last_handed_out_sequence, Some(0));
     }
 
     #[tokio::test]
-    async fn should_fetch_handle_be_clone_send_sync_static() {
-        // Compile-time check: handle is Clone + Send + Sync + 'static.
+    async fn should_next_batch_advance_cursor_on_successful_fetch() {
+        // The success branch (the deterministic counterpart to the
+        // dropped-future test): a completed next_batch advances
+        // last_handed_out_sequence to the fetched sequence, and
+        // successive calls walk forward one entry at a time.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        write_batch(&store, "batches/ok-a", &entries).await;
+        write_batch(&store, "batches/ok-b", &entries).await;
+        producer
+            .enqueue("batches/ok-a".to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue("batches/ok-b".to_string(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(collector.last_handed_out_sequence, None);
+
+        let a = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(a.sequence, 0);
+        assert_eq!(collector.last_handed_out_sequence, Some(0));
+
+        let b = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b.sequence, 1);
+        assert_eq!(collector.last_handed_out_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn should_fetch_handle_clones_fetch_concurrently_without_blocking_owner() {
+        // The fetch handle is the parallel-fetch seam: it must be
+        // Clone + Send + Sync + 'static (compile-time assertion below),
+        // two clones must fetch from separate spawned tasks
+        // concurrently, and the owning Consumer must keep &mut access
+        // throughout (the handle holds an Arc, not a borrow) so it can
+        // still drive the manifest — checked by the ack_through at the
+        // end.
         fn assert_send_sync_static<T: Send + Sync + 'static>() {}
         assert_send_sync_static::<ConsumerFetchHandle>();
 
