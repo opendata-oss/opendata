@@ -152,7 +152,7 @@ Then, the scoring/ranking algorithm looks very roughly like:
 
 We'll store field norms rather than document lengths in postings. This reduces posting size and
 overhead for tracking block-level scoring statistics. The norm is the field length quantized to
-1-bit. We'll use the same quantization formula as lucene (
+1-byte. We'll use the same quantization formula as lucene (
 https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/util/SmallFloat.java#L147).
 The approach there loses precision for longer documents, which is fine because the length
 normalization contribution to BM25 also becomes less significant as document size increases.
@@ -405,7 +405,6 @@ We'll segment Vector into the following segments:
 | `0x0d` | `TermPostings`     | FTS     |
 | `0x0d` | `TermStats`        | FTS     |
 | `0x0e` | `VectorStats`      | FTS     |
-
 | `0x0f` | `FieldStats`       | FTS     |
 
 #### `Deletions` (`RecordType::Deletions` = `0x0c`)
@@ -565,7 +564,7 @@ same SR (though that should always be the case).
 ┌────────────────────────────────────────────────────────────────┐
 │                     FieldStatsValue                            │
 ├────────────────────────────────────────────────────────────────┤
-│  count: i64                                                    |
+│  freq: i64                                                     |
 |  total_length: i64                                             |
 |  deletes: i64                                                  |
 └────────────────────────────────────────────────────────────────┘
@@ -643,8 +642,6 @@ deletes and vectors and triggers a major compaction of the FTS segment whenever 
 deletes crosses `delete_compaction_threshold`. Otherwise it delegates to 
 `SizeTieredCompactionPolicy`.
 
-TODO: `SizeTieredCompactionPolicy` doesn't handle segmented dbs today 
-
 ### Compaction Filter
 
 Actual cleanup of postings is done by a compaction filter. If the compaction doesn't target the 
@@ -656,7 +653,10 @@ FTS segment, it does nothing, Otherwise, it:
   the posting's term
 - Applies the delta to the term statistics.
 - Removes `VectorFieldStatistics` entries for deleted vectors and accumulates field stats deltas.
-- Applies the delta to the field stats.
+- Applies the delta to the field stats. Note that the current compaction filter implementation
+  in slatedb does not allow inserting new keys, so this behaviour depends on the `FieldStats`
+  being present for each field in each SR. For now, we'll guarantee this by emitting a FieldStats
+  delta on each flush. In the future we can add support for adding keys during compaction.
 
 ## Query Processing
 
