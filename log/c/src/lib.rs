@@ -19,6 +19,7 @@ mod logging;
 mod memory;
 mod object_store;
 mod reader;
+mod telemetry;
 
 // Re-export all public FFI types for cbindgen discovery.
 pub use ffi::*;
@@ -30,3 +31,4 @@ pub use logging::*;
 pub use memory::*;
 pub use object_store::*;
 pub use reader::*;
+pub use telemetry::*;

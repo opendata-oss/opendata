@@ -2568,6 +2568,8 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "cbindgen",
+ "metrics",
+ "metrics-exporter-prometheus",
  "opendata-common",
  "opendata-log",
  "tempfile",
