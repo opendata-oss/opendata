@@ -41,13 +41,6 @@ pub struct BatchDescriptor {
     pub location: String,
     /// Per-range metadata items attached to this batch by producers.
     pub metadata: Vec<Metadata>,
-    /// Object size in bytes when known. Reserved for the runtime's
-    /// byte-budget accounting (see `opendata-contrib` RFC 0002). The
-    /// current Buffer manifest format does not carry per-entry object
-    /// size, so v1 always emits `None`. A future manifest extension
-    /// may populate this; runtime callers handle `None` with a
-    /// pessimistic reservation.
-    pub object_bytes: Option<u64>,
 }
 
 /// Cloneable, concurrency-safe handle for fetching data batches from
@@ -231,9 +224,6 @@ impl Consumer {
             sequence: entry.sequence,
             location: entry.location,
             metadata: entry.metadata,
-            // Reserved field; v1 manifests do not carry per-entry
-            // object size.
-            object_bytes: None,
         };
         // fetch_descriptor advances last_fetched_sequence on success
         // and updates the consumer_lag_seconds gauge. We then advance
@@ -285,9 +275,6 @@ impl Consumer {
                 sequence: e.sequence,
                 location: e.location,
                 metadata: e.metadata,
-                // Reserved field; the current manifest format does not
-                // carry per-entry object size. See RFC 0003.
-                object_bytes: None,
             })
             .collect())
     }
@@ -907,8 +894,6 @@ mod tests {
         assert_eq!(v[0].sequence, 0);
         assert_eq!(v[1].sequence, 1);
         assert_eq!(v[2].sequence, 2);
-        // object_bytes is reserved (always None in v1).
-        assert!(v.iter().all(|d| d.object_bytes.is_none()));
 
         // Cursor advanced; next call returns sequences 3 and 4 only.
         let v2 = collector.next_descriptors(10).await.unwrap();
