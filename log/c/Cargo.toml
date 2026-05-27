@@ -15,6 +15,7 @@ log = { path = "..", package = "opendata-log" }
 common = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

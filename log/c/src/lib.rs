@@ -15,6 +15,7 @@ pub mod ffi;
 
 mod db;
 mod iterator;
+mod logging;
 mod memory;
 mod object_store;
 mod reader;
@@ -25,6 +26,7 @@ pub use ffi::*;
 // Re-export all extern "C" functions so they appear in the cdylib.
 pub use db::*;
 pub use iterator::*;
+pub use logging::*;
 pub use memory::*;
 pub use object_store::*;
 pub use reader::*;

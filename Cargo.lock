@@ -2563,6 +2563,7 @@ dependencies = [
  "opendata-log",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
