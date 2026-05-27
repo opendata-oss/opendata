@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -326,4 +327,120 @@ unsafe fn build_records(
         });
     }
     Ok(records)
+}
+
+/// Reads the current durable-sequence watermark.
+///
+/// `*out_sequence` is set to N such that all records with `sequence < N` are
+/// durably persisted. Initial value is 0; advances as the underlying storage
+/// confirms durability (no explicit flush required, though `opendata_log_flush`
+/// does force it).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn opendata_log_durable_sequence(
+    log: *const opendata_log_t,
+    out_sequence: *mut u64,
+) -> opendata_log_result_t {
+    if let Err(e) = require_handle(log, "log") {
+        return e;
+    }
+    if out_sequence.is_null() {
+        return error_result(
+            opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+            "out_sequence must not be null",
+        );
+    }
+    let handle = &*log;
+    *out_sequence = handle.log.durable_sequence();
+    success_result()
+}
+
+/// Subscribes to durable-sequence watermark changes.
+///
+/// `callback` is invoked once on registration with the current watermark, then
+/// on each subsequent advancement. The callback runs on a tokio worker thread
+/// (not the caller's thread) and **must not call other `opendata_log_*`
+/// functions on the same log handle** — doing so will deadlock the runtime.
+///
+/// Intermediate values may be coalesced; the callback always receives the
+/// latest observed value.
+///
+/// `user_data` is passed back verbatim to each callback invocation. The
+/// caller is responsible for ensuring it remains valid (and safe for
+/// concurrent access from worker threads) for the entire lifetime of the
+/// subscription, **including any in-flight callback that may still be
+/// running after `opendata_log_unsubscribe_durable` returns** (see that
+/// function's contract).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn opendata_log_subscribe_durable(
+    log: *const opendata_log_t,
+    callback: Option<extern "C" fn(durable_sequence: u64, user_data: *mut c_void)>,
+    user_data: *mut c_void,
+    out_subscription: *mut *mut opendata_log_subscription_t,
+) -> opendata_log_result_t {
+    if let Err(e) = require_handle(log, "log") {
+        return e;
+    }
+    if let Err(e) = require_out_ptr(out_subscription, "out_subscription") {
+        return e;
+    }
+    let Some(callback) = callback else {
+        return error_result(
+            opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+            "callback must not be null",
+        );
+    };
+
+    let handle = &*log;
+    let mut rx = handle.log.subscribe_durable();
+    let ud = CallbackUserData::new(user_data);
+
+    let task = handle.runtime.spawn(async move {
+        // Initial fire with the current value to bootstrap the subscriber.
+        ud.invoke(callback, *rx.borrow_and_update());
+
+        while rx.changed().await.is_ok() {
+            ud.invoke(callback, *rx.borrow_and_update());
+        }
+    });
+
+    let subscription = Box::new(opendata_log_subscription_t {
+        abort_handle: task.abort_handle(),
+    });
+    *out_subscription = Box::into_raw(subscription);
+    success_result()
+}
+
+/// Cancels a durable-sequence subscription and frees the handle.
+///
+/// **Best-effort with respect to in-flight callbacks.** This call signals the
+/// spawned task to stop and returns immediately. If a callback is currently
+/// executing on a worker thread, it will run to completion *after* this
+/// function returns. A new callback for this subscription will not be
+/// scheduled.
+///
+/// **Caller obligation:** `user_data` must remain valid until every
+/// in-flight invocation of the callback has finished. The C API does not
+/// synchronize with worker threads on unsubscribe; freeing `user_data`
+/// immediately after this call returns is a use-after-free if a callback is
+/// mid-execution. A safe pattern is to keep `user_data` alive as long as
+/// any subscription that references it, e.g. by tying it to the lifetime of
+/// the `opendata_log_t` (close the log first, then free `user_data` once no
+/// pending callback work could possibly remain).
+///
+/// Safe to call after `opendata_log_close` (the spawned task will already
+/// have exited because its watch channel closed when the log dropped).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn opendata_log_unsubscribe_durable(
+    subscription: *mut opendata_log_subscription_t,
+) -> opendata_log_result_t {
+    if subscription.is_null() {
+        return error_result(
+            opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+            "subscription must not be null",
+        );
+    }
+    // Reboxing transfers ownership back. The handle's Drop impl aborts the
+    // spawned task as it goes out of scope.
+    let _ = Box::from_raw(subscription);
+    success_result()
 }
