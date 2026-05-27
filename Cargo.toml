@@ -46,7 +46,7 @@ serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
 foyer = "0.22"
-slatedb = "0.13.0"
+slatedb = { version = "0.13.0", features = ["wal_disable", "lz4"] }
 slatedb-common = "0.13.0"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full", "test-util"] }
