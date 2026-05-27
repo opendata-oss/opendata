@@ -766,10 +766,18 @@ async fn try_advance_durable(
             .await;
         }
         watermarks.update_durable(advanced.epoch);
-        // send_if_modified is monotonic by construction since broadcasts
-        // increase next_sequence and drains pop in order, but we use
-        // send_replace for simplicity — watch coalesces duplicates.
-        durable_sequence_tx.send_replace(advanced.next_sequence);
+        // Only notify on actual advance: `send_replace` always wakes
+        // receivers regardless of value, which would surface phantom
+        // "advance" events to subscribers (e.g. the initial drain
+        // republishing the bootstrap value).
+        durable_sequence_tx.send_if_modified(|current| {
+            if advanced.next_sequence > *current {
+                *current = advanced.next_sequence;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 

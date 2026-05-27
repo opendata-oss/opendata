@@ -43,6 +43,17 @@ pub struct opendata_log_subscription_t {
     pub(crate) abort_handle: AbortHandle,
 }
 
+impl Drop for opendata_log_subscription_t {
+    /// Defense-in-depth: if the handle is ever dropped without going through
+    /// `opendata_log_unsubscribe_durable` (e.g. a future code path that
+    /// reboxes-then-drops, or a panic in unsubscribe before `abort()` runs),
+    /// stop the spawned task here so it can't keep dereferencing `user_data`.
+    /// Idempotent against a prior explicit `abort()`.
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
+
 /// Callback invoked when the durable-sequence watermark advances.
 ///
 /// The first invocation carries the current value at subscription time; each
