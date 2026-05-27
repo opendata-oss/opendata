@@ -104,9 +104,13 @@ impl SlateDbStorage {
                 let mut slate_rx = slate_rx;
                 while slate_rx.changed().await.is_ok() {
                     let durable_seq = slate_rx.borrow_and_update().durable_seq;
-                    if tx.send(durable_seq).is_err() {
-                        break;
-                    }
+                    // Use send_replace rather than send: SlateDB may publish
+                    // a DbStatus change during `open` (e.g. manifest write)
+                    // before any consumer has subscribed, and `send` would
+                    // return Err on zero receivers — killing the bridge
+                    // permanently. send_replace doesn't care about receiver
+                    // count, so late subscribers still get future updates.
+                    tx.send_replace(durable_seq);
                 }
             }
         });

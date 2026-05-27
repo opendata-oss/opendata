@@ -5,20 +5,26 @@
 //! ([`try_append`](LogDb::try_append), [`append_timeout`](LogDb::append_timeout))
 //! and read operations ([`scan`], [`count`]) via the [`LogRead`] trait.
 
+use std::collections::VecDeque;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use common::StorageBuilder;
+use std::sync::OnceLock;
+
 use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
+use common::storage::config::StorageConfig;
+use common::{CompactorBuilder, StorageBuilder, create_object_store};
+use slatedb::compactor::CompactionSchedulerSupplier;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::config::{ReadVisibility, ScanOptions, SegmentConfig};
+use crate::compaction::{CompactorView, CompactorViewCell, LogCompactionSchedulerSupplier};
+use crate::config::{ReadVisibility, RetentionConfig, ScanOptions, SegmentConfig};
 use crate::error::{AppendResult, Error, Result};
 use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
@@ -28,7 +34,9 @@ use crate::reader::{LogIterator, LogRead, LogReadView};
 use crate::segment::SegmentCache;
 use crate::serde::SEQ_BLOCK_KEY;
 use crate::view_tracker::{ViewEntry, ViewTracker};
-use crate::writer::{LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, WrittenView};
+use crate::writer::{
+    LogWrite, LogWriteHandle, LogWriter, LogWriterConfig, RetentionPolicy, WrittenView,
+};
 
 /// The main log interface providing read and write operations.
 ///
@@ -101,7 +109,9 @@ pub struct LogDb {
     clock: Arc<dyn Clock>,
     read_view: Arc<RwLock<LogReadView>>,
     epoch_watcher: EpochWatcher,
+    durable_sequence_rx: watch::Receiver<Sequence>,
     read_subscriber_task: JoinHandle<()>,
+    compactor_view_task: Option<JoinHandle<()>>,
     read_visibility: ReadVisibility,
 }
 
@@ -270,6 +280,12 @@ impl LogDb {
         Ok(())
     }
 
+    /// Test-only delete of a sealed segment's `SegmentMeta` record.
+    #[cfg(test)]
+    pub(crate) async fn delete_segment_meta(&self, segment_id: SegmentId) -> Result<()> {
+        self.handle.delete_segment_meta(segment_id).await
+    }
+
     /// Flushes all pending writes to durable storage.
     ///
     /// This method ensures that all acknowledged writes are durably persisted
@@ -277,6 +293,28 @@ impl LogDb {
     pub async fn flush(&self) -> Result<()> {
         self.handle.flush().await?;
         Ok(())
+    }
+
+    /// Returns the exclusive upper bound of global sequences durably persisted.
+    ///
+    /// A returned value of `N` means every record with sequence `seq < N` is
+    /// durable. The initial value is the next sequence that would be assigned
+    /// at construction; it advances as the underlying storage confirms
+    /// durability — without requiring an explicit [`flush`](Self::flush).
+    ///
+    /// Pairs with [`subscribe_durable`](Self::subscribe_durable) for change
+    /// notifications.
+    pub fn durable_sequence(&self) -> Sequence {
+        *self.durable_sequence_rx.borrow()
+    }
+
+    /// Subscribes to the durable-sequence watermark.
+    ///
+    /// The returned receiver updates whenever the durable-sequence watermark
+    /// advances. See [`durable_sequence`](Self::durable_sequence) for the
+    /// semantics of the value.
+    pub fn subscribe_durable(&self) -> watch::Receiver<Sequence> {
+        self.durable_sequence_rx.clone()
     }
 
     /// Waits for read-side visibility to reach the current requirement.
@@ -304,6 +342,9 @@ impl LogDb {
         drop(self.handle);
         let _ = self.writer_task.await;
         self.read_subscriber_task.abort();
+        if let Some(task) = self.compactor_view_task {
+            task.abort();
+        }
         self.storage
             .close()
             .await
@@ -318,8 +359,10 @@ impl LogDb {
             storage,
             None,
             SegmentConfig::default(),
+            RetentionConfig::default(),
             ReadVisibility::Memory,
             Arc::new(SystemClock),
+            None,
         )
         .await
     }
@@ -335,8 +378,10 @@ impl LogDb {
             storage,
             Some(direct),
             SegmentConfig::default(),
+            RetentionConfig::default(),
             ReadVisibility::Memory,
             Arc::new(SystemClock),
+            None,
         )
         .await
     }
@@ -348,19 +393,26 @@ impl LogDb {
             storage,
             None,
             SegmentConfig::default(),
+            RetentionConfig::default(),
             ReadVisibility::Remote,
             Arc::new(SystemClock),
+            None,
         )
         .await
     }
 
-    /// Shared construction logic used by both `LogDb::new` and `LogDbBuilder::build`.
+    /// Shared construction logic used by `LogDb::new` and `LogDbBuilder::build`.
+    /// When `compactor_view_cell` is `Some`, a durable-gated compactor view
+    /// receiver is installed there so the embedded compaction scheduler can
+    /// track the live set.
     async fn from_storage(
         storage: Arc<dyn common::Storage>,
         direct: Option<Arc<crate::direct::LogDirect>>,
         segment_config: SegmentConfig,
+        retention_config: RetentionConfig,
         read_visibility: ReadVisibility,
         clock: Arc<dyn Clock>,
+        compactor_view_cell: Option<crate::compaction::CompactorViewCell>,
     ) -> Result<Self> {
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = common::SequenceAllocator::load(storage.as_ref(), seq_key)
@@ -373,36 +425,61 @@ impl LogDb {
         let segment_cache = SegmentCache::open(snapshot.as_ref(), segment_config).await?;
         let listing_cache = ListingCache::new();
 
+        let writer_config = LogWriterConfig {
+            retention: retention_config.retention.map(|retention| RetentionPolicy {
+                retention,
+                check_interval: retention_config.check_interval,
+            }),
+            ..LogWriterConfig::default()
+        };
         let (writer, mut handle) = LogWriter::new(
             storage.clone(),
             sequence_allocator,
             segment_cache.clone(),
             listing_cache,
-            LogWriterConfig::default(),
+            Arc::clone(&clock),
+            writer_config,
         )
         .await
         .map_err(Error::Storage)?;
 
         let written_rx = handle.written_rx();
+        let initial_segment_id = segment_cache.latest().map(|s| s.id());
+        let initial_deleted_segment_id = segment_cache.initial_deleted_segment_id();
+        let initial_next_sequence = written_rx.borrow().next_sequence;
+        let compactor_view_task = if let Some(cell) = compactor_view_cell.as_ref() {
+            let (compactor_rx, task) = spawn_compactor_view_publisher(
+                written_rx.clone(),
+                &storage,
+                initial_segment_id,
+                initial_deleted_segment_id,
+            );
+            // Err from `set` would mean the cell was already initialised — that
+            // never happens on our paths, so log it loudly rather than swallow.
+            if cell.set(compactor_rx).is_err() {
+                tracing::warn!("compactor view cell was already initialised");
+            }
+            Some(task)
+        } else {
+            None
+        };
         let writer_task = handle.spawn(writer);
 
-        let initial_segment_id = segment_cache.latest().map(|s| s.id());
         let read_view = Arc::new(RwLock::new(LogReadView::new(
             snapshot as Arc<dyn common::StorageRead>,
             direct,
             segment_cache,
         )));
 
-        let (epoch_watcher, read_subscriber_task) = if read_visibility.is_remote() {
-            spawn_durable_subscriber(
-                written_rx,
-                Arc::clone(&read_view),
-                &storage,
-                initial_segment_id,
-            )
-        } else {
-            spawn_written_subscriber(written_rx, Arc::clone(&read_view), initial_segment_id)
-        };
+        let (epoch_watcher, durable_sequence_rx, read_subscriber_task) = spawn_subscriber(
+            written_rx,
+            &storage,
+            Arc::clone(&read_view),
+            read_visibility,
+            initial_segment_id,
+            initial_deleted_segment_id,
+            initial_next_sequence,
+        );
 
         Ok(Self {
             handle,
@@ -411,7 +488,9 @@ impl LogDb {
             clock,
             read_view,
             epoch_watcher,
+            durable_sequence_rx,
             read_subscriber_task,
+            compactor_view_task,
             read_visibility,
         })
     }
@@ -461,40 +540,9 @@ impl LogRead for LogDb {
 
 /// Builder for creating LogDb instances with custom options.
 ///
-/// This builder provides a fluent API for configuring a LogDb, including
-/// low-level SlateDB knobs via [`StorageBuilder::map_slatedb`].
-///
-/// # Example
-///
-/// ```ignore
-/// use log::LogDbBuilder;
-/// use log::Config;
-/// use common::{StorageBuilder, CompactorBuilder, create_object_store};
-///
-/// // Create a separate runtime for compaction (important for sync/JNI usage)
-/// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
-///     .worker_threads(2)
-///     .enable_all()
-///     .build()
-///     .unwrap();
-///
-/// let mut sb = StorageBuilder::new(&config.storage).await.unwrap();
-/// sb = sb.map_slatedb(|db| {
-///     let obj_store = create_object_store(&slate_config.object_store).unwrap();
-///     db.with_compactor_builder(
-///         CompactorBuilder::new(slate_config.path.clone(), obj_store)
-///             .with_runtime(compaction_runtime.handle().clone())
-///     )
-/// });
-///
-/// let log = LogDbBuilder::new(config)
-///     .with_storage_builder(sb)
-///     .build()
-///     .await?;
-/// ```
+/// This builder provides configuration validation and LogDb construction.
 pub struct LogDbBuilder {
     config: crate::config::Config,
-    storage_builder: Option<StorageBuilder>,
     clock: Option<Arc<dyn Clock>>,
 }
 
@@ -503,18 +551,8 @@ impl LogDbBuilder {
     pub fn new(config: crate::config::Config) -> Self {
         Self {
             config,
-            storage_builder: None,
             clock: None,
         }
-    }
-
-    /// Sets a pre-configured [`StorageBuilder`].
-    ///
-    /// Use this to configure low-level SlateDB knobs like compaction runtime.
-    /// If not called, a default `StorageBuilder` is created from the config.
-    pub fn with_storage_builder(mut self, builder: StorageBuilder) -> Self {
-        self.storage_builder = Some(builder);
-        self
     }
 
     /// Overrides the wall-clock source. Test-only — production callers always
@@ -531,12 +569,11 @@ impl LogDbBuilder {
 
     /// Builds the LogDb instance.
     pub async fn build(self) -> Result<LogDb> {
-        let sb = match self.storage_builder {
-            Some(sb) => sb,
-            None => StorageBuilder::new(&self.config.storage)
-                .await
-                .map_err(|e| Error::Storage(e.to_string()))?,
-        };
+        self.config.validate_retention()?;
+        self.config.validate_compaction()?;
+        let sb = StorageBuilder::new(&self.config.storage)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
         // Route every log record to a SlateDB segment keyed by the 6-byte
         // routing prefix `[subsystem, version, segment_id]`. No-op for the
         // in-memory backend; for slatedb-backed storage this installs the
@@ -544,6 +581,25 @@ impl LogDbBuilder {
         let sb = sb.map_slatedb(|db| {
             db.with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
         });
+        // Install the LogDb compaction scheduler for every SlateDB-backed log.
+        let compactor_view_cell: CompactorViewCell = Arc::new(OnceLock::new());
+        let sb = if let StorageConfig::SlateDb(ref slate_config) = self.config.storage {
+            let path = slate_config.path.clone();
+            let object_store = create_object_store(&slate_config.object_store)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let supplier: Arc<dyn CompactionSchedulerSupplier> =
+                Arc::new(LogCompactionSchedulerSupplier {
+                    cell: Arc::clone(&compactor_view_cell),
+                    options: self.config.compaction.clone(),
+                });
+            sb.map_slatedb(move |db| {
+                db.with_compactor_builder(
+                    CompactorBuilder::new(path, object_store).with_scheduler_supplier(supplier),
+                )
+            })
+        } else {
+            sb
+        };
         let storage = sb
             .build()
             .await
@@ -556,105 +612,207 @@ impl LogDbBuilder {
 
         let clock: Arc<dyn Clock> = self.clock.unwrap_or_else(|| Arc::new(SystemClock));
 
+        // Hand the cell to `from_storage` only when we installed the supplier.
+        let cell_for_writer =
+            matches!(self.config.storage, StorageConfig::SlateDb(_)).then_some(compactor_view_cell);
+
         LogDb::from_storage(
             storage,
             direct,
             self.config.segmentation,
+            self.config.retention,
             self.config.read_visibility,
             clock,
+            cell_for_writer,
         )
         .await
     }
 }
 
-/// Tries to advance the tracker and, on success, applies the new snapshot
-/// to the shared read view and refreshes segments if needed.
-async fn try_advance_read_view(
-    tracker: &mut ViewTracker,
-    read_view: &RwLock<LogReadView>,
-    watermarks: &EpochWatermarks,
-    known_segment_id: &mut Option<SegmentId>,
-    durability: Durability,
-    through_seq: u64,
-) {
-    if let Some(advanced) = tracker.advance(through_seq) {
-        let mut rv = read_view.write().await;
-        rv.update_snapshot(advanced.snapshot as Arc<dyn common::StorageRead>);
+fn spawn_compactor_view_publisher(
+    mut written_rx: watch::Receiver<WrittenView>,
+    storage: &Arc<dyn common::Storage>,
+    initial_segment_id: Option<SegmentId>,
+    initial_deleted_segment_id: Option<SegmentId>,
+) -> (watch::Receiver<CompactorView>, JoinHandle<()>) {
+    let (compactor_tx, compactor_rx) = watch::channel(CompactorView {
+        last_segment_id: initial_segment_id,
+        last_deleted_segment_id: initial_deleted_segment_id,
+    });
+    let mut durable_rx = storage.subscribe_durable();
 
-        // Refresh segments from the snapshot when the writer reports a new segment.
-        if advanced.last_segment_id != *known_segment_id {
-            match rv.refresh_segments(*known_segment_id).await {
-                Ok(()) => {
-                    *known_segment_id = advanced.last_segment_id;
+    let task = tokio::spawn(async move {
+        let mut pending_deletes: VecDeque<(u64, Option<SegmentId>)> = VecDeque::new();
+        let mut last_durable_seq = *durable_rx.borrow();
+
+        loop {
+            tokio::select! {
+                result = written_rx.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
+                    let view = written_rx.borrow_and_update().clone();
+                    pending_deletes.push_back((view.seqnum, view.last_deleted_segment_id));
+                    compactor_tx.send_modify(|state| {
+                        state.last_segment_id = view.last_segment_id;
+                    });
+                    drain_compactor_deletes(
+                        &mut pending_deletes,
+                        last_durable_seq,
+                        &compactor_tx,
+                    );
                 }
-                Err(e) => {
-                    tracing::warn!("failed to refresh segments: {e}");
+                result = durable_rx.changed() => {
+                    if result.is_err() {
+                        break;
+                    }
+                    last_durable_seq = *durable_rx.borrow_and_update();
+                    drain_compactor_deletes(
+                        &mut pending_deletes,
+                        last_durable_seq,
+                        &compactor_tx,
+                    );
                 }
             }
         }
+    });
 
-        match durability {
-            Durability::Written => watermarks.update_written(advanced.epoch),
-            Durability::Durable | Durability::Applied => watermarks.update_durable(advanced.epoch),
-        }
+    (compactor_rx, task)
+}
+
+fn drain_compactor_deletes(
+    pending_deletes: &mut VecDeque<(u64, Option<SegmentId>)>,
+    durable_seq: u64,
+    compactor_tx: &watch::Sender<CompactorView>,
+) {
+    let mut latest_durable_delete = None;
+    while pending_deletes
+        .front()
+        .is_some_and(|(seqnum, _)| *seqnum <= durable_seq)
+    {
+        latest_durable_delete = pending_deletes
+            .pop_front()
+            .map(|(_, deleted_id)| deleted_id);
+    }
+
+    if let Some(last_deleted_segment_id) = latest_durable_delete {
+        compactor_tx.send_modify(|state| {
+            state.last_deleted_segment_id = last_deleted_segment_id;
+        });
     }
 }
 
-fn spawn_written_subscriber(
-    mut written_rx: watch::Receiver<WrittenView>,
-    read_view: Arc<RwLock<LogReadView>>,
-    initial_segment_id: Option<SegmentId>,
-) -> (EpochWatcher, JoinHandle<()>) {
-    let (watermarks, watcher) = EpochWatermarks::new();
-    let mut tracker = ViewTracker::new();
-    let mut known_segment_id = initial_segment_id;
-    let task = tokio::spawn(async move {
-        while written_rx.changed().await.is_ok() {
-            let view = written_rx.borrow_and_update().clone();
-            let seqnum = view.seqnum;
-            tracker.push(ViewEntry {
-                seqnum,
-                epoch: view.epoch,
-                snapshot: view.snapshot,
-                last_segment_id: view.last_segment_id,
-            });
+/// Applies a written view directly to the read view (used in Memory mode where
+/// reads see writes as soon as they're broadcast — no durability gate).
+async fn advance_read_view_to(
+    read_view: &RwLock<LogReadView>,
+    known_segment_id: &mut Option<SegmentId>,
+    known_deleted_segment_id: &mut Option<SegmentId>,
+    snapshot: Arc<dyn common::storage::StorageSnapshot>,
+    new_segment_id: Option<SegmentId>,
+    new_deleted_segment_id: Option<SegmentId>,
+) {
+    let mut rv = read_view.write().await;
+    rv.update_snapshot(snapshot as Arc<dyn common::StorageRead>);
 
-            try_advance_read_view(
-                &mut tracker,
-                &read_view,
-                &watermarks,
-                &mut known_segment_id,
-                Durability::Written,
-                seqnum,
+    if new_segment_id != *known_segment_id {
+        match rv.refresh_segments(*known_segment_id).await {
+            Ok(()) => {
+                *known_segment_id = new_segment_id;
+            }
+            Err(e) => {
+                tracing::warn!("failed to refresh segments: {e}");
+            }
+        }
+    }
+
+    if new_deleted_segment_id > *known_deleted_segment_id {
+        if let Some(through_id) = new_deleted_segment_id {
+            rv.drop_segments_through(through_id);
+        }
+        *known_deleted_segment_id = new_deleted_segment_id;
+    }
+}
+
+/// Drains the tracker up to `durable_seq` and, on advance, atomically updates:
+///
+/// - `durable_sequence_tx` — the published global-sequence watermark
+/// - `watermarks.durable` — the durable epoch
+/// - When `advance_read_view` is true: the shared read view (Remote mode)
+///
+/// All updates happen under the same drain so that subscribers observing
+/// `durable_sequence` advance can rely on the read view having advanced too.
+#[allow(clippy::too_many_arguments)]
+async fn try_advance_durable(
+    tracker: &mut ViewTracker,
+    read_view: &RwLock<LogReadView>,
+    watermarks: &EpochWatermarks,
+    durable_sequence_tx: &watch::Sender<Sequence>,
+    known_segment_id: &mut Option<SegmentId>,
+    known_deleted_segment_id: &mut Option<SegmentId>,
+    advance_read_view: bool,
+    durable_seq: u64,
+) {
+    if let Some(advanced) = tracker.advance(durable_seq) {
+        if advance_read_view {
+            advance_read_view_to(
+                read_view,
+                known_segment_id,
+                known_deleted_segment_id,
+                advanced.snapshot,
+                advanced.last_segment_id,
+                advanced.last_deleted_segment_id,
             )
             .await;
         }
-    });
-    (watcher, task)
+        watermarks.update_durable(advanced.epoch);
+        // Only notify on actual advance: `send_replace` always wakes
+        // receivers regardless of value, which would surface phantom
+        // "advance" events to subscribers (e.g. the initial drain
+        // republishing the bootstrap value).
+        durable_sequence_tx.send_if_modified(|current| {
+            if advanced.next_sequence > *current {
+                *current = advanced.next_sequence;
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
-/// Spawns subscriber tasks for `ReadVisibility::Remote` mode.
+/// Spawns the read-view subscriber.
 ///
-/// A single task watches both the WrittenView channel and the durable
-/// sequence watermark. When a new WrittenView arrives, it's pushed into
-/// the ViewTracker and the "written" watermark is advanced. When
-/// the durable_seq advances, the tracker is drained and the LogReadView
-/// and "durable" watermark are updated.
-fn spawn_durable_subscriber(
+/// A single task watches both the writer's `WrittenView` channel and the
+/// underlying storage's durable seqnum watermark. The behaviour differs by
+/// read visibility:
+///
+/// - **Memory mode** — read view advances on every `WrittenView` change.
+///   `durable_sequence` advances when storage durability catches up.
+/// - **Remote mode** — read view advances only when storage durability covers
+///   the corresponding write; `durable_sequence` advances at the same moment.
+///
+/// In both modes, `durable_sequence` and (in Remote) the read view are
+/// updated together inside [`try_advance_durable`], so observers cannot see
+/// `durable_sequence` move past a write while the read view still lags.
+fn spawn_subscriber(
     mut written_rx: watch::Receiver<WrittenView>,
-    read_view: Arc<RwLock<LogReadView>>,
     storage: &Arc<dyn common::Storage>,
+    read_view: Arc<RwLock<LogReadView>>,
+    read_visibility: ReadVisibility,
     initial_segment_id: Option<SegmentId>,
-) -> (EpochWatcher, JoinHandle<()>) {
+    initial_deleted_segment_id: Option<SegmentId>,
+    initial_next_sequence: Sequence,
+) -> (EpochWatcher, watch::Receiver<Sequence>, JoinHandle<()>) {
     let (watermarks, watcher) = EpochWatermarks::new();
+    let (durable_sequence_tx, durable_sequence_rx) = watch::channel(initial_next_sequence);
     let mut durable_rx = storage.subscribe_durable();
     let mut tracker = ViewTracker::new();
     let mut known_segment_id = initial_segment_id;
+    let mut known_deleted_segment_id = initial_deleted_segment_id;
+    let advance_rv_on_durable = read_visibility.is_remote();
 
     let task = tokio::spawn(async move {
-        // Track the latest known durable_seq so we can re-check after new
-        // writes arrive (the durable notification may arrive before the
-        // WrittenView is pushed).
         let mut last_durable_seq: u64 = *durable_rx.borrow();
 
         loop {
@@ -667,15 +825,37 @@ fn spawn_durable_subscriber(
                     tracker.push(ViewEntry {
                         seqnum: view.seqnum,
                         epoch: view.epoch,
-                        snapshot: view.snapshot,
+                        snapshot: view.snapshot.clone(),
+                        next_sequence: view.next_sequence,
                         last_segment_id: view.last_segment_id,
+                        last_deleted_segment_id: view.last_deleted_segment_id,
                     });
                     watermarks.update_written(view.epoch);
 
-                    // Re-check: the durable watermark may already cover this entry
-                    try_advance_read_view(
-                        &mut tracker, &read_view, &watermarks, &mut known_segment_id,
-                        Durability::Durable, last_durable_seq,
+                    if !advance_rv_on_durable {
+                        // Memory mode: read view sees writes immediately.
+                        advance_read_view_to(
+                            &read_view,
+                            &mut known_segment_id,
+                            &mut known_deleted_segment_id,
+                            view.snapshot,
+                            view.last_segment_id,
+                            view.last_deleted_segment_id,
+                        )
+                        .await;
+                    }
+
+                    // Try drain in case durability already covers this seqnum
+                    // (e.g. InMemoryStorage default, or SlateDB already flushed).
+                    try_advance_durable(
+                        &mut tracker,
+                        &read_view,
+                        &watermarks,
+                        &durable_sequence_tx,
+                        &mut known_segment_id,
+                        &mut known_deleted_segment_id,
+                        advance_rv_on_durable,
+                        last_durable_seq,
                     )
                     .await;
                 }
@@ -684,9 +864,15 @@ fn spawn_durable_subscriber(
                         break;
                     }
                     last_durable_seq = *durable_rx.borrow_and_update();
-                    try_advance_read_view(
-                        &mut tracker, &read_view, &watermarks, &mut known_segment_id,
-                        Durability::Durable, last_durable_seq,
+                    try_advance_durable(
+                        &mut tracker,
+                        &read_view,
+                        &watermarks,
+                        &durable_sequence_tx,
+                        &mut known_segment_id,
+                        &mut known_deleted_segment_id,
+                        advance_rv_on_durable,
+                        last_durable_seq,
                     )
                     .await;
                 }
@@ -694,13 +880,15 @@ fn spawn_durable_subscriber(
         }
     });
 
-    (watcher, task)
+    (watcher, durable_sequence_rx, task)
 }
 
 #[cfg(test)]
 mod tests {
+    use common::Storage;
     use common::StorageBuilder;
     use common::StorageConfig;
+    use common::storage::in_memory::InMemoryStorage;
 
     use super::*;
     use crate::config::Config;
@@ -711,6 +899,94 @@ mod tests {
             storage: StorageConfig::InMemory,
             ..Default::default()
         }
+    }
+
+    async fn make_written_view(
+        storage: &Arc<dyn common::Storage>,
+        seqnum: u64,
+        last_segment_id: Option<SegmentId>,
+        last_deleted_segment_id: Option<SegmentId>,
+    ) -> WrittenView {
+        WrittenView {
+            epoch: seqnum,
+            snapshot: storage.snapshot().await.unwrap(),
+            seqnum,
+            next_sequence: 0,
+            last_segment_id,
+            last_deleted_segment_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn compactor_view_should_publish_new_segments_at_written_latency() {
+        let storage = Arc::new(InMemoryStorage::new().with_deferred_durability());
+        let storage_dyn = storage.clone() as Arc<dyn common::Storage>;
+        let initial_view = make_written_view(&storage_dyn, 0, None, None).await;
+        let (written_tx, written_rx) = watch::channel(initial_view);
+        let (mut compactor_rx, task) =
+            spawn_compactor_view_publisher(written_rx, &storage_dyn, None, None);
+
+        let write_result = storage
+            .apply(vec![common::storage::RecordOp::Delete(Bytes::from_static(
+                b"segment-meta-1",
+            ))])
+            .await
+            .unwrap();
+        written_tx.send_replace(
+            make_written_view(&storage_dyn, write_result.seqnum, Some(3), None).await,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), compactor_rx.changed())
+            .await
+            .expect("timed out waiting for compactor view")
+            .expect("compactor view channel closed");
+        let view = *compactor_rx.borrow_and_update();
+        assert_eq!(view.last_segment_id, Some(3));
+        assert_eq!(view.last_deleted_segment_id, None);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn compactor_view_should_delay_deleted_segments_until_durable() {
+        let storage = Arc::new(InMemoryStorage::new().with_deferred_durability());
+        let storage_dyn = storage.clone() as Arc<dyn common::Storage>;
+        let initial_view = make_written_view(&storage_dyn, 0, Some(2), None).await;
+        let (written_tx, written_rx) = watch::channel(initial_view);
+        let (mut compactor_rx, task) =
+            spawn_compactor_view_publisher(written_rx, &storage_dyn, Some(2), None);
+
+        let write_result = storage
+            .apply(vec![common::storage::RecordOp::Delete(Bytes::from_static(
+                b"segment-meta-1",
+            ))])
+            .await
+            .unwrap();
+        written_tx.send_replace(
+            make_written_view(&storage_dyn, write_result.seqnum, Some(2), Some(1)).await,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), compactor_rx.changed())
+            .await
+            .expect("timed out waiting for written compactor update")
+            .expect("compactor view channel closed");
+        let view = *compactor_rx.borrow_and_update();
+        assert_eq!(view.last_segment_id, Some(2));
+        assert_eq!(
+            view.last_deleted_segment_id, None,
+            "delete should remain hidden until durable",
+        );
+
+        storage.flush_to(write_result.seqnum);
+
+        tokio::time::timeout(Duration::from_secs(1), compactor_rx.changed())
+            .await
+            .expect("timed out waiting for durable compactor update")
+            .expect("compactor view channel closed");
+        let view = *compactor_rx.borrow_and_update();
+        assert_eq!(view.last_deleted_segment_id, Some(1));
+
+        task.abort();
     }
 
     #[tokio::test]
@@ -1939,6 +2215,135 @@ mod tests {
         assert_eq!(keys, vec![Bytes::from("alpha"), Bytes::from("beta")]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn should_delete_expired_segments_via_periodic_retention_loop() {
+        // Drives the writer's `run`-loop `select!` branch end-to-end through
+        // the public API, reached via the periodic `tokio::time::interval`
+        // inside `LogWriter::run` (rather than calling `tick_retention`
+        // directly).
+        use crate::Config;
+        use common::clock::MockClock;
+        use std::time::SystemTime;
+
+        let t0_secs: u64 = 10_000;
+        let retention = Duration::from_secs(60);
+        let seal_interval = Duration::from_secs(60);
+        let check_interval = Duration::from_millis(10);
+
+        let clock = Arc::new(MockClock::with_time(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(t0_secs),
+        ));
+        let config = Config {
+            storage: StorageConfig::InMemory,
+            segmentation: SegmentConfig {
+                seal_interval: Some(seal_interval),
+            },
+            retention: RetentionConfig {
+                retention: Some(retention),
+                check_interval,
+            },
+            ..Config::default()
+        };
+        let log = LogDbBuilder::new(config)
+            .with_clock(Arc::clone(&clock) as Arc<dyn Clock>)
+            .build()
+            .await
+            .unwrap();
+
+        // Create segment 1 at T=t0, then seal it (segment 2 also starts at t0).
+        // Segment 1's effective end_time is segment 2's start_time_ms = t0_ms.
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v"),
+        }])
+        .await
+        .unwrap();
+        log.seal_segment().await.unwrap();
+
+        let before: Vec<_> = log
+            .list_segments(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(before, vec![1, 2]);
+
+        // Move the writer's wall-clock past the retention cutoff for segment 1.
+        clock.set_time(SystemTime::UNIX_EPOCH + Duration::from_secs(t0_secs + 70));
+
+        // Advance `tokio::time` past one `check_interval` so the writer's
+        // interval branch in `select!` fires. Under `start_paused`, sleeping
+        // both bumps virtual time and yields, giving the spawned writer
+        // task room to run `tick_retention` to completion.
+        tokio::time::sleep(check_interval + Duration::from_millis(1)).await;
+        // tick_retention has several internal `.await` points (apply +
+        // snapshot + broadcast); a few extra yields drain them before we
+        // check the public surface.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Local reader should now see segment 1 dropped from the view.
+        let after: Vec<_> = log
+            .list_segments(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(after, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn should_drop_deleted_segment_from_local_reader_view() {
+        // given: three sealed user segments
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v0"),
+        }])
+        .await
+        .unwrap();
+        log.seal_segment().await.unwrap();
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v1"),
+        }])
+        .await
+        .unwrap();
+        log.seal_segment().await.unwrap();
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v2"),
+        }])
+        .await
+        .unwrap();
+
+        let before: Vec<_> = log
+            .list_segments(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(before, vec![1, 2, 3]);
+
+        // when: retention deletes the oldest segment's metadata
+        log.delete_segment_meta(1).await.unwrap();
+
+        // then: local readers converge — segment 1 is no longer visible
+        // without reopening the LogDb.
+        let after: Vec<_> = log
+            .list_segments(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(after, vec![2, 3]);
+    }
+
     #[tokio::test]
     async fn should_list_segments_without_flush() {
         // given
@@ -2128,8 +2533,10 @@ mod tests {
             SegmentConfig {
                 seal_interval: Some(Duration::from_nanos(1)),
             },
+            RetentionConfig::default(),
             ReadVisibility::Memory,
             Arc::new(SystemClock),
+            None,
         )
         .await
         .unwrap();
@@ -2401,5 +2808,178 @@ mod tests {
         // should contribute (covered_to from count_in_range is below the
         // range start, so scan_lo gets pulled to seg_lo).
         assert_eq!(log.count(Bytes::from("k"), 7..).await.unwrap(), 3);
+    }
+
+    // ---- durable_sequence tests ----
+
+    #[tokio::test]
+    async fn durable_sequence_starts_at_zero_on_fresh_log() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        assert_eq!(log.durable_sequence(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_sequence_advances_on_immediately_durable_storage() {
+        // Default InMemoryStorage marks writes durable immediately. The
+        // subscriber should pick that up without an explicit flush.
+        let log = LogDb::open(test_config()).await.unwrap();
+        let mut rx = log.subscribe_durable();
+
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Wait for subscriber to publish past the append.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *rx.borrow_and_update() < 2 {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("durable_sequence should advance to >= 2 after immediately-durable append");
+
+        assert!(log.durable_sequence() >= 2);
+    }
+
+    #[tokio::test]
+    async fn durable_sequence_does_not_advance_until_storage_flushes() {
+        // With deferred durability, the storage's durable watermark stays
+        // behind until flush_to/flush is called.
+        let storage =
+            Arc::new(common::storage::in_memory::InMemoryStorage::new().with_deferred_durability());
+        let log = LogDb::new(Arc::clone(&storage) as Arc<dyn common::Storage>)
+            .await
+            .unwrap();
+        let initial = log.durable_sequence();
+
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v0"),
+        }])
+        .await
+        .unwrap();
+
+        // Give the subscriber a moment to drain anything it could.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            log.durable_sequence(),
+            initial,
+            "durable_sequence must not advance without storage durability"
+        );
+
+        common::Storage::flush(storage.as_ref()).await.unwrap();
+
+        // Subscriber observes durable_rx advance and publishes.
+        let mut rx = log.subscribe_durable();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *rx.borrow_and_update() < 1 {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("durable_sequence should advance after storage flush");
+        assert!(log.durable_sequence() >= 1);
+    }
+
+    #[tokio::test]
+    async fn durable_sequence_advances_on_explicit_flush() {
+        let storage =
+            Arc::new(common::storage::in_memory::InMemoryStorage::new().with_deferred_durability());
+        let log = LogDb::new(Arc::clone(&storage) as Arc<dyn common::Storage>)
+            .await
+            .unwrap();
+
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        log.flush().await.unwrap();
+
+        let mut rx = log.subscribe_durable();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *rx.borrow_and_update() < 2 {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("durable_sequence should advance to >= 2 after LogDb::flush()");
+    }
+
+    #[tokio::test]
+    async fn durable_sequence_advance_implies_scan_visibility_in_remote_mode() {
+        // The unified subscriber updates the read view and durable_sequence
+        // under the same drain. When durable_sequence advances past N, a
+        // scan must see the records with seq < N immediately.
+        let storage =
+            Arc::new(common::storage::in_memory::InMemoryStorage::new().with_deferred_durability());
+        let log = LogDb::new_durable(Arc::clone(&storage) as Arc<dyn common::Storage>)
+            .await
+            .unwrap();
+
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v0"),
+        }])
+        .await
+        .unwrap();
+
+        // Not yet durable — scan should be empty.
+        let mut iter = log.scan(Bytes::from("k"), ..).await.unwrap();
+        assert!(iter.next().await.unwrap().is_none());
+
+        common::Storage::flush(storage.as_ref()).await.unwrap();
+
+        // Wait for durable_sequence to advance.
+        let mut rx = log.subscribe_durable();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *rx.borrow_and_update() < 1 {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        // Now scan must see the record (no extra sleeps/yields needed).
+        let mut iter = log.scan(Bytes::from("k"), ..).await.unwrap();
+        let entry = iter.next().await.unwrap().unwrap();
+        assert_eq!(entry.value, Bytes::from("v0"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_durable_notifies_on_advance() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        let mut rx = log.subscribe_durable();
+        assert_eq!(*rx.borrow_and_update(), 0);
+
+        log.try_append(vec![Record {
+            key: Bytes::from("k"),
+            value: Bytes::from("v"),
+        }])
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), rx.changed())
+            .await
+            .expect("subscribe_durable should fire on advance")
+            .unwrap();
+        assert!(*rx.borrow() >= 1);
     }
 }

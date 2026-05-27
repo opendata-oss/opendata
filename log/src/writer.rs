@@ -19,30 +19,39 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::Ttl::NoExpiry;
+use common::clock::Clock;
 use common::coordinator::{EpochWatcher, EpochWatermarks};
-use common::storage::PutOptions;
+use common::storage::{PutOptions, RecordOp};
 use common::{PutRecordOp, SequenceAllocator, WriteOptions};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::AppendError;
 use crate::listing::ListingCache;
-use crate::model::{AppendOutput, Record as UserRecord, SegmentId};
+use crate::model::{AppendOutput, Record as UserRecord, SegmentId, Sequence};
 use crate::segment::{LogSegment, SegmentAssignment, SegmentCache};
-use crate::serde::LogEntryKey;
+use crate::serde::{LogEntryKey, SegmentMetaKey};
 
 /// Snapshot of writer state broadcast to subscribers after each write.
+///
+/// The two segment-id watermarks below are monotonic and (combined with
+/// RFC 0005's "retention only deletes from the low end" invariant) fully
+/// describe the live user-segment range. Safe under `watch` coalescing.
 #[derive(Clone)]
 pub(crate) struct WrittenView {
     pub epoch: u64,
     pub snapshot: Arc<dyn common::storage::StorageSnapshot>,
     /// Storage engine sequence number for this write.
     pub seqnum: u64,
-    /// ID of the most recently created segment, if any.
-    /// Subscribers compare this against their local state to detect new segments
-    /// and reload them from the snapshot. This is safe under watch coalescing
-    /// because it is a monotonic watermark, not an incremental delta.
+    /// Exclusive upper bound of global sequences allocated as of this write.
+    /// Equals `SequenceAllocator::peek_next_sequence()` at broadcast time.
+    pub next_sequence: Sequence,
+    /// Id of the largest user segment created so far. `None` before the first
+    /// segment is created.
     pub last_segment_id: Option<SegmentId>,
+    /// Id of the largest user segment whose `SegmentMeta` has been deleted.
+    /// `None` until the first delete is observed.
+    pub last_deleted_segment_id: Option<SegmentId>,
 }
 
 /// The write type for the log writer.
@@ -64,6 +73,11 @@ pub(crate) enum WriterCommand {
         timestamp_ms: i64,
         result_tx: oneshot::Sender<Result<(), String>>,
     },
+    #[cfg(test)]
+    DeleteSegmentMeta {
+        segment_id: SegmentId,
+        result_tx: oneshot::Sender<Result<(), String>>,
+    },
     Flush {
         result_tx: oneshot::Sender<Result<u64, String>>,
     },
@@ -72,14 +86,28 @@ pub(crate) enum WriterCommand {
 /// Configuration for the log writer.
 pub(crate) struct LogWriterConfig {
     pub queue_capacity: usize,
+    /// Retention policy. When `Some`, the writer's main loop runs a periodic
+    /// retention check that deletes `SegmentMeta` records for expired sealed
+    /// segments. `None` disables the check entirely.
+    pub retention: Option<RetentionPolicy>,
 }
 
 impl Default for LogWriterConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 10_000,
+            retention: None,
         }
     }
+}
+
+/// Retention policy controlling the writer's periodic expiry check.
+#[derive(Debug, Clone)]
+pub(crate) struct RetentionPolicy {
+    /// Segments whose end time is older than `now() - retention` expire.
+    pub retention: Duration,
+    /// How often the writer evaluates expiry.
+    pub check_interval: Duration,
 }
 
 /// The log writer task. Owns all write-side state and runs as a spawned async task.
@@ -92,6 +120,9 @@ pub(crate) struct LogWriter {
     written_tx: watch::Sender<WrittenView>,
     watermarks: EpochWatermarks,
     last_segment_id: Option<SegmentId>,
+    last_deleted_segment_id: Option<SegmentId>,
+    clock: Arc<dyn Clock>,
+    retention: Option<RetentionPolicy>,
 }
 
 impl LogWriter {
@@ -101,17 +132,25 @@ impl LogWriter {
         sequence_allocator: SequenceAllocator,
         segment_cache: SegmentCache,
         listing_cache: ListingCache,
+        clock: Arc<dyn Clock>,
         config: LogWriterConfig,
     ) -> Result<(Self, LogWriteHandle), String> {
         let (cmd_tx, cmd_rx) = mpsc::channel(config.queue_capacity);
 
         let initial_snapshot = storage.snapshot().await.map_err(|e| e.to_string())?;
         let last_segment_id = segment_cache.latest().map(|s| s.id());
+        let last_deleted_segment_id = segment_cache.initial_deleted_segment_id();
+        // Anything persisted before construction is already covered by the
+        // storage's initial durable watermark, so `peek_next_sequence` is the
+        // exclusive upper bound of already-durable global sequences.
+        let initial_next_sequence = sequence_allocator.peek_next_sequence();
         let initial_view = WrittenView {
             epoch: 0,
             snapshot: initial_snapshot,
             seqnum: 0,
+            next_sequence: initial_next_sequence,
             last_segment_id,
+            last_deleted_segment_id,
         };
         let (written_tx, written_rx) = watch::channel(initial_view);
         let (watermarks, watcher) = EpochWatermarks::new();
@@ -125,6 +164,9 @@ impl LogWriter {
             written_tx,
             watermarks,
             last_segment_id,
+            last_deleted_segment_id,
+            clock,
+            retention: config.retention,
         };
 
         let handle = LogWriteHandle {
@@ -137,26 +179,88 @@ impl LogWriter {
         Ok((writer, handle))
     }
 
-    /// Runs the writer loop, processing commands from the receiver.
+    /// Runs the writer loop, processing commands and periodic retention
+    /// ticks when retention is configured.
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<WriterCommand>) {
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                WriterCommand::Append { write, result_tx } => {
-                    let result = self.handle_append(write).await;
-                    let _ = result_tx.send(result);
+        let mut retention_tick = self
+            .retention
+            .as_ref()
+            .map(|p| tokio::time::interval(p.check_interval));
+        loop {
+            tokio::select! {
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else { break };
+                    self.handle_command(cmd).await;
                 }
-                #[cfg(test)]
-                WriterCommand::ForceSeal {
-                    timestamp_ms,
-                    result_tx,
+                _ = async {
+                    match retention_tick.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
                 } => {
-                    let result = self.handle_force_seal(timestamp_ms).await;
-                    let _ = result_tx.send(result);
+                    self.tick_retention().await;
                 }
-                WriterCommand::Flush { result_tx } => {
-                    let result = self.handle_flush().await;
-                    let _ = result_tx.send(result);
-                }
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, cmd: WriterCommand) {
+        match cmd {
+            WriterCommand::Append { write, result_tx } => {
+                let result = self.handle_append(write).await;
+                let _ = result_tx.send(result);
+            }
+            #[cfg(test)]
+            WriterCommand::ForceSeal {
+                timestamp_ms,
+                result_tx,
+            } => {
+                let result = self.handle_force_seal(timestamp_ms).await;
+                let _ = result_tx.send(result);
+            }
+            #[cfg(test)]
+            WriterCommand::DeleteSegmentMeta {
+                segment_id,
+                result_tx,
+            } => {
+                let result = self.handle_delete_segment_meta(segment_id).await;
+                let _ = result_tx.send(result);
+            }
+            WriterCommand::Flush { result_tx } => {
+                let result = self.handle_flush().await;
+                let _ = result_tx.send(result);
+            }
+        }
+    }
+
+    /// Periodic retention check: deletes `SegmentMeta` for any sealed segment
+    /// whose end time (the successor's `start_time_ms`) is past
+    /// `now - retention`. Per-segment failures log and are retried next tick.
+    async fn tick_retention(&mut self) {
+        let Some(policy) = self.retention.clone() else {
+            return;
+        };
+        let now_ms = match self.clock.now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as i64,
+            Err(e) => {
+                // Falling back to 0 would silently disable retention; skip
+                // the tick and retry once the clock is sane again.
+                tracing::warn!("retention: clock before UNIX_EPOCH, skipping tick: {e}");
+                return;
+            }
+        };
+        let cutoff = now_ms - policy.retention.as_millis() as i64;
+
+        let segments = self.segment_cache.all();
+        let expired: Vec<SegmentId> = segments
+            .windows(2)
+            .filter(|w| w[1].meta().start_time_ms < cutoff)
+            .map(|w| w[0].id())
+            .collect();
+
+        for id in expired {
+            if let Err(e) = self.handle_delete_segment_meta(id).await {
+                tracing::warn!("retention: failed to delete SegmentMeta for segment {id}: {e}");
             }
         }
     }
@@ -169,12 +273,12 @@ impl LogWriter {
             return Ok(None);
         }
 
-        let mut records = Vec::new();
+        let mut puts = Vec::new();
 
         // 1. Allocate sequences
         let (base_seq, maybe_block_record) = self.sequence_allocator.allocate(count);
         if let Some(r) = maybe_block_record {
-            records.push(PutRecordOp::new_with_options(
+            puts.push(PutRecordOp::new_with_options(
                 r,
                 PutOptions { ttl: NoExpiry },
             ));
@@ -183,18 +287,19 @@ impl LogWriter {
         // 2. Assign segment (appends segment metadata record if new)
         let assignment =
             self.segment_cache
-                .assign_segment(write.timestamp_ms, base_seq, &mut records, false);
+                .assign_segment(write.timestamp_ms, base_seq, &mut puts, false);
 
         // 3. Assign listing entries for new keys
         let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
         self.listing_cache
-            .assign_new_keys(assignment.segment.id(), &keys, &mut records);
+            .assign_new_keys(assignment.segment.id(), &keys, &mut puts);
 
         // 4. Build log entry records
-        self.add_entries(&assignment.segment, base_seq, &write.records, &mut records);
+        self.add_entries(&assignment.segment, base_seq, &write.records, &mut puts);
 
         // 5. Write to storage and broadcast
-        self.write_and_broadcast(records, &assignment).await?;
+        let ops: Vec<RecordOp> = puts.into_iter().map(RecordOp::Put).collect();
+        self.apply_and_broadcast(ops, Some(&assignment)).await?;
 
         Ok(Some(AppendOutput {
             start_sequence: base_seq,
@@ -205,44 +310,89 @@ impl LogWriter {
     #[cfg(test)]
     async fn handle_force_seal(&mut self, timestamp_ms: i64) -> Result<(), String> {
         let next_seq = self.sequence_allocator.peek_next_sequence();
-        let mut records = Vec::new();
-        let assignment =
-            self.segment_cache
-                .assign_segment(timestamp_ms, next_seq, &mut records, true);
+        let mut puts = Vec::new();
+        let assignment = self
+            .segment_cache
+            .assign_segment(timestamp_ms, next_seq, &mut puts, true);
 
-        if !records.is_empty() {
-            self.write_and_broadcast(records, &assignment).await?;
+        if !puts.is_empty() {
+            let ops: Vec<RecordOp> = puts.into_iter().map(RecordOp::Put).collect();
+            self.apply_and_broadcast(ops, Some(&assignment)).await?;
         }
 
         Ok(())
     }
 
-    /// Writes records to storage, updates the segments snapshot if needed,
-    /// takes a new storage snapshot, bumps the epoch, and broadcasts.
-    async fn write_and_broadcast(
+    /// Deletes a sealed segment's `SegmentMeta` record.
+    ///
+    /// Idempotent at the storage layer: a missing key in SlateDB is a harmless
+    /// no-op. The local cache is updated only after the storage write succeeds,
+    /// so a failed delete leaves the segment live (retention will retry).
+    async fn handle_delete_segment_meta(&mut self, segment_id: SegmentId) -> Result<(), String> {
+        let key = SegmentMetaKey::new(segment_id).serialize();
+        let ops = vec![RecordOp::Delete(key)];
+        let write_result = self.apply(ops).await?;
+        self.segment_cache.remove(segment_id);
+        // Deletion watermark is monotonic — only advance. Advancing here is
+        // safe even though `apply` doesn't tell us whether the key existed:
+        // SlateDB transitions to a terminal error state on any write failure
+        // (see `Db::check_closed`), so a successful `apply` implies every
+        // prior `apply` on this writer also succeeded. Retention's caller
+        // (`tick_retention`) iterates expired ids in ascending order, so
+        // successful advances are contiguous from the low end.
+        if self
+            .last_deleted_segment_id
+            .is_none_or(|prev| prev < segment_id)
+        {
+            self.last_deleted_segment_id = Some(segment_id);
+        }
+        self.broadcast(write_result.seqnum).await
+    }
+
+    /// Writes ops to storage and broadcasts the resulting view.
+    ///
+    /// Used by the append/seal paths where no post-write state change is
+    /// needed before the broadcast. For deletes, prefer the explicit
+    /// `apply` + `broadcast` pair so cache/watermark updates can happen
+    /// between them.
+    async fn apply_and_broadcast(
         &mut self,
-        records: Vec<PutRecordOp>,
-        assignment: &SegmentAssignment,
+        ops: Vec<RecordOp>,
+        assignment: Option<&SegmentAssignment>,
     ) -> Result<(), String> {
+        let write_result = self.apply(ops).await?;
+        if let Some(assignment) = assignment
+            && assignment.is_new
+        {
+            self.last_segment_id = Some(assignment.segment.id());
+        }
+        self.broadcast(write_result.seqnum).await
+    }
+
+    /// Writes ops to storage. Returns the resulting `WriteResult`.
+    async fn apply(&mut self, ops: Vec<RecordOp>) -> Result<common::storage::WriteResult, String> {
         let options = WriteOptions {
             await_durable: false,
         };
-        let write_result = self
-            .storage
-            .put_with_options(records, options)
+        self.storage
+            .apply_with_options(ops, options)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    }
 
+    /// Takes a fresh storage snapshot, bumps the epoch, and broadcasts a
+    /// new `WrittenView` using current watermarks. Must be called after a
+    /// successful `apply` (and any post-write state updates).
+    async fn broadcast(&mut self, seqnum: u64) -> Result<(), String> {
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.epoch += 1;
-        if assignment.is_new {
-            self.last_segment_id = Some(assignment.segment.id());
-        }
         self.written_tx.send_replace(WrittenView {
             epoch: self.epoch,
             snapshot,
-            seqnum: write_result.seqnum,
+            seqnum,
+            next_sequence: self.sequence_allocator.peek_next_sequence(),
             last_segment_id: self.last_segment_id,
+            last_deleted_segment_id: self.last_deleted_segment_id,
         });
         self.watermarks.update_written(self.epoch);
         Ok(())
@@ -385,6 +535,24 @@ impl LogWriteHandle {
         Self::recv_epoch(result_rx).await
     }
 
+    /// Test-only command-driven delete of a sealed segment's `SegmentMeta`
+    /// record. Production deletes go through `LogWriter::tick_retention`.
+    #[cfg(test)]
+    pub(crate) async fn delete_segment_meta(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<(), crate::error::Error> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(WriterCommand::DeleteSegmentMeta {
+                segment_id,
+                result_tx,
+            })
+            .await
+            .map_err(|_| crate::error::Error::Internal("writer shut down".into()))?;
+        Self::recv_cmd(result_rx).await
+    }
+
     /// The highest epoch that has reached written visibility.
     pub(crate) fn written_epoch(&self) -> u64 {
         *self.watcher.written_rx.borrow()
@@ -427,6 +595,15 @@ mod tests {
         storage: Arc<dyn common::Storage>,
         config: LogWriterConfig,
     ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
+        let clock: Arc<dyn Clock> = Arc::new(common::clock::SystemClock);
+        create_writer_with_storage_and_clock(storage, clock, config).await
+    }
+
+    async fn create_writer_with_storage_and_clock(
+        storage: Arc<dyn common::Storage>,
+        clock: Arc<dyn Clock>,
+        config: LogWriterConfig,
+    ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
         let seq_key = Bytes::from_static(&SEQ_BLOCK_KEY);
         let sequence_allocator = SequenceAllocator::load(storage.as_ref(), seq_key)
             .await
@@ -441,6 +618,7 @@ mod tests {
             sequence_allocator,
             segment_cache,
             listing_cache,
+            clock,
             config,
         )
         .await
@@ -635,8 +813,9 @@ mod tests {
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
 
-        // Enable put failure after writer is running
-        failing.fail_put(common::StorageError::Storage("test put error".into()));
+        // Enable apply failure after writer is running. Appends flow through
+        // Storage::apply_with_options so we fail at that seam.
+        failing.fail_apply(common::StorageError::Storage("test put error".into()));
 
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(
@@ -701,8 +880,8 @@ mod tests {
             create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
         let _task = handle.spawn(writer);
 
-        // First append fails
-        failing.fail_put_once(common::StorageError::Storage("test put error".into()));
+        // First append fails. Appends go through Storage::apply_with_options.
+        failing.fail_apply_once(common::StorageError::Storage("test put error".into()));
         let result = handle.try_append(make_write(&["key1"], 1000)).await;
         assert!(result.is_err());
 
@@ -729,6 +908,359 @@ mod tests {
             "expected Shutdown, got: {:?}",
             result,
         );
+    }
+
+    #[tokio::test]
+    async fn should_delete_segment_meta_and_advance_watermarks() {
+        // given: writer has produced two user segments
+        let (writer, mut handle, storage) = create_writer().await;
+        let mut written_rx = handle.written_rx();
+        let _task = handle.spawn(writer);
+
+        handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
+        handle.force_seal(2000).await.unwrap();
+        handle.flush().await.unwrap();
+
+        use crate::storage::LogStorageRead as _;
+        let segs_before = storage.scan_segments(1..u32::MAX).await.unwrap();
+        assert_eq!(
+            segs_before.iter().map(|s| s.id()).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let epoch_before = handle.written_epoch();
+
+        // when: delete segment 1's SegmentMeta
+        handle.delete_segment_meta(1).await.unwrap();
+
+        // then: storage scan no longer sees segment 1
+        handle.flush().await.unwrap();
+        let segs_after = storage.scan_segments(1..u32::MAX).await.unwrap();
+        assert_eq!(
+            segs_after.iter().map(|s| s.id()).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        // and: the broadcast carries the deletion watermark
+        let view = written_rx.borrow_and_update().clone();
+        assert_eq!(view.last_deleted_segment_id, Some(1));
+        assert_eq!(view.last_segment_id, Some(2));
+        assert!(handle.written_epoch() > epoch_before);
+    }
+
+    #[tokio::test]
+    async fn should_be_idempotent_when_deleting_unknown_segment() {
+        // given: writer with no segments yet
+        let (writer, mut handle, _storage) = create_writer().await;
+        let mut written_rx = handle.written_rx();
+        let _task = handle.spawn(writer);
+
+        // when: delete a never-created segment
+        handle.delete_segment_meta(42).await.unwrap();
+
+        // then: the watermark still advances (subscribers can converge),
+        // and no error is surfaced
+        let view = written_rx.borrow_and_update().clone();
+        assert_eq!(view.last_deleted_segment_id, Some(42));
+    }
+
+    #[tokio::test]
+    async fn should_not_regress_deletion_watermark() {
+        // given: a writer with two sealed segments deleted out of order
+        let (writer, mut handle, _storage) = create_writer().await;
+        let mut written_rx = handle.written_rx();
+        let _task = handle.spawn(writer);
+        handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
+        handle.force_seal(2000).await.unwrap();
+        handle.force_seal(3000).await.unwrap();
+
+        // when: delete the higher id first, then the lower id
+        handle.delete_segment_meta(2).await.unwrap();
+        handle.delete_segment_meta(1).await.unwrap();
+
+        // then: watermark is the max of the two, not the most recent
+        let view = written_rx.borrow_and_update().clone();
+        assert_eq!(view.last_deleted_segment_id, Some(2));
+    }
+
+    #[storage_test]
+    async fn should_propagate_storage_error_on_delete(storage: Arc<dyn Storage>) {
+        let failing = FailingStorage::wrap(storage);
+        let (writer, mut handle, _) =
+            create_writer_with_storage(failing.clone(), LogWriterConfig::default()).await;
+        let _task = handle.spawn(writer);
+
+        // Force the next apply call to fail.
+        failing.fail_apply(common::StorageError::Storage("delete failed".into()));
+
+        let result = handle.delete_segment_meta(1).await;
+        assert!(
+            matches!(&result, Err(crate::error::Error::Storage(msg)) if msg.contains("delete failed")),
+            "expected Storage error, got: {:?}",
+            result,
+        );
+    }
+
+    // ---- Retention tick tests ----
+    //
+    // These tests drive `tick_retention` directly on a non-spawned writer.
+    // That tests the policy logic in isolation; the periodic interval that
+    // calls into it from `run()` is tokio's responsibility.
+
+    use common::clock::MockClock;
+
+    fn retention_policy(secs: u64) -> RetentionPolicy {
+        RetentionPolicy {
+            retention: Duration::from_secs(secs),
+            check_interval: Duration::from_millis(1),
+        }
+    }
+
+    async fn create_writer_for_retention(
+        clock: Arc<MockClock>,
+        retention_secs: u64,
+    ) -> (LogWriter, LogWriteHandle, Arc<dyn common::Storage>) {
+        let storage = Arc::new(InMemoryStorage::default());
+        let config = LogWriterConfig {
+            retention: Some(retention_policy(retention_secs)),
+            ..LogWriterConfig::default()
+        };
+        create_writer_with_storage_and_clock(storage, clock, config).await
+    }
+
+    fn ms_after_epoch(secs: u64) -> i64 {
+        (secs as i64) * 1000
+    }
+
+    fn epoch_plus(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[tokio::test]
+    async fn tick_retention_is_noop_when_no_segments() {
+        let clock = Arc::new(MockClock::with_time(epoch_plus(10_000)));
+        let (mut writer, _h, storage) = create_writer_for_retention(Arc::clone(&clock), 60).await;
+
+        writer.tick_retention().await;
+
+        use crate::storage::LogStorageRead as _;
+        let segs = storage.scan_segments(1..u32::MAX).await.unwrap();
+        assert_eq!(segs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tick_retention_skips_the_active_segment() {
+        // Active segment alone has no successor → no end-time → never expires.
+        let clock = Arc::new(MockClock::with_time(epoch_plus(10_000)));
+        let (mut writer, _h, storage) = create_writer_for_retention(Arc::clone(&clock), 60).await;
+
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v"),
+                }],
+                timestamp_ms: ms_after_epoch(1_000),
+            })
+            .await
+            .unwrap();
+
+        clock.set_time(epoch_plus(100_000)); // far past any plausible retention
+        writer.tick_retention().await;
+
+        use crate::storage::LogStorageRead as _;
+        let segs = storage.scan_segments(1..u32::MAX).await.unwrap();
+        assert_eq!(segs.iter().map(|s| s.id()).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn tick_retention_keeps_sealed_segment_within_retention() {
+        // Segment 1 sealed at T=2000s, segment 2 active. At T=2030s with 60s
+        // retention, segment 1's end (2000s) is not yet older than 1970s.
+        let clock = Arc::new(MockClock::with_time(epoch_plus(2_030)));
+        let (mut writer, _h, storage) = create_writer_for_retention(Arc::clone(&clock), 60).await;
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v"),
+                }],
+                timestamp_ms: ms_after_epoch(1_000),
+            })
+            .await
+            .unwrap();
+        writer
+            .handle_force_seal(ms_after_epoch(2_000))
+            .await
+            .unwrap();
+
+        writer.tick_retention().await;
+
+        use crate::storage::LogStorageRead as _;
+        let segs = storage.scan_segments(1..u32::MAX).await.unwrap();
+        assert_eq!(segs.iter().map(|s| s.id()).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn tick_retention_deletes_expired_sealed_segment() {
+        // Segment 1 sealed at T=2000s (its successor's start). At T=10_000s
+        // with 60s retention, the cutoff is 9940s; segment 1's end (2000s)
+        // is well past expiry.
+        let clock = Arc::new(MockClock::with_time(epoch_plus(10_000)));
+        let (mut writer, _h, storage) = create_writer_for_retention(Arc::clone(&clock), 60).await;
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v"),
+                }],
+                timestamp_ms: ms_after_epoch(1_000),
+            })
+            .await
+            .unwrap();
+        writer
+            .handle_force_seal(ms_after_epoch(2_000))
+            .await
+            .unwrap();
+
+        writer.tick_retention().await;
+
+        use crate::storage::LogStorageRead as _;
+        let segs = storage.scan_segments(1..u32::MAX).await.unwrap();
+        assert_eq!(segs.iter().map(|s| s.id()).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn tick_retention_deletes_all_expired_segments_in_one_tick() {
+        let clock = Arc::new(MockClock::with_time(epoch_plus(10_000)));
+        let (mut writer, _h, storage) = create_writer_for_retention(Arc::clone(&clock), 60).await;
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v0"),
+                }],
+                timestamp_ms: ms_after_epoch(1_000),
+            })
+            .await
+            .unwrap();
+        writer
+            .handle_force_seal(ms_after_epoch(2_000))
+            .await
+            .unwrap();
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v1"),
+                }],
+                timestamp_ms: ms_after_epoch(2_000),
+            })
+            .await
+            .unwrap();
+        writer
+            .handle_force_seal(ms_after_epoch(3_000))
+            .await
+            .unwrap();
+
+        writer.tick_retention().await;
+
+        use crate::storage::LogStorageRead as _;
+        let segs = storage.scan_segments(1..u32::MAX).await.unwrap();
+        // Both seg 1 (end 2000s) and seg 2 (end 3000s) are well past expiry.
+        assert_eq!(segs.iter().map(|s| s.id()).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn tick_retention_is_idempotent_across_ticks() {
+        let clock = Arc::new(MockClock::with_time(epoch_plus(10_000)));
+        let (mut writer, _h, storage) = create_writer_for_retention(Arc::clone(&clock), 60).await;
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v"),
+                }],
+                timestamp_ms: ms_after_epoch(1_000),
+            })
+            .await
+            .unwrap();
+        writer
+            .handle_force_seal(ms_after_epoch(2_000))
+            .await
+            .unwrap();
+
+        writer.tick_retention().await;
+        writer.tick_retention().await; // second tick: cache no longer has seg 1
+
+        use crate::storage::LogStorageRead as _;
+        let segs = storage.scan_segments(1..u32::MAX).await.unwrap();
+        assert_eq!(segs.iter().map(|s| s.id()).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn tick_retention_advances_deletion_watermark() {
+        let clock = Arc::new(MockClock::with_time(epoch_plus(10_000)));
+        let (mut writer, handle, _storage) =
+            create_writer_for_retention(Arc::clone(&clock), 60).await;
+        let mut written_rx = handle.written_rx();
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v"),
+                }],
+                timestamp_ms: ms_after_epoch(1_000),
+            })
+            .await
+            .unwrap();
+        writer
+            .handle_force_seal(ms_after_epoch(2_000))
+            .await
+            .unwrap();
+
+        writer.tick_retention().await;
+
+        let view = written_rx.borrow_and_update().clone();
+        assert_eq!(view.last_deleted_segment_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn tick_retention_does_nothing_when_disabled() {
+        // Build writer with retention = None. Even after segments are sealed,
+        // tick_retention should be a no-op (run() never calls it in this case,
+        // but invoking it directly should still be safe).
+        let storage = Arc::new(InMemoryStorage::default());
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::with_time(epoch_plus(10_000)));
+        let (mut writer, _h, _storage) = create_writer_with_storage_and_clock(
+            storage.clone() as Arc<dyn common::Storage>,
+            clock,
+            LogWriterConfig::default(),
+        )
+        .await;
+        writer
+            .handle_append(LogWrite {
+                records: vec![UserRecord {
+                    key: Bytes::from("k"),
+                    value: Bytes::from("v"),
+                }],
+                timestamp_ms: ms_after_epoch(1_000),
+            })
+            .await
+            .unwrap();
+        writer
+            .handle_force_seal(ms_after_epoch(2_000))
+            .await
+            .unwrap();
+
+        writer.tick_retention().await;
+
+        use crate::storage::LogStorageRead as _;
+        let segs = (storage as Arc<dyn common::Storage>)
+            .scan_segments(1..u32::MAX)
+            .await
+            .unwrap();
+        assert_eq!(segs.iter().map(|s| s.id()).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[tokio::test]

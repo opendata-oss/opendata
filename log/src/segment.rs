@@ -110,6 +110,40 @@ impl SegmentCache {
         self.segments.values().next_back().cloned()
     }
 
+    /// Returns the id of the oldest (lowest-id) live segment, if any.
+    ///
+    /// Combined with [`SegmentCache::latest`], this characterises the live
+    /// range. Retention removes only from the low end of the log (see RFC
+    /// 0005), so the gap below this id implies a deletion watermark.
+    pub(crate) fn oldest_id(&self) -> Option<SegmentId> {
+        self.segments.values().next().map(|s| s.id())
+    }
+
+    /// Returns the deletion watermark implied by the current cache contents:
+    /// `Some(oldest_id - 1)` when the oldest live id is above
+    /// [`FIRST_USER_SEGMENT_ID`] (i.e., earlier segments must have been
+    /// deleted), or `None` when no deletions are observable from the cache.
+    pub(crate) fn initial_deleted_segment_id(&self) -> Option<SegmentId> {
+        self.oldest_id()
+            .filter(|oldest| *oldest > FIRST_USER_SEGMENT_ID)
+            .map(|oldest| oldest - 1)
+    }
+
+    /// Removes the segment with the given id, if present, and returns it.
+    pub(crate) fn remove(&mut self, segment_id: SegmentId) -> Option<LogSegment> {
+        let start_seq = self
+            .segments
+            .iter()
+            .find_map(|(seq, seg)| (seg.id() == segment_id).then_some(*seq))?;
+        self.segments.remove(&start_seq)
+    }
+
+    /// Drops every segment with id `<= through_id`. Used by readers to
+    /// converge to the writer's published deletion watermark.
+    pub(crate) fn drop_through(&mut self, through_id: SegmentId) {
+        self.segments.retain(|_, seg| seg.id() > through_id);
+    }
+
     /// Returns all segments ordered by start sequence.
     pub(crate) fn all(&self) -> Vec<LogSegment> {
         self.segments.values().cloned().collect()
@@ -782,6 +816,82 @@ mod tests {
         cache.refresh(storage.as_ref(), None).await.unwrap();
         assert_eq!(cache.all().len(), 1);
         assert_eq!(cache.all()[0].id(), 1);
+    }
+
+    #[storage_test]
+    async fn oldest_id_returns_none_when_empty(storage: Arc<dyn Storage>) {
+        let cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        assert!(cache.oldest_id().is_none());
+    }
+
+    #[storage_test]
+    async fn oldest_id_tracks_lowest_segment_id(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
+        assert_eq!(cache.oldest_id(), Some(1));
+
+        // After removing the first segment the next-oldest takes its place.
+        cache.remove(1);
+        assert_eq!(cache.oldest_id(), Some(2));
+    }
+
+    #[storage_test]
+    async fn remove_drops_segment_by_id(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+
+        let removed = cache.remove(1).expect("segment 1 should be present");
+        assert_eq!(removed.id(), 1);
+        let all = cache.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id(), 2);
+    }
+
+    #[storage_test]
+    async fn remove_is_noop_for_missing_id(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+
+        assert!(cache.remove(99).is_none());
+        assert_eq!(cache.all().len(), 1);
+    }
+
+    #[storage_test]
+    async fn drop_through_removes_low_end_segments(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(200, 3000)).await;
+
+        cache.drop_through(2);
+
+        let remaining: Vec<_> = cache.all().into_iter().map(|s| s.id()).collect();
+        assert_eq!(remaining, vec![3]);
+    }
+
+    #[storage_test]
+    async fn drop_through_is_noop_when_threshold_below_oldest(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+
+        cache.drop_through(0);
+        assert_eq!(cache.all().len(), 2);
     }
 
     #[storage_test]

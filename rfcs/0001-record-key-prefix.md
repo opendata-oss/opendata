@@ -99,7 +99,7 @@ Two things led us away from it:
    A common byte-2 record tag is incompatible with that layout.
 
 Subsystems that want a record-type discriminator are free to keep one — they just choose where it sits.
-Timeseries, vector, and keyvalue still place a tag at byte 2; the log subsystem (v2 onwards) places its tag after a 4-byte segment id.
+Timeseries, vector, and keyvalue still place a tag at byte 2; the log subsystem places its tag after a 4-byte segment id.
 
 ### Shared prefix version
 

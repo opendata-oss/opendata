@@ -12,10 +12,10 @@ use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::DbReader;
 use slatedb::config::Settings;
-pub use slatedb::db_cache::CachedEntry;
+pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
-use slatedb::db_cache::{CachedKey, DbCache};
+pub use slatedb::db_cache::{CachedEntry, CachedKey};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
@@ -190,6 +190,10 @@ impl StorageReaderRuntime {
     /// Creates a new reader runtime with default options.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn block_cache(&self) -> Option<Arc<dyn DbCache>> {
+        self.block_cache.clone()
     }
 
     /// Sets a block cache for SlateDB reads.

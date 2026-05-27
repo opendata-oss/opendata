@@ -235,4 +235,3 @@ This would enable use cases such as:
 |------------|-------------|
 | 2026-01-07 | Initial draft |
 | 2026-01-12 | Added link to varint implementation |
-| 2026-05-19 | Key format v2: `segment_id` precedes `record_type`; system segment (id 0) reserved for `SeqBlock` and `SegmentMeta` records; user segments start at id 1. Enables a fixed 6-byte SlateDB segment-extractor prefix that routes every per-segment record (entries + listings) to the same SlateDB segment. |

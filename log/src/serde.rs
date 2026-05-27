@@ -67,8 +67,8 @@ impl From<common::serde::DeserializeError> for Error {
     }
 }
 
-/// Key format version (currently 0x02 — segment_id precedes record_type).
-pub const KEY_VERSION: u8 = 0x02;
+/// Key format version for log storage.
+pub const KEY_VERSION: u8 = 0x01;
 
 /// Subsystem byte for log storage (see [`common::serde::subsystem`]).
 pub const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
@@ -144,10 +144,10 @@ const SEGMENT_ID_OFFSET: usize = KEY_PREFIX_LEN;
 /// Offset of the record-type tag byte inside a log key, after the segment id.
 const RECORD_TYPE_OFFSET: usize = SEGMENT_ID_OFFSET + 4;
 
-/// Length of the v2 segmented key prefix: `[subsystem, version, seg_id(4), record_type]`.
+/// Length of the segmented key prefix: `[subsystem, version, seg_id(4), record_type]`.
 const SEGMENTED_PREFIX_LEN: usize = RECORD_TYPE_OFFSET + 1;
 
-/// Writes the v2 segmented prefix into `buf`:
+/// Writes the segmented prefix into `buf`:
 /// `[subsystem, version, seg_id BE, record_type]`.
 fn write_segmented_prefix(buf: &mut BytesMut, segment_id: SegmentId, record_type: u8) {
     KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
@@ -155,7 +155,7 @@ fn write_segmented_prefix(buf: &mut BytesMut, segment_id: SegmentId, record_type
     buf.put_u8(record_type);
 }
 
-/// Parses a v2 segmented prefix, validating the subsystem/version/tag.
+/// Parses a segmented prefix, validating the subsystem/version/tag.
 /// Returns the segment id along with the remaining (post-prefix) bytes.
 fn parse_segmented_prefix(data: &[u8], expected_tag: u8) -> Result<(SegmentId, &[u8]), Error> {
     KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
@@ -452,7 +452,7 @@ impl ListingEntryKey {
 
     /// Creates a storage key range for scanning listing entries within a
     /// single segment. Cross-segment iteration is the caller's responsibility:
-    /// the v2 layout interleaves listing records with log entries across
+    /// the key layout interleaves listing records with log entries across
     /// segment boundaries, so a wide cross-segment range scan is not safe.
     pub fn scan_range_for_segment(segment_id: SegmentId) -> BytesRange {
         BytesRange::prefix(Self::segment_prefix(segment_id))
