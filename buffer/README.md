@@ -147,7 +147,9 @@ consumer.ack_through(high).await?;
 
 `next_descriptors` reads the manifest once and returns up to `K` contiguous descriptors past an internal read-ahead cursor. `ConsumerFetchHandle::fetch` is stateless and safe to call concurrently across cloned handles. `ack_through` advances the durable frontier through `sequence` in one dequeue, dequeue-first (in-memory state moves only on success).
 
-The caller is responsible for tracking which sequences have actually completed and only calling `ack_through` with the highest fully-processed *contiguous* sequence; out-of-order completion is normal but the durable frontier only moves on a contiguous run. Full design, including the descriptor handout contract and failure modes, lives in [RFC 0003](rfcs/0003-consumer-read-ahead.md). The OpenData docs site has a [walkthrough with the pipelined-consumer pattern](https://github.com/opendata-oss/opendata-docs/blob/main/docs/buffer/architecture.mdx).
+The caller is responsible for tracking which sequences have actually completed and only calling `ack_through` with the highest fully-processed *contiguous* sequence; out-of-order completion is normal but the durable frontier only moves on a contiguous run. Full design, including the descriptor handout contract and failure modes, lives in [RFC 0003](rfcs/0003-consumer-read-ahead.md). The OpenData docs site has a [walkthrough with the pipelined-consumer pattern](.https://www.opendata.dev/docs/buffer/architecture#read-ahead-and-batched-acks). 
+
+opendata-contrib has a generic pipelined runtime built on top of the readahead APIs. Learn more about it [here](https://github.com/opendata-oss/opendata-contrib/tree/main/runtime/opendata-ingest-runtime).
 
 ## Delivery guarantees
 
