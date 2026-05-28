@@ -2034,6 +2034,8 @@ dependencies = [
  "async-trait",
  "bencher",
  "bytes",
+ "metrics",
+ "metrics-util 0.18.0",
  "opendata-log",
  "serde_yaml",
  "tikv-jemallocator",

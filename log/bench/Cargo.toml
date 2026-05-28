@@ -12,6 +12,8 @@ anyhow.workspace = true
 async-trait.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
+metrics.workspace = true
+metrics-util = "0.18"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator.workspace = true

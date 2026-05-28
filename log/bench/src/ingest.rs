@@ -4,6 +4,8 @@ use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
 use log::{Config, LogDb, Record};
 
+use crate::slatedb_metrics::{self, SlatedbSnapshot};
+
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 
 fn load_log_config(path: &str) -> anyhow::Result<Config> {
@@ -79,6 +81,14 @@ impl Benchmark for IngestBenchmark {
             },
         };
         let log = LogDb::open(config).await?;
+
+        // Capture slatedb counters at the start so we can report per-run deltas
+        // even when the global registry is shared across bench iterations.
+        let metrics_handle = slatedb_metrics::handle();
+        let slatedb_before = metrics_handle
+            .as_ref()
+            .map(SlatedbSnapshot::capture)
+            .unwrap_or_default();
 
         // Generate keys
         let keys: Vec<Bytes> = (0..num_keys)
@@ -177,6 +187,34 @@ impl Benchmark for IngestBenchmark {
                 .add(
                     "broadcast_other_avg_ns",
                     stats.broadcast_other_ns as f64 / n,
+                );
+        }
+
+        // Surface a subset of SlateDB's internal counters as deltas for the
+        // run. Useful for spotting backpressure and flush activity that aren't
+        // visible from the LogDb write path.
+        if let Some(handle) = metrics_handle.as_ref() {
+            let after = SlatedbSnapshot::capture(handle);
+            let d = after.delta_since(&slatedb_before);
+            summary = summary
+                .add("slatedb_backpressure_count", d.backpressure_count as f64)
+                .add("slatedb_write_ops", d.write_ops as f64)
+                .add("slatedb_write_batch_count", d.write_batch_count as f64)
+                .add(
+                    "slatedb_immutable_memtable_flushes",
+                    d.immutable_memtable_flushes as f64,
+                )
+                .add("slatedb_wal_buffer_flushes", d.wal_buffer_flushes as f64)
+                .add(
+                    "slatedb_wal_buffer_flush_requests",
+                    d.wal_buffer_flush_requests as f64,
+                )
+                .add("slatedb_l0_flush_bytes", d.l0_flush_bytes as f64)
+                .add("slatedb_l0_sst_count", d.l0_sst_count)
+                .add("slatedb_total_mem_size_bytes", d.total_mem_size_bytes)
+                .add(
+                    "slatedb_wal_buffer_estimated_bytes",
+                    d.wal_buffer_estimated_bytes,
                 );
         }
 
