@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use common::StorageConfig;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
 
 use crate::error::Error;
@@ -53,14 +53,7 @@ pub struct Config {
     /// `Memory` (default) exposes writes as soon as they are visible in memory.
     /// `Remote` only exposes writes after remote/object-store durability is
     /// confirmed by the storage engine.
-    ///
-    /// Backward-compatibility: legacy boolean `read_durable` values are accepted
-    /// and mapped as `false => Memory`, `true => Remote`.
-    #[serde(
-        default,
-        alias = "read_durable",
-        deserialize_with = "deserialize_read_visibility"
-    )]
+    #[serde(default)]
     pub read_visibility: ReadVisibility,
 
     /// Retention policy; see [`RetentionConfig`] and RFC 0005.
@@ -128,26 +121,6 @@ impl ReadVisibility {
     pub fn is_remote(self) -> bool {
         matches!(self, Self::Remote)
     }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ReadVisibilityCompat {
-    Bool(bool),
-    Level(ReadVisibility),
-}
-
-fn deserialize_read_visibility<'de, D>(deserializer: D) -> Result<ReadVisibility, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<ReadVisibilityCompat>::deserialize(deserializer)?;
-    Ok(match value {
-        None => ReadVisibility::default(),
-        Some(ReadVisibilityCompat::Bool(false)) => ReadVisibility::Memory,
-        Some(ReadVisibilityCompat::Bool(true)) => ReadVisibility::Remote,
-        Some(ReadVisibilityCompat::Level(level)) => level,
-    })
 }
 
 /// Configuration for log segmentation.
@@ -337,52 +310,6 @@ impl Default for ReaderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Deserialize)]
-    struct DurabilityOnly {
-        #[serde(
-            default,
-            alias = "read_durable",
-            deserialize_with = "deserialize_read_visibility"
-        )]
-        read_visibility: ReadVisibility,
-    }
-
-    #[test]
-    fn should_default_read_visibility_to_memory_when_missing() {
-        // given
-        let json = "{}";
-
-        // when
-        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
-
-        // then
-        assert_eq!(cfg.read_visibility, ReadVisibility::Memory);
-    }
-
-    #[test]
-    fn should_deserialize_legacy_bool_true_as_remote() {
-        // given
-        let json = r#"{"read_durable": true}"#;
-
-        // when
-        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
-
-        // then
-        assert_eq!(cfg.read_visibility, ReadVisibility::Remote);
-    }
-
-    #[test]
-    fn should_deserialize_enum_remote() {
-        // given
-        let json = r#"{"read_visibility": "remote"}"#;
-
-        // when
-        let cfg: DurabilityOnly = serde_json::from_str(json).unwrap();
-
-        // then
-        assert_eq!(cfg.read_visibility, ReadVisibility::Remote);
-    }
 
     fn config_with(retention: Option<Duration>, seal_interval: Option<Duration>) -> Config {
         Config {
