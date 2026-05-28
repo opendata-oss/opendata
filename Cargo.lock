@@ -2035,6 +2035,7 @@ dependencies = [
  "bencher",
  "bytes",
  "opendata-log",
+ "serde_yaml",
  "tikv-jemallocator",
  "tokio",
 ]

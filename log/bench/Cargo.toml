@@ -10,6 +10,7 @@ bytes.workspace = true
 log = { path = "..", package = "opendata-log" }
 anyhow.workspace = true
 async-trait.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

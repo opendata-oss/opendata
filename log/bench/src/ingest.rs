@@ -6,6 +6,13 @@ use log::{Config, LogDb, Record};
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 
+fn load_log_config(path: &str) -> anyhow::Result<Config> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path, e))?;
+    serde_yaml::from_str(&contents)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", path, e))
+}
+
 /// Create a parameter set for the ingest benchmark.
 fn make_params(batch_size: usize, value_size: usize, key_length: usize, num_keys: usize) -> Params {
     let mut params = Params::new();
@@ -61,10 +68,16 @@ impl Benchmark for IngestBenchmark {
         let bytes_counter = bench.counter("bytes");
         let batch_latency = bench.histogram("batch_latency_us");
 
-        // Initialize log with fresh in-memory storage
-        let config = Config {
-            storage: bench.spec().data().storage.clone(),
-            ..Default::default()
+        // Build the LogDb config. When `log_config` is set, the YAML file is
+        // the source of truth — its `storage` wins and `data.storage` is
+        // ignored. Otherwise, fall back to grafting `data.storage` onto
+        // default config.
+        let config = match bench.spec().params().get("log_config") {
+            Some(path) => load_log_config(path)?,
+            None => Config {
+                storage: bench.spec().data().storage.clone(),
+                ..Default::default()
+            },
         };
         let log = LogDb::open(config).await?;
 
