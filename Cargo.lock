@@ -309,7 +309,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bencher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2028,7 +2028,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "log-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2466,7 +2466,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "opendata-buffer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-common"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-log-c"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "cbindgen",
@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "opendata-common",
  "proc-macro-crate",
@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "timeseries-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4737,7 +4737,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vector-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-channel",
