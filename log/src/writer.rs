@@ -114,6 +114,9 @@ pub(crate) struct RetentionPolicy {
 /// Cumulative write-path timing counters, used to isolate the LogDb-internal
 /// contribution to per-append latency from the SlateDB-internal contribution.
 ///
+/// Per-phase counters accumulate exactly once per `handle_append` call, so
+/// dividing any of them by `append_count` yields a per-append average.
+///
 /// Updated only from the single writer task, so atomic stores use `Relaxed`.
 #[derive(Default)]
 pub struct WriteStats {
@@ -121,6 +124,24 @@ pub struct WriteStats {
     pub append_count: AtomicU64,
     /// Cumulative wall-clock time spent inside `handle_append`, in nanoseconds.
     pub append_total_ns: AtomicU64,
+
+    // ---- LogDb-internal phases (each measured once per handle_append) ----
+    /// Time in `sequence_allocator.allocate`.
+    pub seq_alloc_ns: AtomicU64,
+    /// Time in `segment_cache.assign_segment`.
+    pub segment_assign_ns: AtomicU64,
+    /// Time in the listing-cache step: materializing the `Vec<Bytes>` of keys
+    /// and calling `listing_cache.assign_new_keys`.
+    pub listing_assign_ns: AtomicU64,
+    /// Time in `add_entries` (LogEntryKey serialization + record construction).
+    pub add_entries_ns: AtomicU64,
+    /// Time rebuilding `Vec<PutRecordOp>` into `Vec<RecordOp>` before apply.
+    pub ops_rebuild_ns: AtomicU64,
+    /// Time in `broadcast` excluding `storage.snapshot` (the watch channel
+    /// send, epoch bump, and watermarks update).
+    pub broadcast_other_ns: AtomicU64,
+
+    // ---- SlateDB-internal (storage seam) ----
     /// Cumulative wall-clock time inside `storage.apply_with_options` (the
     /// SlateDB `write_with_options` call), in nanoseconds. Counts every apply,
     /// including segment-meta deletes from retention.
@@ -137,6 +158,12 @@ impl WriteStats {
         WriteStatsSnapshot {
             append_count: self.append_count.load(Ordering::Relaxed),
             append_total_ns: self.append_total_ns.load(Ordering::Relaxed),
+            seq_alloc_ns: self.seq_alloc_ns.load(Ordering::Relaxed),
+            segment_assign_ns: self.segment_assign_ns.load(Ordering::Relaxed),
+            listing_assign_ns: self.listing_assign_ns.load(Ordering::Relaxed),
+            add_entries_ns: self.add_entries_ns.load(Ordering::Relaxed),
+            ops_rebuild_ns: self.ops_rebuild_ns.load(Ordering::Relaxed),
+            broadcast_other_ns: self.broadcast_other_ns.load(Ordering::Relaxed),
             storage_apply_ns: self.storage_apply_ns.load(Ordering::Relaxed),
             storage_apply_count: self.storage_apply_count.load(Ordering::Relaxed),
             storage_snapshot_ns: self.storage_snapshot_ns.load(Ordering::Relaxed),
@@ -150,6 +177,12 @@ impl WriteStats {
 pub struct WriteStatsSnapshot {
     pub append_count: u64,
     pub append_total_ns: u64,
+    pub seq_alloc_ns: u64,
+    pub segment_assign_ns: u64,
+    pub listing_assign_ns: u64,
+    pub add_entries_ns: u64,
+    pub ops_rebuild_ns: u64,
+    pub broadcast_other_ns: u64,
     pub storage_apply_ns: u64,
     pub storage_apply_count: u64,
     pub storage_snapshot_ns: u64,
@@ -327,6 +360,7 @@ impl LogWriter {
         let mut puts = Vec::new();
 
         // 1. Allocate sequences
+        let phase = Instant::now();
         let (base_seq, maybe_block_record) = self.sequence_allocator.allocate(count);
         if let Some(r) = maybe_block_record {
             puts.push(PutRecordOp::new_with_options(
@@ -334,22 +368,41 @@ impl LogWriter {
                 PutOptions { ttl: NoExpiry },
             ));
         }
+        self.stats
+            .seq_alloc_ns
+            .fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // 2. Assign segment (appends segment metadata record if new)
+        let phase = Instant::now();
         let assignment =
             self.segment_cache
                 .assign_segment(write.timestamp_ms, base_seq, &mut puts, false);
+        self.stats
+            .segment_assign_ns
+            .fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // 3. Assign listing entries for new keys
+        let phase = Instant::now();
         let keys: Vec<Bytes> = write.records.iter().map(|r| r.key.clone()).collect();
         self.listing_cache
             .assign_new_keys(assignment.segment.id(), &keys, &mut puts);
+        self.stats
+            .listing_assign_ns
+            .fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // 4. Build log entry records
+        let phase = Instant::now();
         self.add_entries(&assignment.segment, base_seq, &write.records, &mut puts);
+        self.stats
+            .add_entries_ns
+            .fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // 5. Write to storage and broadcast
+        let phase = Instant::now();
         let ops: Vec<RecordOp> = puts.into_iter().map(RecordOp::Put).collect();
+        self.stats
+            .ops_rebuild_ns
+            .fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.apply_and_broadcast(ops, Some(&assignment)).await?;
 
         self.stats
@@ -449,11 +502,13 @@ impl LogWriter {
     /// new `WrittenView` using current watermarks. Must be called after a
     /// successful `apply` (and any post-write state updates).
     async fn broadcast(&mut self, seqnum: u64) -> Result<(), String> {
-        let started = Instant::now();
+        let snapshot_start = Instant::now();
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
-        self.stats
-            .storage_snapshot_ns
-            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let after_snapshot = Instant::now();
+        self.stats.storage_snapshot_ns.fetch_add(
+            (after_snapshot - snapshot_start).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         self.stats
             .storage_snapshot_count
             .fetch_add(1, Ordering::Relaxed);
@@ -467,6 +522,10 @@ impl LogWriter {
             last_deleted_segment_id: self.last_deleted_segment_id,
         });
         self.watermarks.update_written(self.epoch);
+        self.stats.broadcast_other_ns.fetch_add(
+            after_snapshot.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 

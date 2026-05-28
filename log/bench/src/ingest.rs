@@ -138,12 +138,13 @@ impl Benchmark for IngestBenchmark {
             .add("throughput_bytes", bytes_per_sec)
             .add("elapsed_ms", runner.elapsed().as_millis() as f64);
         if stats.append_count > 0 {
-            let append_avg_ns = stats.append_total_ns as f64 / stats.append_count as f64;
+            let n = stats.append_count as f64;
+            let append_avg_ns = stats.append_total_ns as f64 / n;
             let logdb_only_ns = stats
                 .append_total_ns
                 .saturating_sub(stats.storage_apply_ns)
                 .saturating_sub(stats.storage_snapshot_ns) as f64
-                / stats.append_count as f64;
+                / n;
             let slatedb_fraction = if stats.append_total_ns > 0 {
                 (stats.storage_apply_ns + stats.storage_snapshot_ns) as f64
                     / stats.append_total_ns as f64
@@ -165,7 +166,18 @@ impl Benchmark for IngestBenchmark {
                 .add("logdb_only_avg_ns", logdb_only_ns)
                 .add("slatedb_apply_avg_ns", apply_avg_ns)
                 .add("slatedb_snapshot_avg_ns", snapshot_avg_ns)
-                .add("slatedb_fraction", slatedb_fraction);
+                .add("slatedb_fraction", slatedb_fraction)
+                // Per-phase breakdown of the LogDb-internal cost (each phase
+                // runs once per handle_append, so divide by append_count).
+                .add("seq_alloc_avg_ns", stats.seq_alloc_ns as f64 / n)
+                .add("segment_assign_avg_ns", stats.segment_assign_ns as f64 / n)
+                .add("listing_assign_avg_ns", stats.listing_assign_ns as f64 / n)
+                .add("add_entries_avg_ns", stats.add_entries_ns as f64 / n)
+                .add("ops_rebuild_avg_ns", stats.ops_rebuild_ns as f64 / n)
+                .add(
+                    "broadcast_other_avg_ns",
+                    stats.broadcast_other_ns as f64 / n,
+                );
         }
 
         bench.summarize(summary).await?;
