@@ -5,23 +5,22 @@
 //! orphaned and proposes compactions or drains accordingly. See
 //! [`propose_compactions`] for the per-state behaviour.
 //!
-//! The scheduler doesn't read storage. It subscribes to a compactor-facing
-//! view (via a [`std::sync::OnceLock`] installed after the writer is created)
-//! and derives the live user-segment range from the two segment-id watermarks
-//! published there. Because retention only deletes from the low end of the
-//! log (RFC 0005), the live set is always a contiguous id range, so two
-//! integers fully describe it.
+//! The scheduler doesn't read storage. It reads a compactor-facing view (a
+//! shared [`ArcSwap`] the writer publishes into) and derives the live
+//! user-segment range from the two segment-id watermarks published there.
+//! Because retention only deletes from the low end of the log (RFC 0005), the
+//! live set is always a contiguous id range, so two integers fully describe it.
 
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use slatedb::compactor::{
     CompactionScheduler, CompactionSchedulerSupplier, CompactionSpec, CompactorStateView, SourceId,
 };
 use slatedb::config::CompactorOptions;
 use slatedb::manifest::Segment;
-use tokio::sync::watch;
 use ulid::Ulid;
 
 use crate::config::LogCompactionOptions;
@@ -40,10 +39,11 @@ pub(crate) struct CompactorView {
     pub last_deleted_segment_id: Option<SegmentId>,
 }
 
-/// Cell shared between the builder and the supplier; the writer's
-/// `CompactorView` receiver is installed here once the writer exists. While
-/// empty the scheduler treats the live set as uninitialized.
-pub(crate) type CompactorViewCell = Arc<OnceLock<watch::Receiver<CompactorView>>>;
+/// Cell shared between the builder, the compaction supplier, and the writer.
+/// The writer publishes the latest `CompactorView` here on each segment
+/// change; the scheduler reads the most recent value. Initialised to an empty
+/// live set (`None`/`None`), which `compute_bounds` treats as uninitialized.
+pub(crate) type CompactorViewCell = Arc<ArcSwap<CompactorView>>;
 
 /// L0 SST count at or above which the system segment is consolidated.
 const SYSTEM_SEGMENT_L0_THRESHOLD: usize = 2;
@@ -82,7 +82,7 @@ impl CompactionSchedulerSupplier for LogCompactionSchedulerSupplier {
 }
 
 /// LogDb's `CompactionScheduler` impl. Reads the writer's live-set watermarks
-/// from a shared `OnceLock`-gated watch receiver; never touches storage.
+/// from a shared `ArcSwap` cell; never touches storage.
 pub(crate) struct LogCompactionScheduler {
     cell: CompactorViewCell,
     options: LogCompactionOptions,
@@ -90,10 +90,8 @@ pub(crate) struct LogCompactionScheduler {
 
 impl CompactionScheduler for LogCompactionScheduler {
     fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
-        let bounds = self.cell.get().and_then(|rx| {
-            let view = rx.borrow();
-            compute_bounds(view.last_segment_id, view.last_deleted_segment_id)
-        });
+        let view = self.cell.load();
+        let bounds = compute_bounds(view.last_segment_id, view.last_deleted_segment_id);
         let active = collect_active_compactions(state);
         let segments: Vec<SegmentSnapshot> = state
             .manifest()
