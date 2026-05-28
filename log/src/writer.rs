@@ -15,7 +15,8 @@
 //! - **Durable** — after `storage.flush()`, once SlateDB has synced to disk.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::Ttl::NoExpiry;
@@ -110,6 +111,51 @@ pub(crate) struct RetentionPolicy {
     pub check_interval: Duration,
 }
 
+/// Cumulative write-path timing counters, used to isolate the LogDb-internal
+/// contribution to per-append latency from the SlateDB-internal contribution.
+///
+/// Updated only from the single writer task, so atomic stores use `Relaxed`.
+#[derive(Default)]
+pub struct WriteStats {
+    /// Number of `handle_append` invocations measured.
+    pub append_count: AtomicU64,
+    /// Cumulative wall-clock time spent inside `handle_append`, in nanoseconds.
+    pub append_total_ns: AtomicU64,
+    /// Cumulative wall-clock time inside `storage.apply_with_options` (the
+    /// SlateDB `write_with_options` call), in nanoseconds. Counts every apply,
+    /// including segment-meta deletes from retention.
+    pub storage_apply_ns: AtomicU64,
+    pub storage_apply_count: AtomicU64,
+    /// Cumulative wall-clock time inside `storage.snapshot` (the SlateDB
+    /// `snapshot` call invoked from `broadcast`), in nanoseconds.
+    pub storage_snapshot_ns: AtomicU64,
+    pub storage_snapshot_count: AtomicU64,
+}
+
+impl WriteStats {
+    pub fn snapshot(&self) -> WriteStatsSnapshot {
+        WriteStatsSnapshot {
+            append_count: self.append_count.load(Ordering::Relaxed),
+            append_total_ns: self.append_total_ns.load(Ordering::Relaxed),
+            storage_apply_ns: self.storage_apply_ns.load(Ordering::Relaxed),
+            storage_apply_count: self.storage_apply_count.load(Ordering::Relaxed),
+            storage_snapshot_ns: self.storage_snapshot_ns.load(Ordering::Relaxed),
+            storage_snapshot_count: self.storage_snapshot_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time read of [`WriteStats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteStatsSnapshot {
+    pub append_count: u64,
+    pub append_total_ns: u64,
+    pub storage_apply_ns: u64,
+    pub storage_apply_count: u64,
+    pub storage_snapshot_ns: u64,
+    pub storage_snapshot_count: u64,
+}
+
 /// The log writer task. Owns all write-side state and runs as a spawned async task.
 pub(crate) struct LogWriter {
     storage: Arc<dyn common::Storage>,
@@ -123,6 +169,7 @@ pub(crate) struct LogWriter {
     last_deleted_segment_id: Option<SegmentId>,
     clock: Arc<dyn Clock>,
     retention: Option<RetentionPolicy>,
+    stats: Arc<WriteStats>,
 }
 
 impl LogWriter {
@@ -154,6 +201,7 @@ impl LogWriter {
         };
         let (written_tx, written_rx) = watch::channel(initial_view);
         let (watermarks, watcher) = EpochWatermarks::new();
+        let stats = Arc::new(WriteStats::default());
 
         let writer = Self {
             storage,
@@ -167,6 +215,7 @@ impl LogWriter {
             last_deleted_segment_id,
             clock,
             retention: config.retention,
+            stats: Arc::clone(&stats),
         };
 
         let handle = LogWriteHandle {
@@ -174,6 +223,7 @@ impl LogWriter {
             cmd_rx: Some(cmd_rx),
             written_rx,
             watcher,
+            stats,
         };
 
         Ok((writer, handle))
@@ -272,6 +322,7 @@ impl LogWriter {
         if count == 0 {
             return Ok(None);
         }
+        let started = Instant::now();
 
         let mut puts = Vec::new();
 
@@ -300,6 +351,11 @@ impl LogWriter {
         // 5. Write to storage and broadcast
         let ops: Vec<RecordOp> = puts.into_iter().map(RecordOp::Put).collect();
         self.apply_and_broadcast(ops, Some(&assignment)).await?;
+
+        self.stats
+            .append_total_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stats.append_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(Some(AppendOutput {
             start_sequence: base_seq,
@@ -374,17 +430,33 @@ impl LogWriter {
         let options = WriteOptions {
             await_durable: false,
         };
-        self.storage
+        let started = Instant::now();
+        let result = self
+            .storage
             .apply_with_options(ops, options)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        self.stats
+            .storage_apply_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stats
+            .storage_apply_count
+            .fetch_add(1, Ordering::Relaxed);
+        result
     }
 
     /// Takes a fresh storage snapshot, bumps the epoch, and broadcasts a
     /// new `WrittenView` using current watermarks. Must be called after a
     /// successful `apply` (and any post-write state updates).
     async fn broadcast(&mut self, seqnum: u64) -> Result<(), String> {
+        let started = Instant::now();
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
+        self.stats
+            .storage_snapshot_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stats
+            .storage_snapshot_count
+            .fetch_add(1, Ordering::Relaxed);
         self.epoch += 1;
         self.written_tx.send_replace(WrittenView {
             epoch: self.epoch,
@@ -436,6 +508,7 @@ pub(crate) struct LogWriteHandle {
     cmd_rx: Option<mpsc::Receiver<WriterCommand>>,
     written_rx: watch::Receiver<WrittenView>,
     watcher: EpochWatcher,
+    stats: Arc<WriteStats>,
 }
 
 impl LogWriteHandle {
@@ -566,6 +639,13 @@ impl LogWriteHandle {
     /// Returns the durable epoch (highest epoch that has been flushed to disk).
     pub(crate) fn durable_epoch(&self) -> u64 {
         *self.watcher.durable_rx.borrow()
+    }
+
+    /// Returns a clone of the cumulative write-path timing stats. The Arc is
+    /// shared with the writer task; reads see whatever values were stored at
+    /// the time of the load.
+    pub(crate) fn stats(&self) -> Arc<WriteStats> {
+        Arc::clone(&self.stats)
     }
 }
 

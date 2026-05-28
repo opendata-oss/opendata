@@ -9,8 +9,7 @@ const MICROS_PER_SEC: f64 = 1_000_000.0;
 fn load_log_config(path: &str) -> anyhow::Result<Config> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path, e))?;
-    serde_yaml::from_str(&contents)
-        .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", path, e))
+    serde_yaml::from_str(&contents).map_err(|e| anyhow::anyhow!("failed to parse {}: {}", path, e))
 }
 
 /// Create a parameter set for the ingest benchmark.
@@ -131,14 +130,45 @@ impl Benchmark for IngestBenchmark {
         let ops_per_sec = records_written as f64 / elapsed_secs;
         let bytes_per_sec = (records_written * record_size) as f64 / elapsed_secs;
 
-        bench
-            .summarize(
-                Summary::new()
-                    .add("throughput_ops", ops_per_sec)
-                    .add("throughput_bytes", bytes_per_sec)
-                    .add("elapsed_ms", runner.elapsed().as_millis() as f64),
-            )
-            .await?;
+        // Write-path timing breakdown: split the per-append wall-clock between
+        // LogDb-internal work and the underlying storage (SlateDB).
+        let stats = log.write_stats();
+        let mut summary = Summary::new()
+            .add("throughput_ops", ops_per_sec)
+            .add("throughput_bytes", bytes_per_sec)
+            .add("elapsed_ms", runner.elapsed().as_millis() as f64);
+        if stats.append_count > 0 {
+            let append_avg_ns = stats.append_total_ns as f64 / stats.append_count as f64;
+            let logdb_only_ns = stats
+                .append_total_ns
+                .saturating_sub(stats.storage_apply_ns)
+                .saturating_sub(stats.storage_snapshot_ns) as f64
+                / stats.append_count as f64;
+            let slatedb_fraction = if stats.append_total_ns > 0 {
+                (stats.storage_apply_ns + stats.storage_snapshot_ns) as f64
+                    / stats.append_total_ns as f64
+            } else {
+                0.0
+            };
+            let apply_avg_ns = if stats.storage_apply_count > 0 {
+                stats.storage_apply_ns as f64 / stats.storage_apply_count as f64
+            } else {
+                0.0
+            };
+            let snapshot_avg_ns = if stats.storage_snapshot_count > 0 {
+                stats.storage_snapshot_ns as f64 / stats.storage_snapshot_count as f64
+            } else {
+                0.0
+            };
+            summary = summary
+                .add("append_avg_ns", append_avg_ns)
+                .add("logdb_only_avg_ns", logdb_only_ns)
+                .add("slatedb_apply_avg_ns", apply_avg_ns)
+                .add("slatedb_snapshot_avg_ns", snapshot_avg_ns)
+                .add("slatedb_fraction", slatedb_fraction);
+        }
+
+        bench.summarize(summary).await?;
 
         // Close the log to release SlateDB fence
         log.close().await?;

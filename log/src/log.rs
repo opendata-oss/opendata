@@ -317,6 +317,13 @@ impl LogDb {
         self.durable_sequence_rx.clone()
     }
 
+    /// Returns a snapshot of cumulative write-path timing counters. Intended
+    /// for benchmarks and diagnostics that want to attribute per-append
+    /// latency between LogDb-internal work and the underlying storage engine.
+    pub fn write_stats(&self) -> crate::writer::WriteStatsSnapshot {
+        self.handle.stats().snapshot()
+    }
+
     /// Waits for read-side visibility to reach the current requirement.
     async fn sync_reads(&self) -> Result<()> {
         let (target, durability) = match self.read_visibility {
