@@ -13,6 +13,7 @@ use crate::params::Params;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Configuration for benchmark data storage.
+    #[serde(default)]
     pub data: DataConfig,
     /// Optional reporter for persisting metrics.
     ///
