@@ -191,12 +191,13 @@ impl Benchmark for IngestBenchmark {
         }
 
         // Surface a subset of SlateDB's internal counters as deltas for the
-        // run. Useful for spotting backpressure and flush activity that aren't
-        // visible from the LogDb write path.
+        // run. Useful for spotting backpressure, flush activity, and
+        // compactor progress that aren't visible from the LogDb write path.
         if let Some(handle) = metrics_handle.as_ref() {
             let after = SlatedbSnapshot::capture(handle);
             let d = after.delta_since(&slatedb_before);
             summary = summary
+                // DB write-path counters
                 .add("slatedb_backpressure_count", d.backpressure_count as f64)
                 .add("slatedb_write_ops", d.write_ops as f64)
                 .add("slatedb_write_batch_count", d.write_batch_count as f64)
@@ -210,11 +211,37 @@ impl Benchmark for IngestBenchmark {
                     d.wal_buffer_flush_requests as f64,
                 )
                 .add("slatedb_l0_flush_bytes", d.l0_flush_bytes as f64)
+                // DB gauges
                 .add("slatedb_l0_sst_count", d.l0_sst_count)
+                .add(
+                    "slatedb_segment_max_l0_sst_count",
+                    d.segment_max_l0_sst_count,
+                )
                 .add("slatedb_total_mem_size_bytes", d.total_mem_size_bytes)
                 .add(
                     "slatedb_wal_buffer_estimated_bytes",
                     d.wal_buffer_estimated_bytes,
+                )
+                // Compactor progress
+                .add(
+                    "slatedb_compactor_bytes_compacted",
+                    d.compactor_bytes_compacted as f64,
+                )
+                .add(
+                    "slatedb_compactor_running_compactions",
+                    d.compactor_running_compactions,
+                )
+                .add(
+                    "slatedb_compactor_throughput_bps",
+                    d.compactor_throughput_bps,
+                )
+                .add(
+                    "slatedb_compactor_total_bytes_being_compacted",
+                    d.compactor_total_bytes_being_compacted,
+                )
+                .add(
+                    "slatedb_compactor_last_completion_ts_sec",
+                    d.compactor_last_completion_ts_sec,
                 );
         }
 

@@ -95,11 +95,20 @@ pub fn handle() -> Option<Handle> {
     HANDLE.get().cloned()
 }
 
-/// Subset of `slatedb.db.*` metrics that are useful for ingest-bench
-/// interpretation. Counters are cumulative; subtract before/after snapshots to
-/// get a per-run delta.
+/// Subset of `slatedb.*` metrics useful for ingest-bench interpretation.
+///
+/// **Capture semantics differ by field kind:**
+/// - **Counters** are cumulative and read non-destructively. Use
+///   [`delta_since`](Self::delta_since) to get the per-run delta.
+/// - **Gauges** are read non-destructively; the snapshot holds the value at
+///   capture time.
+/// - **Histogram quantiles** (`*_p50_ms`, `*_p99_ms`) are computed at capture
+///   time *by draining* the underlying buckets. Calling
+///   [`capture`](Self::capture) at the start of a run discards any pre-run
+///   accumulation; the end-of-run capture then sees only this run's samples.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SlatedbSnapshot {
+    // ---- DB counters ----
     pub backpressure_count: u64,
     pub write_ops: u64,
     pub write_batch_count: u64,
@@ -107,9 +116,27 @@ pub struct SlatedbSnapshot {
     pub wal_buffer_flushes: u64,
     pub wal_buffer_flush_requests: u64,
     pub l0_flush_bytes: u64,
+
+    // ---- DB gauges (end-of-run) ----
     pub l0_sst_count: f64,
+    pub segment_max_l0_sst_count: f64,
     pub total_mem_size_bytes: f64,
     pub wal_buffer_estimated_bytes: f64,
+
+    // ---- Compactor counters ----
+    pub compactor_bytes_compacted: u64,
+
+    // ---- Compactor gauges (end-of-run) ----
+    pub compactor_running_compactions: f64,
+    pub compactor_throughput_bps: f64,
+    pub compactor_total_bytes_being_compacted: f64,
+    pub compactor_last_completion_ts_sec: f64,
+    // NOTE: slatedb defines `component=compactor` on its instrumented object
+    // store, but routes the compactor through the same `component=db` store
+    // when built via `DbBuilder::with_compactor_builder` (the path LogDb
+    // uses). So per-component object-store request_count/duration metrics
+    // collapse to a single `db` bucket and can't be split here. Fix is
+    // upstream — see `slatedb::db::builder::build_handler`.
 }
 
 impl SlatedbSnapshot {
@@ -124,8 +151,19 @@ impl SlatedbSnapshot {
             wal_buffer_flush_requests: handle.counter_value("slatedb.db.wal_buffer_flush_requests"),
             l0_flush_bytes: handle.counter_value("slatedb.db.l0_flush_bytes"),
             l0_sst_count: handle.gauge_value("slatedb.db.l0_sst_count"),
+            segment_max_l0_sst_count: handle.gauge_value("slatedb.db.segment_max_l0_sst_count"),
             total_mem_size_bytes: handle.gauge_value("slatedb.db.total_mem_size_bytes"),
             wal_buffer_estimated_bytes: handle.gauge_value("slatedb.db.wal_buffer_estimated_bytes"),
+
+            compactor_bytes_compacted: handle.counter_value("slatedb.compactor.bytes_compacted"),
+            compactor_running_compactions: handle
+                .gauge_value("slatedb.compactor.running_compactions"),
+            compactor_throughput_bps: handle
+                .gauge_value("slatedb.compactor.total_throughput_bytes_per_sec"),
+            compactor_total_bytes_being_compacted: handle
+                .gauge_value("slatedb.compactor.total_bytes_being_compacted"),
+            compactor_last_completion_ts_sec: handle
+                .gauge_value("slatedb.compactor.last_compaction_timestamp_sec"),
         }
     }
 
@@ -149,10 +187,21 @@ impl SlatedbSnapshot {
                 .wal_buffer_flush_requests
                 .saturating_sub(before.wal_buffer_flush_requests),
             l0_flush_bytes: self.l0_flush_bytes.saturating_sub(before.l0_flush_bytes),
+
             // Gauges: report the end-of-run absolute value, not a delta.
             l0_sst_count: self.l0_sst_count,
+            segment_max_l0_sst_count: self.segment_max_l0_sst_count,
             total_mem_size_bytes: self.total_mem_size_bytes,
             wal_buffer_estimated_bytes: self.wal_buffer_estimated_bytes,
+
+            compactor_bytes_compacted: self
+                .compactor_bytes_compacted
+                .saturating_sub(before.compactor_bytes_compacted),
+
+            compactor_running_compactions: self.compactor_running_compactions,
+            compactor_throughput_bps: self.compactor_throughput_bps,
+            compactor_total_bytes_being_compacted: self.compactor_total_bytes_being_compacted,
+            compactor_last_completion_ts_sec: self.compactor_last_completion_ts_sec,
         }
     }
 }

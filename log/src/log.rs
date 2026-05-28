@@ -404,9 +404,10 @@ impl LogDb {
     }
 
     /// Shared construction logic used by `LogDb::new` and `LogDbBuilder::build`.
-    /// When `compactor_view_cell` is `Some`, a durable-gated compactor view
-    /// receiver is installed there so the embedded compaction scheduler can
-    /// track the live set.
+    /// When `compactor_view_cell` is `Some`, it is seeded with the recovered
+    /// live set here and then handed to the writer, which publishes further
+    /// updates into it directly (segment creates at written latency, durable
+    /// deletes once durable). The embedded compaction scheduler reads the cell.
     async fn from_storage(
         storage: Arc<dyn common::Storage>,
         direct: Option<Arc<crate::direct::LogDirect>>,
