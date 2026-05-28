@@ -39,16 +39,6 @@ typedef struct opendata_log_object_store_t opendata_log_object_store_t;
 
 typedef struct opendata_log_reader_t opendata_log_reader_t;
 
-/**
- * Opaque handle representing a registered durable-sequence subscription.
- *
- * Created by `opendata_log_subscribe_durable` and destroyed by
- * `opendata_log_unsubscribe_durable`. Must be freed explicitly even if the
- * log has been closed; closing the log aborts the task but does not free
- * this handle.
- */
-typedef struct opendata_log_subscription_t opendata_log_subscription_t;
-
 typedef struct opendata_log_t opendata_log_t;
 
 typedef struct opendata_log_result_t {
@@ -104,19 +94,6 @@ typedef struct opendata_log_reader_config_t {
   int64_t refresh_interval_ms;
 } opendata_log_reader_config_t;
 
-/**
- * Callback invoked when the durable-sequence watermark advances.
- *
- * The first invocation carries the current value at subscription time; each
- * subsequent invocation carries the latest observed value (intermediate
- * values may be coalesced).
- *
- * The callback is invoked on a tokio worker thread, not the caller's thread.
- * It must not call other `opendata_log_*` functions on the same log handle
- * (this would deadlock the runtime).
- */
-typedef void (*opendata_log_durable_callback_t)(uint64_t durable_sequence, void *user_data);
-
 struct opendata_log_result_t opendata_log_open(const struct opendata_log_config_t *config,
                                                struct opendata_log_t **out_log);
 
@@ -161,64 +138,6 @@ struct opendata_log_result_t opendata_log_list_segments(const struct opendata_lo
                                                         const struct opendata_log_seq_range_t *seq_range,
                                                         struct opendata_log_segment_t **out_segments,
                                                         uintptr_t *out_count);
-
-/**
- * Reads the current durable-sequence watermark.
- *
- * `*out_sequence` is set to N such that all records with `sequence < N` are
- * durably persisted. Initial value is 0; advances as the underlying storage
- * confirms durability (no explicit flush required, though `opendata_log_flush`
- * does force it).
- */
-struct opendata_log_result_t opendata_log_durable_sequence(const struct opendata_log_t *log,
-                                                           uint64_t *out_sequence);
-
-/**
- * Subscribes to durable-sequence watermark changes.
- *
- * `callback` is invoked once on registration with the current watermark, then
- * on each subsequent advancement. The callback runs on a tokio worker thread
- * (not the caller's thread) and **must not call other `opendata_log_*`
- * functions on the same log handle** — doing so will deadlock the runtime.
- *
- * Intermediate values may be coalesced; the callback always receives the
- * latest observed value.
- *
- * `user_data` is passed back verbatim to each callback invocation. The
- * caller is responsible for ensuring it remains valid (and safe for
- * concurrent access from worker threads) for the entire lifetime of the
- * subscription, **including any in-flight callback that may still be
- * running after `opendata_log_unsubscribe_durable` returns** (see that
- * function's contract).
- */
-struct opendata_log_result_t opendata_log_subscribe_durable(const struct opendata_log_t *log,
-                                                            void (*callback)(uint64_t durable_sequence,
-                                                                             void *user_data),
-                                                            void *user_data,
-                                                            struct opendata_log_subscription_t **out_subscription);
-
-/**
- * Cancels a durable-sequence subscription and frees the handle.
- *
- * **Best-effort with respect to in-flight callbacks.** This call signals the
- * spawned task to stop and returns immediately. If a callback is currently
- * executing on a worker thread, it will run to completion *after* this
- * function returns. A new callback for this subscription will not be
- * scheduled.
- *
- * **Caller obligation:** `user_data` must remain valid until every
- * in-flight invocation of the callback has finished. The C API does not
- * synchronize with worker threads on unsubscribe; freeing `user_data`
- * immediately after this call returns is a use-after-free if a callback is
- * mid-execution. A safe pattern is to keep `user_data` alive as long as
- * any subscription that references it, e.g. by tying it to the lifetime of
- * the `opendata_log_t` (close the log first, then free `user_data` once no
- * pending callback work could possibly remain).
- *
- * Safe to call after `opendata_log_close` (the spawned task will already
- * have exited because its watch channel closed when the log dropped).
- */
-struct opendata_log_result_t opendata_log_unsubscribe_durable(struct opendata_log_subscription_t *subscription);
 
 struct opendata_log_result_t opendata_log_iterator_next(struct opendata_log_iterator_t *iterator,
                                                         bool *out_present,

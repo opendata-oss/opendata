@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::model::{SegmentId, Sequence};
+use crate::model::SegmentId;
 use common::storage::StorageSnapshot;
 
 /// A write-aligned read view entry.
@@ -16,8 +16,6 @@ pub(crate) struct ViewEntry {
     pub seqnum: u64,
     pub epoch: u64,
     pub snapshot: Arc<dyn StorageSnapshot>,
-    /// Exclusive upper bound of global sequences allocated as of this entry.
-    pub next_sequence: Sequence,
     pub last_segment_id: Option<SegmentId>,
     pub last_deleted_segment_id: Option<SegmentId>,
 }
@@ -82,7 +80,6 @@ mod tests {
             seqnum: 1,
             epoch: 10,
             snapshot: snap.clone(),
-            next_sequence: 0,
             last_segment_id: Some(7),
             last_deleted_segment_id: None,
         });
@@ -103,7 +100,6 @@ mod tests {
             seqnum: 5,
             epoch: 1,
             snapshot: snap,
-            next_sequence: 0,
             last_segment_id: Some(9),
             last_deleted_segment_id: None,
         });
@@ -122,7 +118,6 @@ mod tests {
             seqnum: 1,
             epoch: 1,
             snapshot: make_snapshot().await,
-            next_sequence: 0,
             last_segment_id: Some(0),
             last_deleted_segment_id: None,
         });
@@ -130,7 +125,6 @@ mod tests {
             seqnum: 3,
             epoch: 2,
             snapshot: make_snapshot().await,
-            next_sequence: 0,
             last_segment_id: Some(1),
             last_deleted_segment_id: None,
         });
@@ -138,7 +132,6 @@ mod tests {
             seqnum: 5,
             epoch: 3,
             snapshot: make_snapshot().await,
-            next_sequence: 0,
             last_segment_id: Some(2),
             last_deleted_segment_id: None,
         });
