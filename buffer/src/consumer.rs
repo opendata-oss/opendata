@@ -16,6 +16,7 @@ use crate::queue::{Metadata, QueueConsumer};
 const DEQUEUE_INTERVAL: u64 = 100;
 
 /// A batch of entries read from object storage by the [`Consumer`].
+#[derive(Debug)]
 pub struct ConsumedBatch {
     /// The deserialized opaque byte entries from the data batch.
     pub entries: Vec<Bytes>,
@@ -27,6 +28,88 @@ pub struct ConsumedBatch {
     pub metadata: Vec<Metadata>,
 }
 
+/// Lightweight pointer to one manifest entry. Carries everything a
+/// caller needs to fetch the corresponding data batch from object
+/// storage without re-reading the manifest.
+///
+/// Returned by [`Consumer::next_descriptors`]. See RFC 0003.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchDescriptor {
+    /// The queue sequence number of this batch.
+    pub sequence: u64,
+    /// The object storage path of the data batch.
+    pub location: String,
+    /// Per-range metadata items attached to this batch by producers.
+    pub metadata: Vec<Metadata>,
+}
+
+/// Cloneable, concurrency-safe handle for fetching data batches from
+/// object storage given a [`BatchDescriptor`].
+///
+/// The handle holds an `Arc<dyn ObjectStore>` and the manifest path
+/// (used as a metric label only). It carries no manifest cursor and
+/// no mutable state, so it is safe to clone into many fetch worker
+/// tasks while the owning [`Consumer`] keeps `&mut`-only access to
+/// manifest operations (`next_descriptors`, `ack`, `ack_through`,
+/// `flush`).
+///
+/// See RFC 0003 ("Concurrency Model") for the full contract.
+#[derive(Clone)]
+pub struct ConsumerFetchHandle {
+    object_store: Arc<dyn ObjectStore>,
+    manifest_path: String,
+}
+
+impl std::fmt::Debug for ConsumerFetchHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerFetchHandle")
+            .field("manifest_path", &self.manifest_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConsumerFetchHandle {
+    /// Fetch and decode the batch identified by `descriptor`. Stateless
+    /// — does not consult or mutate manifest state. Safe to call
+    /// concurrently from multiple tasks (against the same handle clone
+    /// or distinct clones); two calls against the same descriptor
+    /// produce identical [`ConsumedBatch`] values.
+    ///
+    /// The handle does not detect epoch fencing on its own; a fenced
+    /// consumer's [`Consumer::next_descriptors`] is what surfaces
+    /// `Error::Fenced`. Fetches against descriptors handed out before
+    /// fencing succeed against object storage as long as the data
+    /// object is still present (i.e. before GC runs).
+    pub async fn fetch(&self, descriptor: BatchDescriptor) -> Result<ConsumedBatch> {
+        let _ = &self.manifest_path; // reserved for future per-source label
+        let start = Instant::now();
+        let path = Path::from(descriptor.location.as_str());
+        let data = self
+            .object_store
+            .get(&path)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .bytes()
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let data_len = data.len() as u64;
+        let entries = decode_batch(data)?;
+
+        metrics::counter!(m::BATCHES_COLLECTED).increment(1);
+        metrics::counter!(m::ENTRIES_COLLECTED).increment(entries.len() as u64);
+        metrics::counter!(m::BYTES_COLLECTED).increment(data_len);
+        metrics::histogram!(m::FETCH_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
+
+        Ok(ConsumedBatch {
+            entries,
+            sequence: descriptor.sequence,
+            location: descriptor.location,
+            metadata: descriptor.metadata,
+        })
+    }
+}
+
 /// Reads batches of ingested entries from object storage via a queue consumer.
 ///
 /// The consumer iterates over entries in the queue manifest in ingestion order,
@@ -36,11 +119,18 @@ pub struct ConsumedBatch {
 pub struct Consumer {
     consumer: QueueConsumer,
     object_store: Arc<dyn ObjectStore>,
+    manifest_path: String,
     gc_shutdown: CancellationToken,
     gc_handle: tokio::task::JoinHandle<()>,
     ack_count: u64,
     last_acked_sequence: Option<u64>,
     last_fetched_sequence: Option<u64>,
+    /// Read-ahead cursor: highest sequence handed out by
+    /// [`Consumer::next_descriptors`]. Distinct from
+    /// `last_fetched_sequence` because callers may receive
+    /// descriptors before the corresponding fetch resolves.
+    /// Initialized from `last_acked_sequence` on construction.
+    last_handed_out_sequence: Option<u64>,
 }
 
 impl Consumer {
@@ -62,8 +152,9 @@ impl Consumer {
         last_acked_sequence: Option<u64>,
     ) -> Result<Self> {
         crate::metric_names::describe_consumer_metrics();
+        let manifest_path = config.manifest_path.clone();
         let consumer =
-            QueueConsumer::with_object_store(config.manifest_path.clone(), object_store.clone());
+            QueueConsumer::with_object_store(manifest_path.clone(), object_store.clone());
 
         // Fence previous consumers and position the cursor before spawning GC.
         consumer.initialize().await?;
@@ -84,75 +175,141 @@ impl Consumer {
         Ok(Self {
             consumer,
             object_store,
+            manifest_path,
             ack_count: 0,
             last_acked_sequence,
             gc_shutdown,
             gc_handle,
             last_fetched_sequence: last_acked_sequence,
+            last_handed_out_sequence: last_acked_sequence,
         })
     }
 
     /// Read the next data batch from object storage.
     ///
-    /// If no batch has been fetched yet, peeks the earliest entry in the queue.
-    /// Otherwise, reads the entry with sequence `last_fetched_sequence + 1`.
-    /// Returns `None` if no matching entry is available.
+    /// Serial fetch of the next batch: peeks the next manifest entry
+    /// past the last handed-out / fetched sequence, fetches the
+    /// corresponding object, and returns it. Returns `None` if no
+    /// entry is available. May be called repeatedly to walk successive
+    /// batches; the read cursor is independent of the ack frontier.
+    ///
+    /// **Cancellation-safe and fetch-failure-safe.** The cursor
+    /// (`last_handed_out_sequence`) advances **only after** a
+    /// successful fetch. If the fetch fails, or if the future is
+    /// dropped mid-fetch, the cursor is unchanged and a subsequent
+    /// `next_batch` re-fetches the same entry.
+    ///
+    /// This is written as an inline peek-fetch-advance rather than a
+    /// wrapper over [`Consumer::next_descriptors`] +
+    /// [`Consumer::fetch_descriptor`] because `next_descriptors`
+    /// advances the cursor at handout time (a handed-out descriptor is
+    /// not reissued within a process; see the Descriptor Handout
+    /// Contract). Inlining keeps the cursor advance after the fetch
+    /// `await`, so a failed or dropped fetch leaves the cursor
+    /// untouched — the behavior `next_batch` callers expect.
     pub async fn next_batch(&mut self) -> Result<Option<ConsumedBatch>> {
-        let queue_entry = match self.last_fetched_sequence {
-            None => self.consumer.peek().await?,
-            Some(seq) => self.consumer.read(seq.wrapping_add(1)).await?,
-        };
+        let entries = self
+            .consumer
+            .descriptors_after(self.last_handed_out_sequence, 1)
+            .await?;
         metrics::gauge!(m::QUEUE_LENGTH).set(self.consumer.len() as f64);
-        match queue_entry {
-            Some(entry) => {
-                let sequence = entry.sequence;
-                let batch = self.fetch_batch(entry).await?;
-                self.last_fetched_sequence = Some(sequence);
-                if let Some(ref b) = batch
-                    && let Some(last_meta) = b.metadata.last()
-                {
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as i64;
-                    let lag_s = (now_ms - last_meta.ingestion_time_ms) as f64 / 1000.0;
-                    metrics::gauge!(m::CONSUMER_LAG_SECONDS).set(lag_s.max(0.0));
-                }
-                Ok(batch)
-            }
-            None => Ok(None),
+        let Some(entry) = entries.into_iter().next() else {
+            return Ok(None);
+        };
+        let descriptor = BatchDescriptor {
+            sequence: entry.sequence,
+            location: entry.location,
+            metadata: entry.metadata,
+        };
+        // fetch_descriptor advances last_fetched_sequence on success
+        // and updates the consumer_lag_seconds gauge. We then advance
+        // last_handed_out_sequence ourselves — only on success. If
+        // the fetch errors or the future is cancelled, neither cursor
+        // moves and the next next_batch re-issues the same entry.
+        let batch = self.fetch_descriptor(descriptor).await?;
+        self.last_handed_out_sequence = Some(batch.sequence);
+        Ok(Some(batch))
+    }
+
+    /// Read the manifest once and return up to `max` contiguous
+    /// [`BatchDescriptor`]s past the consumer's read-ahead cursor.
+    ///
+    /// Does not perform any object-store GET. Does not mutate the
+    /// durable ack frontier. Advances the in-memory read-ahead cursor
+    /// (`last_handed_out_sequence`) by the number of descriptors
+    /// returned.
+    ///
+    /// Returns an empty `Vec` if no new entries are available;
+    /// returns `Err(Error::Fenced)` if the consumer's epoch no longer
+    /// matches the manifest's.
+    ///
+    /// **Caller contract**: once a descriptor is returned, the caller
+    /// is responsible for either fetching and processing it or
+    /// accepting that it will be re-handed-out only via process
+    /// restart (`Consumer::new` with a `last_acked_sequence` argument).
+    /// Lost descriptors are not reissued within a process. See RFC
+    /// 0003 "Descriptor Handout Contract" for the full rules.
+    pub async fn next_descriptors(&mut self, max: usize) -> Result<Vec<BatchDescriptor>> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let entries = self
+            .consumer
+            .descriptors_after(self.last_handed_out_sequence, max)
+            .await?;
+        metrics::gauge!(m::QUEUE_LENGTH).set(self.consumer.len() as f64);
+        if let Some(last) = entries.last() {
+            self.last_handed_out_sequence = Some(last.sequence);
+        }
+        let count = entries.len() as u64;
+        if count > 0 {
+            metrics::counter!(m::DESCRIPTORS_HANDED_OUT).increment(count);
+        }
+        Ok(entries
+            .into_iter()
+            .map(|e| BatchDescriptor {
+                sequence: e.sequence,
+                location: e.location,
+                metadata: e.metadata,
+            })
+            .collect())
+    }
+
+    /// Construct a cloneable fetch handle. O(1); each call returns a
+    /// fresh handle, and the handle itself implements `Clone` for
+    /// further duplication into worker tasks.
+    pub fn fetch_handle(&self) -> ConsumerFetchHandle {
+        ConsumerFetchHandle {
+            object_store: self.object_store.clone(),
+            manifest_path: self.manifest_path.clone(),
         }
     }
 
-    async fn fetch_batch(
-        &self,
-        queue_entry: crate::queue::QueueEntry,
-    ) -> Result<Option<ConsumedBatch>> {
-        let start = Instant::now();
-        let path = Path::from(queue_entry.location.as_str());
-        let data = self
-            .object_store
-            .get(&path)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .bytes()
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let data_len = data.len() as u64;
-        let entries = decode_batch(data)?;
-
-        metrics::counter!(m::BATCHES_COLLECTED).increment(1);
-        metrics::counter!(m::ENTRIES_COLLECTED).increment(entries.len() as u64);
-        metrics::counter!(m::BYTES_COLLECTED).increment(data_len);
-        metrics::histogram!(m::FETCH_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
-
-        Ok(Some(ConsumedBatch {
-            entries,
-            sequence: queue_entry.sequence,
-            location: queue_entry.location,
-            metadata: queue_entry.metadata,
-        }))
+    /// Fetch and decode a single batch via the consumer's serial
+    /// wrapper. Equivalent to `self.fetch_handle().fetch(descriptor)`,
+    /// but additionally maintains the consumer's serial lag cursor
+    /// (`last_fetched_sequence` + the `consumer_lag_seconds` gauge)
+    /// used by the legacy `next_batch` path.
+    ///
+    /// Parallel-fetch callers should use [`Consumer::fetch_handle`]
+    /// directly; the runtime owns its own per-stage latency
+    /// histograms (RFC 0002).
+    pub async fn fetch_descriptor(&mut self, descriptor: BatchDescriptor) -> Result<ConsumedBatch> {
+        let handle = self.fetch_handle();
+        let batch = handle.fetch(descriptor).await?;
+        self.last_fetched_sequence = match self.last_fetched_sequence {
+            Some(prev) => Some(prev.max(batch.sequence)),
+            None => Some(batch.sequence),
+        };
+        if let Some(last_meta) = batch.metadata.last() {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let lag_s = (now_ms - last_meta.ingestion_time_ms) as f64 / 1000.0;
+            metrics::gauge!(m::CONSUMER_LAG_SECONDS).set(lag_s.max(0.0));
+        }
+        Ok(batch)
     }
 
     /// Acknowledge that the batch with the given sequence number has been processed.
@@ -177,6 +334,40 @@ impl Consumer {
         if self.ack_count.is_multiple_of(DEQUEUE_INTERVAL) {
             self.consumer.dequeue(sequence).await?;
         }
+        Ok(())
+    }
+
+    /// Advance the durable ack frontier through (and including)
+    /// `sequence`. Performs `dequeue(sequence)` against the manifest
+    /// **first**, then updates in-memory state on success.
+    ///
+    /// On error (storage, fence), `last_acked_sequence` and the
+    /// `buffer.acks` counter remain at their pre-call values. A retry
+    /// against the same sequence is safe.
+    ///
+    /// Errors if `sequence <= last_acked_sequence` (the frontier is
+    /// monotonic).
+    pub async fn ack_through(&mut self, sequence: u64) -> Result<()> {
+        if let Some(last) = self.last_acked_sequence
+            && sequence <= last
+        {
+            return Err(Error::Storage(format!(
+                "non-monotonic ack_through: last_acked={last}, requested={sequence}"
+            )));
+        }
+        let count_advanced = match self.last_acked_sequence {
+            None => sequence + 1,
+            Some(last) => sequence - last,
+        };
+
+        // Durable dequeue first. Bubbles up Fenced and Storage errors
+        // without touching local state.
+        self.consumer.dequeue(sequence).await?;
+
+        // Only mutate in-memory state after dequeue succeeds.
+        self.last_acked_sequence = Some(sequence);
+        self.ack_count = self.ack_count.wrapping_add(count_advanced);
+        metrics::counter!(m::ACKS).increment(count_advanced);
         Ok(())
     }
 
@@ -651,5 +842,372 @@ mod tests {
         let batch = collector.next_batch().await.unwrap().unwrap();
         assert_eq!(batch.location, "batches/second");
         assert_eq!(batch.sequence, 1);
+    }
+
+    // ========================================================================
+    // RFC 0003 read-ahead API tests.
+    // ========================================================================
+
+    async fn enqueue_n(
+        store: &Arc<dyn ObjectStore>,
+        producer: &QueueProducer,
+        n: usize,
+    ) -> Vec<String> {
+        let entries = test_entries();
+        let mut locations = Vec::with_capacity(n);
+        for i in 0..n {
+            let loc = format!("batches/seq-{i:06}");
+            write_batch(store, &loc, &entries).await;
+            producer.enqueue(loc.clone(), vec![]).await.unwrap();
+            locations.push(loc);
+        }
+        locations
+    }
+
+    #[tokio::test]
+    async fn should_next_descriptors_max_zero_return_empty_without_manifest_read() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 3).await;
+
+        // max=0 returns empty and does not advance the cursor.
+        let v = collector.next_descriptors(0).await.unwrap();
+        assert!(v.is_empty());
+
+        // Subsequent next_descriptors still sees all three.
+        let v = collector.next_descriptors(10).await.unwrap();
+        assert_eq!(v.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn should_next_descriptors_return_contiguous_run_when_available() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 5).await;
+
+        let v = collector.next_descriptors(3).await.unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].sequence, 0);
+        assert_eq!(v[1].sequence, 1);
+        assert_eq!(v[2].sequence, 2);
+
+        // Cursor advanced; next call returns sequences 3 and 4 only.
+        let v2 = collector.next_descriptors(10).await.unwrap();
+        assert_eq!(v2.len(), 2);
+        assert_eq!(v2[0].sequence, 3);
+        assert_eq!(v2[1].sequence, 4);
+
+        // Empty when nothing new.
+        let v3 = collector.next_descriptors(10).await.unwrap();
+        assert!(v3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_next_descriptors_return_fewer_than_max_on_short_manifest() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 2).await;
+
+        let v = collector.next_descriptors(10).await.unwrap();
+        assert_eq!(v.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_fetch_handle_return_same_consumed_batch_as_fetch_descriptor() {
+        // Fetch the *same* descriptor through both paths and compare:
+        // sequence, location, metadata, entries must all match.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        let location = "batches/handle-vs-wrapper";
+        write_batch(&store, location, &entries).await;
+        let metadata = vec![Metadata {
+            start_index: 0,
+            ingestion_time_ms: 1_700_000_000_000,
+            payload: Bytes::from(r#"{"k":"v"}"#),
+        }];
+        producer
+            .enqueue(location.to_string(), metadata.clone())
+            .await
+            .unwrap();
+
+        let descriptors = collector.next_descriptors(1).await.unwrap();
+        assert_eq!(descriptors.len(), 1);
+        let d = descriptors[0].clone();
+
+        let from_handle = collector.fetch_handle().fetch(d.clone()).await.unwrap();
+        let from_wrapper = collector.fetch_descriptor(d).await.unwrap();
+
+        assert_eq!(from_handle.sequence, from_wrapper.sequence);
+        assert_eq!(from_handle.location, from_wrapper.location);
+        assert_eq!(from_handle.metadata, from_wrapper.metadata);
+        assert_eq!(from_handle.entries, from_wrapper.entries);
+        // And both must match what the producer actually wrote.
+        assert_eq!(from_handle.location, location);
+        assert_eq!(from_handle.entries.len(), 2);
+        assert_eq!(from_handle.metadata, metadata);
+    }
+
+    #[tokio::test]
+    async fn should_next_batch_not_advance_cursor_on_fetch_failure() {
+        // Pre-RFC-0003 contract: next_batch advances its cursor only
+        // after a successful fetch. The wrapper must roll back the
+        // private last_handed_out_sequence on fetch error so a retry
+        // re-issues the same batch.
+        use slatedb::object_store::path::Path;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        let location_a = "batches/a-fails-then-succeeds";
+        let location_b = "batches/b";
+        write_batch(&store, location_a, &entries).await;
+        write_batch(&store, location_b, &entries).await;
+        producer
+            .enqueue(location_a.to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue(location_b.to_string(), vec![])
+            .await
+            .unwrap();
+
+        // Delete A's data object so the fetch will fail.
+        store.delete(&Path::from(location_a)).await.unwrap();
+
+        // First next_batch fails on the fetch.
+        let r = collector.next_batch().await;
+        assert!(
+            matches!(r, Err(Error::Storage(_))),
+            "expected Storage error, got {r:?}"
+        );
+
+        // Re-write A so the next fetch succeeds.
+        write_batch(&store, location_a, &entries).await;
+
+        // Second next_batch must return A — cursor did not advance past
+        // it on the previous failure.
+        let b = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b.sequence, 0);
+        assert_eq!(b.location, location_a);
+        // Acknowledge A and confirm forward progress to B.
+        collector.ack(b.sequence).await.unwrap();
+        let b2 = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b2.sequence, 1);
+        assert_eq!(b2.location, location_b);
+    }
+
+    #[tokio::test]
+    async fn should_next_batch_not_advance_cursor_when_future_is_dropped() {
+        // Cancellation safety: constructing a `next_batch` future and
+        // dropping it before it completes must leave
+        // last_handed_out_sequence untouched, so the entry is not
+        // skipped. The structural property: last_handed_out_sequence is
+        // mutated *after* the fetch_descriptor await returns Ok, so a
+        // future dropped before that line leaves the cursor unchanged.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        write_batch(&store, "batches/cancel-a", &entries).await;
+        producer
+            .enqueue("batches/cancel-a".to_string(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(collector.last_handed_out_sequence, None);
+
+        // Construct the future and drop it without ever polling it.
+        {
+            let fut = collector.next_batch();
+            drop(fut);
+        }
+        assert_eq!(
+            collector.last_handed_out_sequence, None,
+            "dropped next_batch future must not advance the cursor"
+        );
+
+        // The entry was not consumed: a real next_batch still returns it.
+        let b = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b.sequence, 0);
+        assert_eq!(b.location, "batches/cancel-a");
+        assert_eq!(collector.last_handed_out_sequence, Some(0));
+    }
+
+    #[tokio::test]
+    async fn should_next_batch_advance_cursor_on_successful_fetch() {
+        // The success branch (the deterministic counterpart to the
+        // dropped-future test): a completed next_batch advances
+        // last_handed_out_sequence to the fetched sequence, and
+        // successive calls walk forward one entry at a time.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        write_batch(&store, "batches/ok-a", &entries).await;
+        write_batch(&store, "batches/ok-b", &entries).await;
+        producer
+            .enqueue("batches/ok-a".to_string(), vec![])
+            .await
+            .unwrap();
+        producer
+            .enqueue("batches/ok-b".to_string(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(collector.last_handed_out_sequence, None);
+
+        let a = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(a.sequence, 0);
+        assert_eq!(collector.last_handed_out_sequence, Some(0));
+
+        let b = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(b.sequence, 1);
+        assert_eq!(collector.last_handed_out_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn should_fetch_handle_clones_fetch_concurrently_without_blocking_owner() {
+        // The fetch handle is the parallel-fetch seam: it must be
+        // Clone + Send + Sync + 'static (compile-time assertion below),
+        // two clones must fetch from separate spawned tasks
+        // concurrently, and the owning Consumer must keep &mut access
+        // throughout (the handle holds an Arc, not a borrow) so it can
+        // still drive the manifest — checked by the ack_through at the
+        // end.
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<ConsumerFetchHandle>();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 4).await;
+        let descriptors = collector.next_descriptors(4).await.unwrap();
+
+        // Two clones of the same handle, run from spawned tasks.
+        let handle = collector.fetch_handle();
+        let h1 = handle.clone();
+        let h2 = handle.clone();
+        let d0 = descriptors[0].clone();
+        let d1 = descriptors[1].clone();
+        let t1 = tokio::spawn(async move { h1.fetch(d0).await.unwrap() });
+        let t2 = tokio::spawn(async move { h2.fetch(d1).await.unwrap() });
+        let r1 = t1.await.unwrap();
+        let r2 = t2.await.unwrap();
+        assert_eq!(r1.sequence, 0);
+        assert_eq!(r2.sequence, 1);
+
+        // Owner can still drive next_descriptors and ack_through after
+        // the spawned tasks completed (no &mut conflict because the
+        // handle holds an Arc, not a borrow).
+        collector.ack_through(1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_ack_through_advance_frontier_in_one_call() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 5).await;
+
+        let _v = collector.next_descriptors(5).await.unwrap();
+
+        // Advance through sequence 3 in one call.
+        collector.ack_through(3).await.unwrap();
+        // Manifest has 1 entry remaining (sequence 4).
+        assert_eq!(collector.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_ack_through_reject_non_monotonic_input() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 5).await;
+        collector.next_descriptors(5).await.unwrap();
+
+        collector.ack_through(2).await.unwrap();
+        let err = collector.ack_through(2).await.unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("non-monotonic ack_through")),
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+        // The bookkeeping did not advance.
+        assert_eq!(collector.last_acked_sequence, Some(2));
+    }
+
+    #[tokio::test]
+    async fn should_ack_through_leave_state_unchanged_on_fence() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector1) =
+            make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 5).await;
+        collector1.next_descriptors(5).await.unwrap();
+        collector1.ack_through(0).await.unwrap();
+        assert_eq!(collector1.last_acked_sequence, Some(0));
+
+        // Fence collector1 by spinning up a second consumer.
+        let (_, _collector2) = make_collector(&store, test_collector_config(), None).await;
+
+        // ack_through against the fenced consumer must error and leave
+        // last_acked_sequence at 0.
+        let err = collector1.ack_through(2).await.unwrap_err();
+        assert!(matches!(err, Error::Fenced));
+        assert_eq!(collector1.last_acked_sequence, Some(0));
+    }
+
+    #[tokio::test]
+    async fn should_next_descriptors_surface_fence() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector1) =
+            make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 3).await;
+
+        let (_, _collector2) = make_collector(&store, test_collector_config(), None).await;
+
+        let result = collector1.next_descriptors(10).await;
+        assert!(matches!(result, Err(Error::Fenced)));
+    }
+
+    #[tokio::test]
+    async fn should_next_batch_be_equivalent_to_descriptor_plus_fetch() {
+        // Equivalence: next_batch == next_descriptors(1) + fetch_descriptor.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        let entries = test_entries();
+        let location = "batches/equiv";
+        write_batch(&store, location, &entries).await;
+        producer
+            .enqueue(location.to_string(), vec![])
+            .await
+            .unwrap();
+
+        let via_wrapper = collector.next_batch().await.unwrap().unwrap();
+        assert_eq!(via_wrapper.sequence, 0);
+        assert_eq!(via_wrapper.location, location);
+        assert_eq!(via_wrapper.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_descriptor_handout_contract_not_reissue_lost_descriptors() {
+        // Per RFC 0003: once next_descriptors returns a descriptor,
+        // it is not handed out again within the same process.
+        // Recovery is restart from the durable ack frontier.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (producer, mut collector) = make_collector(&store, test_collector_config(), None).await;
+        enqueue_n(&store, &producer, 3).await;
+
+        // Hand out 2 descriptors; "lose" them (drop without acking).
+        let lost = collector.next_descriptors(2).await.unwrap();
+        assert_eq!(lost.len(), 2);
+        drop(lost);
+
+        // The same consumer's next_descriptors moves on past them.
+        let next = collector.next_descriptors(10).await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].sequence, 2);
+
+        // Recovery: a fresh consumer initialized from the last durable
+        // ack (None here, since nothing was acked) re-emits the
+        // unacked range from the start.
+        collector.close().await.unwrap();
+        let (_, mut recovered) = make_collector(&store, test_collector_config(), None).await;
+        let again = recovered.next_descriptors(10).await.unwrap();
+        assert_eq!(again.len(), 3);
+        assert_eq!(again[0].sequence, 0);
     }
 }
