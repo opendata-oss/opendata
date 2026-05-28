@@ -58,31 +58,6 @@ impl Handle {
         total
     }
 
-    /// Debug helper: dump every counter the registry currently knows about
-    /// along with its non-zero value. Intended for troubleshooting metric
-    /// name mismatches.
-    pub fn dump_counters(&self) -> Vec<(String, u64)> {
-        let mut out = Vec::new();
-        self.registry.visit_counters(|key, counter| {
-            let v = counter.load(Ordering::Relaxed);
-            out.push((key.name().to_string(), v));
-        });
-        out.sort();
-        out
-    }
-
-    pub fn dump_gauges(&self) -> Vec<(String, f64)> {
-        let mut out = Vec::new();
-        self.registry.visit_gauges(|key, gauge| {
-            out.push((
-                key.name().to_string(),
-                f64::from_bits(gauge.load(Ordering::Relaxed)),
-            ));
-        });
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
     /// Last-set gauge value. Sums across labeled variants when several exist;
     /// in practice the gauges we care about are unlabeled, so this is just the
     /// current value.
