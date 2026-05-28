@@ -2527,6 +2527,7 @@ dependencies = [
 name = "opendata-log"
 version = "0.2.2"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.22.1",

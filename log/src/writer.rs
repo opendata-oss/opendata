@@ -14,6 +14,7 @@
 //!   memtable (visible to snapshot reads, but not yet on disk).
 //! - **Durable** — after `storage.flush()`, once SlateDB has synced to disk.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ use common::{PutRecordOp, SequenceAllocator, WriteOptions};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::compaction::{CompactorView, CompactorViewCell};
 use crate::error::AppendError;
 use crate::listing::ListingCache;
 use crate::model::{AppendOutput, Record as UserRecord, SegmentId, Sequence};
@@ -90,6 +92,9 @@ pub(crate) struct LogWriterConfig {
     /// retention check that deletes `SegmentMeta` records for expired sealed
     /// segments. `None` disables the check entirely.
     pub retention: Option<RetentionPolicy>,
+    /// Shared cell the writer publishes the compactor-facing live-set view
+    /// into. `None` disables compactor publication (no embedded compaction).
+    pub compactor_view: Option<CompactorViewCell>,
 }
 
 impl Default for LogWriterConfig {
@@ -97,6 +102,7 @@ impl Default for LogWriterConfig {
         Self {
             queue_capacity: 10_000,
             retention: None,
+            compactor_view: None,
         }
     }
 }
@@ -123,6 +129,20 @@ pub(crate) struct LogWriter {
     last_deleted_segment_id: Option<SegmentId>,
     clock: Arc<dyn Clock>,
     retention: Option<RetentionPolicy>,
+    /// Shared cell publishing the compactor-facing live-set view. `None` when
+    /// embedded compaction is disabled.
+    compactor_view: Option<CompactorViewCell>,
+    /// Segment deletions awaiting durability, as `(write seqnum, resulting
+    /// last_deleted_segment_id)`. `run`'s durable branch drains an entry once
+    /// its seqnum is durable and publishes its id, so the compactor never sees
+    /// a deletion before its `SegmentMeta` delete is durable. Always empty when
+    /// `compactor_view` is `None`; entries left queued at shutdown are dropped
+    /// (re-seeded from durable state on the next open).
+    ///
+    /// The id is captured per entry, not read from `self` at drain time: a
+    /// later, not-yet-durable delete may already have advanced
+    /// `last_deleted_segment_id`, and publishing that would expose it early.
+    pending_deletes: VecDeque<(u64, Option<SegmentId>)>,
 }
 
 impl LogWriter {
@@ -167,6 +187,8 @@ impl LogWriter {
             last_deleted_segment_id,
             clock,
             retention: config.retention,
+            compactor_view: config.compactor_view,
+            pending_deletes: VecDeque::new(),
         };
 
         let handle = LogWriteHandle {
@@ -186,7 +208,14 @@ impl LogWriter {
             .retention
             .as_ref()
             .map(|p| tokio::time::interval(p.check_interval));
+        let mut durable_rx = self.storage.subscribe_durable();
+        let mut durable_closed = false;
         loop {
+            // Listen for durability only while deletes await their gate;
+            // otherwise the branch parks and plain appends never wake the
+            // writer here. Stop once the channel closes, so a closed
+            // `durable_rx` can't busy-spin the branch on `Err`.
+            let awaiting_durable = !self.pending_deletes.is_empty() && !durable_closed;
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
@@ -199,6 +228,23 @@ impl LogWriter {
                     }
                 } => {
                     self.tick_retention().await;
+                }
+                result = async {
+                    if awaiting_durable {
+                        durable_rx.changed().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    // A closed durable channel means storage is shutting down;
+                    // stop draining but keep serving until the command channel
+                    // closes.
+                    if result.is_err() {
+                        durable_closed = true;
+                    } else {
+                        let durable_seq = *durable_rx.borrow_and_update();
+                        self.drain_compactor_deletes(durable_seq);
+                    }
                 }
             }
         }
@@ -346,6 +392,17 @@ impl LogWriter {
         {
             self.last_deleted_segment_id = Some(segment_id);
         }
+        // Queue for the compactor; `run`'s durable branch releases it once
+        // `write_result.seqnum` is durable. No drain here: `durable_rx` is
+        // long-lived and consumed only in that branch, so a durable advance
+        // that lands now (some storages flush synchronously inside `apply`) is
+        // retained as an unseen `watch` version. Since the seqnum exceeds the
+        // current durable watermark, the branch's next `changed()` fires either
+        // immediately or after the flush that makes it durable.
+        if self.compactor_view.is_some() {
+            self.pending_deletes
+                .push_back((write_result.seqnum, self.last_deleted_segment_id));
+        }
         self.broadcast(write_result.seqnum).await
     }
 
@@ -365,8 +422,52 @@ impl LogWriter {
             && assignment.is_new
         {
             self.last_segment_id = Some(assignment.segment.id());
+            self.publish_compactor_segment();
         }
         self.broadcast(write_result.seqnum).await
+    }
+
+    /// Publishes `last_segment_id` to the compactor view when a new segment is
+    /// created, so plain appends do no compactor work. No-op when compaction is
+    /// disabled. `rcu` keeps the read-modify-write atomic so the other field is
+    /// preserved (the writer task is the only runtime mutator, but cheap).
+    fn publish_compactor_segment(&self) {
+        let Some(cell) = self.compactor_view.as_ref() else {
+            return;
+        };
+        cell.rcu(|current| CompactorView {
+            last_segment_id: self.last_segment_id,
+            ..**current
+        });
+    }
+
+    /// Releases queued segment deletions to the compactor view once their write
+    /// is durable. Pops every pending delete with `seqnum <= durable_seq` and
+    /// publishes the highest resulting `last_deleted_segment_id`. No-op when
+    /// compaction is disabled or nothing is newly durable.
+    fn drain_compactor_deletes(&mut self, durable_seq: u64) {
+        let Some(cell) = self.compactor_view.as_ref() else {
+            return;
+        };
+        let mut latest_durable_delete = None;
+        while self
+            .pending_deletes
+            .front()
+            .is_some_and(|(seqnum, _)| *seqnum <= durable_seq)
+        {
+            latest_durable_delete = self
+                .pending_deletes
+                .pop_front()
+                .map(|(_, deleted_id)| deleted_id);
+        }
+        if let Some(last_deleted_segment_id) = latest_durable_delete {
+            // `rcu` keeps the read-modify-write atomic; see
+            // `publish_compactor_segment` for why.
+            cell.rcu(|current| CompactorView {
+                last_deleted_segment_id,
+                ..**current
+            });
+        }
     }
 
     /// Writes ops to storage. Returns the resulting `WriteResult`.
@@ -981,6 +1082,148 @@ mod tests {
         // then: watermark is the max of the two, not the most recent
         let view = written_rx.borrow_and_update().clone();
         assert_eq!(view.last_deleted_segment_id, Some(2));
+    }
+
+    // ---- Compactor-view publication tests ----
+
+    use arc_swap::ArcSwap;
+
+    fn empty_compactor_view() -> CompactorViewCell {
+        Arc::new(ArcSwap::from_pointee(CompactorView {
+            last_segment_id: None,
+            last_deleted_segment_id: None,
+        }))
+    }
+
+    async fn wait_for_deleted(cell: &CompactorViewCell, expected: Option<SegmentId>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cell.load().last_deleted_segment_id == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("compactor view did not reflect durable delete in time");
+    }
+
+    #[tokio::test]
+    async fn compactor_view_should_publish_new_segment_at_written_latency() {
+        let cell = empty_compactor_view();
+        let config = LogWriterConfig {
+            compactor_view: Some(cell.clone()),
+            ..LogWriterConfig::default()
+        };
+        let (writer, mut handle, _storage) = create_writer_with_config(config).await;
+        let _task = handle.spawn(writer);
+
+        // The first append creates segment 1; its id is published immediately,
+        // without waiting for durability.
+        handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
+
+        let view = **cell.load();
+        assert_eq!(view.last_segment_id, Some(1));
+        assert_eq!(view.last_deleted_segment_id, None);
+    }
+
+    #[tokio::test]
+    async fn compactor_view_should_delay_deleted_segment_until_durable() {
+        let storage: Arc<dyn common::Storage> =
+            Arc::new(InMemoryStorage::new().with_deferred_durability());
+        let cell = empty_compactor_view();
+        let config = LogWriterConfig {
+            compactor_view: Some(cell.clone()),
+            ..LogWriterConfig::default()
+        };
+        let (writer, mut handle, _storage) = create_writer_with_storage(storage, config).await;
+        let _task = handle.spawn(writer);
+
+        // Create two user segments (ids 1 and 2).
+        handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
+        handle.force_seal(2000).await.unwrap();
+        assert_eq!(cell.load().last_segment_id, Some(2));
+
+        // Delete segment 1. Its write isn't durable yet (deferred durability),
+        // so the deletion stays hidden from the compactor view.
+        handle.delete_segment_meta(1).await.unwrap();
+        assert_eq!(
+            cell.load().last_deleted_segment_id,
+            None,
+            "delete should remain hidden until durable",
+        );
+
+        // Flushing makes the delete durable; the writer's durable branch then
+        // releases it to the compactor view.
+        handle.flush().await.unwrap();
+        wait_for_deleted(&cell, Some(1)).await;
+    }
+
+    #[tokio::test]
+    async fn compactor_view_should_release_delete_without_explicit_flush_when_durability_is_synchronous()
+     {
+        // Default InMemoryStorage marks writes durable synchronously inside
+        // `apply`, so a delete is durable the instant it is written. The writer
+        // must still release it to the compactor view — the durable branch
+        // reacts to the unseen `watch` version left by that synchronous durable
+        // advance, with no explicit flush. This pins the immediate-drain path
+        // that the deferred-durability test above does not exercise.
+        let cell = empty_compactor_view();
+        let config = LogWriterConfig {
+            compactor_view: Some(cell.clone()),
+            ..LogWriterConfig::default()
+        };
+        let (writer, mut handle, _storage) = create_writer_with_config(config).await;
+        let _task = handle.spawn(writer);
+
+        handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
+        handle.force_seal(2000).await.unwrap();
+        handle.delete_segment_meta(1).await.unwrap();
+
+        wait_for_deleted(&cell, Some(1)).await;
+    }
+
+    #[tokio::test]
+    async fn compactor_view_should_gate_each_delete_on_its_own_durability() {
+        // Two deletes queued together must be released independently as their
+        // individual writes become durable: making only the first delete's
+        // write durable must advance the view to the first id, NOT the second,
+        // even though `self.last_deleted_segment_id` already reflects the
+        // second. This is the per-entry durability gate in `pending_deletes`.
+        let storage = Arc::new(InMemoryStorage::new().with_deferred_durability());
+        let cell = empty_compactor_view();
+        let config = LogWriterConfig {
+            compactor_view: Some(cell.clone()),
+            ..LogWriterConfig::default()
+        };
+        let (writer, mut handle, _storage) =
+            create_writer_with_storage(storage.clone() as Arc<dyn common::Storage>, config).await;
+        let mut written_rx = handle.written_rx();
+        let _task = handle.spawn(writer);
+
+        // Three user segments (ids 1, 2, 3) so segments 1 and 2 can be deleted.
+        handle.try_append(make_write(&["k1"], 1000)).await.unwrap();
+        handle.force_seal(2000).await.unwrap();
+        handle.force_seal(3000).await.unwrap();
+
+        // Delete segment 1, then segment 2, capturing each write's seqnum.
+        handle.delete_segment_meta(1).await.unwrap();
+        let delete_1_seq = written_rx.borrow_and_update().seqnum;
+        handle.delete_segment_meta(2).await.unwrap();
+        let delete_2_seq = written_rx.borrow_and_update().seqnum;
+        assert!(delete_2_seq > delete_1_seq);
+
+        // Nothing durable yet: both deletes stay hidden.
+        assert_eq!(cell.load().last_deleted_segment_id, None);
+
+        // Make ONLY delete 1 durable. The view must advance to Some(1); delete
+        // 2's SegmentMeta write is not durable, so it must remain hidden.
+        storage.flush_to(delete_1_seq);
+        wait_for_deleted(&cell, Some(1)).await;
+
+        // Now make delete 2 durable too.
+        storage.flush_to(delete_2_seq);
+        wait_for_deleted(&cell, Some(2)).await;
     }
 
     #[storage_test]

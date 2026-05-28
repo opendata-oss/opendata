@@ -23,6 +23,7 @@ default = []
 http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "dep:metrics-exporter-prometheus", "dep:tikv-jemallocator"]
 
 [dependencies]
+arc-swap = "1"
 async-trait.workspace = true
 bytes.workspace = true
 common.workspace = true
