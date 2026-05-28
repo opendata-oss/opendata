@@ -8,6 +8,7 @@ members = [
     "log",
     "log/bench",
     "log/c",
+    "log/inspect",
     "timeseries",
     "timeseries/bench",
     "vector",

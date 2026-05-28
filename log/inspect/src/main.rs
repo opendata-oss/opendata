@@ -1,0 +1,302 @@
+//! `log-inspect` — a small CLI for inspecting an OpenData log via [`LogDbReader`].
+//!
+//! The tool opens a read-only view of a log and exposes its segments, keys, and
+//! entries for ad-hoc inspection. It never writes, so it is safe to point at a
+//! log that another process owns.
+//!
+//! # Storage selection
+//!
+//! Point the CLI at storage either with a YAML config file describing a full
+//! [`ReaderConfig`] (`--config`), or with the convenience flags that build a
+//! SlateDB-on-local-filesystem config (`--data-dir`, `--db-path`).
+//!
+//! # Examples
+//!
+//! ```text
+//! log-inspect --data-dir ./.data segments
+//! log-inspect --data-dir ./.data keys
+//! log-inspect --data-dir ./.data count orders
+//! log-inspect --data-dir ./.data scan orders --limit 20
+//! log-inspect --config reader.yaml scan orders --from 100 --to 200 --hex
+//! ```
+
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use clap::{Args, Parser, Subcommand};
+use common::StorageConfig;
+use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
+use log::{LogDbReader, LogRead, ReaderConfig};
+
+/// Inspect an OpenData log through a read-only [`LogDbReader`].
+#[derive(Debug, Parser)]
+#[command(name = "log-inspect", version, about)]
+struct Cli {
+    #[command(flatten)]
+    storage: StorageArgs,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Flags controlling which log the reader opens.
+#[derive(Debug, Args)]
+struct StorageArgs {
+    /// Path to a YAML file describing a full `ReaderConfig`.
+    ///
+    /// When set, takes precedence over the convenience flags below.
+    #[arg(long, value_name = "FILE", global = true)]
+    config: Option<String>,
+
+    /// Local filesystem directory backing the object store.
+    ///
+    /// Used to build a SlateDB-on-local config when `--config` is absent.
+    #[arg(long, value_name = "DIR", default_value = ".data", global = true)]
+    data_dir: String,
+
+    /// Path prefix for the log's data within the object store.
+    #[arg(long, value_name = "PREFIX", default_value = "data", global = true)]
+    db_path: String,
+
+    /// How often (ms) the reader polls storage for newly written data.
+    #[arg(long, value_name = "MS", default_value_t = 1000, global = true)]
+    refresh_interval_ms: u64,
+}
+
+impl StorageArgs {
+    /// Resolves these flags into a [`ReaderConfig`].
+    fn into_reader_config(self) -> Result<ReaderConfig> {
+        if let Some(path) = self.config {
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading config file {path}"))?;
+            let config: ReaderConfig = serde_yaml::from_str(&contents)
+                .with_context(|| format!("parsing config file {path}"))?;
+            return Ok(config);
+        }
+
+        let storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: self.db_path,
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: self.data_dir,
+            }),
+            settings_path: None,
+            block_cache: None,
+        });
+
+        Ok(ReaderConfig {
+            storage,
+            refresh_interval: Duration::from_millis(self.refresh_interval_ms),
+        })
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// List segments overlapping a sequence range (default: all).
+    Segments {
+        /// Lowest sequence number to include.
+        #[arg(long)]
+        from: Option<u64>,
+        /// Exclusive upper bound on sequence number.
+        #[arg(long)]
+        to: Option<u64>,
+    },
+    /// List distinct keys within a segment-id range (default: all).
+    Keys {
+        /// Lowest segment id to include.
+        #[arg(long)]
+        segment_start: Option<u32>,
+        /// Exclusive upper bound on segment id.
+        #[arg(long)]
+        segment_end: Option<u32>,
+    },
+    /// Count entries for a key within a sequence range (default: all).
+    Count {
+        /// The key whose entries to count.
+        key: String,
+        /// Lowest sequence number to include.
+        #[arg(long)]
+        from: Option<u64>,
+        /// Exclusive upper bound on sequence number.
+        #[arg(long)]
+        to: Option<u64>,
+    },
+    /// Scan and print entries for a key within a sequence range.
+    Scan {
+        /// The key whose entries to scan.
+        key: String,
+        /// Lowest sequence number to include.
+        #[arg(long)]
+        from: Option<u64>,
+        /// Exclusive upper bound on sequence number.
+        #[arg(long)]
+        to: Option<u64>,
+        /// Stop after printing this many entries.
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Render values as hex instead of UTF-8 (lossy).
+        #[arg(long)]
+        hex: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = Cli::parse();
+    let config = cli.storage.into_reader_config()?;
+    let reader = LogDbReader::open(config)
+        .await
+        .context("opening LogDbReader")?;
+
+    let result = run(&reader, cli.command).await;
+
+    // Always shut down the background refresh task cleanly, even on error.
+    reader.close().await;
+    result
+}
+
+/// Dispatches a single inspection command against an open reader.
+async fn run(reader: &LogDbReader, command: Command) -> Result<()> {
+    match command {
+        Command::Segments { from, to } => segments(reader, from, to).await,
+        Command::Keys {
+            segment_start,
+            segment_end,
+        } => keys(reader, segment_start, segment_end).await,
+        Command::Count { key, from, to } => count(reader, key, from, to).await,
+        Command::Scan {
+            key,
+            from,
+            to,
+            limit,
+            hex,
+        } => scan(reader, key, from, to, limit, hex).await,
+    }
+}
+
+async fn segments(reader: &LogDbReader, from: Option<u64>, to: Option<u64>) -> Result<()> {
+    let segments = reader
+        .list_segments(seq_range(from, to))
+        .await
+        .context("listing segments")?;
+
+    if segments.is_empty() {
+        println!("(no segments)");
+        return Ok(());
+    }
+
+    println!("{:>8}  {:>16}  {:>24}", "ID", "START_SEQ", "CREATED");
+    for segment in &segments {
+        println!(
+            "{:>8}  {:>16}  {:>24}",
+            segment.id,
+            segment.start_seq,
+            format_time(segment.start_time_ms),
+        );
+    }
+    println!("\n{} segment(s)", segments.len());
+    Ok(())
+}
+
+async fn keys(
+    reader: &LogDbReader,
+    segment_start: Option<u32>,
+    segment_end: Option<u32>,
+) -> Result<()> {
+    let mut iter = reader
+        .list_keys(segment_id_range(segment_start, segment_end))
+        .await
+        .context("listing keys")?;
+
+    let mut count = 0u64;
+    while let Some(key) = iter.next().await.context("reading next key")? {
+        println!("{}", render(&key.key, false));
+        count += 1;
+    }
+
+    if count == 0 {
+        println!("(no keys)");
+    } else {
+        println!("\n{count} key(s)");
+    }
+    Ok(())
+}
+
+async fn count(
+    reader: &LogDbReader,
+    key: String,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Result<()> {
+    let total = reader
+        .count(Bytes::from(key), seq_range(from, to))
+        .await
+        .context("counting entries")?;
+    println!("{total}");
+    Ok(())
+}
+
+async fn scan(
+    reader: &LogDbReader,
+    key: String,
+    from: Option<u64>,
+    to: Option<u64>,
+    limit: Option<u64>,
+    hex: bool,
+) -> Result<()> {
+    let mut iter = reader
+        .scan(Bytes::from(key), seq_range(from, to))
+        .await
+        .context("opening scan")?;
+
+    let mut printed = 0u64;
+    while let Some(entry) = iter.next().await.context("reading next entry")? {
+        if limit.is_some_and(|n| printed >= n) {
+            break;
+        }
+        println!("{:>16}  {}", entry.sequence, render(&entry.value, hex));
+        printed += 1;
+    }
+
+    if printed == 0 {
+        println!("(no entries)");
+    } else {
+        println!("\n{printed} entry/entries");
+    }
+    Ok(())
+}
+
+/// Builds an inclusive-lower, exclusive-upper sequence range from optional bounds.
+fn seq_range(from: Option<u64>, to: Option<u64>) -> std::ops::Range<u64> {
+    from.unwrap_or(0)..to.unwrap_or(u64::MAX)
+}
+
+/// Builds a segment-id range from optional bounds.
+fn segment_id_range(start: Option<u32>, end: Option<u32>) -> std::ops::Range<u32> {
+    start.unwrap_or(0)..end.unwrap_or(u32::MAX)
+}
+
+/// Renders a byte string for display: hex when requested, otherwise UTF-8 lossy.
+fn render(bytes: &[u8], hex: bool) -> String {
+    if hex {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// Formats a millisecond epoch timestamp as a human-readable UTC string.
+fn format_time(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string())
+        .unwrap_or_else(|| format!("{ms} (ms)"))
+}
