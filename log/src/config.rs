@@ -231,6 +231,18 @@ pub struct LogCompactionOptions {
     /// (id 0) is unaffected.
     #[serde(default)]
     pub drain_only: bool,
+
+    /// **Experimental knob.** When set, the compaction scheduler proposes
+    /// only active-segment L0 compactions and orphan drains — the one-shot
+    /// final consolidation that would normally merge a sealed segment's L0
+    /// + SRs into a single SR is suppressed. Sealed segments remain in
+    /// whatever shape they had at seal time. Intended for benchmarks that
+    /// want to isolate the L0-side workload from the (much heavier)
+    /// consolidation rewrites. Has no effect when `drain_only` is also set
+    /// (drain_only is strictly more aggressive). The system segment (id 0)
+    /// is unaffected.
+    #[serde(default)]
+    pub l0_only: bool,
 }
 
 fn default_min_l0_per_compaction() -> usize {
@@ -247,6 +259,7 @@ impl Default for LogCompactionOptions {
             min_l0_per_compaction: default_min_l0_per_compaction(),
             max_l0_per_compaction: default_max_l0_per_compaction(),
             drain_only: false,
+            l0_only: false,
         }
     }
 }

@@ -289,7 +289,11 @@ pub(crate) fn propose_compactions(
                 }
             }
             _ => {
-                if bounds.is_some()
+                // EXPERIMENTAL: l0_only mode suppresses the one-shot final
+                // consolidation that sealed segments would otherwise get.
+                // Active-segment L0 work and orphan drains remain enabled.
+                if !options.l0_only
+                    && bounds.is_some()
                     && !is_single_sr_steady(segment)
                     && let Some(spec) = build_consolidation_spec(segment, &mut next_sr)
                 {
@@ -737,6 +741,68 @@ mod tests {
         // Empty user segment yields no spec.
         assert!(!kinds.iter().any(|(p, _)| p == &prefix_for(4)));
         assert_eq!(kinds.len(), 3);
+    }
+
+    #[test]
+    fn l0_only_skips_sealed_consolidation_but_keeps_everything_else() {
+        // Layout:
+        //   id 0: system, L0=2  → still consolidates (system path unaffected)
+        //   id 1: orphan (outside bounds) → still drained
+        //   id 2: sealed, not steady (1 L0 + 2 SRs) → would normally consolidate; SKIPPED
+        //   id 3: sealed, steady (0 L0 + 1 SR) → no work either way
+        //   id 4: active, L0 at threshold → still L0-compacts
+        let segments = vec![
+            snapshot(0, 2, &[]),
+            snapshot(1, 0, &[7]),
+            snapshot(2, 1, &[8, 9]),
+            snapshot(3, 0, &[5]),
+            snapshot(4, 4, &[]),
+        ];
+        let opts = LogCompactionOptions {
+            l0_only: true,
+            ..default_options()
+        };
+        let specs = propose_compactions(
+            &segments,
+            bounds(2, 4),
+            &ActiveCompactionsView::default(),
+            &opts,
+        );
+
+        let kinds: Vec<_> = specs
+            .iter()
+            .map(|s| (s.segment().clone(), s.is_drain()))
+            .collect();
+        // System consolidates (unaffected by l0_only).
+        assert!(kinds.contains(&(prefix_for(0), false)));
+        // Orphan drained (unaffected by l0_only).
+        assert!(kinds.contains(&(prefix_for(1), true)));
+        // Sealed non-steady id 2 is suppressed — this is the l0_only effect.
+        assert!(!kinds.iter().any(|(p, _)| p == &prefix_for(2)));
+        // Active L0 compaction proceeds.
+        assert!(kinds.contains(&(prefix_for(4), false)));
+        assert_eq!(kinds.len(), 3);
+    }
+
+    #[test]
+    fn drain_only_overrides_l0_only_when_both_set() {
+        // drain_only is strictly more aggressive — if both flags are on,
+        // drain_only wins (the short-circuit before the active/sealed match
+        // already enforces this; this test just locks the behavior in).
+        let segments = vec![snapshot(3, 4, &[])];
+        let opts = LogCompactionOptions {
+            drain_only: true,
+            l0_only: true,
+            ..default_options()
+        };
+        let specs = propose_compactions(
+            &segments,
+            bounds(1, 3),
+            &ActiveCompactionsView::default(),
+            &opts,
+        );
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].is_drain());
     }
 
     #[test]
