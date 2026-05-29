@@ -220,6 +220,17 @@ pub struct LogCompactionOptions {
     /// Defaults to 8.
     #[serde(default = "default_max_l0_per_compaction")]
     pub max_l0_per_compaction: usize,
+
+    /// **Destructive experimental knob.** When set, the compaction scheduler
+    /// emits [`CompactionSpec::DrainSegment`] specs for every user segment
+    /// (id > 0) that has any L0 SSTs or sorted runs, instead of consolidating.
+    /// Drains retire the listed sources without preserving their data — so
+    /// **everything written to user segments is discarded by compaction**.
+    /// Intended only for ingest-rate benchmarks where read-back is not
+    /// measured, to remove the compactor as a bottleneck. The system segment
+    /// (id 0) is unaffected.
+    #[serde(default)]
+    pub drain_only: bool,
 }
 
 fn default_min_l0_per_compaction() -> usize {
@@ -235,6 +246,7 @@ impl Default for LogCompactionOptions {
         Self {
             min_l0_per_compaction: default_min_l0_per_compaction(),
             max_l0_per_compaction: default_max_l0_per_compaction(),
+            drain_only: false,
         }
     }
 }
@@ -386,6 +398,7 @@ mod tests {
             compaction: LogCompactionOptions {
                 min_l0_per_compaction: 10,
                 max_l0_per_compaction: 5,
+                ..LogCompactionOptions::default()
             },
             ..Config::default()
         };
@@ -407,6 +420,7 @@ mod tests {
             compaction: LogCompactionOptions {
                 min_l0_per_compaction: 4,
                 max_l0_per_compaction: 4,
+                ..LogCompactionOptions::default()
             },
             ..Config::default()
         };

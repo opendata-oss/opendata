@@ -254,6 +254,17 @@ pub(crate) fn propose_compactions(
             continue;
         }
 
+        // EXPERIMENTAL: drain-only mode bypasses live-set classification.
+        // Any user segment with sources gets a drain spec. Used for ingest
+        // throughput benchmarks to take the compactor's read+merge+rewrite
+        // work off the critical path.
+        if options.drain_only {
+            if !segment.l0_ids.is_empty() || !segment.sr_ids.is_empty() {
+                out.push(build_drain_spec(segment));
+            }
+            continue;
+        }
+
         if let Some(b) = bounds {
             if id > b.last_id {
                 panic!(
@@ -689,6 +700,57 @@ mod tests {
             &ActiveCompactionsView::default(),
             &default_options(),
         );
+    }
+
+    #[test]
+    fn drain_only_drains_every_user_segment_with_sources() {
+        // drain_only mode: every user segment (id > 0) with L0 or SR gets a
+        // drain spec, regardless of whether it would otherwise be active /
+        // sealed / steady. The system segment (id 0) keeps its normal
+        // behavior (consolidate at L0 threshold).
+        let segments = vec![
+            snapshot(0, 2, &[]),  // system: consolidate (unchanged)
+            snapshot(2, 0, &[5]), // sealed steady-state user: drain anyway
+            snapshot(3, 4, &[]),  // active user with L0: drain
+            snapshot(4, 0, &[]),  // empty user: skip
+        ];
+        let opts = LogCompactionOptions {
+            drain_only: true,
+            ..default_options()
+        };
+        let specs = propose_compactions(
+            &segments,
+            bounds(2, 4),
+            &ActiveCompactionsView::default(),
+            &opts,
+        );
+
+        let kinds: Vec<_> = specs
+            .iter()
+            .map(|s| (s.segment().clone(), s.is_drain()))
+            .collect();
+        // System segment still consolidates (not drained).
+        assert!(kinds.contains(&(prefix_for(0), false)));
+        // Both user segments with sources are drained.
+        assert!(kinds.contains(&(prefix_for(2), true)));
+        assert!(kinds.contains(&(prefix_for(3), true)));
+        // Empty user segment yields no spec.
+        assert!(!kinds.iter().any(|(p, _)| p == &prefix_for(4)));
+        assert_eq!(kinds.len(), 3);
+    }
+
+    #[test]
+    fn drain_only_still_skips_segments_with_active_compactions() {
+        // drain_only doesn't override the active-compaction guard.
+        let segments = vec![snapshot(3, 4, &[])];
+        let mut active = ActiveCompactionsView::default();
+        active.segment_prefixes.insert(prefix_for(3));
+        let opts = LogCompactionOptions {
+            drain_only: true,
+            ..default_options()
+        };
+        let specs = propose_compactions(&segments, bounds(1, 3), &active, &opts);
+        assert!(specs.is_empty());
     }
 
     #[test]
