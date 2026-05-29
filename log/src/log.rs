@@ -5,14 +5,13 @@
 //! ([`try_append`](LogDb::try_append), [`append_timeout`](LogDb::append_timeout))
 //! and read operations ([`scan`], [`count`]) via the [`LogRead`] trait.
 
-use std::collections::VecDeque;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::sync::OnceLock;
 
 use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
@@ -111,7 +110,6 @@ pub struct LogDb {
     epoch_watcher: EpochWatcher,
     durable_sequence_rx: watch::Receiver<Sequence>,
     read_subscriber_task: JoinHandle<()>,
-    compactor_view_task: Option<JoinHandle<()>>,
     read_visibility: ReadVisibility,
 }
 
@@ -342,9 +340,6 @@ impl LogDb {
         drop(self.handle);
         let _ = self.writer_task.await;
         self.read_subscriber_task.abort();
-        if let Some(task) = self.compactor_view_task {
-            task.abort();
-        }
         self.storage
             .close()
             .await
@@ -402,9 +397,10 @@ impl LogDb {
     }
 
     /// Shared construction logic used by `LogDb::new` and `LogDbBuilder::build`.
-    /// When `compactor_view_cell` is `Some`, a durable-gated compactor view
-    /// receiver is installed there so the embedded compaction scheduler can
-    /// track the live set.
+    /// When `compactor_view_cell` is `Some`, it is seeded with the recovered
+    /// live set here and handed to the writer, which publishes later updates
+    /// (segment creates at written latency, deletes once durable). The embedded
+    /// compaction scheduler reads the cell.
     async fn from_storage(
         storage: Arc<dyn common::Storage>,
         direct: Option<Arc<crate::direct::LogDirect>>,
@@ -425,11 +421,23 @@ impl LogDb {
         let segment_cache = SegmentCache::open(snapshot.as_ref(), segment_config).await?;
         let listing_cache = ListingCache::new();
 
+        let initial_segment_id = segment_cache.latest().map(|s| s.id());
+        let initial_deleted_segment_id = segment_cache.initial_deleted_segment_id();
+        // Seed the compactor view with recovered state so the scheduler sees
+        // the live set immediately; the writer owns all further updates.
+        if let Some(cell) = compactor_view_cell.as_ref() {
+            cell.store(Arc::new(CompactorView {
+                last_segment_id: initial_segment_id,
+                last_deleted_segment_id: initial_deleted_segment_id,
+            }));
+        }
+
         let writer_config = LogWriterConfig {
             retention: retention_config.retention.map(|retention| RetentionPolicy {
                 retention,
                 check_interval: retention_config.check_interval,
             }),
+            compactor_view: compactor_view_cell,
             ..LogWriterConfig::default()
         };
         let (writer, mut handle) = LogWriter::new(
@@ -444,25 +452,7 @@ impl LogDb {
         .map_err(Error::Storage)?;
 
         let written_rx = handle.written_rx();
-        let initial_segment_id = segment_cache.latest().map(|s| s.id());
-        let initial_deleted_segment_id = segment_cache.initial_deleted_segment_id();
         let initial_next_sequence = written_rx.borrow().next_sequence;
-        let compactor_view_task = if let Some(cell) = compactor_view_cell.as_ref() {
-            let (compactor_rx, task) = spawn_compactor_view_publisher(
-                written_rx.clone(),
-                &storage,
-                initial_segment_id,
-                initial_deleted_segment_id,
-            );
-            // Err from `set` would mean the cell was already initialised — that
-            // never happens on our paths, so log it loudly rather than swallow.
-            if cell.set(compactor_rx).is_err() {
-                tracing::warn!("compactor view cell was already initialised");
-            }
-            Some(task)
-        } else {
-            None
-        };
         let writer_task = handle.spawn(writer);
 
         let read_view = Arc::new(RwLock::new(LogReadView::new(
@@ -490,7 +480,6 @@ impl LogDb {
             epoch_watcher,
             durable_sequence_rx,
             read_subscriber_task,
-            compactor_view_task,
             read_visibility,
         })
     }
@@ -582,7 +571,11 @@ impl LogDbBuilder {
             db.with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
         });
         // Install the LogDb compaction scheduler for every SlateDB-backed log.
-        let compactor_view_cell: CompactorViewCell = Arc::new(OnceLock::new());
+        let compactor_view_cell: CompactorViewCell =
+            Arc::new(ArcSwap::from_pointee(CompactorView {
+                last_segment_id: None,
+                last_deleted_segment_id: None,
+            }));
         let sb = if let StorageConfig::SlateDb(ref slate_config) = self.config.storage {
             let path = slate_config.path.clone();
             let object_store = create_object_store(&slate_config.object_store)
@@ -626,79 +619,6 @@ impl LogDbBuilder {
             cell_for_writer,
         )
         .await
-    }
-}
-
-fn spawn_compactor_view_publisher(
-    mut written_rx: watch::Receiver<WrittenView>,
-    storage: &Arc<dyn common::Storage>,
-    initial_segment_id: Option<SegmentId>,
-    initial_deleted_segment_id: Option<SegmentId>,
-) -> (watch::Receiver<CompactorView>, JoinHandle<()>) {
-    let (compactor_tx, compactor_rx) = watch::channel(CompactorView {
-        last_segment_id: initial_segment_id,
-        last_deleted_segment_id: initial_deleted_segment_id,
-    });
-    let mut durable_rx = storage.subscribe_durable();
-
-    let task = tokio::spawn(async move {
-        let mut pending_deletes: VecDeque<(u64, Option<SegmentId>)> = VecDeque::new();
-        let mut last_durable_seq = *durable_rx.borrow();
-
-        loop {
-            tokio::select! {
-                result = written_rx.changed() => {
-                    if result.is_err() {
-                        break;
-                    }
-                    let view = written_rx.borrow_and_update().clone();
-                    pending_deletes.push_back((view.seqnum, view.last_deleted_segment_id));
-                    compactor_tx.send_modify(|state| {
-                        state.last_segment_id = view.last_segment_id;
-                    });
-                    drain_compactor_deletes(
-                        &mut pending_deletes,
-                        last_durable_seq,
-                        &compactor_tx,
-                    );
-                }
-                result = durable_rx.changed() => {
-                    if result.is_err() {
-                        break;
-                    }
-                    last_durable_seq = *durable_rx.borrow_and_update();
-                    drain_compactor_deletes(
-                        &mut pending_deletes,
-                        last_durable_seq,
-                        &compactor_tx,
-                    );
-                }
-            }
-        }
-    });
-
-    (compactor_rx, task)
-}
-
-fn drain_compactor_deletes(
-    pending_deletes: &mut VecDeque<(u64, Option<SegmentId>)>,
-    durable_seq: u64,
-    compactor_tx: &watch::Sender<CompactorView>,
-) {
-    let mut latest_durable_delete = None;
-    while pending_deletes
-        .front()
-        .is_some_and(|(seqnum, _)| *seqnum <= durable_seq)
-    {
-        latest_durable_delete = pending_deletes
-            .pop_front()
-            .map(|(_, deleted_id)| deleted_id);
-    }
-
-    if let Some(last_deleted_segment_id) = latest_durable_delete {
-        compactor_tx.send_modify(|state| {
-            state.last_deleted_segment_id = last_deleted_segment_id;
-        });
     }
 }
 
@@ -885,10 +805,8 @@ fn spawn_subscriber(
 
 #[cfg(test)]
 mod tests {
-    use common::Storage;
     use common::StorageBuilder;
     use common::StorageConfig;
-    use common::storage::in_memory::InMemoryStorage;
 
     use super::*;
     use crate::config::Config;
@@ -899,94 +817,6 @@ mod tests {
             storage: StorageConfig::InMemory,
             ..Default::default()
         }
-    }
-
-    async fn make_written_view(
-        storage: &Arc<dyn common::Storage>,
-        seqnum: u64,
-        last_segment_id: Option<SegmentId>,
-        last_deleted_segment_id: Option<SegmentId>,
-    ) -> WrittenView {
-        WrittenView {
-            epoch: seqnum,
-            snapshot: storage.snapshot().await.unwrap(),
-            seqnum,
-            next_sequence: 0,
-            last_segment_id,
-            last_deleted_segment_id,
-        }
-    }
-
-    #[tokio::test]
-    async fn compactor_view_should_publish_new_segments_at_written_latency() {
-        let storage = Arc::new(InMemoryStorage::new().with_deferred_durability());
-        let storage_dyn = storage.clone() as Arc<dyn common::Storage>;
-        let initial_view = make_written_view(&storage_dyn, 0, None, None).await;
-        let (written_tx, written_rx) = watch::channel(initial_view);
-        let (mut compactor_rx, task) =
-            spawn_compactor_view_publisher(written_rx, &storage_dyn, None, None);
-
-        let write_result = storage
-            .apply(vec![common::storage::RecordOp::Delete(Bytes::from_static(
-                b"segment-meta-1",
-            ))])
-            .await
-            .unwrap();
-        written_tx.send_replace(
-            make_written_view(&storage_dyn, write_result.seqnum, Some(3), None).await,
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), compactor_rx.changed())
-            .await
-            .expect("timed out waiting for compactor view")
-            .expect("compactor view channel closed");
-        let view = *compactor_rx.borrow_and_update();
-        assert_eq!(view.last_segment_id, Some(3));
-        assert_eq!(view.last_deleted_segment_id, None);
-
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn compactor_view_should_delay_deleted_segments_until_durable() {
-        let storage = Arc::new(InMemoryStorage::new().with_deferred_durability());
-        let storage_dyn = storage.clone() as Arc<dyn common::Storage>;
-        let initial_view = make_written_view(&storage_dyn, 0, Some(2), None).await;
-        let (written_tx, written_rx) = watch::channel(initial_view);
-        let (mut compactor_rx, task) =
-            spawn_compactor_view_publisher(written_rx, &storage_dyn, Some(2), None);
-
-        let write_result = storage
-            .apply(vec![common::storage::RecordOp::Delete(Bytes::from_static(
-                b"segment-meta-1",
-            ))])
-            .await
-            .unwrap();
-        written_tx.send_replace(
-            make_written_view(&storage_dyn, write_result.seqnum, Some(2), Some(1)).await,
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), compactor_rx.changed())
-            .await
-            .expect("timed out waiting for written compactor update")
-            .expect("compactor view channel closed");
-        let view = *compactor_rx.borrow_and_update();
-        assert_eq!(view.last_segment_id, Some(2));
-        assert_eq!(
-            view.last_deleted_segment_id, None,
-            "delete should remain hidden until durable",
-        );
-
-        storage.flush_to(write_result.seqnum);
-
-        tokio::time::timeout(Duration::from_secs(1), compactor_rx.changed())
-            .await
-            .expect("timed out waiting for durable compactor update")
-            .expect("compactor view channel closed");
-        let view = *compactor_rx.borrow_and_update();
-        assert_eq!(view.last_deleted_segment_id, Some(1));
-
-        task.abort();
     }
 
     #[tokio::test]
