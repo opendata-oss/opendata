@@ -1,10 +1,10 @@
 //! Recall benchmark for the vector database.
 //!
-//! Splits work into three phases — [`Phase::Ingest`], [`Phase::Cold`], and
-//! [`Phase::Warm`]. The phases to run are configured per-dataset via the
-//! [`Dataset::phases`] field and can be overridden through the bencher
-//! config's `[params.recall]` section. Each phase opens its own fresh
-//! `VectorDb` or `VectorDbReader` and closes it before the next phase starts.
+//! Splits work into three phases — `INGEST`, `COLD`, and `WARM`. The phases
+//! to run are configured per-dataset via the dataset's `phases` field and
+//! can be overridden through the bencher config's `[params.recall]`
+//! section. Each phase opens its own fresh `VectorDb` or `VectorDbReader`
+//! and closes it before the next phase starts.
 
 mod cold;
 mod filter;
