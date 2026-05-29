@@ -232,16 +232,35 @@ pub struct LogCompactionOptions {
     #[serde(default)]
     pub drain_only: bool,
 
-    /// **Experimental knob.** When set, the compaction scheduler emits only
-    /// L0-relief specs (merging up to `max_l0_per_compaction` L0 SSTs into a
-    /// fresh SR) for every segment — active or sealed — that has ≥
-    /// `min_l0_per_compaction` L0s. The one-shot whole-segment consolidation
-    /// (merging L0 + every SR into a single SR) that sealed segments would
-    /// otherwise get is suppressed. Sealed segments keep multiple SRs
-    /// forever, growing read amplification, so this is appropriate only for
-    /// benchmarks that don't measure read-back. Has no effect when
-    /// `drain_only` is also set (drain_only is strictly more aggressive).
-    /// The system segment (id 0) is unaffected.
+    /// Compaction strategy that bounds write amplification at the cost of
+    /// higher steady-state read amplification.
+    ///
+    /// When unset (default), each segment goes through two compaction
+    /// phases over its lifetime:
+    /// 1. **L0 relief** (repeating) — every `min_l0_per_compaction` L0s
+    ///    merge into a fresh SR. Each record is rewritten once here.
+    /// 2. **Final consolidation** (one-shot, at seal) — every L0 + every
+    ///    SR are merged into a single SR. Each record is rewritten *again*.
+    ///
+    /// Total per-record write amplification: **2 rewrites** (L0-flush
+    /// itself + relief + consolidation = 3 writes per byte).
+    ///
+    /// When `l0_only` is set, phase 2 is skipped entirely. Sealed segments
+    /// keep whatever SRs they accumulated during phase 1, and read
+    /// amplification grows with the number of relief cycles. Total
+    /// per-record write amplification drops to **1 rewrite** (L0-flush +
+    /// relief = 2 writes per byte).
+    ///
+    /// Use this when:
+    /// - Workload is write-heavy and read amplification is acceptable.
+    /// - The S3 PUT bandwidth saved by the consolidation rewrite is more
+    ///   valuable than the read-side tail latency it would have prevented.
+    ///
+    /// L0 relief continues to run on both active and sealed segments
+    /// whenever any segment accumulates ≥ `min_l0_per_compaction` L0s, so
+    /// L0 counts stay bounded under either setting. The system segment
+    /// (id 0) and orphan-segment drains are unaffected. `drain_only`
+    /// supersedes this setting when both are configured.
     #[serde(default)]
     pub l0_only: bool,
 }

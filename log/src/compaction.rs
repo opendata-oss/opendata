@@ -345,13 +345,20 @@ pub(crate) fn propose_compactions(
                 }
             }
             _ => {
-                // EXPERIMENTAL: l0_only mode suppresses the one-shot
-                // *consolidation* (merge L0+SRs into a single SR) that sealed
-                // segments would otherwise get, but still relieves L0
-                // pressure on sealed segments — otherwise sealed L0s remain
-                // pinned at `l0_max_ssts`, and any memtable that touches the
-                // sealed segment (e.g. batches crossing a seal boundary)
-                // permanently fails the L0 commit gate.
+                // Sealed-segment policy. With `l0_only` set we still relieve
+                // L0 pressure (merge L0s into a fresh SR) but never run the
+                // final whole-segment consolidation — caller has accepted
+                // multi-SR sealed segments in exchange for lower write
+                // amplification. Without `l0_only` we do the one-shot
+                // consolidation that merges L0+SRs into a single SR.
+                //
+                // Note: L0 relief MUST run on sealed segments even in
+                // l0_only mode. If a segment is sealed while its L0 count
+                // is at `l0_max_ssts`, any memtable that touches it (e.g. a
+                // batch crossing a seal boundary) is permanently rejected
+                // by the L0 commit gate until something drops the sealed
+                // segment's L0 count — and the active-segment branch can't
+                // help with that.
                 if options.l0_only {
                     if segment.l0_ids.len() >= options.min_l0_per_compaction
                         && let Some(spec) = build_active_l0_spec(
