@@ -224,6 +224,11 @@ struct LogCompactionOptions {
     /// Maximum number of L0 SSTs to roll into one fresh SR per
     /// active-segment compaction.
     pub max_l0_per_compaction: usize,
+
+    /// When set, skip the sealed-segment final consolidation and keep
+    /// only L0 relief (see [Sealed segment](#sealed-segment)). Trades higher read
+    /// amplification for lower write amplification. Default: `false`.
+    pub l0_only: bool,
 }
 ```
 
@@ -367,6 +372,13 @@ for (prefix, tree) in sealed_trees(manifest) {
 
 Because no new writes land in a sealed segment, this runs once in the
 success case; if it fails or is preempted, the scheduler re-proposes it.
+
+With `l0_only` set, this final consolidation is suppressed: sealed
+segments keep whatever SRs they accumulated and are scanned as multiple
+SRs, trading higher read amplification for one fewer rewrite per record.
+L0 relief still runs on sealed segments (an L0 count pinned at
+`l0_max_ssts` would otherwise permanently fail the commit gate for any
+memtable touching the segment), so L0 stays bounded under either setting.
 
 #### Orphaned (expired) segment
 
@@ -589,3 +601,4 @@ compactor rather than keeping them with the writer.
 |------------|-------------|
 | 2026-05-20 | Initial draft. SegmentMeta-as-source-of-truth protocol: writer deletes SegmentMeta on expiry, compactor garbage-collects orphaned SlateDB segments. |
 | 2026-05-22 | Implementation: rename `l0_high_water` → `min_l0_per_compaction`; drop `live_set_refresh_interval` (deferred to standalone-compactor RFC); restate live-set propagation as a shape-dependent concern (in-process notification for embedded, storage polling for future standalone). |
+| 2026-05-29 | Add `l0_only` option: suppress sealed-segment final consolidation, keeping only L0 relief, to trade read amplification for lower write amplification. |

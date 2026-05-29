@@ -247,6 +247,21 @@ pub struct LogCompactionOptions {
     /// Defaults to 8.
     #[serde(default = "default_max_l0_per_compaction")]
     pub max_l0_per_compaction: usize,
+
+    /// When set, skip the one-shot final consolidation that merges a sealed
+    /// segment's L0s and sorted runs into a single SR, saving one rewrite per
+    /// record at the cost of leaving sealed segments as multiple SRs. L0
+    /// relief still runs, so L0 counts stay bounded; the system segment
+    /// (id 0) and orphan drains are unaffected.
+    ///
+    /// The log is append-only, so unlike general SlateDB use there are no
+    /// updates or deletes to reconcile across L0s and SRs — the merge buys no
+    /// correctness, only read-side key locality within each SST. When writes
+    /// target a small subset of logs (low key cardinality), a single relief
+    /// pass already yields good per-SST locality, so consolidation adds
+    /// little and `l0_only` is a clear win.
+    #[serde(default)]
+    pub l0_only: bool,
 }
 
 fn default_min_l0_per_compaction() -> usize {
@@ -262,6 +277,7 @@ impl Default for LogCompactionOptions {
         Self {
             min_l0_per_compaction: default_min_l0_per_compaction(),
             max_l0_per_compaction: default_max_l0_per_compaction(),
+            l0_only: false,
         }
     }
 }
@@ -459,6 +475,7 @@ mod tests {
             compaction: LogCompactionOptions {
                 min_l0_per_compaction: 10,
                 max_l0_per_compaction: 5,
+                ..LogCompactionOptions::default()
             },
             ..Config::default()
         };
@@ -480,6 +497,7 @@ mod tests {
             compaction: LogCompactionOptions {
                 min_l0_per_compaction: 4,
                 max_l0_per_compaction: 4,
+                ..LogCompactionOptions::default()
             },
             ..Config::default()
         };

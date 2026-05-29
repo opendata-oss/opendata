@@ -278,7 +278,26 @@ pub(crate) fn propose_compactions(
                 }
             }
             _ => {
-                if bounds.is_some()
+                // Sealed-segment policy. With `l0_only` we skip the one-shot
+                // consolidation (L0+SRs → single SR) and only relieve L0
+                // pressure; otherwise we consolidate.
+                //
+                // L0 relief MUST run on sealed segments even under l0_only: a
+                // segment sealed with its L0 count at `l0_max_ssts` would
+                // permanently fail the L0 commit gate for any memtable that
+                // touches it (e.g. a batch crossing the seal boundary), and
+                // the active-segment branch can't drain it.
+                if options.l0_only {
+                    if segment.l0_ids.len() >= options.min_l0_per_compaction
+                        && let Some(spec) = build_active_l0_spec(
+                            segment,
+                            &mut next_sr,
+                            options.max_l0_per_compaction,
+                        )
+                    {
+                        out.push(spec);
+                    }
+                } else if bounds.is_some()
                     && !is_single_sr_steady(segment)
                     && let Some(spec) = build_consolidation_spec(segment, &mut next_sr)
                 {
@@ -720,5 +739,46 @@ mod tests {
         // Sealed id 3 was steady — must not be in the output.
         assert!(!kinds.iter().any(|(p, _)| p == &prefix_for(3)));
         assert_eq!(kinds.len(), 4);
+    }
+
+    #[test]
+    fn l0_only_skips_sealed_consolidation_but_keeps_everything_else() {
+        // Layout:
+        //   id 0: system, L0=2  → still consolidates (system path unaffected)
+        //   id 1: orphan (outside bounds) → still drained
+        //   id 2: sealed, not steady (1 L0 + 2 SRs) → would normally consolidate; SKIPPED
+        //   id 3: sealed, steady (0 L0 + 1 SR) → no work either way
+        //   id 4: active, L0 at threshold → still L0-compacts
+        let segments = vec![
+            snapshot(0, 2, &[]),
+            snapshot(1, 0, &[7]),
+            snapshot(2, 1, &[8, 9]),
+            snapshot(3, 0, &[5]),
+            snapshot(4, 4, &[]),
+        ];
+        let opts = LogCompactionOptions {
+            l0_only: true,
+            ..default_options()
+        };
+        let specs = propose_compactions(
+            &segments,
+            bounds(2, 4),
+            &ActiveCompactionsView::default(),
+            &opts,
+        );
+
+        let kinds: Vec<_> = specs
+            .iter()
+            .map(|s| (s.segment().clone(), s.is_drain()))
+            .collect();
+        // System consolidates (unaffected by l0_only).
+        assert!(kinds.contains(&(prefix_for(0), false)));
+        // Orphan drained (unaffected by l0_only).
+        assert!(kinds.contains(&(prefix_for(1), true)));
+        // Sealed non-steady id 2 is suppressed — this is the l0_only effect.
+        assert!(!kinds.iter().any(|(p, _)| p == &prefix_for(2)));
+        // Active L0 compaction proceeds.
+        assert!(kinds.contains(&(prefix_for(4), false)));
+        assert_eq!(kinds.len(), 3);
     }
 }

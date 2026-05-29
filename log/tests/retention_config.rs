@@ -70,6 +70,7 @@ async fn open_rejects_min_l0_above_max_l0() {
         compaction: LogCompactionOptions {
             min_l0_per_compaction: 10,
             max_l0_per_compaction: 5,
+            ..LogCompactionOptions::default()
         },
         ..Config::default()
     };
