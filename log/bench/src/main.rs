@@ -19,7 +19,9 @@ async fn main() -> anyhow::Result<()> {
     // Honor RUST_LOG (e.g. `RUST_LOG=slatedb=info,log=debug`). Falls back to
     // `warn` if unset, so we don't dump anything noisy by default.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
         .init();
 
     // Install before any LogDb opens so SlateDB metric registrations land in

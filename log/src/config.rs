@@ -232,6 +232,21 @@ pub struct LogCompactionOptions {
     #[serde(default)]
     pub drain_only: bool,
 
+    /// **Diagnostic knob.** When set, the compaction scheduler always
+    /// proposes no compactions — L0 SSTs accumulate indefinitely in object
+    /// storage, sorted runs are never created, and no drains are emitted.
+    /// Pair with a very large `l0_max_ssts`/`l0_max_ssts_per_key` on the
+    /// SlateDB side to bypass the L0 commit gate entirely, isolating the
+    /// flush pipeline as the subject of measurement.
+    ///
+    /// Data is **not lost** (unlike `drain_only`), but object storage will
+    /// grow without bound for the lifetime of the run. Only appropriate
+    /// for short-duration benchmarks. The system segment (id 0) and orphan
+    /// drains are also suppressed. Supersedes `drain_only` and `l0_only`
+    /// when set.
+    #[serde(default)]
+    pub disabled: bool,
+
     /// Compaction strategy that bounds write amplification at the cost of
     /// higher steady-state read amplification.
     ///
@@ -280,6 +295,7 @@ impl Default for LogCompactionOptions {
             max_l0_per_compaction: default_max_l0_per_compaction(),
             drain_only: false,
             l0_only: false,
+            disabled: false,
         }
     }
 }

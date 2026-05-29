@@ -274,6 +274,13 @@ pub(crate) fn propose_compactions(
     active: &ActiveCompactionsView,
     options: &LogCompactionOptions,
 ) -> Vec<CompactionSpec> {
+    // Diagnostic short-circuit: a fully disabled scheduler. Callers using
+    // this must also raise SlateDB's `l0_max_ssts` / `l0_max_ssts_per_key`
+    // ceilings so the L0 commit gate doesn't trip without compactions ever
+    // running.
+    if options.disabled {
+        return Vec::new();
+    }
     let mut next_sr = next_fresh_sr_id(segments, active.max_destination);
     let mut out = Vec::new();
 
@@ -845,10 +852,8 @@ mod tests {
             &opts,
         );
 
-        let by_segment: std::collections::HashMap<_, _> = specs
-            .iter()
-            .map(|s| (s.segment().clone(), s))
-            .collect();
+        let by_segment: std::collections::HashMap<_, _> =
+            specs.iter().map(|s| (s.segment().clone(), s)).collect();
 
         // System consolidates as usual.
         let sys = by_segment.get(&prefix_for(0)).expect("system spec");
@@ -870,6 +875,49 @@ mod tests {
         assert_eq!(active.sources().len(), 4);
 
         assert_eq!(specs.len(), 4);
+    }
+
+    #[test]
+    fn disabled_short_circuits_with_empty_output_even_when_work_pending() {
+        // System needs consolidation, active needs L0 compaction, orphan
+        // needs draining, sealed segment needs L0 relief — everything that
+        // would normally generate specs. `disabled` skips all of it.
+        let segments = vec![
+            snapshot(0, 5, &[]),
+            snapshot(1, 0, &[7]),
+            snapshot(2, 4, &[8, 9]),
+            snapshot(3, 4, &[]),
+        ];
+        let opts = LogCompactionOptions {
+            disabled: true,
+            ..default_options()
+        };
+        let specs = propose_compactions(
+            &segments,
+            bounds(2, 3),
+            &ActiveCompactionsView::default(),
+            &opts,
+        );
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn disabled_supersedes_drain_only_and_l0_only() {
+        // disabled wins over both other strategy flags.
+        let segments = vec![snapshot(3, 4, &[])];
+        let opts = LogCompactionOptions {
+            disabled: true,
+            drain_only: true,
+            l0_only: true,
+            ..default_options()
+        };
+        let specs = propose_compactions(
+            &segments,
+            bounds(1, 3),
+            &ActiveCompactionsView::default(),
+            &opts,
+        );
+        assert!(specs.is_empty());
     }
 
     #[test]
