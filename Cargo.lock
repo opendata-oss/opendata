@@ -1753,7 +1753,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -4020,7 +4020,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.13.0"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=l0-flush-gate-counter#f8d16eab6afe72b49db1e7e877509595b401378f"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=l0-flush-gate-counter#f2cd1ef0441063144f80863e1528d8b31d7db2a8"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -4066,7 +4066,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.13.0"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=l0-flush-gate-counter#f8d16eab6afe72b49db1e7e877509595b401378f"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=l0-flush-gate-counter#f2cd1ef0441063144f80863e1528d8b31d7db2a8"
 dependencies = [
  "chrono",
  "log",
@@ -4077,7 +4077,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.13.0"
-source = "git+https://github.com/hachikuji/slatedb.git?branch=l0-flush-gate-counter#f8d16eab6afe72b49db1e7e877509595b401378f"
+source = "git+https://github.com/hachikuji/slatedb.git?branch=l0-flush-gate-counter#f2cd1ef0441063144f80863e1528d8b31d7db2a8"
 dependencies = [
  "async-trait",
  "bytes",
