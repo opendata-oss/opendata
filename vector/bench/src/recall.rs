@@ -13,8 +13,25 @@ mod ingest;
 mod parquet;
 mod warm;
 
-use parquet::{BaseRow, ParquetVectorBatchReader, VectorBatchReader};
-use vector::Filter;
+use parquet::ParquetVectorBatchReader;
+use vector::{Attribute, Filter};
+
+/// A base-vector row: the embedding plus any metadata attributes read from
+/// the configured `metadata_columns`. For fvecs/bvecs `attributes` is empty.
+pub(crate) struct BaseRow {
+    pub embedding: Vec<f32>,
+    pub attributes: Vec<Attribute>,
+}
+
+/// A reader that yields batches of base rows (embedding + metadata
+/// attributes). Implemented by both the fvecs/bvecs byte reader and the
+/// Parquet reader so the ingest stream is format-agnostic.
+pub(crate) trait VectorBatchReader: Send {
+    /// Returns the next batch of rows, or `None` when exhausted. The
+    /// `max_rows` hint is honoured by the fvecs/bvecs reader; the Parquet
+    /// reader yields whole arrow batches and treats it as advisory.
+    fn read_batch(&mut self, max_rows: usize) -> anyhow::Result<Option<Vec<BaseRow>>>;
+}
 
 /// Generate ground-truth files for every `[[params.recall]]` dataset in the
 /// given bench config (or the default dataset list when none is configured).
@@ -206,10 +223,7 @@ impl VectorFileBatchReader {
         })
     }
 
-    fn read_vector_batch(
-        &mut self,
-        max_rows: usize,
-    ) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
+    fn read_vector_batch(&mut self, max_rows: usize) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
         if self.remaining == Some(0) {
             return Ok(None);
         }
@@ -516,10 +530,7 @@ impl Dataset {
 
     /// Open a [`VectorBatchReader`] for the base vectors, dispatching on the
     /// dataset's format.
-    fn open_base_reader(
-        &self,
-        data_dir: &Path,
-    ) -> anyhow::Result<Box<dyn VectorBatchReader>> {
+    fn open_base_reader(&self, data_dir: &Path) -> anyhow::Result<Box<dyn VectorBatchReader>> {
         let path = self.base_path(data_dir);
         let dimensions = self.dimensions as usize;
         match self.format {
@@ -564,7 +575,8 @@ impl Dataset {
             anyhow::bail!("metadata_columns is only supported for parquet datasets");
         }
         let index_all = self.indexed_columns.is_empty();
-        let field_types = parquet::read_field_types(&self.base_path(data_dir), &self.metadata_columns)?;
+        let field_types =
+            parquet::read_field_types(&self.base_path(data_dir), &self.metadata_columns)?;
         Ok(field_types
             .into_iter()
             .map(|(name, field_type)| {
@@ -622,9 +634,10 @@ impl Dataset {
                      (should be validated at parse time)",
                 );
                 let id_map = match &self.id_column {
-                    Some(id_column) => {
-                        Some(parquet::read_id_index_map(&self.base_path(data_dir), id_column)?)
-                    }
+                    Some(id_column) => Some(parquet::read_id_index_map(
+                        &self.base_path(data_dir),
+                        id_column,
+                    )?),
                     None => None,
                 };
                 parquet::read_ground_truth(&path, column, id_map.as_ref())
@@ -701,8 +714,7 @@ impl Dataset {
         let query_path = self.query_path(data_dir);
         // Per-query values for each referenced column, aligned with embeddings
         // by row order (both read the query file from row 0).
-        let columns =
-            parquet::read_attribute_columns(&query_path, &referenced, embeddings.len())?;
+        let columns = parquet::read_attribute_columns(&query_path, &referenced, embeddings.len())?;
 
         let mut out = Vec::with_capacity(embeddings.len());
         for (i, embedding) in embeddings.into_iter().enumerate() {
@@ -885,11 +897,19 @@ impl From<Params> for Dataset {
         let metadata_columns = p
             .get("metadata_columns")
             .map(param_to_string_list)
-            .unwrap_or_else(|| default.map(|d| d.metadata_columns.clone()).unwrap_or_default());
+            .unwrap_or_else(|| {
+                default
+                    .map(|d| d.metadata_columns.clone())
+                    .unwrap_or_default()
+            });
         let indexed_columns = p
             .get("indexed_columns")
             .map(param_to_string_list)
-            .unwrap_or_else(|| default.map(|d| d.indexed_columns.clone()).unwrap_or_default());
+            .unwrap_or_else(|| {
+                default
+                    .map(|d| d.indexed_columns.clone())
+                    .unwrap_or_default()
+            });
         let filter_spec = p
             .get("filter_spec")
             .map(|s| s.to_string())
@@ -980,7 +1000,11 @@ impl From<Params> for Dataset {
         let block_cache_disk_bytes = p
             .get_parse::<i64>("block_cache_disk_bytes")
             .ok()
-            .or_else(|| default.and_then(|d| d.block_cache_disk_bytes).map(|v| v as i64))
+            .or_else(|| {
+                default
+                    .and_then(|d| d.block_cache_disk_bytes)
+                    .map(|v| v as i64)
+            })
             .filter(|b| *b > 0)
             .map(|b| b as u64);
         let block_cache_disk_path: &'static str = match p.get("block_cache_disk_path") {

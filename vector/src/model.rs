@@ -526,9 +526,7 @@ impl Filter {
         match self {
             Filter::Eq(field, value) => attributes.get(field) == Some(value),
             Filter::Neq(field, value) => attributes.get(field) != Some(value),
-            Filter::In(field, values) => attributes
-                .get(field)
-                .is_some_and(|v| values.contains(v)),
+            Filter::In(field, values) => attributes.get(field).is_some_and(|v| values.contains(v)),
             Filter::And(filters) => filters.iter().all(|f| f.matches(attributes)),
             Filter::Or(filters) => filters.iter().any(|f| f.matches(attributes)),
         }

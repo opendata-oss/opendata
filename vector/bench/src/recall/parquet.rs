@@ -22,25 +22,17 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeStringArray, ListArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
-};
 use arrow::array::cast::AsArray;
+use arrow::array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, ListArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use vector::{Attribute, AttributeValue, FieldType};
 
-use crate::recall::normalize_vec;
-
-/// A base-vector row: the embedding plus any metadata attributes read from
-/// the configured `metadata_columns`. For fvecs/bvecs `attributes` is empty.
-pub(crate) struct BaseRow {
-    pub embedding: Vec<f32>,
-    pub attributes: Vec<Attribute>,
-}
+use crate::recall::{BaseRow, VectorBatchReader, normalize_vec};
 
 /// Number of rows the underlying Parquet reader yields per arrow batch.
 /// Each call to [`ParquetVectorBatchReader::read_batch`] returns one such
@@ -88,17 +80,6 @@ impl ParquetVectorBatchReader {
             normalize,
         })
     }
-}
-
-/// A reader that yields batches of base rows (embedding + metadata
-/// attributes). Implemented by both the fvecs/bvecs byte reader and the
-/// Parquet reader so the ingest stream is format-agnostic.
-pub(crate) trait VectorBatchReader: Send {
-    /// Returns the next batch of rows, or `None` when exhausted. The
-    /// `max_rows` hint is honoured by the fvecs/bvecs reader; the Parquet
-    /// reader yields whole arrow batches (sized by [`PARQUET_BATCH_ROWS`])
-    /// and treats it as advisory.
-    fn read_batch(&mut self, max_rows: usize) -> anyhow::Result<Option<Vec<BaseRow>>>;
 }
 
 impl VectorBatchReader for ParquetVectorBatchReader {
@@ -218,7 +199,9 @@ pub(crate) fn read_attribute_columns(
             if values.len() > remaining {
                 values.truncate(remaining);
             }
-            out.get_mut(name).expect("column key present").extend(values);
+            out.get_mut(name)
+                .expect("column key present")
+                .extend(values);
         }
         rows_read += batch.num_rows().min(limit - rows_read);
     }
@@ -238,9 +221,9 @@ pub(crate) fn read_field_types(
     let schema = builder.schema();
     let mut out = Vec::with_capacity(columns.len());
     for name in columns {
-        let field = schema
-            .field_with_name(name)
-            .with_context(|| format!("metadata column '{}' not found in {}", name, path.display()))?;
+        let field = schema.field_with_name(name).with_context(|| {
+            format!("metadata column '{}' not found in {}", name, path.display())
+        })?;
         let field_type = match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 => FieldType::String,
             DataType::Int8
@@ -280,7 +263,11 @@ fn extract_attribute_column(
         ($arr:expr, $map:expr) => {{
             let a = $arr;
             for i in 0..n {
-                out.push(if a.is_null(i) { None } else { Some($map(a.value(i))) });
+                out.push(if a.is_null(i) {
+                    None
+                } else {
+                    Some($map(a.value(i)))
+                });
             }
         }};
     }
@@ -394,7 +381,10 @@ pub(crate) fn read_id_index_map(
         .with_context(|| format!("failed to open parquet file {}", base_path.display()))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| {
-            format!("failed to read parquet metadata for {}", base_path.display())
+            format!(
+                "failed to read parquet metadata for {}",
+                base_path.display()
+            )
         })?
         .with_batch_size(PARQUET_BATCH_ROWS)
         .build()

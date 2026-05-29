@@ -39,10 +39,10 @@ fn parse_config_path() -> anyhow::Result<PathBuf> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => {
-                config = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?,
-                ));
+                config =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--config requires a path")
+                    })?));
             }
             "--help" | "-h" => {
                 eprintln!(

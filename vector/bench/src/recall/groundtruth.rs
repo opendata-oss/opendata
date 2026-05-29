@@ -31,10 +31,7 @@ const GROUNDTRUTH_DEPTH: usize = 10;
 const CHUNK_VECTORS: usize = 16_384;
 
 /// Generate and write the ground-truth file for a single dataset.
-pub(crate) async fn generate_for_dataset(
-    dataset: &Dataset,
-    data_dir: &Path,
-) -> anyhow::Result<()> {
+pub(crate) async fn generate_for_dataset(dataset: &Dataset, data_dir: &Path) -> anyhow::Result<()> {
     let gt_path = data_dir.join(dataset.ground_truth_file);
     let queries = dataset.load_queries(data_dir)?;
     if queries.is_empty() {
@@ -77,7 +74,14 @@ pub(crate) async fn generate_for_dataset(
                     continue;
                 }
                 let score = score(metric, &query.embedding, &row.embedding);
-                push_candidate(heap, Candidate { id: offset + j as u32, score }, k);
+                push_candidate(
+                    heap,
+                    Candidate {
+                        id: offset + j as u32,
+                        score,
+                    },
+                    k,
+                );
             }
         });
 
@@ -101,9 +105,10 @@ pub(crate) async fn generate_for_dataset(
     match dataset.format {
         VecFormat::Fvecs | VecFormat::Bvecs => write_ivecs(&gt_path, &ground_truth)?,
         VecFormat::Parquet => {
-            let column = dataset.ground_truth_column.as_deref().context(
-                "parquet dataset missing ground_truth_column (required to write GT)",
-            )?;
+            let column = dataset
+                .ground_truth_column
+                .as_deref()
+                .context("parquet dataset missing ground_truth_column (required to write GT)")?;
             write_parquet_ground_truth(&gt_path, column, &ground_truth)?;
         }
     }
@@ -192,19 +197,14 @@ fn write_ivecs(path: &Path, rows: &[Vec<i32>]) -> anyhow::Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     for row in rows {
         writer.write_all(&(row.len() as u32).to_le_bytes())?;
-        let bytes =
-            unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
+        let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
         writer.write_all(bytes)?;
     }
     writer.flush()?;
     Ok(())
 }
 
-fn write_parquet_ground_truth(
-    path: &Path,
-    column: &str,
-    rows: &[Vec<i32>],
-) -> anyhow::Result<()> {
+fn write_parquet_ground_truth(path: &Path, column: &str, rows: &[Vec<i32>]) -> anyhow::Result<()> {
     let mut offsets = Vec::with_capacity(rows.len() + 1);
     offsets.push(0i32);
     let mut flat = Vec::new();
