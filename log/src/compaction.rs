@@ -99,7 +99,63 @@ impl CompactionScheduler for LogCompactionScheduler {
             .iter()
             .map(SegmentSnapshot::from_segment)
             .collect();
-        propose_compactions(&segments, bounds, &active, &self.options)
+
+        // Per-tick summary. Info-level so it's visible with
+        // RUST_LOG='log::compaction=info' but doesn't pollute defaults.
+        let total_l0: usize = segments.iter().map(|s| s.l0_ids.len()).sum();
+        let total_sr: usize = segments.iter().map(|s| s.sr_ids.len()).sum();
+        tracing::info!(
+            target: "log::compaction",
+            bounds = ?bounds,
+            segments = segments.len(),
+            total_l0,
+            total_sr,
+            active_compactions = active.segment_prefixes.len(),
+            drain_only = self.options.drain_only,
+            l0_only = self.options.l0_only,
+            "compaction scheduler tick: input",
+        );
+        // Per-segment detail at debug level — gets verbose with many
+        // segments, so keep it gated.
+        for s in &segments {
+            let id = decode_segment_id(&s.prefix);
+            tracing::debug!(
+                target: "log::compaction",
+                segment_id = ?id,
+                l0 = s.l0_ids.len(),
+                srs = s.sr_ids.len(),
+                in_flight = active.segment_prefixes.contains(&s.prefix),
+                "segment state",
+            );
+        }
+
+        let specs = propose_compactions(&segments, bounds, &active, &self.options);
+
+        // Output summary: how many specs of each kind. If this is 0 while
+        // the input clearly has work (high total_l0), the scheduler is
+        // wedged on its own policy — start drilling into the per-spec
+        // debug lines below.
+        let drains = specs.iter().filter(|s| s.is_drain()).count();
+        let tiered = specs.len() - drains;
+        tracing::info!(
+            target: "log::compaction",
+            proposed = specs.len(),
+            tiered,
+            drains,
+            "compaction scheduler tick: proposed",
+        );
+        for s in &specs {
+            tracing::debug!(
+                target: "log::compaction",
+                segment = ?s.segment(),
+                is_drain = s.is_drain(),
+                sources = s.sources().len(),
+                destination = ?s.destination(),
+                "proposed spec",
+            );
+        }
+
+        specs
     }
 }
 
