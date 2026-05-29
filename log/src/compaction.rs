@@ -345,11 +345,24 @@ pub(crate) fn propose_compactions(
                 }
             }
             _ => {
-                // EXPERIMENTAL: l0_only mode suppresses the one-shot final
-                // consolidation that sealed segments would otherwise get.
-                // Active-segment L0 work and orphan drains remain enabled.
-                if !options.l0_only
-                    && bounds.is_some()
+                // EXPERIMENTAL: l0_only mode suppresses the one-shot
+                // *consolidation* (merge L0+SRs into a single SR) that sealed
+                // segments would otherwise get, but still relieves L0
+                // pressure on sealed segments — otherwise sealed L0s remain
+                // pinned at `l0_max_ssts`, and any memtable that touches the
+                // sealed segment (e.g. batches crossing a seal boundary)
+                // permanently fails the L0 commit gate.
+                if options.l0_only {
+                    if segment.l0_ids.len() >= options.min_l0_per_compaction
+                        && let Some(spec) = build_active_l0_spec(
+                            segment,
+                            &mut next_sr,
+                            options.max_l0_per_compaction,
+                        )
+                    {
+                        out.push(spec);
+                    }
+                } else if bounds.is_some()
                     && !is_single_sr_steady(segment)
                     && let Some(spec) = build_consolidation_spec(segment, &mut next_sr)
                 {
@@ -800,17 +813,17 @@ mod tests {
     }
 
     #[test]
-    fn l0_only_skips_sealed_consolidation_but_keeps_everything_else() {
-        // Layout:
+    fn l0_only_relieves_l0_on_every_segment_but_skips_consolidation() {
+        // Layout (bounds 2..=4):
         //   id 0: system, L0=2  → still consolidates (system path unaffected)
         //   id 1: orphan (outside bounds) → still drained
-        //   id 2: sealed, not steady (1 L0 + 2 SRs) → would normally consolidate; SKIPPED
-        //   id 3: sealed, steady (0 L0 + 1 SR) → no work either way
-        //   id 4: active, L0 at threshold → still L0-compacts
+        //   id 2: sealed, L0=4 + 2 SRs → L0-relieved (not consolidated)
+        //   id 3: sealed, L0=0 + 1 SR (steady) → no work
+        //   id 4: active, L0=4 → L0-relieved as before
         let segments = vec![
             snapshot(0, 2, &[]),
             snapshot(1, 0, &[7]),
-            snapshot(2, 1, &[8, 9]),
+            snapshot(2, 4, &[8, 9]),
             snapshot(3, 0, &[5]),
             snapshot(4, 4, &[]),
         ];
@@ -825,19 +838,31 @@ mod tests {
             &opts,
         );
 
-        let kinds: Vec<_> = specs
+        let by_segment: std::collections::HashMap<_, _> = specs
             .iter()
-            .map(|s| (s.segment().clone(), s.is_drain()))
+            .map(|s| (s.segment().clone(), s))
             .collect();
-        // System consolidates (unaffected by l0_only).
-        assert!(kinds.contains(&(prefix_for(0), false)));
-        // Orphan drained (unaffected by l0_only).
-        assert!(kinds.contains(&(prefix_for(1), true)));
-        // Sealed non-steady id 2 is suppressed — this is the l0_only effect.
-        assert!(!kinds.iter().any(|(p, _)| p == &prefix_for(2)));
-        // Active L0 compaction proceeds.
-        assert!(kinds.contains(&(prefix_for(4), false)));
-        assert_eq!(kinds.len(), 3);
+
+        // System consolidates as usual.
+        let sys = by_segment.get(&prefix_for(0)).expect("system spec");
+        assert!(!sys.is_drain());
+        // Orphan is drained.
+        let orph = by_segment.get(&prefix_for(1)).expect("orphan drain");
+        assert!(orph.is_drain());
+        // Sealed segment 2: L0-relief only, NOT consolidation.
+        // build_consolidation_spec would include the 2 SRs as sources; the
+        // L0-relief path uses only L0s.
+        let sealed = by_segment.get(&prefix_for(2)).expect("sealed L0 relief");
+        assert!(!sealed.is_drain());
+        assert_eq!(sealed.sources().len(), 4, "should be L0s only, not L0+SRs");
+        // Steady sealed has no work.
+        assert!(!by_segment.contains_key(&prefix_for(3)));
+        // Active L0 relief still happens.
+        let active = by_segment.get(&prefix_for(4)).expect("active L0 relief");
+        assert!(!active.is_drain());
+        assert_eq!(active.sources().len(), 4);
+
+        assert_eq!(specs.len(), 4);
     }
 
     #[test]
