@@ -237,6 +237,24 @@ struct opendata_log_result_t opendata_log_key_iterator_next(struct opendata_log_
 
 struct opendata_log_result_t opendata_log_key_iterator_close(struct opendata_log_key_iterator_t *iterator);
 
+/**
+ * Installs a global `tracing` subscriber that writes to stderr.
+ *
+ * `filter` is an `EnvFilter` directive string (same syntax as `RUST_LOG`),
+ * e.g. `"info"`, `"slatedb=debug"`, or `"slatedb=debug,opendata_log=info"`.
+ * Pass `NULL` to fall back to the `RUST_LOG` environment variable, or
+ * `"info"` if `RUST_LOG` is unset.
+ *
+ * Must be called at most once per process, before `opendata_log_open`. The
+ * underlying `tracing` global default can only be set once; if a subscriber
+ * is already installed (e.g. by another Rust component embedded in the same
+ * host), this returns `OPENDATA_LOG_ERROR_INTERNAL`.
+ *
+ * Hosts that already manage their own `tracing` subscriber should not call
+ * this function.
+ */
+struct opendata_log_result_t opendata_log_enable_logging(const char *filter);
+
 void opendata_log_result_free(struct opendata_log_result_t result);
 
 void opendata_log_bytes_free(uint8_t *data, uintptr_t len);
@@ -279,5 +297,37 @@ struct opendata_log_result_t opendata_log_reader_list_segments(const struct open
                                                                const struct opendata_log_seq_range_t *seq_range,
                                                                struct opendata_log_segment_t **out_segments,
                                                                uintptr_t *out_count);
+
+/**
+ * Installs a global `metrics-rs` Prometheus recorder that captures SlateDB
+ * metrics emitted from any `LogDb` or `LogDbReader` opened in this process.
+ *
+ * **Idempotent and lock-free.** Safe to call any number of times from any
+ * thread; only the first call actually installs the recorder, subsequent
+ * calls observe the cached result. Safe to call before or after
+ * `opendata_log_open` / `opendata_log_reader_open`.
+ *
+ * Returns `OPENDATA_LOG_ERROR_INTERNAL` if a different `metrics-rs` recorder
+ * is already installed in the process (e.g. by another embedded Rust
+ * component). In that case `opendata_log_render_metrics` will return an
+ * empty buffer.
+ */
+struct opendata_log_result_t opendata_log_init_telemetry(void);
+
+/**
+ * Renders the current SlateDB metrics in Prometheus text-exposition format.
+ *
+ * On success, allocates a heap buffer and writes its address and length to
+ * `*out_data` / `*out_len`. The caller owns the buffer and must release it
+ * with `opendata_log_bytes_free`.
+ *
+ * Lazily initializes the recorder on first call if `opendata_log_init_telemetry`
+ * was not invoked explicitly. If a foreign `metrics-rs` recorder occupies
+ * the global slot, returns success with `*out_data = NULL` and `*out_len = 0`
+ * (an empty buffer is not an error).
+ *
+ * `out_data` and `out_len` must be non-null. The function never blocks.
+ */
+struct opendata_log_result_t opendata_log_render_metrics(uint8_t **out_data, uintptr_t *out_len);
 
 #endif  /* OPENDATA_LOG_H */

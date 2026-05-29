@@ -2560,10 +2560,13 @@ version = "0.3.0"
 dependencies = [
  "bytes",
  "cbindgen",
+ "metrics",
+ "metrics-exporter-prometheus",
  "opendata-common",
  "opendata-log",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

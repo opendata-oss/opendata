@@ -944,3 +944,78 @@ fn subscribe_rejects_null_out_pointer() {
     );
     assert_ok(unsafe { opendata_log_close(log) });
 }
+
+// ---- telemetry tests ----
+
+#[test]
+fn telemetry_captures_slatedb_metrics() {
+    // Install the recorder before opening the log so slatedb's metric
+    // describes land in our PrometheusRecorder. Idempotent across tests —
+    // the OnceLock makes repeat calls cheap and any order tolerable.
+    assert_ok(opendata_log_init_telemetry());
+
+    let dir = tempfile::tempdir().unwrap();
+    let os_path = CString::new(dir.path().to_str().unwrap()).unwrap();
+    let db_path = CString::new("telemetry-test").unwrap();
+
+    let mut store: *mut opendata_log_object_store_t = ptr::null_mut();
+    assert_ok(unsafe { opendata_log_object_store_local(os_path.as_ptr(), &mut store) });
+
+    let config = opendata_log_config_t {
+        storage_type: OPENDATA_LOG_STORAGE_SLATEDB,
+        slatedb_path: db_path.as_ptr(),
+        object_store: store,
+        settings_path: ptr::null(),
+        seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+    };
+    let mut log: *mut opendata_log_t = ptr::null_mut();
+    assert_ok(unsafe { opendata_log_open(&config, &mut log) });
+
+    unsafe { append_records(log, b"telemetry-key", 4) };
+    assert_ok(unsafe { opendata_log_flush(log) });
+
+    let mut data: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    assert_ok(unsafe { opendata_log_render_metrics(&mut data, &mut len) });
+    assert!(!data.is_null());
+    assert!(len > 0, "rendered metrics buffer must not be empty");
+
+    let text = unsafe { std::slice::from_raw_parts(data, len) };
+    let text = std::str::from_utf8(text).expect("metrics text is utf-8");
+    assert!(
+        text.contains("slatedb_db_"),
+        "expected slatedb_db_* metric in rendered output, got:\n{text}"
+    );
+
+    unsafe { opendata_log_bytes_free(data, len) };
+
+    // Render again to exercise the steady-state path and confirm the first
+    // release didn't poison the global state.
+    let mut data2: *mut u8 = ptr::null_mut();
+    let mut len2: usize = 0;
+    assert_ok(unsafe { opendata_log_render_metrics(&mut data2, &mut len2) });
+    assert!(!data2.is_null());
+    assert!(len2 > 0);
+    unsafe { opendata_log_bytes_free(data2, len2) };
+
+    // Repeat init must be a successful no-op.
+    assert_ok(opendata_log_init_telemetry());
+
+    assert_ok(unsafe { opendata_log_close(log) });
+    assert_ok(unsafe { opendata_log_object_store_close(store) });
+}
+
+#[test]
+fn render_metrics_rejects_null_out_params() {
+    let mut data: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    assert_error(
+        unsafe { opendata_log_render_metrics(ptr::null_mut(), &mut len) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+    assert_error(
+        unsafe { opendata_log_render_metrics(&mut data, ptr::null_mut()) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+}
