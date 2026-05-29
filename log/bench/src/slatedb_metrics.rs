@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, SharedString, Unit};
+use metrics_util::Summary;
 use metrics_util::registry::{AtomicStorage, Registry};
 
 /// Global recorder that owns the registry SlateDB metrics flow into.
@@ -70,6 +71,51 @@ impl Handle {
         });
         total
     }
+
+    /// Like [`counter_value`](Self::counter_value), but only counts variants
+    /// whose labels contain every `(name, value)` pair in `required`.
+    pub fn counter_value_filtered(&self, name: &str, required: &[(&str, &str)]) -> u64 {
+        let mut total = 0u64;
+        self.registry.visit_counters(|key, counter| {
+            if key.name() == name && key_matches_labels(key, required) {
+                total = total.saturating_add(counter.load(Ordering::Relaxed));
+            }
+        });
+        total
+    }
+
+    /// Drains every histogram matching `name` and the `required` labels into
+    /// a single [`Summary`]. Drains the underlying buckets — values are gone
+    /// after the call. Returns `None` if no matching histogram recorded
+    /// anything (quantile reads would be meaningless).
+    ///
+    /// Multiple labeled variants matching the filter are merged into one
+    /// summary, which is what you want for "p99 of every PUT regardless of
+    /// which API path it took."
+    pub fn histogram_summary(&self, name: &str, required: &[(&str, &str)]) -> Option<Summary> {
+        let mut summary = Summary::with_defaults();
+        self.registry.visit_histograms(|key, bucket| {
+            if key.name() == name && key_matches_labels(key, required) {
+                bucket.clear_with(|values| {
+                    for &v in values {
+                        summary.add(v);
+                    }
+                });
+            }
+        });
+        if summary.count() == 0 {
+            None
+        } else {
+            Some(summary)
+        }
+    }
+}
+
+fn key_matches_labels(key: &Key, required: &[(&str, &str)]) -> bool {
+    required.iter().all(|(rk, rv)| {
+        key.labels()
+            .any(|lbl| lbl.key() == *rk && lbl.value() == *rv)
+    })
 }
 
 static HANDLE: OnceLock<Handle> = OnceLock::new();
@@ -137,10 +183,37 @@ pub struct SlatedbSnapshot {
     // uses). So per-component object-store request_count/duration metrics
     // collapse to a single `db` bucket and can't be split here. Fix is
     // upstream — see `slatedb::db::builder::build_handler`.
+
+    // ---- Object-store PUT/GET latency (component=db slice, ms) ----
+    //
+    // PUTs cover L0 memtable flushes plus compactor SST writes (slatedb
+    // routes both through the same instrumented store). GETs cover compactor
+    // SST reads + any cold path reads. Filtered by `op` only; merges across
+    // the `api` variants (plain put, multipart_init/part/complete for PUT;
+    // get/get_range/head/list for GET) into one summary per direction.
+    pub put_count: u64,
+    pub put_p50_ms: f64,
+    pub put_p99_ms: f64,
+    pub get_count: u64,
+    pub get_p50_ms: f64,
+    pub get_p99_ms: f64,
 }
 
 impl SlatedbSnapshot {
     pub fn capture(handle: &Handle) -> Self {
+        let put_labels = [("op", "put")];
+        let get_labels = [("op", "get")];
+        let put_summary =
+            handle.histogram_summary("slatedb.object_store.request_duration_seconds", &put_labels);
+        let get_summary =
+            handle.histogram_summary("slatedb.object_store.request_duration_seconds", &get_labels);
+        let q = |s: &Option<Summary>, q: f64| -> f64 {
+            s.as_ref()
+                .and_then(|s| s.quantile(q))
+                .map(|v| v * 1000.0)
+                .unwrap_or(0.0)
+        };
+
         Self {
             backpressure_count: handle.counter_value("slatedb.db.backpressure_count"),
             write_ops: handle.counter_value("slatedb.db.write_ops"),
@@ -164,6 +237,15 @@ impl SlatedbSnapshot {
                 .gauge_value("slatedb.compactor.total_bytes_being_compacted"),
             compactor_last_completion_ts_sec: handle
                 .gauge_value("slatedb.compactor.last_compaction_timestamp_sec"),
+
+            put_count: handle
+                .counter_value_filtered("slatedb.object_store.request_count", &put_labels),
+            put_p50_ms: q(&put_summary, 0.5),
+            put_p99_ms: q(&put_summary, 0.99),
+            get_count: handle
+                .counter_value_filtered("slatedb.object_store.request_count", &get_labels),
+            get_p50_ms: q(&get_summary, 0.5),
+            get_p99_ms: q(&get_summary, 0.99),
         }
     }
 
@@ -202,6 +284,13 @@ impl SlatedbSnapshot {
             compactor_throughput_bps: self.compactor_throughput_bps,
             compactor_total_bytes_being_compacted: self.compactor_total_bytes_being_compacted,
             compactor_last_completion_ts_sec: self.compactor_last_completion_ts_sec,
+
+            put_count: self.put_count.saturating_sub(before.put_count),
+            put_p50_ms: self.put_p50_ms,
+            put_p99_ms: self.put_p99_ms,
+            get_count: self.get_count.saturating_sub(before.get_count),
+            get_p50_ms: self.get_p50_ms,
+            get_p99_ms: self.get_p99_ms,
         }
     }
 }

@@ -242,7 +242,15 @@ impl Benchmark for IngestBenchmark {
                 .add(
                     "slatedb_compactor_last_completion_ts_sec",
                     d.compactor_last_completion_ts_sec,
-                );
+                )
+                // Object-store PUT/GET latency (component=db; covers L0
+                // flushes + compactor I/O — slatedb 0.13.0 doesn't split).
+                .add("slatedb_put_count", d.put_count as f64)
+                .add("slatedb_put_p50_ms", d.put_p50_ms)
+                .add("slatedb_put_p99_ms", d.put_p99_ms)
+                .add("slatedb_get_count", d.get_count as f64)
+                .add("slatedb_get_p50_ms", d.get_p50_ms)
+                .add("slatedb_get_p99_ms", d.get_p99_ms);
         }
 
         bench.summarize(summary).await?;
