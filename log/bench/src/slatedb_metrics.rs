@@ -169,6 +169,15 @@ pub struct SlatedbSnapshot {
     pub total_mem_size_bytes: f64,
     pub wal_buffer_estimated_bytes: f64,
 
+    // ---- Memtable-flush counters ----
+    /// Number of times the tracker refused to dispatch a pending memtable
+    /// because its touched segment already had `reserved_l0_slots +
+    /// tree_l0_len >= l0_max_ssts` (or the per-key variant). High rates
+    /// alongside backpressure attribute the backpressure to the L0 gate
+    /// — either committed L0 backlog (compactor behind) or in-flight
+    /// reservations (upload/manifest head-of-line).
+    pub l0_dispatch_gated_count: u64,
+
     // ---- Compactor counters ----
     pub compactor_bytes_compacted: u64,
 
@@ -223,6 +232,8 @@ impl SlatedbSnapshot {
             wal_buffer_flushes: handle.counter_value("slatedb.db.wal_buffer_flushes"),
             wal_buffer_flush_requests: handle.counter_value("slatedb.db.wal_buffer_flush_requests"),
             l0_flush_bytes: handle.counter_value("slatedb.db.l0_flush_bytes"),
+            l0_dispatch_gated_count: handle
+                .counter_value("slatedb.memtable_flush.l0_dispatch_gated_count"),
             l0_sst_count: handle.gauge_value("slatedb.db.l0_sst_count"),
             segment_max_l0_sst_count: handle.gauge_value("slatedb.db.segment_max_l0_sst_count"),
             total_mem_size_bytes: handle.gauge_value("slatedb.db.total_mem_size_bytes"),
@@ -269,6 +280,9 @@ impl SlatedbSnapshot {
                 .wal_buffer_flush_requests
                 .saturating_sub(before.wal_buffer_flush_requests),
             l0_flush_bytes: self.l0_flush_bytes.saturating_sub(before.l0_flush_bytes),
+            l0_dispatch_gated_count: self
+                .l0_dispatch_gated_count
+                .saturating_sub(before.l0_dispatch_gated_count),
 
             // Gauges: report the end-of-run absolute value, not a delta.
             l0_sst_count: self.l0_sst_count,

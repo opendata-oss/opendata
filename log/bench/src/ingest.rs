@@ -211,6 +211,10 @@ impl Benchmark for IngestBenchmark {
                     d.wal_buffer_flush_requests as f64,
                 )
                 .add("slatedb_l0_flush_bytes", d.l0_flush_bytes as f64)
+                .add(
+                    "slatedb_l0_dispatch_gated_count",
+                    d.l0_dispatch_gated_count as f64,
+                )
                 // DB gauges
                 .add("slatedb_l0_sst_count", d.l0_sst_count)
                 .add(
