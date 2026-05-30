@@ -33,7 +33,9 @@ config = "0.14"
 dashmap = "6.1.0"
 fail = "0.5"
 figment = { version = "0.10", features = ["yaml"] }
+bitpacking = { version = "0.9", default-features = false, features = ["bitpacker8x"] }
 futures = { version = "0.3", features = ["std"] }
+icu_segmenter = "2"
 moka = { version = "0.12", features = ["future"] }
 bencher = { path = "./bencher" }
 common = { path = "./common", package = "opendata-common", version = "0.1.16" }

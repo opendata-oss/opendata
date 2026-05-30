@@ -20,6 +20,7 @@ struct TestVector {
     category: &'static str,
     department: &'static str,
     rank: i64,
+    body: &'static str,
 }
 
 struct TestServerFixture {
@@ -43,6 +44,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "electronics",
             department: "hw",
             rank: 1,
+            body: "the quick brown fox jumps over the lazy dog",
         },
         TestVector {
             id: "doc-2",
@@ -50,6 +52,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "electronics",
             department: "hw",
             rank: 2,
+            body: "vector database stores fox embeddings",
         },
         TestVector {
             id: "doc-3",
@@ -57,6 +60,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "electronics",
             department: "hw",
             rank: 3,
+            body: "another fox sighting in town with a fox call",
         },
         TestVector {
             id: "doc-4",
@@ -64,6 +68,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "electronics",
             department: "hw",
             rank: 4,
+            body: "completely unrelated content about cats and birds",
         },
         TestVector {
             id: "doc-5",
@@ -71,6 +76,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "electronics",
             department: "hw",
             rank: 5,
+            body: "a vector database powers semantic search",
         },
         TestVector {
             id: "doc-6",
@@ -78,6 +84,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "books",
             department: "media",
             rank: 6,
+            body: "a novel about pirates and treasure",
         },
         TestVector {
             id: "doc-7",
@@ -85,6 +92,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "books",
             department: "media",
             rank: 7,
+            body: "history of the roman empire",
         },
         TestVector {
             id: "doc-8",
@@ -92,6 +100,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "books",
             department: "media",
             rank: 8,
+            body: "cookbook with italian recipes",
         },
         TestVector {
             id: "doc-9",
@@ -99,6 +108,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "books",
             department: "media",
             rank: 9,
+            body: "guide to backyard gardening",
         },
         TestVector {
             id: "doc-10",
@@ -106,6 +116,7 @@ fn test_vectors() -> Vec<TestVector> {
             category: "books",
             department: "media",
             rank: 10,
+            body: "biography of a famous painter",
         },
     ]
 }
@@ -121,6 +132,7 @@ async fn setup_server_with_vectors() -> TestServerFixture {
         MetadataFieldSpec::new("category", FieldType::String, true),
         MetadataFieldSpec::new("department", FieldType::String, true),
         MetadataFieldSpec::new("rank", FieldType::Int64, true),
+        MetadataFieldSpec::new("body", FieldType::Text, false),
     ];
     let config = Config {
         storage: StorageConfig::InMemory,
@@ -186,6 +198,7 @@ async fn write_vectors(client: &Client, base_url: &str, vectors: &[TestVector]) 
                     "category": vector.category,
                     "department": vector.department,
                     "rank": vector.rank,
+                    "body": vector.body,
                 }
             }))
             .collect::<Vec<_>>()
@@ -316,6 +329,57 @@ async fn should_return_filtered_vectors_from_search() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn should_rank_documents_by_bm25_via_http_search() {
+    // given
+    let fixture = setup_server_with_vectors().await;
+
+    // when
+    let response = fixture
+        .client
+        .post(format!("{}/api/v1/vector/search", fixture.base_url))
+        .header("content-type", "application/protobuf+json")
+        .header("accept", "application/protobuf+json")
+        .body(
+            serde_json::to_vec(&json!({
+                "bm25": {"field": "body", "query": "fox"},
+                "k": 10
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // then
+    assert!(response.status().is_success());
+    let body: serde_json::Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["status"], "success");
+
+    let results = body["results"].as_array().unwrap();
+    let returned_ids: Vec<&str> = results
+        .iter()
+        .map(|r| r["vector"]["id"].as_str().unwrap())
+        .collect();
+
+    // Documents containing "fox" should be present, others absent.
+    assert!(returned_ids.contains(&"doc-1"));
+    assert!(returned_ids.contains(&"doc-2"));
+    assert!(returned_ids.contains(&"doc-3"));
+    assert!(!returned_ids.contains(&"doc-4"));
+
+    // doc-3 (fox appears twice) should rank first.
+    assert_eq!(returned_ids[0], "doc-3");
+
+    // Body text field should be returned by default.
+    assert!(
+        results[0]["vector"]["attributes"]["body"]
+            .as_str()
+            .unwrap_or("")
+            .contains("fox")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn should_get_vectors_by_id() {
     // given
     let fixture = setup_server_with_vectors().await;
@@ -346,5 +410,6 @@ async fn should_get_vectors_by_id() {
             vector.department
         );
         assert_eq!(body["vector"]["attributes"]["rank"], vector.rank);
+        assert_eq!(body["vector"]["attributes"]["body"], vector.body);
     }
 }

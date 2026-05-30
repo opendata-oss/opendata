@@ -168,6 +168,8 @@ pub(crate) enum FilterKind {
 }
 
 /// SearchRequest is the request body for POST /api/v1/vector/search.
+///
+/// Exactly one of `vector` (ANN) or `bm25` (full-text search) must be set.
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct SearchRequest {
     #[prost(float, repeated, tag = "1")]
@@ -180,6 +182,17 @@ pub(crate) struct SearchRequest {
     pub(crate) filter: Option<FilterMessage>,
     #[prost(string, repeated, tag = "5")]
     pub(crate) include_fields: Vec<String>,
+    #[prost(message, optional, tag = "6")]
+    pub(crate) bm25: Option<Bm25QueryMessage>,
+}
+
+/// Bm25QueryMessage selects BM25 full-text search on a `FieldType::Text` field.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct Bm25QueryMessage {
+    #[prost(string, tag = "1")]
+    pub(crate) field: String,
+    #[prost(string, tag = "2")]
+    pub(crate) query: String,
 }
 
 /// SearchResponse is the response for POST /api/v1/vector/search.
@@ -353,6 +366,7 @@ mod tests {
                 })),
             }),
             include_fields: vec![],
+            bm25: None,
         };
 
         // when

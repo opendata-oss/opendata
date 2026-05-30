@@ -6,10 +6,13 @@ pub mod centroid_info;
 pub mod centroid_stats;
 pub mod centroids;
 pub mod collection_meta;
+pub(crate) mod field_stats;
 pub mod id_dictionary;
 pub mod key;
 pub mod metadata_index;
 pub mod posting_list;
+pub(crate) mod term_postings;
+pub(crate) mod term_stats;
 pub mod vector_bitmap;
 pub mod vector_data;
 pub(crate) mod vector_id;
@@ -35,24 +38,36 @@ pub const KEY_VERSION: u8 = 0x01;
 pub const SUBSYSTEM: u8 = common::serde::subsystem::VECTOR;
 
 /// Record type enumeration for vector database records.
+///
+/// Tag `0x0c` is reserved for `Deletions` and tags `0x0d`-`0x0f` are reserved
+/// for FTS records per RFC-0006. `VectorIndexData` and `CentroidSeqBlock` were
+/// moved out of that range to make room (storage compatibility is pre-1.0).
+///
+/// `FtsTerm` (`0x0d`) covers both `TermPostings` and `TermStats`; the two are
+/// disambiguated by the trailing discriminator byte in the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
     CollectionMeta = 0x01,
-    // TODO: reset these IDs
+    CentroidSeqBlock = 0x02,
+    VectorIndexData = 0x03,
     PostingList = 0x04,
     IdDictionary = 0x05,
     VectorData = 0x06,
-    VectorIndexData = 0x0D,
     MetadataIndex = 0x07,
     SeqBlock = 0x08,
     CentroidStats = 0x09,
     Centroids = 0x0A,
     CentroidInfo = 0x0B,
-    CentroidSeqBlock = 0x0C,
+    /// FTS term postings or term stats (discriminated by trailing key byte).
+    FtsTerm = 0x0D,
+    /// FTS per-vector field length stats.
+    FtsVectorFieldStats = 0x0E,
+    /// FTS per-field corpus stats.
+    FtsFieldStats = 0x0F,
 }
 
 impl RecordType {
-    /// Returns the ID of this record type (1-15).
+    /// Returns the ID of this record type.
     pub fn id(&self) -> u8 {
         *self as u8
     }
@@ -61,16 +76,19 @@ impl RecordType {
     pub fn from_id(id: u8) -> Result<Self, EncodingError> {
         match id {
             0x01 => Ok(RecordType::CollectionMeta),
+            0x02 => Ok(RecordType::CentroidSeqBlock),
+            0x03 => Ok(RecordType::VectorIndexData),
             0x04 => Ok(RecordType::PostingList),
             0x05 => Ok(RecordType::IdDictionary),
             0x06 => Ok(RecordType::VectorData),
-            0x0D => Ok(RecordType::VectorIndexData),
             0x07 => Ok(RecordType::MetadataIndex),
             0x08 => Ok(RecordType::SeqBlock),
             0x09 => Ok(RecordType::CentroidStats),
             0x0A => Ok(RecordType::Centroids),
             0x0B => Ok(RecordType::CentroidInfo),
-            0x0C => Ok(RecordType::CentroidSeqBlock),
+            0x0D => Ok(RecordType::FtsTerm),
+            0x0E => Ok(RecordType::FtsVectorFieldStats),
+            0x0F => Ok(RecordType::FtsFieldStats),
             _ => Err(EncodingError {
                 message: format!("Invalid record type: 0x{:02x}", id),
             }),
@@ -133,6 +151,9 @@ pub enum FieldType {
     Int64 = 1,
     Float64 = 2,
     Bool = 3,
+    /// Full-text-searchable string. Stored as `AttributeValue::String`, always
+    /// indexed for BM25 regardless of `indexed` flag (RFC-0006).
+    Text = 4,
     /// Vector type (tag 255) - used internally to store vectors as a special field.
     /// Not valid in collection metadata schemas.
     Vector = 255,
@@ -145,6 +166,7 @@ impl FieldType {
             1 => Ok(FieldType::Int64),
             2 => Ok(FieldType::Float64),
             3 => Ok(FieldType::Bool),
+            4 => Ok(FieldType::Text),
             255 => Ok(FieldType::Vector),
             _ => Err(EncodingError {
                 message: format!("Invalid field type: {}", byte),
@@ -291,6 +313,11 @@ impl FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(value))
             }
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
             FieldType::Vector => Err(EncodingError {
                 message: "Vector values cannot be used in sortable key encoding".to_string(),
             }),
@@ -601,6 +628,11 @@ impl Decode for FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(v))
             }
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
             FieldType::Vector => Err(EncodingError {
                 message: "Vector type requires dimensions context; use decode_with_dimensions"
                     .to_string(),
@@ -677,6 +709,11 @@ impl FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(v))
             }
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
             FieldType::Vector => {
                 let expected_bytes = dimensions * 4;
                 if buf.len() < expected_bytes {
@@ -724,16 +761,19 @@ mod tests {
         // given
         let types = [
             RecordType::CollectionMeta,
+            RecordType::CentroidSeqBlock,
+            RecordType::VectorIndexData,
             RecordType::PostingList,
             RecordType::IdDictionary,
             RecordType::VectorData,
-            // VectorMeta (0x07) was removed - data merged into VectorData
             RecordType::MetadataIndex,
             RecordType::SeqBlock,
             RecordType::CentroidStats,
             RecordType::Centroids,
             RecordType::CentroidInfo,
-            RecordType::CentroidSeqBlock,
+            RecordType::FtsTerm,
+            RecordType::FtsVectorFieldStats,
+            RecordType::FtsFieldStats,
         ];
 
         for record_type in types {
