@@ -320,6 +320,7 @@ fn extract_attribute_column(
             collect!(a, |v: bool| AttributeValue::Bool(v));
         }
         FieldType::Vector => bail!("metadata column '{}' cannot be a Vector field", name),
+        FieldType::Text => bail!("metadata column '{}' cannot be a Text field", name),
     }
     Ok(out)
 }
