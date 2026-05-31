@@ -1,5 +1,12 @@
+mod ann;
+mod bm25;
+mod collectors;
+mod driver;
+mod filter;
+mod materializer;
+
 use crate::error::{Error, Result};
-use crate::math::bm25;
+use crate::math::bm25 as bm25_math;
 use crate::math::distance;
 use crate::metric_names::{QUERY_SEARCH_DURATION_SECONDS, QUERY_VECTORS_SCORED_TOTAL};
 use crate::model::{
@@ -320,7 +327,7 @@ impl QueryEngine {
         let dimensions = self.options.dimensions as usize;
 
         // Reused per-doc buffer so we don't allocate a fresh Vec each iteration.
-        let mut hits: Vec<bm25::Bm25TermEntry> = Vec::with_capacity(streams.len());
+        let mut hits: Vec<bm25_math::Bm25TermEntry> = Vec::with_capacity(streams.len());
 
         while head_heap.peek().is_some() {
             let doc_id = head_heap.peek().expect("non-empty").doc_id;
@@ -336,7 +343,7 @@ impl QueryEngine {
                 let entry = stream
                     .pop()
                     .expect("stream head was on heap but pop returned None");
-                hits.push(bm25::Bm25TermEntry {
+                hits.push(bm25_math::Bm25TermEntry {
                     freq: entry.freq,
                     norm: entry.norm,
                     idf: stream.idf,
@@ -382,7 +389,7 @@ impl QueryEngine {
             }
 
             // Single BM25 evaluation per document.
-            let score = bm25::score(&hits, avgdl);
+            let score = bm25_math::score(&hits, avgdl);
 
             // Skip candidates that cannot enter the current top-K.
             if top_k.len() == query.limit
@@ -458,7 +465,7 @@ impl QueryEngine {
             if entries.is_empty() {
                 continue;
             }
-            streams.push(PostingStream::new(entries, bm25::idf(n_docs, n_t)));
+            streams.push(PostingStream::new(entries, bm25_math::idf(n_docs, n_t)));
         }
         Ok(streams)
     }
