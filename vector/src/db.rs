@@ -27,6 +27,7 @@ use crate::serde::key::{
     SeqBlockKey,
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
@@ -122,6 +123,9 @@ pub(crate) struct LastAppliedSnapshot {
     pub(crate) centroid_index: Arc<LeveledCentroidIndex<'static>>,
     pub(crate) centroid_cache: Arc<AllCentroidsCache>,
     pub(crate) centroid_count: usize,
+    /// FTS deletions bitmap loaded from storage after the last flush, used by
+    /// the BM25 query path to hide deleted/replaced docs without a per-query read.
+    pub(crate) fts_deletions: Arc<VectorBitmap>,
 }
 
 /// Vector database for storing and querying embedding vectors.
@@ -250,11 +254,13 @@ impl VectorDb {
             config.distance_metric,
         )
         .await?;
+        let fts_deletions = Arc::new(snapshot.get_deletions().await?);
         let last_applied_snapshot = Arc::new(Mutex::new(LastAppliedSnapshot {
             snapshot: snapshot.clone(),
             centroid_cache: Arc::new(loaded_tree.centroid_cache.cache()),
             centroid_index: loaded_tree.query_centroid_index,
             centroid_count: loaded_tree.num_leaf_centroids,
+            fts_deletions,
         }));
 
         let _ = id_allocator.freeze();
@@ -890,16 +896,20 @@ impl VectorDb {
 
     /// Create a QueryEngine from the current snapshot for executing queries.
     pub(crate) fn query_engine(&self) -> QueryEngine {
-        let (snapshot, centroid_index) = {
+        let (snapshot, centroid_index, deletions) = {
             let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
-            (guard.snapshot.clone(), guard.centroid_index.clone())
+            (
+                guard.snapshot.clone(),
+                guard.centroid_index.clone(),
+                guard.fts_deletions.clone(),
+            )
         };
         let options = QueryEngineOptions {
             dimensions: self.config.dimensions,
             distance_metric: self.config.distance_metric,
             query_pruning_factor: self.config.query_pruning_factor,
         };
-        QueryEngine::new(options, centroid_index, snapshot)
+        QueryEngine::new(options, centroid_index, snapshot, deletions)
     }
 
     /// Search using brute-force centroid lookup (for diagnostics).
@@ -912,16 +922,25 @@ impl VectorDb {
     }
 
     pub async fn snapshot(&self) -> Box<dyn VectorDbRead> {
-        let (snapshot, centroid_index) = {
+        let (snapshot, centroid_index, deletions) = {
             let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
-            (guard.snapshot.clone(), guard.centroid_index.clone())
+            (
+                guard.snapshot.clone(),
+                guard.centroid_index.clone(),
+                guard.fts_deletions.clone(),
+            )
         };
         let options = QueryEngineOptions {
             dimensions: self.config.dimensions,
             distance_metric: self.config.distance_metric,
             query_pruning_factor: self.config.query_pruning_factor,
         };
-        Box::new(VectorDbReader::new(options, centroid_index, snapshot)) as Box<dyn VectorDbRead>
+        Box::new(VectorDbReader::new(
+            options,
+            centroid_index,
+            snapshot,
+            deletions,
+        )) as Box<dyn VectorDbRead>
     }
 }
 

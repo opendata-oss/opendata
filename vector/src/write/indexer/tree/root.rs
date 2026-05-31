@@ -146,7 +146,7 @@ mod tests {
         let original_root_count = h.state.root_centroid_count();
 
         // when
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         SplitRoot::new(&opts, &snapshot, 1)
             .execute(&mut delta, &h.state)
             .await
@@ -174,7 +174,7 @@ mod tests {
         .await;
         let opts = create_opts(4);
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
 
         // when:
         SplitRoot::new(&opts, &snapshot, 1)

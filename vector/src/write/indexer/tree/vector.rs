@@ -198,6 +198,9 @@ impl WriteVectors {
                     ))
                 })?;
             delta.forward_index.delete_vector(old_vector_id);
+            // RFC-0006: hide the replaced internal id on the FTS query path via
+            // the Deletions bitmap (postings/term-stats are left in place).
+            delta.fts_index.add_deleted_vector_id(old_vector_id);
             for old_centroid in old_vector_index_data.postings {
                 delta
                     .search_index
@@ -247,6 +250,9 @@ impl WriteVectors {
             delta
                 .forward_index
                 .delete_external_id_and_vector(external_id, vector_id);
+            // RFC-0006: hide the deleted internal id on the FTS query path via
+            // the Deletions bitmap (postings/term-stats are left in place).
+            delta.fts_index.add_deleted_vector_id(vector_id);
             for old_centroid in old_vector_index_data.postings {
                 delta
                     .search_index
@@ -834,7 +840,7 @@ mod tests {
         let id_b = h.storage.lookup_internal_id("b").await.unwrap().unwrap();
         let id_c = h.storage.lookup_internal_id("c").await.unwrap().unwrap();
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let depth = TreeDepth::of(h.state.centroids_meta().depth);
         let level = TreeLevel::leaf(depth);
         let old_centroid = centroid_id(CENTROID_ID_NUM);
@@ -896,7 +902,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let rv = ReassignVectors::new(&opts, &snapshot, 1, reassignments, level);
         rv.execute(&h.state, &mut delta).await.unwrap();
         let ops = delta.freeze(1, &mut h.state);
@@ -918,7 +924,7 @@ mod tests {
             .await;
         let id_a = h.storage.lookup_internal_id("a").await.unwrap().unwrap();
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let depth = TreeDepth::of(h.state.centroids_meta().depth);
         let level = TreeLevel::leaf(depth);
         let old_centroid = centroid_id(CENTROID_ID_NUM);

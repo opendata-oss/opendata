@@ -10,6 +10,7 @@ use crate::db::VectorDbRead;
 use crate::error::{Error, Result};
 use crate::model::{Query, ReaderConfig, SearchOptions, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::indexer::tree::centroids::{
@@ -33,6 +34,9 @@ pub struct VectorDbReader {
     options: QueryEngineOptions,
     centroid_index: Arc<LeveledCentroidIndex<'static>>,
     storage: Arc<dyn StorageRead>,
+    /// FTS deletions bitmap loaded at open time. The reader only supports
+    /// static dbs, so this is loaded once and shared with each QueryEngine.
+    deletions: Arc<VectorBitmap>,
 }
 
 impl VectorDbReader {
@@ -79,18 +83,22 @@ impl VectorDbReader {
             query_pruning_factor: config.query_pruning_factor,
         };
 
-        Ok(Self::new(options, centroid_index, storage))
+        let deletions = Arc::new(storage.get_deletions().await?);
+
+        Ok(Self::new(options, centroid_index, storage, deletions))
     }
 
     pub(crate) fn new(
         options: QueryEngineOptions,
         centroid_index: Arc<LeveledCentroidIndex<'static>>,
         storage: Arc<dyn StorageRead>,
+        deletions: Arc<VectorBitmap>,
     ) -> Self {
         Self {
             options,
             centroid_index,
             storage,
+            deletions,
         }
     }
 
@@ -111,6 +119,7 @@ impl VectorDbReader {
             self.options.clone(),
             self.centroid_index.clone(),
             self.storage.clone(),
+            self.deletions.clone(),
         )
     }
 }

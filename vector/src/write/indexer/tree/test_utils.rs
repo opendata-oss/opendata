@@ -162,7 +162,7 @@ impl IndexerOpTestHarnessBuilder {
             centroid_cache,
         );
 
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
 
         let mut centroid_ids: Vec<_> = self.vectors.keys().copied().collect();
         centroid_ids.sort();
@@ -302,7 +302,7 @@ impl IndexerOpTestHarness {
             assert_attributes_conform_to_schema(&self.vector_schema, &write.attributes);
         }
         let snapshot = self.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&self.state);
+        let mut delta = VectorIndexDelta::new(&self.state, false);
         let ops = vec![VectorDbOp::Write(writes)];
         let wv = WriteVectors::new(opts, &snapshot, SNAPSHOT_EPOCH, ops);
         wv.execute(&self.state, &mut delta).await.unwrap();
@@ -311,7 +311,7 @@ impl IndexerOpTestHarness {
 
     pub async fn delete_and_apply(&mut self, opts: &Arc<IndexerOpts>, ids: Vec<String>) -> usize {
         let snapshot = self.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&self.state);
+        let mut delta = VectorIndexDelta::new(&self.state, false);
         let ops = vec![VectorDbOp::Delete(ids)];
         let wv = WriteVectors::new(opts, &snapshot, SNAPSHOT_EPOCH, ops);
         let (_inserts, _updates, deletes) = wv.execute(&self.state, &mut delta).await.unwrap();

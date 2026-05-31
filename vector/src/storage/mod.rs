@@ -5,13 +5,15 @@ use crate::error::{Error, Result};
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
+use crate::serde::deletions::DeletionsValue;
 use crate::serde::id_dictionary::IdDictionaryValue;
 use crate::serde::key::{
-    CentroidInfoKey, CentroidStatsKey, CentroidsKey, IdDictionaryKey, MetadataIndexKey,
-    PostingListKey, VectorDataKey, VectorIndexDataKey,
+    CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey, IdDictionaryKey,
+    MetadataIndexKey, PostingListKey, VectorDataKey, VectorIndexDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::serde::vector_index_data::VectorIndexDataValue;
@@ -244,6 +246,24 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
                 Ok(value)
             }
             None => Ok(MetadataIndexValue::new()),
+        }
+    }
+
+    /// Load the singleton FTS deletions bitmap.
+    ///
+    /// Returns a bitmap of internal vector IDs that have been deleted or
+    /// replaced. Returns an empty bitmap if the record does not exist yet.
+    async fn get_deletions(&self) -> Result<VectorBitmap> {
+        let key = DeletionsKey::new().encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = DeletionsValue::decode_from_bytes(&record.value).map_err(|e| {
+                    Error::Encoding(format!("failed to decode DeletionsValue: {e}"))
+                })?;
+                Ok(value.0)
+            }
+            None => Ok(VectorBitmap::new()),
         }
     }
 }

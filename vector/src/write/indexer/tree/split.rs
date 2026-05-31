@@ -753,7 +753,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
         assert_eq!(result.splits.len(), 1);
@@ -838,7 +838,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
         assert_eq!(result.splits.len(), 1);
@@ -911,7 +911,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
 
@@ -938,7 +938,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,
@@ -993,7 +993,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,
@@ -1049,7 +1049,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
         assert_eq!(result.splits.len(), 1);
@@ -1102,7 +1102,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,
@@ -1168,7 +1168,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,

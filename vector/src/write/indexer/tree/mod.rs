@@ -59,11 +59,12 @@ pub(crate) struct IndexerOpts {
     pub(crate) indexed_fields: HashSet<String>,
     /// Names of fields declared with `FieldType::Text` (RFC-0006).
     ///
-    /// Currently informational: the Indexer drives FTS updates from each
-    /// `VectorWrite.text_attribute_summaries`, which is pre-populated by the
-    /// write path. Carrying the set here lets future milestones (e.g. delete
-    /// handling) discover text fields without re-reading `CollectionMeta`.
-    #[allow(dead_code)]
+    /// The Indexer drives FTS updates from each
+    /// `VectorWrite.text_attribute_summaries` (pre-populated by the write
+    /// path); this set lets it discover, without re-reading `CollectionMeta`,
+    /// whether the collection uses FTS at all. When empty, the `FtsIndexDelta`
+    /// freezes to a no-op so non-FTS collections don't pay the deletions
+    /// bitmap's storage overhead.
     pub(crate) text_fields: HashSet<String>,
 }
 
@@ -159,7 +160,11 @@ impl Indexer {
         );
         let update_start = Instant::now();
         let mut stats = IndexerStats::default();
-        let mut delta = VectorIndexDelta::new(&self.state);
+        // Gate FTS index emission on whether the collection actually declares
+        // text fields; without them the delta freezes to a no-op (see
+        // `FtsIndexDelta::freeze`), sparing non-FTS collections the deletions
+        // bitmap's storage overhead.
+        let mut delta = VectorIndexDelta::new(&self.state, !self.opts.text_fields.is_empty());
 
         let batch = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, ops);
         let batch_start = Instant::now();

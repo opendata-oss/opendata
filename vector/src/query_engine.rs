@@ -10,6 +10,7 @@ use crate::serde::field_stats::FieldStatsValue;
 use crate::serde::key::{FieldStatsKey, TermPostingsKey, TermStatsKey};
 use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
 use crate::serde::term_stats::TermStatsValue;
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::VectorId;
 use crate::storage::VectorDbStorageReadExt;
@@ -45,6 +46,10 @@ pub(crate) struct QueryEngine {
     options: QueryEngineOptions,
     centroid_index: Arc<LeveledCentroidIndex<'static>>,
     storage: Arc<dyn StorageRead>,
+    /// FTS deletions bitmap published by the flusher, used by the BM25 query
+    /// path to hide deleted/replaced docs without a per-query storage read.
+    #[allow(dead_code)]
+    deletions: Arc<VectorBitmap>,
 }
 
 impl QueryEngine {
@@ -52,11 +57,13 @@ impl QueryEngine {
         options: QueryEngineOptions,
         centroid_index: Arc<LeveledCentroidIndex<'static>>,
         storage: Arc<dyn StorageRead>,
+        deletions: Arc<VectorBitmap>,
     ) -> Self {
         Self {
             options,
             centroid_index,
             storage,
+            deletions,
         }
     }
 
@@ -363,6 +370,17 @@ impl QueryEngine {
                 continue;
             }
 
+            // The in-memory FTS deletions bitmap is the authority for delete
+            // resolution on this path. `doc_id` is the raw internal id from
+            // the posting, which is the same id space the bitmap indexes
+            // (data vectors are level 0, so the raw u64 equals
+            // `VectorId::data_vector_id(doc_id).id()`). Skip deleted/replaced
+            // docs before paying the scoring cost; this — not the forward
+            // index — hides deleted documents.
+            if self.deletions.contains(doc_id) {
+                continue;
+            }
+
             // Single BM25 evaluation per document.
             let score = bm25::score(&hits, avgdl);
 
@@ -374,37 +392,36 @@ impl QueryEngine {
                 continue;
             }
 
-            // TODO(rfc-0006 milestone 1): once the FTS deletions bitmap is
-            // available, defer this lookup until after the loop and consult
-            // the bitmap inline here instead. With the bitmap we only need
-            // the forward index for the K survivors, not for every scored
-            // candidate.
-            let id = VectorId::data_vector_id(doc_id);
-            let Some(vector_data) = self.storage.get_vector_data(id, dimensions).await? else {
-                continue;
-            };
-
             // The bound check above already guaranteed this entry beats the
             // current worst when the heap is full, so just evict and push.
+            // We defer the forward-index `get_vector_data` lookup until after
+            // the loop so it runs only for the K survivors rather than every
+            // scored candidate.
             if top_k.len() == query.limit {
                 top_k.pop();
             }
-            top_k.push(WorstFirst {
-                score,
-                doc_id,
-                vector_data,
+            top_k.push(WorstFirst { score, doc_id });
+        }
+
+        // Fetch the forward-index `VectorData` for only the K survivors. The
+        // deletions bitmap above already resolved deletes, so the get None
+        // branch is a defensive fallback (e.g. a concurrent compaction) rather
+        // than the primary delete mechanism.
+        let mut results: Vec<SearchResult> = Vec::with_capacity(top_k.len());
+        for candidate in top_k.into_iter() {
+            let vector_id = VectorId::data_vector_id(candidate.doc_id);
+            let Some(vector_data) = self.storage.get_vector_data(vector_id, dimensions).await?
+            else {
+                continue;
+            };
+            results.push(SearchResult {
+                score: candidate.score,
+                vector: Self::vector_data_to_vector(&vector_data),
             });
         }
 
-        // Drain top-K and order results: descending score, ties broken by
-        // ascending doc id (matches the existing ANN ordering convention).
-        let mut results: Vec<SearchResult> = top_k
-            .into_iter()
-            .map(|e| SearchResult {
-                score: e.score,
-                vector: Self::vector_data_to_vector(&e.vector_data),
-            })
-            .collect();
+        // Order results: descending score, ties broken by ascending doc id
+        // (matches the existing ANN ordering convention).
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -893,10 +910,13 @@ fn window_for(doc_id: u64) -> (u64, u64) {
 
 /// Top-K candidate ordered so `BinaryHeap::peek()` returns the worst
 /// (lowest-score, highest-doc-id) entry — the one to evict next.
+///
+/// Only the score and `doc_id` are carried through the scoring loop; the
+/// forward-index `VectorData` is fetched lazily for the K survivors after the
+/// loop completes (see `search_bm25`).
 struct WorstFirst {
     score: f32,
     doc_id: u64,
-    vector_data: VectorDataValue,
 }
 
 impl PartialEq for WorstFirst {

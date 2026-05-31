@@ -6,6 +6,7 @@ pub mod centroid_info;
 pub mod centroid_stats;
 pub mod centroids;
 pub mod collection_meta;
+pub(crate) mod deletions;
 pub(crate) mod field_stats;
 pub mod id_dictionary;
 pub mod key;
@@ -58,6 +59,8 @@ pub enum RecordType {
     CentroidStats = 0x09,
     Centroids = 0x0A,
     CentroidInfo = 0x0B,
+    /// FTS deletions bitmap — singleton RoaringTreemap of deleted vector ids.
+    Deletions = 0x0C,
     /// FTS term postings or term stats (discriminated by trailing key byte).
     FtsTerm = 0x0D,
     /// FTS per-vector field length stats.
@@ -86,6 +89,7 @@ impl RecordType {
             0x09 => Ok(RecordType::CentroidStats),
             0x0A => Ok(RecordType::Centroids),
             0x0B => Ok(RecordType::CentroidInfo),
+            0x0C => Ok(RecordType::Deletions),
             0x0D => Ok(RecordType::FtsTerm),
             0x0E => Ok(RecordType::FtsVectorFieldStats),
             0x0F => Ok(RecordType::FtsFieldStats),
@@ -771,6 +775,7 @@ mod tests {
             RecordType::CentroidStats,
             RecordType::Centroids,
             RecordType::CentroidInfo,
+            RecordType::Deletions,
             RecordType::FtsTerm,
             RecordType::FtsVectorFieldStats,
             RecordType::FtsFieldStats,

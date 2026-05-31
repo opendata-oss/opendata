@@ -161,6 +161,123 @@ async fn should_return_text_field_by_default_in_bm25_results() {
 }
 
 #[tokio::test]
+async fn should_exclude_deleted_documents_from_bm25_results() {
+    // given - several docs where a subset contain "quick"
+    let db = VectorDb::open(make_db_config()).await.unwrap();
+    db.write(vec![
+        doc("d1", "quick brown fox jumps over the lazy dog"),
+        doc("d2", "a quick rabbit hops across the green meadow"),
+        doc("d3", "the quick otter slides down the muddy bank"),
+        doc("d4", "slow turtle naps under a warm rock all day"),
+        doc("d5", "calm river flows gently past the old mill"),
+    ])
+    .await
+    .unwrap();
+    db.flush().await.unwrap();
+
+    // sanity - "quick" matches the three quick docs and excludes the rest
+    let results = db
+        .search(&Query::bm25("body", "quick").with_limit(10))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r.vector.id.as_str()).collect();
+    assert!(ids.contains(&"d1"), "expected d1 present, got {:?}", ids);
+    assert!(ids.contains(&"d2"), "expected d2 present, got {:?}", ids);
+    assert!(ids.contains(&"d3"), "expected d3 present, got {:?}", ids);
+    assert!(!ids.contains(&"d4"), "expected d4 absent, got {:?}", ids);
+    assert!(!ids.contains(&"d5"), "expected d5 absent, got {:?}", ids);
+
+    // when - delete one of the matching docs and flush
+    db.delete(vec!["d2"]).await.unwrap();
+    db.flush().await.unwrap();
+
+    let results = db
+        .search(&Query::bm25("body", "quick").with_limit(10))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r.vector.id.as_str()).collect();
+
+    // then - the deleted doc is gone, the other matching docs remain
+    assert!(
+        !ids.contains(&"d2"),
+        "expected deleted d2 to be absent from results, got {:?}",
+        ids
+    );
+    assert!(
+        ids.contains(&"d1"),
+        "expected d1 to still be present, got {:?}",
+        ids
+    );
+    assert!(
+        ids.contains(&"d3"),
+        "expected d3 to still be present, got {:?}",
+        ids
+    );
+
+    // and - scores remain non-increasing (sensible ranking)
+    for window in results.windows(2) {
+        assert!(
+            window[0].score >= window[1].score,
+            "expected non-increasing BM25 scores, got {} then {}",
+            window[0].score,
+            window[1].score,
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_reflect_upsert_in_bm25_results() {
+    // given - a doc whose body contains "quick"
+    let db = VectorDb::open(make_db_config()).await.unwrap();
+    db.write(vec![doc("d1", "quick brown fox jumps high")])
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+
+    let results = db
+        .search(&Query::bm25("body", "quick").with_limit(10))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r.vector.id.as_str()).collect();
+    assert!(
+        ids.contains(&"d1"),
+        "expected d1 present before upsert, got {:?}",
+        ids
+    );
+
+    // when - upsert d1 with a body that does NOT contain "quick"
+    db.write(vec![doc("d1", "sleepy badger digs a deep burrow")])
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+
+    // then - d1 is absent from "quick" results (old internal id hidden by the
+    // deletions bitmap, new internal id has no "quick" posting)
+    let results = db
+        .search(&Query::bm25("body", "quick").with_limit(10))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r.vector.id.as_str()).collect();
+    assert!(
+        !ids.contains(&"d1"),
+        "expected upserted d1 to be absent from 'quick' results, got {:?}",
+        ids
+    );
+
+    // and - a query for a term in the new body returns d1
+    let results = db
+        .search(&Query::bm25("body", "badger").with_limit(10))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r.vector.id.as_str()).collect();
+    assert!(
+        ids.contains(&"d1"),
+        "expected d1 to match a term from its new body, got {:?}",
+        ids
+    );
+}
+
+#[tokio::test]
 async fn should_respect_field_projection_for_bm25_results() {
     // given
     let db = VectorDb::open(make_db_config()).await.unwrap();

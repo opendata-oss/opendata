@@ -303,7 +303,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let merge = MergeCentroids::new(&opts, level, &snapshot, 1);
         let (reassignments, merge_count) = merge.execute(&h.state, &mut delta).await.unwrap();
         h.apply_delta(delta).await;
@@ -374,7 +374,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let merge = MergeCentroids::new(&opts, level, &snapshot, 1);
         let (reassignments, merge_count) = merge.execute(&h.state, &mut delta).await.unwrap();
 
@@ -413,7 +413,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let merge = MergeCentroids::new(&opts, level, &snapshot, 1);
         let (reassignments, merge_count) = merge.execute(&h.state, &mut delta).await.unwrap();
 
@@ -431,7 +431,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let (reassignments, merge_count) = MergeCentroids::new(&opts, level, &snapshot, 1)
             .execute(&h.state, &mut delta)
             .await
@@ -503,7 +503,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let (reassignments, merge_count) = MergeCentroids::new(&opts, level, &snapshot, 1)
             .execute(&h.state, &mut delta)
             .await
@@ -530,7 +530,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let (reassignments, merge_count) = MergeCentroids::new(&opts, level, &snapshot, 1)
             .execute(&h.state, &mut delta)
             .await

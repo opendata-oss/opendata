@@ -1,4 +1,5 @@
 use crate::db::LastAppliedSnapshot;
+use crate::storage::VectorDbStorageReadExt;
 use crate::write::delta::{VectorDbDeltaView, VectorDbOpDelta};
 use crate::write::indexer::tree::centroids::{
     CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader,
@@ -113,6 +114,7 @@ impl VectorDbFlusher {
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.validate(snapshot.clone()).await;
+        let fts_deletions = Arc::new(snapshot.get_deletions().await.map_err(|e| e.to_string())?);
         let stored_reader = StoredCentroidReader::new(
             self.opts.dimensions as usize,
             snapshot.clone(),
@@ -132,6 +134,7 @@ impl VectorDbFlusher {
             centroid_cache: index_outputs.centroid_cache,
             centroid_index: Arc::new(query_centroid_index),
             centroid_count: index_outputs.leaf_centroids,
+            fts_deletions,
         };
         self.last_snapshot = snapshot.clone();
         self.last_snapshot_epoch = snapshot_epoch;
@@ -297,6 +300,7 @@ mod tests {
                 centroid_cache: cache,
                 centroid_index: query_centroid_index,
                 centroid_count: 1,
+                fts_deletions: Arc::new(crate::serde::vector_bitmap::VectorBitmap::new()),
             })),
         )
     }

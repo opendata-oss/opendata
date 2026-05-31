@@ -856,6 +856,7 @@ mod tests {
             centroid_cache: query_cache,
             centroid_index: Arc::new(centroid_index),
             centroid_count: 0,
+            fts_deletions: Arc::new(crate::serde::vector_bitmap::VectorBitmap::new()),
         }
     }
 

@@ -80,6 +80,44 @@ impl Default for CentroidsKey {
     }
 }
 
+/// Deletions key - singleton record storing the FTS deletions bitmap.
+///
+/// Key layout: `[subsystem | version | tag]` (3 bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionsKey;
+
+impl RecordKey for DeletionsKey {
+    const RECORD_TYPE: RecordType = RecordType::Deletions;
+}
+
+impl DeletionsKey {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        Self::RECORD_TYPE.write_prefix(&mut buf);
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < PREFIX_AND_TAG_LEN {
+            return Err(EncodingError {
+                message: "Buffer too short for DeletionsKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        Ok(DeletionsKey)
+    }
+}
+
+impl Default for DeletionsKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// PostingList key - maps centroid ID to vector IDs.
 ///
 /// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
@@ -789,6 +827,20 @@ mod tests {
         // when
         let encoded = key.encode();
         let decoded = CentroidsKey::decode(&encoded).unwrap();
+
+        // then
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), 3);
+    }
+
+    #[test]
+    fn should_round_trip_deletions_key() {
+        // given
+        let key = DeletionsKey::new();
+
+        // when
+        let encoded = key.encode();
+        let decoded = DeletionsKey::decode(&encoded).unwrap();
 
         // then
         assert_eq!(decoded, key);
