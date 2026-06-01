@@ -1,7 +1,7 @@
 //! Prepared query filter (`PreparedFilter`).
 //!
 //! Lowers a [`Filter`] AST into precomputed metadata bitmaps so the query
-//! drivers can answer per-document membership with a cheap
+//! operators can answer per-item membership with a cheap
 //! [`PreparedFilter::matches`] check. Negations are kept as exclusion bitmaps
 //! rather than complemented positive sets, so building a filter never has to
 //! enumerate the entire corpus universe.
@@ -19,14 +19,14 @@ use crate::storage::VectorDbStorageReadExt;
 
 /// Executable form of a query [`Filter`].
 ///
-/// A document matches when it is present in `positive` (or `positive` is
+/// An item matches when it is present in `positive` (or `positive` is
 /// `None`, meaning "no positive constraint") and absent from every bitmap in
 /// `negative`. Equivalently, the matching set is `positive ∩ ¬(⋃ negative)`.
 pub(crate) struct PreparedFilter {
-    /// Documents allowed by the positive (union/intersection) part of the
+    /// Items allowed by the positive (union/intersection) part of the
     /// filter. `None` imposes no positive constraint (matches all ids).
     positive: Option<RoaringTreemap>,
-    /// Documents excluded by negations. A document matches only if it is
+    /// Items excluded by negations. An item matches only if it is
     /// absent from every bitmap here.
     negative: Vec<RoaringTreemap>,
 }
@@ -40,7 +40,7 @@ enum Single {
 
 impl PreparedFilter {
     /// Build a prepared filter from an optional filter expression. `None`
-    /// matches every document.
+    /// matches every item.
     pub(crate) async fn build(expr: Option<&Filter>, storage: &dyn StorageRead) -> Result<Self> {
         match expr {
             None => Ok(Self::match_all()),

@@ -1,31 +1,30 @@
 mod ann;
 mod bm25;
 mod collectors;
-mod driver;
 mod filter;
-mod materializer;
+mod lookup;
+mod operator;
+mod project;
+mod types;
 
+use crate::Vector;
 use crate::error::{Error, Result};
-use crate::math::bm25 as bm25_math;
 use crate::math::distance;
 use crate::metric_names::{QUERY_SEARCH_DURATION_SECONDS, QUERY_VECTORS_SCORED_TOTAL};
-use crate::model::{Bm25Query, FieldSelection, Query, ScoreBy, SearchOptions, SearchResult};
+use crate::model::{Bm25Query, Query, ScoreBy, SearchOptions, SearchResult};
+use crate::query_engine::bm25::BM25Operator;
 use crate::query_engine::filter::PreparedFilter;
+use crate::query_engine::lookup::LookupOperator;
+use crate::query_engine::operator::Operator;
+use crate::query_engine::project::ProjectOperator;
 use crate::serde::collection_meta::DistanceMetric;
-use crate::serde::field_stats::FieldStatsValue;
-use crate::serde::key::{FieldStatsKey, TermPostingsKey, TermStatsKey};
-use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
-use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_bitmap::VectorBitmap;
-use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::VectorId;
 use crate::storage::VectorDbStorageReadExt;
-use crate::text;
 use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
-use crate::{Attribute, Vector};
 use common::storage::StorageRead;
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,7 +52,6 @@ pub(crate) struct QueryEngine {
     storage: Arc<dyn StorageRead>,
     /// FTS deletions bitmap published by the flusher, used by the BM25 query
     /// path to hide deleted/replaced docs without a per-query storage read.
-    #[allow(dead_code)]
     deletions: Arc<VectorBitmap>,
 }
 
@@ -100,18 +98,7 @@ impl QueryEngine {
             return Ok(None);
         };
 
-        Ok(Some(Self::vector_data_to_vector(&vector_data)))
-    }
-
-    fn vector_data_to_vector(vector_data: &VectorDataValue) -> Vector {
-        let attributes = vector_data
-            .fields()
-            .map(|field| Attribute::new(field.field_name.clone(), field.value.clone().into()))
-            .collect();
-        Vector {
-            id: vector_data.external_id().to_string(),
-            attributes,
-        }
+        Ok(Some(lookup::vector_data_to_vector(&vector_data)))
     }
 
     pub(crate) async fn search_exact_nprobe(
@@ -171,7 +158,7 @@ impl QueryEngine {
         }
 
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
-        Self::apply_field_selection(&mut results, &query.include_fields);
+        project::apply_field_selection(&mut results, &query.include_fields);
         Ok(results)
     }
 
@@ -257,7 +244,7 @@ impl QueryEngine {
 
         // 7. K-way merge and resolve top-k forward index lookups
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
-        Self::apply_field_selection(&mut results, &query.include_fields);
+        project::apply_field_selection(&mut results, &query.include_fields);
         debug!(
             op = "search_with_options",
             elapsed_ms = t.elapsed().as_millis()
@@ -267,210 +254,43 @@ impl QueryEngine {
 
     /// BM25 search path (RFC-0006 Milestone 0).
     ///
-    /// Iterates the union of per-term posting lists document by document in
-    /// descending `doc_id` order, accumulates each document's BM25 score in a
-    /// single pass, and maintains a top-K min-heap. Metadata filtering is
-    /// applied via a cached allow-list bitmap that is recomputed in 10K-wide
-    /// `doc_id` windows as the loop advances.
+    /// Assembles the operator chain `project -> lookup -> bm25` and runs it.
+    /// The BM25 operator scores and ranks ids (metadata filtering and FTS delete
+    /// resolution happen there, before scoring), the lookup operator resolves
+    /// the forward-index data, and the project operator applies field selection.
     async fn search_bm25(&self, bm25: &Bm25Query, query: &Query) -> Result<Vec<SearchResult>> {
         let t = Instant::now();
         if query.limit == 0 {
             return Ok(Vec::new());
         }
 
-        let terms = dedupe_query_terms(&bm25.query);
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
+        let filter = PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
+        let scorer = BM25Operator::new(
+            self.storage.clone(),
+            bm25.clone(),
+            filter,
+            self.deletions.clone(),
+            query.limit,
+        );
+        let lookup = LookupOperator::new(
+            self.storage.clone(),
+            self.options.dimensions as usize,
+            Box::new(scorer),
+        );
+        let project = ProjectOperator::new(query.include_fields.clone(), Box::new(lookup));
 
-        // Per-field corpus stats are required to compute IDF / avgdl.
-        let field_stats = self.load_field_stats(&bm25.field).await?;
-        let n_docs = field_stats.count.max(0) as u64;
-        if n_docs == 0 || field_stats.total_length <= 0 {
-            return Ok(Vec::new());
-        }
-        let avgdl = field_stats.total_length as f32 / n_docs as f32;
+        let results = project
+            .execute()
+            .await?
+            .into_iter()
+            .map(SearchResult::from)
+            .collect();
 
-        // Build one stream per query term with the term's pre-computed IDF.
-        let mut streams = self.open_term_streams(&bm25.field, &terms, n_docs).await?;
-        if streams.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Max-heap of (current head doc_id, stream index) so we can pop all
-        // streams sharing the next-highest doc_id together.
-        let mut head_heap: BinaryHeap<StreamHead> = BinaryHeap::with_capacity(streams.len());
-        for (idx, stream) in streams.iter().enumerate() {
-            if let Some(doc_id) = stream.peek_doc_id() {
-                head_heap.push(StreamHead {
-                    doc_id,
-                    stream_idx: idx,
-                });
-            }
-        }
-
-        // Prepared metadata filter. `matches` answers per-doc membership
-        // without materialising the full corpus universe, so the BM25 loop can
-        // check each candidate as it is scored.
-        let prepared_filter =
-            PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
-
-        // Min-heap (via `WorstFirst` ordering) tracking the K worst candidates
-        // accepted so far. `peek()` is the candidate to evict.
-        let mut top_k: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(query.limit);
-        let dimensions = self.options.dimensions as usize;
-
-        // Reused per-doc buffer so we don't allocate a fresh Vec each iteration.
-        let mut hits: Vec<bm25_math::Bm25TermEntry> = Vec::with_capacity(streams.len());
-
-        while head_heap.peek().is_some() {
-            let doc_id = head_heap.peek().expect("non-empty").doc_id;
-
-            // Drain every stream sharing this doc_id into a per-doc hit buffer.
-            hits.clear();
-            while let Some(top) = head_heap.peek().copied() {
-                if top.doc_id != doc_id {
-                    break;
-                }
-                head_heap.pop();
-                let stream = &mut streams[top.stream_idx];
-                let entry = stream
-                    .pop()
-                    .expect("stream head was on heap but pop returned None");
-                hits.push(bm25_math::Bm25TermEntry {
-                    freq: entry.freq,
-                    norm: entry.norm,
-                    idf: stream.idf,
-                });
-                if let Some(next) = stream.peek_doc_id() {
-                    head_heap.push(StreamHead {
-                        doc_id: next,
-                        stream_idx: top.stream_idx,
-                    });
-                }
-            }
-
-            // Apply the metadata filter BEFORE scoring so excluded docs
-            // don't pay the BM25 cost.
-            if !prepared_filter.matches(doc_id) {
-                continue;
-            }
-
-            // The in-memory FTS deletions bitmap is the authority for delete
-            // resolution on this path. `doc_id` is the raw internal id from
-            // the posting, which is the same id space the bitmap indexes
-            // (data vectors are level 0, so the raw u64 equals
-            // `VectorId::data_vector_id(doc_id).id()`). Skip deleted/replaced
-            // docs before paying the scoring cost; this — not the forward
-            // index — hides deleted documents.
-            if self.deletions.contains(doc_id) {
-                continue;
-            }
-
-            // Single BM25 evaluation per document.
-            let score = bm25_math::score(&hits, avgdl);
-
-            // Skip candidates that cannot enter the current top-K.
-            if top_k.len() == query.limit
-                && let Some(worst) = top_k.peek()
-                && !is_better(score, doc_id, worst.score, worst.doc_id)
-            {
-                continue;
-            }
-
-            // The bound check above already guaranteed this entry beats the
-            // current worst when the heap is full, so just evict and push.
-            // We defer the forward-index `get_vector_data` lookup until after
-            // the loop so it runs only for the K survivors rather than every
-            // scored candidate.
-            if top_k.len() == query.limit {
-                top_k.pop();
-            }
-            top_k.push(WorstFirst { score, doc_id });
-        }
-
-        // Fetch the forward-index `VectorData` for only the K survivors. The
-        // deletions bitmap above already resolved deletes, so the get None
-        // branch is a defensive fallback (e.g. a concurrent compaction) rather
-        // than the primary delete mechanism.
-        let mut results: Vec<SearchResult> = Vec::with_capacity(top_k.len());
-        for candidate in top_k.into_iter() {
-            let vector_id = VectorId::data_vector_id(candidate.doc_id);
-            let Some(vector_data) = self.storage.get_vector_data(vector_id, dimensions).await?
-            else {
-                continue;
-            };
-            results.push(SearchResult {
-                score: candidate.score,
-                vector: Self::vector_data_to_vector(&vector_data),
-            });
-        }
-
-        // Order results: descending score, ties broken by ascending doc id
-        // (matches the existing ANN ordering convention).
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.vector.id.cmp(&b.vector.id))
-        });
-        Self::apply_field_selection(&mut results, &query.include_fields);
         debug!(
             op = "search_bm25",
             elapsed_ms = t.elapsed().as_millis() as u64
         );
         Ok(results)
-    }
-
-    /// Load postings + term stats for each query term and wrap them as
-    /// `PostingStream`s carrying pre-computed IDF. Streams for which the
-    /// term has no documents are omitted.
-    async fn open_term_streams(
-        &self,
-        field: &str,
-        terms: &[String],
-        n_docs: u64,
-    ) -> Result<Vec<PostingStream>> {
-        let mut streams = Vec::with_capacity(terms.len());
-        for term in terms {
-            let postings = self.load_term_postings(field, term).await?;
-            let stats = self.load_term_stats(field, term).await?;
-            let n_t = stats.freq.max(0) as u64;
-            if n_t == 0 {
-                continue;
-            }
-            // Block iteration order is already descending by doc id.
-            let entries: Vec<PostingEntry> = postings.iter_entries().copied().collect();
-            if entries.is_empty() {
-                continue;
-            }
-            streams.push(PostingStream::new(entries, bm25_math::idf(n_docs, n_t)));
-        }
-        Ok(streams)
-    }
-
-    async fn load_field_stats(&self, field: &str) -> Result<FieldStatsValue> {
-        let key = FieldStatsKey::new(field).encode();
-        match self.storage.get(key).await? {
-            Some(record) => Ok(FieldStatsValue::decode_from_bytes(&record.value)?),
-            None => Ok(FieldStatsValue::default()),
-        }
-    }
-
-    async fn load_term_stats(&self, field: &str, term: &str) -> Result<TermStatsValue> {
-        let key = TermStatsKey::new(field, term).encode();
-        match self.storage.get(key).await? {
-            Some(record) => Ok(TermStatsValue::decode_from_bytes(&record.value)?),
-            None => Ok(TermStatsValue::default()),
-        }
-    }
-
-    async fn load_term_postings(&self, field: &str, term: &str) -> Result<TermPostingsValue> {
-        let key = TermPostingsKey::new(field, term).encode();
-        match self.storage.get(key).await? {
-            Some(record) => Ok(TermPostingsValue::decode_from_bytes(&record.value)?),
-            None => Ok(TermPostingsValue::default()),
-        }
     }
 
     /// Apply query-aware dynamic pruning
@@ -647,7 +467,7 @@ impl QueryEngine {
                 };
                 results.push(SearchResult {
                     score: sr.distance.score(),
-                    vector: Self::vector_data_to_vector(&vector_data),
+                    vector: lookup::vector_data_to_vector(&vector_data),
                 });
 
                 if results.len() == k {
@@ -657,26 +477,6 @@ impl QueryEngine {
         }
 
         Ok(results)
-    }
-
-    /// Apply field projection to search results.
-    fn apply_field_selection(results: &mut [SearchResult], selection: &FieldSelection) {
-        match selection {
-            FieldSelection::All => {}
-            FieldSelection::None => {
-                for result in results.iter_mut() {
-                    result.vector.attributes.clear();
-                }
-            }
-            FieldSelection::Fields(names) => {
-                for result in results.iter_mut() {
-                    result
-                        .vector
-                        .attributes
-                        .retain(|attr| names.contains(&attr.name));
-                }
-            }
-        }
     }
 }
 
@@ -706,126 +506,6 @@ impl Ord for MergeEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.distance.cmp(&other.0.distance)
     }
-}
-
-/// A term's postings paired with the term's precomputed IDF.
-///
-/// Yields entries in descending `doc_id` order — the same order the
-/// underlying `TermPostingsValue` blocks are stored in (RFC-0006).
-struct PostingStream {
-    /// All entries in descending `doc_id` order.
-    entries: Vec<PostingEntry>,
-    /// Index of the next entry to yield (`pop`).
-    cursor: usize,
-    /// IDF for this stream's term in the current corpus.
-    idf: f32,
-}
-
-impl PostingStream {
-    fn new(entries: Vec<PostingEntry>, idf: f32) -> Self {
-        Self {
-            entries,
-            cursor: 0,
-            idf,
-        }
-    }
-
-    fn peek_doc_id(&self) -> Option<u64> {
-        self.entries.get(self.cursor).map(|e| e.doc_id)
-    }
-
-    /// Consume the current head and advance to the next entry.
-    fn pop(&mut self) -> Option<PostingEntry> {
-        let current = *self.entries.get(self.cursor)?;
-        self.cursor += 1;
-        Some(current)
-    }
-}
-
-/// Heap entry referring to the current head of a `PostingStream` by index.
-///
-/// Ordered by `doc_id` descending so the max-heap returns the
-/// next-highest-id head across all streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StreamHead {
-    doc_id: u64,
-    stream_idx: usize,
-}
-
-impl Ord for StreamHead {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.doc_id
-            .cmp(&other.doc_id)
-            .then_with(|| other.stream_idx.cmp(&self.stream_idx))
-    }
-}
-
-impl PartialOrd for StreamHead {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Top-K candidate ordered so `BinaryHeap::peek()` returns the worst
-/// (lowest-score, highest-doc-id) entry — the one to evict next.
-///
-/// Only the score and `doc_id` are carried through the scoring loop; the
-/// forward-index `VectorData` is fetched lazily for the K survivors after the
-/// loop completes (see `search_bm25`).
-struct WorstFirst {
-    score: f32,
-    doc_id: u64,
-}
-
-impl PartialEq for WorstFirst {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for WorstFirst {}
-
-impl PartialOrd for WorstFirst {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for WorstFirst {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap; we want the "worst" candidate at the
-        // top, so a candidate that is *worse* must compare *greater*. Worse
-        // means lower score, or — on a score tie — higher doc id (since the
-        // final results are sorted by ascending doc id on ties).
-        other
-            .score
-            .total_cmp(&self.score)
-            .then_with(|| self.doc_id.cmp(&other.doc_id))
-    }
-}
-
-/// Returns `true` when `(new_score, new_doc_id)` would rank ahead of
-/// `(other_score, other_doc_id)` in the final BM25 result ordering
-/// (descending score, ties broken by ascending doc id).
-fn is_better(new_score: f32, new_doc_id: u64, other_score: f32, other_doc_id: u64) -> bool {
-    match new_score.partial_cmp(&other_score) {
-        Some(Ordering::Greater) => true,
-        Some(Ordering::Less) => false,
-        Some(Ordering::Equal) | None => new_doc_id < other_doc_id,
-    }
-}
-
-/// Tokenize a BM25 query string and drop duplicate terms while preserving
-/// first-seen order.
-fn dedupe_query_terms(query: &str) -> Vec<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut unique = Vec::new();
-    for term in text::tokenize(query) {
-        if seen.insert(term.clone()) {
-            unique.push(term);
-        }
-    }
-    unique
 }
 
 #[cfg(test)]
@@ -1599,5 +1279,49 @@ mod tests {
                 results[i].score
             );
         }
+    }
+
+    #[tokio::test]
+    async fn should_search_bm25_end_to_end() {
+        // given - a text field and a few documents
+        let config = Config {
+            storage: StorageConfig::InMemory,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            metadata_fields: vec![MetadataFieldSpec::new("body", FieldType::Text, false)],
+            ..Default::default()
+        };
+        let db = VectorDb::open(config).await.unwrap();
+        db.write(vec![
+            Vector::builder("d1", vec![0.0; 3])
+                .attribute("body", "the quick brown fox")
+                .build(),
+            Vector::builder("d2", vec![0.0; 3])
+                .attribute("body", "a fox and another fox")
+                .build(),
+            Vector::builder("d3", vec![0.0; 3])
+                .attribute("body", "completely unrelated text")
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // when - run a BM25 query through the full project -> lookup -> bm25 chain
+        let results = db
+            .search(&Query::bm25("body", "fox").with_limit(10))
+            .await
+            .unwrap();
+
+        // then - only matching docs, with the denser match ranked first
+        let ids: Vec<&str> = results.iter().map(|r| r.vector.id.as_str()).collect();
+        assert_eq!(ids, vec!["d2", "d1"]);
+        // scores are non-increasing
+        assert!(results[0].score >= results[1].score);
+        // the text field is materialized in the result by default
+        assert_eq!(
+            results[0].vector.attribute("body"),
+            Some(&AttributeValue::String("a fox and another fox".to_string()))
+        );
     }
 }
