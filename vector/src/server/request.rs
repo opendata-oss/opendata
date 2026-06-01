@@ -186,13 +186,35 @@ impl SearchRequest {
     }
 
     fn from_proto_request(proto_request: proto::SearchRequest) -> Result<Self, Error> {
-        if proto_request.vector.is_empty() {
-            return Err(Error::InvalidInput("vector is required".to_string()));
-        }
         if proto_request.k == 0 {
             return Err(Error::InvalidInput("k must be greater than 0".to_string()));
         }
-        let mut query = Query::new(proto_request.vector).with_limit(proto_request.k as usize);
+        let has_vector = !proto_request.vector.is_empty();
+        let has_bm25 = proto_request.bm25.is_some();
+        let mut query = match (has_vector, has_bm25) {
+            (true, false) => Query::ann(proto_request.vector),
+            (false, true) => {
+                let bm25 = proto_request.bm25.expect("bm25 set");
+                if bm25.field.is_empty() {
+                    return Err(Error::InvalidInput("bm25.field is required".to_string()));
+                }
+                if bm25.query.is_empty() {
+                    return Err(Error::InvalidInput("bm25.query is required".to_string()));
+                }
+                Query::bm25(bm25.field, bm25.query)
+            }
+            (false, false) => {
+                return Err(Error::InvalidInput(
+                    "one of 'vector' or 'bm25' is required".to_string(),
+                ));
+            }
+            (true, true) => {
+                return Err(Error::InvalidInput(
+                    "'vector' and 'bm25' are mutually exclusive".to_string(),
+                ));
+            }
+        }
+        .with_limit(proto_request.k as usize);
         if let Some(filter) = proto_request.filter {
             query = query.with_filter(proto_filter_to_filter(filter)?);
         }
@@ -211,14 +233,40 @@ impl SearchRequest {
         json_request: JsonSearchRequest,
         metadata_fields: &HashMap<String, FieldType>,
     ) -> Result<Self, Error> {
-        if json_request.vector.is_empty() {
-            return Err(Error::InvalidInput("vector is required".to_string()));
-        }
         if json_request.k == 0 {
             return Err(Error::InvalidInput("k must be greater than 0".to_string()));
         }
+        let has_vector = json_request
+            .vector
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let has_bm25 = json_request.bm25.is_some();
 
-        let mut query = Query::new(json_request.vector).with_limit(json_request.k as usize);
+        let mut query = match (has_vector, has_bm25) {
+            (true, false) => Query::ann(json_request.vector.unwrap_or_default()),
+            (false, true) => {
+                let bm25 = json_request.bm25.expect("bm25 set");
+                if bm25.field.is_empty() {
+                    return Err(Error::InvalidInput("bm25.field is required".to_string()));
+                }
+                if bm25.query.is_empty() {
+                    return Err(Error::InvalidInput("bm25.query is required".to_string()));
+                }
+                Query::bm25(bm25.field, bm25.query)
+            }
+            (false, false) => {
+                return Err(Error::InvalidInput(
+                    "one of 'vector' or 'bm25' is required".to_string(),
+                ));
+            }
+            (true, true) => {
+                return Err(Error::InvalidInput(
+                    "'vector' and 'bm25' are mutually exclusive".to_string(),
+                ));
+            }
+        }
+        .with_limit(json_request.k as usize);
         if let Some(filter) = json_request.filter {
             query = query.with_filter(json_filter_to_filter(filter, metadata_fields)?);
         }
@@ -261,7 +309,8 @@ struct JsonDeleteRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonSearchRequest {
-    vector: Vec<f32>,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
     k: u32,
     #[serde(default)]
     nprobe: Option<u32>,
@@ -269,6 +318,16 @@ struct JsonSearchRequest {
     filter: Option<JsonFilter>,
     #[serde(default)]
     include_fields: Option<Vec<String>>,
+    #[serde(default)]
+    bm25: Option<JsonBm25Query>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonBm25Query {
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    query: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,30 +336,35 @@ struct JsonVector {
     attributes: HashMap<String, Value>,
 }
 
+/// JSON representation of a query filter. Exactly one operator field must be
+/// set. Used by the HTTP API and re-exported for reuse (e.g. by the
+/// benchmark harness) so the wire format has a single definition.
 #[derive(Debug, Deserialize)]
-struct JsonFilter {
+pub struct JsonFilter {
     #[serde(default)]
-    eq: Option<JsonComparisonFilter>,
+    pub eq: Option<JsonComparisonFilter>,
     #[serde(default)]
-    neq: Option<JsonComparisonFilter>,
+    pub neq: Option<JsonComparisonFilter>,
     #[serde(default)]
-    r#in: Option<JsonInFilter>,
+    pub r#in: Option<JsonInFilter>,
     #[serde(default)]
-    and: Option<Vec<JsonFilter>>,
+    pub and: Option<Vec<JsonFilter>>,
     #[serde(default)]
-    or: Option<Vec<JsonFilter>>,
+    pub or: Option<Vec<JsonFilter>>,
 }
 
+/// A single `eq`/`neq` comparison: `field` against a JSON `value`.
 #[derive(Debug, Deserialize)]
-struct JsonComparisonFilter {
-    field: String,
-    value: Value,
+pub struct JsonComparisonFilter {
+    pub field: String,
+    pub value: Value,
 }
 
+/// An `in` filter: `field` against a set of JSON `values`.
 #[derive(Debug, Deserialize)]
-struct JsonInFilter {
-    field: String,
-    values: Vec<Value>,
+pub struct JsonInFilter {
+    pub field: String,
+    pub values: Vec<Value>,
 }
 
 fn proto_vector_to_vector(index: usize, doc: proto::Vector) -> Result<crate::Vector, Error> {
@@ -485,7 +549,7 @@ fn json_attribute_to_value(
     }
 
     match schema.get(name).copied() {
-        Some(FieldType::String) => parse_string_value(index, name, value),
+        Some(FieldType::String) | Some(FieldType::Text) => parse_string_value(index, name, value),
         Some(FieldType::Int64) => parse_int64_value(index, name, value),
         Some(FieldType::Float64) => parse_float64_value(index, name, value),
         Some(FieldType::Bool) => parse_bool_value(index, name, value),
@@ -521,6 +585,10 @@ fn json_filter_value_to_attribute(
             .as_bool()
             .map(AttributeValue::Bool)
             .ok_or_else(|| Error::InvalidInput(format!("filter field '{}' must be bool", field))),
+        Some(FieldType::Text) => Err(Error::InvalidInput(format!(
+            "filter field '{}' is a text field and is not filterable; use a BM25 query instead",
+            field
+        ))),
         Some(FieldType::Vector) => Err(Error::InvalidInput(format!(
             "filter field '{}' must be scalar",
             field
@@ -903,7 +971,7 @@ mod tests {
         .unwrap();
 
         // then
-        assert_eq!(request.query.vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(request.query.ann_vector(), Some(&vec![1.0, 2.0, 3.0]));
         assert_eq!(request.query.limit, 10);
         assert_eq!(request.options.nprobe, Some(20));
         assert_eq!(
@@ -940,7 +1008,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("vector is required")
+                .contains("one of 'vector' or 'bm25' is required")
         );
     }
 
@@ -991,6 +1059,7 @@ mod tests {
                 })),
             }),
             include_fields: vec![],
+            bm25: None,
         }
         .encode_to_vec();
 
@@ -999,7 +1068,7 @@ mod tests {
             SearchRequest::from_body(&protobuf_headers(), &body, &HashMap::new()).unwrap();
 
         // then
-        assert_eq!(request.query.vector, vec![1.0, 2.0, 3.0]);
+        assert_eq!(request.query.ann_vector(), Some(&vec![1.0, 2.0, 3.0]));
         assert_eq!(request.query.limit, 10);
         assert_eq!(
             request.query.filter,
@@ -1046,5 +1115,164 @@ mod tests {
         // then
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid protobuf"));
+    }
+
+    #[test]
+    fn should_parse_bm25_search_request_from_json() {
+        // given
+        let json = br#"{
+            "bm25": {"field": "body", "query": "fox jumps"},
+            "k": 5
+        }"#;
+
+        // when
+        let request = SearchRequest::from_body(
+            &protojson_headers(),
+            json,
+            &HashMap::from([("body".to_string(), FieldType::Text)]),
+        )
+        .unwrap();
+
+        // then
+        assert!(request.query.ann_vector().is_none());
+        assert!(matches!(
+            &request.query.score_by,
+            crate::ScoreBy::Bm25(q) if q.field == "body" && q.query == "fox jumps"
+        ));
+        assert_eq!(request.query.limit, 5);
+    }
+
+    #[test]
+    fn should_parse_bm25_search_request_from_protobuf() {
+        // given
+        let body = proto::SearchRequest {
+            vector: vec![],
+            k: 5,
+            nprobe: None,
+            filter: None,
+            include_fields: vec![],
+            bm25: Some(proto::Bm25QueryMessage {
+                field: "body".to_string(),
+                query: "fox".to_string(),
+            }),
+        }
+        .encode_to_vec();
+
+        // when
+        let request =
+            SearchRequest::from_body(&protobuf_headers(), &body, &HashMap::new()).unwrap();
+
+        // then
+        assert!(matches!(
+            &request.query.score_by,
+            crate::ScoreBy::Bm25(q) if q.field == "body" && q.query == "fox"
+        ));
+        assert_eq!(request.query.limit, 5);
+    }
+
+    #[test]
+    fn should_reject_search_request_with_both_vector_and_bm25() {
+        // given
+        let json = br#"{
+            "vector": [1.0, 2.0],
+            "bm25": {"field": "body", "query": "fox"},
+            "k": 5
+        }"#;
+
+        // when
+        let result = SearchRequest::from_body(&protojson_headers(), json, &HashMap::new());
+
+        // then
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn should_reject_bm25_search_request_with_empty_field() {
+        // given
+        let json = br#"{
+            "bm25": {"field": "", "query": "fox"},
+            "k": 5
+        }"#;
+
+        // when
+        let result = SearchRequest::from_body(&protojson_headers(), json, &HashMap::new());
+
+        // then
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("bm25.field is required")
+        );
+    }
+
+    #[test]
+    fn should_reject_bm25_search_request_with_empty_query() {
+        // given
+        let json = br#"{
+            "bm25": {"field": "body", "query": ""},
+            "k": 5
+        }"#;
+
+        // when
+        let result = SearchRequest::from_body(&protojson_headers(), json, &HashMap::new());
+
+        // then
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("bm25.query is required")
+        );
+    }
+
+    #[test]
+    fn should_parse_text_field_in_write_request() {
+        // given
+        let json = br#"{
+            "upsertVectors": [{
+                "id": "doc-1",
+                "attributes": {
+                    "vector": [1.0, 2.0, 3.0],
+                    "body": "the quick brown fox"
+                }
+            }]
+        }"#;
+        let schema = HashMap::from([("body".to_string(), FieldType::Text)]);
+
+        // when
+        let request = WriteRequest::from_body(&protojson_headers(), json, &schema).unwrap();
+
+        // then
+        assert!(matches!(
+            request.upsert_vectors[0].attribute("body"),
+            Some(AttributeValue::String(value)) if value == "the quick brown fox"
+        ));
+    }
+
+    #[test]
+    fn should_reject_filter_on_text_field() {
+        // given
+        let json = br#"{
+            "vector": [1.0, 2.0],
+            "k": 5,
+            "filter": {"eq": {"field": "body", "value": "fox"}}
+        }"#;
+        let schema = HashMap::from([("body".to_string(), FieldType::Text)]);
+
+        // when
+        let result = SearchRequest::from_body(&protojson_headers(), json, &schema);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not filterable"));
     }
 }

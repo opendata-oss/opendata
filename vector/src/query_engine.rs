@@ -1,16 +1,25 @@
 use crate::error::{Error, Result};
+use crate::math::bm25;
 use crate::math::distance;
-use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
+use crate::metric_names::{QUERY_SEARCH_DURATION_SECONDS, QUERY_VECTORS_SCORED_TOTAL};
+use crate::model::{
+    Bm25Query, FieldSelection, Filter, Query, ScoreBy, SearchOptions, SearchResult,
+};
 use crate::serde::collection_meta::DistanceMetric;
+use crate::serde::field_stats::FieldStatsValue;
+use crate::serde::key::{FieldStatsKey, TermPostingsKey, TermStatsKey};
+use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
+use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::VectorId;
 use crate::storage::VectorDbStorageReadExt;
+use crate::text;
 use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::{Attribute, Vector};
 use common::storage::StorageRead;
 use roaring::RoaringTreemap;
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -98,16 +107,24 @@ impl QueryEngine {
         query: &Query,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        if query.vector.len() != self.options.dimensions as usize {
+        let ann_vector = match &query.score_by {
+            ScoreBy::Ann(v) => v,
+            ScoreBy::Bm25(_) => {
+                return Err(Error::InvalidInput(
+                    "search_exact_nprobe only supports ANN queries".to_string(),
+                ));
+            }
+        };
+        if ann_vector.len() != self.options.dimensions as usize {
             return Err(Error::InvalidInput(format!(
                 "Query dimension mismatch: expected {}, got {}",
                 self.options.dimensions,
-                query.vector.len()
+                ann_vector.len()
             )));
         }
 
         // Normalize query vector if required.
-        let query_vector = self.normalize_query_if_needed(&query.vector);
+        let query_vector = self.normalize_query_if_needed(ann_vector);
 
         // Brute-force: compute distance from query to every live centroid
         let centroid_candidates = self.search_centroids(&query_vector, usize::MAX).await?;
@@ -149,18 +166,42 @@ impl QueryEngine {
         query: &Query,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
+        let search_start = Instant::now();
+        let result = self.search_with_options_inner(query, options).await;
+        metrics::histogram!(QUERY_SEARCH_DURATION_SECONDS)
+            .record(search_start.elapsed().as_secs_f64());
+        result
+    }
+
+    async fn search_with_options_inner(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        match &query.score_by {
+            ScoreBy::Ann(vector) => self.search_ann(vector, query, options).await,
+            ScoreBy::Bm25(bm25) => self.search_bm25(bm25, query).await,
+        }
+    }
+
+    async fn search_ann(
+        &self,
+        ann_vector: &[f32],
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
         let nprobe = options.nprobe.unwrap_or_else(|| query.limit.clamp(10, 100));
         // 1. Validate query dimensions
-        if query.vector.len() != self.options.dimensions as usize {
+        if ann_vector.len() != self.options.dimensions as usize {
             return Err(Error::InvalidInput(format!(
                 "Query dimension mismatch: expected {}, got {}",
                 self.options.dimensions,
-                query.vector.len()
+                ann_vector.len()
             )));
         }
 
         // 2. Normalize query vector if required.
-        let query_vector = self.normalize_query_if_needed(&query.vector);
+        let query_vector = self.normalize_query_if_needed(ann_vector);
 
         // 3. Search HNSW for nearest centroids
         let num_centroids = nprobe;
@@ -206,6 +247,246 @@ impl QueryEngine {
             elapsed_ms = t.elapsed().as_millis()
         );
         Ok(results)
+    }
+
+    /// BM25 search path (RFC-0006 Milestone 0).
+    ///
+    /// Iterates the union of per-term posting lists document by document in
+    /// descending `doc_id` order, accumulates each document's BM25 score in a
+    /// single pass, and maintains a top-K min-heap. Metadata filtering is
+    /// applied via a cached allow-list bitmap that is recomputed in 10K-wide
+    /// `doc_id` windows as the loop advances.
+    async fn search_bm25(&self, bm25: &Bm25Query, query: &Query) -> Result<Vec<SearchResult>> {
+        let t = Instant::now();
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let terms = dedupe_query_terms(&bm25.query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Per-field corpus stats are required to compute IDF / avgdl.
+        let field_stats = self.load_field_stats(&bm25.field).await?;
+        let n_docs = field_stats.count.max(0) as u64;
+        if n_docs == 0 || field_stats.total_length <= 0 {
+            return Ok(Vec::new());
+        }
+        let avgdl = field_stats.total_length as f32 / n_docs as f32;
+
+        // Build one stream per query term with the term's pre-computed IDF.
+        let mut streams = self.open_term_streams(&bm25.field, &terms, n_docs).await?;
+        if streams.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Max-heap of (current head doc_id, stream index) so we can pop all
+        // streams sharing the next-highest doc_id together.
+        let mut head_heap: BinaryHeap<StreamHead> = BinaryHeap::with_capacity(streams.len());
+        for (idx, stream) in streams.iter().enumerate() {
+            if let Some(doc_id) = stream.peek_doc_id() {
+                head_heap.push(StreamHead {
+                    doc_id,
+                    stream_idx: idx,
+                });
+            }
+        }
+
+        // Filter window: re-evaluate the filter bitmap over a chunk of doc
+        // ids at a time so we never materialise the full corpus universe.
+        // `low` is inclusive; as the loop walks lower we recompute the window
+        // containing the current doc id in one step (no sliding).
+        let mut filter_window: Option<FilterWindow> = match &query.filter {
+            None => None,
+            Some(filter) => {
+                let top = head_heap.peek().expect("streams non-empty").doc_id;
+                let (low, high) = window_for(top);
+                let bitmap = self.recompute_filter_window(filter, low, high).await?;
+                Some(FilterWindow { low, high, bitmap })
+            }
+        };
+
+        // Min-heap (via `WorstFirst` ordering) tracking the K worst candidates
+        // accepted so far. `peek()` is the candidate to evict.
+        let mut top_k: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(query.limit);
+        let dimensions = self.options.dimensions as usize;
+
+        // Reused per-doc buffer so we don't allocate a fresh Vec each iteration.
+        let mut hits: Vec<bm25::Bm25TermEntry> = Vec::with_capacity(streams.len());
+
+        while head_heap.peek().is_some() {
+            let doc_id = head_heap.peek().expect("non-empty").doc_id;
+
+            // Drain every stream sharing this doc_id into a per-doc hit buffer.
+            hits.clear();
+            while let Some(top) = head_heap.peek().copied() {
+                if top.doc_id != doc_id {
+                    break;
+                }
+                head_heap.pop();
+                let stream = &mut streams[top.stream_idx];
+                let entry = stream
+                    .pop()
+                    .expect("stream head was on heap but pop returned None");
+                hits.push(bm25::Bm25TermEntry {
+                    freq: entry.freq,
+                    norm: entry.norm,
+                    idf: stream.idf,
+                });
+                if let Some(next) = stream.peek_doc_id() {
+                    head_heap.push(StreamHead {
+                        doc_id: next,
+                        stream_idx: top.stream_idx,
+                    });
+                }
+            }
+
+            // Refresh the chunked filter window if we've walked past it.
+            // The windows are aligned to multiples of `FILTER_WINDOW_SIZE`,
+            // so the window containing `doc_id` is reachable in one step.
+            if let Some(filter) = query.filter.as_ref()
+                && let Some(window) = filter_window.as_mut()
+                && doc_id < window.low
+            {
+                let (low, high) = window_for(doc_id);
+                window.bitmap = self.recompute_filter_window(filter, low, high).await?;
+                window.low = low;
+                window.high = high;
+            }
+
+            // Apply the metadata filter BEFORE scoring so excluded docs
+            // don't pay the BM25 cost.
+            if let Some(window) = filter_window.as_ref()
+                && !window.bitmap.contains(doc_id)
+            {
+                continue;
+            }
+
+            // Single BM25 evaluation per document.
+            let score = bm25::score(&hits, avgdl);
+
+            // Skip candidates that cannot enter the current top-K.
+            if top_k.len() == query.limit
+                && let Some(worst) = top_k.peek()
+                && !is_better(score, doc_id, worst.score, worst.doc_id)
+            {
+                continue;
+            }
+
+            // TODO(rfc-0006 milestone 1): once the FTS deletions bitmap is
+            // available, defer this lookup until after the loop and consult
+            // the bitmap inline here instead. With the bitmap we only need
+            // the forward index for the K survivors, not for every scored
+            // candidate.
+            let id = VectorId::data_vector_id(doc_id);
+            let Some(vector_data) = self.storage.get_vector_data(id, dimensions).await? else {
+                continue;
+            };
+
+            // The bound check above already guaranteed this entry beats the
+            // current worst when the heap is full, so just evict and push.
+            if top_k.len() == query.limit {
+                top_k.pop();
+            }
+            top_k.push(WorstFirst {
+                score,
+                doc_id,
+                vector_data,
+            });
+        }
+
+        // Drain top-K and order results: descending score, ties broken by
+        // ascending doc id (matches the existing ANN ordering convention).
+        let mut results: Vec<SearchResult> = top_k
+            .into_iter()
+            .map(|e| SearchResult {
+                score: e.score,
+                vector: Self::vector_data_to_vector(&e.vector_data),
+            })
+            .collect();
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.vector.id.cmp(&b.vector.id))
+        });
+        Self::apply_field_selection(&mut results, &query.include_fields);
+        debug!(
+            op = "search_bm25",
+            elapsed_ms = t.elapsed().as_millis() as u64
+        );
+        Ok(results)
+    }
+
+    /// Load postings + term stats for each query term and wrap them as
+    /// `PostingStream`s carrying pre-computed IDF. Streams for which the
+    /// term has no documents are omitted.
+    async fn open_term_streams(
+        &self,
+        field: &str,
+        terms: &[String],
+        n_docs: u64,
+    ) -> Result<Vec<PostingStream>> {
+        let mut streams = Vec::with_capacity(terms.len());
+        for term in terms {
+            let postings = self.load_term_postings(field, term).await?;
+            let stats = self.load_term_stats(field, term).await?;
+            let n_t = stats.freq.max(0) as u64;
+            if n_t == 0 {
+                continue;
+            }
+            // Block iteration order is already descending by doc id.
+            let entries: Vec<PostingEntry> = postings.iter_entries().copied().collect();
+            if entries.is_empty() {
+                continue;
+            }
+            streams.push(PostingStream::new(entries, bm25::idf(n_docs, n_t)));
+        }
+        Ok(streams)
+    }
+
+    /// Evaluate the query filter for a single `[low, high]` doc-id window.
+    ///
+    /// The universe used for `Filter::Neq` complement is the full inclusive
+    /// `[low, high]` range — `RoaringTreemap::insert_range` materialises this
+    /// in O(window_size / 2^16) bitmap containers, which is much cheaper than
+    /// scanning every posting stream just to collect doc ids. Doc ids outside
+    /// the streams never reach the membership check, so widening the
+    /// universe is safe.
+    async fn recompute_filter_window(
+        &self,
+        filter: &Filter,
+        low: u64,
+        high: u64,
+    ) -> Result<RoaringTreemap> {
+        let mut universe = RoaringTreemap::new();
+        universe.insert_range(low..=high);
+        Self::evaluate_filter(filter, &universe, self.storage.as_ref()).await
+    }
+
+    async fn load_field_stats(&self, field: &str) -> Result<FieldStatsValue> {
+        let key = FieldStatsKey::new(field).encode();
+        match self.storage.get(key).await? {
+            Some(record) => Ok(FieldStatsValue::decode_from_bytes(&record.value)?),
+            None => Ok(FieldStatsValue::default()),
+        }
+    }
+
+    async fn load_term_stats(&self, field: &str, term: &str) -> Result<TermStatsValue> {
+        let key = TermStatsKey::new(field, term).encode();
+        match self.storage.get(key).await? {
+            Some(record) => Ok(TermStatsValue::decode_from_bytes(&record.value)?),
+            None => Ok(TermStatsValue::default()),
+        }
+    }
+
+    async fn load_term_postings(&self, field: &str, term: &str) -> Result<TermPostingsValue> {
+        let key = TermPostingsKey::new(field, term).encode();
+        match self.storage.get(key).await? {
+            Some(record) => Ok(TermPostingsValue::decode_from_bytes(&record.value)?),
+            None => Ok(TermPostingsValue::default()),
+        }
     }
 
     /// Apply query-aware dynamic pruning
@@ -306,13 +587,16 @@ impl QueryEngine {
             elapsed_ms = elapsed.as_millis()
         );
         let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
+        let mut total_scored: u64 = 0;
         for result in results {
             let scored =
                 result.map_err(|e| Error::Internal(format!("task join error: {}", e)))??;
+            total_scored += scored.len() as u64;
             if !scored.is_empty() {
                 sorted_lists.push(scored);
             }
         }
+        metrics::counter!(QUERY_VECTORS_SCORED_TOTAL).increment(total_scored);
 
         Ok(sorted_lists)
     }
@@ -523,6 +807,147 @@ impl Ord for MergeEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.distance.cmp(&other.0.distance)
     }
+}
+
+/// A term's postings paired with the term's precomputed IDF.
+///
+/// Yields entries in descending `doc_id` order — the same order the
+/// underlying `TermPostingsValue` blocks are stored in (RFC-0006).
+struct PostingStream {
+    /// All entries in descending `doc_id` order.
+    entries: Vec<PostingEntry>,
+    /// Index of the next entry to yield (`pop`).
+    cursor: usize,
+    /// IDF for this stream's term in the current corpus.
+    idf: f32,
+}
+
+impl PostingStream {
+    fn new(entries: Vec<PostingEntry>, idf: f32) -> Self {
+        Self {
+            entries,
+            cursor: 0,
+            idf,
+        }
+    }
+
+    fn peek_doc_id(&self) -> Option<u64> {
+        self.entries.get(self.cursor).map(|e| e.doc_id)
+    }
+
+    /// Consume the current head and advance to the next entry.
+    fn pop(&mut self) -> Option<PostingEntry> {
+        let current = *self.entries.get(self.cursor)?;
+        self.cursor += 1;
+        Some(current)
+    }
+}
+
+/// Heap entry referring to the current head of a `PostingStream` by index.
+///
+/// Ordered by `doc_id` descending so the max-heap returns the
+/// next-highest-id head across all streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamHead {
+    doc_id: u64,
+    stream_idx: usize,
+}
+
+impl Ord for StreamHead {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.doc_id
+            .cmp(&other.doc_id)
+            .then_with(|| other.stream_idx.cmp(&self.stream_idx))
+    }
+}
+
+impl PartialOrd for StreamHead {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Width of the doc-id window used to materialise the metadata-filter
+/// allow-list. Tuned so the universe roughly matches a SlateDB scan unit.
+const FILTER_WINDOW_SIZE: u64 = 10_000;
+
+/// Cached filter allow-list for an inclusive `[low, high]` doc-id window.
+struct FilterWindow {
+    /// Inclusive lower bound (zero when the window covers down to id 0).
+    low: u64,
+    /// Inclusive upper bound — the highest `doc_id` covered by `bitmap`.
+    high: u64,
+    /// Allow-list emitted by `evaluate_filter` for the doc ids in
+    /// `[low, high]`.
+    bitmap: RoaringTreemap,
+}
+
+/// Returns the `[low, high]` filter window containing `doc_id`. Windows are
+/// aligned to multiples of [`FILTER_WINDOW_SIZE`], so the loop can jump to
+/// the window covering any current doc id in one step.
+fn window_for(doc_id: u64) -> (u64, u64) {
+    let low = doc_id - (doc_id % FILTER_WINDOW_SIZE);
+    let high = low.saturating_add(FILTER_WINDOW_SIZE - 1);
+    (low, high)
+}
+
+/// Top-K candidate ordered so `BinaryHeap::peek()` returns the worst
+/// (lowest-score, highest-doc-id) entry — the one to evict next.
+struct WorstFirst {
+    score: f32,
+    doc_id: u64,
+    vector_data: VectorDataValue,
+}
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for WorstFirst {}
+
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorstFirst {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap; we want the "worst" candidate at the
+        // top, so a candidate that is *worse* must compare *greater*. Worse
+        // means lower score, or — on a score tie — higher doc id (since the
+        // final results are sorted by ascending doc id on ties).
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+/// Returns `true` when `(new_score, new_doc_id)` would rank ahead of
+/// `(other_score, other_doc_id)` in the final BM25 result ordering
+/// (descending score, ties broken by ascending doc id).
+fn is_better(new_score: f32, new_doc_id: u64, other_score: f32, other_doc_id: u64) -> bool {
+    match new_score.partial_cmp(&other_score) {
+        Some(Ordering::Greater) => true,
+        Some(Ordering::Less) => false,
+        Some(Ordering::Equal) | None => new_doc_id < other_doc_id,
+    }
+}
+
+/// Tokenize a BM25 query string and drop duplicate terms while preserving
+/// first-seen order.
+fn dedupe_query_terms(query: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut unique = Vec::new();
+    for term in text::tokenize(query) {
+        if seen.insert(term.clone()) {
+            unique.push(term);
+        }
+    }
+    unique
 }
 
 #[cfg(test)]

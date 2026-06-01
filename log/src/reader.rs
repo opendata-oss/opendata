@@ -4,6 +4,7 @@
 //! - [`LogRead`]: The trait defining read operations on the log.
 //! - [`LogDbReader`]: A read-only view of the log that implements `LogRead`.
 
+use std::collections::BTreeSet;
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,12 +16,14 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{CountOptions, ReaderConfig, ScanOptions, SegmentConfig};
+use crate::config::{ReaderConfig, ScanOptions, SegmentConfig};
+use crate::direct::LogDirect;
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
+use crate::serde::LogEntryKey;
 use crate::storage::{LogStorageRead as _, SegmentIterator};
 use common::storage::factory::create_storage_read;
 use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
@@ -109,12 +112,9 @@ pub trait LogRead {
 
     /// Counts entries for a key within a sequence number range.
     ///
-    /// Returns the number of entries in the specified range. This is useful
+    /// Returns the exact number of entries in the specified range. Useful
     /// for computing lag (how far behind a consumer is) or progress metrics.
     ///
-    /// This method uses default count options (exact count). Use
-    /// [`count_with_options`] for approximate counts.
-    ///
     /// # Arguments
     ///
     /// * `key` - The key identifying the log stream to count.
@@ -123,30 +123,7 @@ pub trait LogRead {
     /// # Errors
     ///
     /// Returns an error if the count fails due to storage issues.
-    ///
-    /// [`count_with_options`]: LogRead::count_with_options
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
-        self.count_with_options(key, seq_range, CountOptions::default())
-            .await
-    }
-
-    /// Counts entries for a key within a sequence number range with custom options.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key identifying the log stream to count.
-    /// * `seq_range` - The sequence number range to count.
-    /// * `options` - Count options, including whether to return an approximate count.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the count fails due to storage issues.
-    async fn count_with_options(
-        &self,
-        key: Bytes,
-        seq_range: impl RangeBounds<Sequence> + Send,
-        options: CountOptions,
-    ) -> Result<u64>;
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64>;
 
     /// Lists distinct keys within a segment range.
     ///
@@ -227,19 +204,45 @@ pub trait LogRead {
     ) -> Result<Vec<Segment>>;
 }
 
+/// Clips `query` to the sequence window owned by `segments[i]`.
+///
+/// Relies on the tiling guarantee from
+/// [`SegmentCache::find_covering`](crate::segment::SegmentCache::find_covering):
+/// segments come back ordered, and each segment owns sequences up to the
+/// next segment's `start_seq`. The last segment in the covering set has no
+/// successor, so its upper bound is taken from `query.end`.
+fn segment_window(segments: &[LogSegment], i: usize, query: &Range<Sequence>) -> Range<Sequence> {
+    let next_start = segments
+        .get(i + 1)
+        .map(|s| s.meta().start_seq)
+        .unwrap_or(u64::MAX);
+    let lo = query.start.max(segments[i].meta().start_seq);
+    let hi = query.end.min(next_start);
+    lo..hi
+}
+
 /// Shared read component used by both `LogDb` and `LogDbReader`.
 ///
 /// Contains the storage and segment cache needed for read operations.
 /// Wrapped in `Arc<RwLock<_>>` by both consumers.
 pub(crate) struct LogReadView {
     pub(crate) storage: Arc<dyn StorageRead>,
+    pub(crate) direct: Option<Arc<LogDirect>>,
     pub(crate) segments: SegmentCache,
 }
 
 impl LogReadView {
     /// Creates a new `LogReadView`.
-    pub(crate) fn new(storage: Arc<dyn StorageRead>, segments: SegmentCache) -> Self {
-        Self { storage, segments }
+    pub(crate) fn new(
+        storage: Arc<dyn StorageRead>,
+        direct: Option<Arc<LogDirect>>,
+        segments: SegmentCache,
+    ) -> Self {
+        Self {
+            storage,
+            direct,
+            segments,
+        }
     }
 
     /// Replaces the underlying storage snapshot with a new one.
@@ -247,11 +250,12 @@ impl LogReadView {
         self.storage = snapshot;
     }
 
-    /// Incrementally loads new segments from the current storage snapshot.
+    /// Reloads segments from the current storage snapshot.
     ///
-    /// Only loads segments with ID > `after_segment_id`. This is used by
-    /// subscriber tasks to refresh segments without needing segments propagated
-    /// through the watch channel.
+    /// When `after_segment_id` is `Some`, only newer segments are appended.
+    /// When `None`, the segment cache is fully replaced from storage. The
+    /// standalone reader uses the full-reload path so it converges on both
+    /// newly-created and deleted segments.
     pub(crate) async fn refresh_segments(
         &mut self,
         after_segment_id: Option<SegmentId>,
@@ -259,6 +263,12 @@ impl LogReadView {
         self.segments
             .refresh(self.storage.as_ref(), after_segment_id)
             .await
+    }
+
+    /// Drops every cached segment with id `<= through_id`. Used by subscriber
+    /// tasks to converge to the writer's published deletion watermark.
+    pub(crate) fn drop_segments_through(&mut self, through_id: SegmentId) {
+        self.segments.drop_through(through_id);
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
@@ -271,12 +281,86 @@ impl LogReadView {
         LogIterator::open(Arc::clone(&self.storage), &self.segments, key, seq_range)
     }
 
+    /// Counts entries for `key` in `seq_range`, exact.
+    ///
+    /// Fans out across overlapping segments — clipped to each segment's
+    /// window. When [`LogDirect`] is available, walks persisted SSTs via
+    /// `count_in_range` for the bulk count and scans `(covered_to, seg_hi)`
+    /// to pick up anything still in the memtable. Otherwise falls back to
+    /// a plain scan tally.
+    pub(crate) async fn count(&self, key: Bytes, seq_range: Range<Sequence>) -> Result<u64> {
+        let segments = self.segments.find_covering(&seq_range);
+        let mut total = 0u64;
+        for (i, segment) in segments.iter().enumerate() {
+            let window = segment_window(&segments, i, &seq_range);
+            if window.start >= window.end {
+                continue;
+            }
+            let n = match self.direct.as_deref() {
+                Some(direct) => {
+                    self.count_segment_via_direct(direct, segment, &key, window)
+                        .await?
+                }
+                None => self.storage.count_entries(segment, &key, window).await?,
+            };
+            total = total.saturating_add(n);
+        }
+        Ok(total)
+    }
+
+    /// Counts entries in a single segment slice using [`LogDirect`].
+    ///
+    /// Walks persisted SSTs via `count_in_range` and tops up with a tail
+    /// scan above the witness key. The tail scan covers two cases at once:
+    /// writes still in the memtable, and writes flushed since `direct`'s
+    /// manifest snapshot was taken (the DbReader polls, so its view can lag
+    /// the writer).
+    async fn count_segment_via_direct(
+        &self,
+        direct: &LogDirect,
+        segment: &LogSegment,
+        key: &Bytes,
+        window: Range<Sequence>,
+    ) -> Result<u64> {
+        let byte_range = LogEntryKey::scan_range(segment, key, window.clone());
+        let result = direct.count_in_range(&byte_range).await?;
+        // LogDb is append-only, so only puts contribute. Tombstones or
+        // merges in this byte range would indicate an unsupported op.
+        let mut total = result.counts.num_puts;
+
+        let scan_lo = match result.covered_to {
+            Some(covered_key) => LogEntryKey::deserialize(&covered_key, segment.meta().start_seq)?
+                .sequence
+                .saturating_add(1),
+            None => window.start,
+        };
+        if scan_lo < window.end {
+            total = total.saturating_add(
+                self.storage
+                    .count_entries(segment, key, scan_lo..window.end)
+                    .await?,
+            );
+        }
+        Ok(total)
+    }
+
     /// Lists distinct keys within a segment range.
+    ///
+    /// Stitches per-segment scans together by walking the segment cache —
+    /// the key layout interleaves listings with log entries across
+    /// segment boundaries, so a single wide-range storage scan is not safe.
     pub(crate) async fn list_keys(
         &self,
         segment_range: Range<SegmentId>,
     ) -> Result<LogKeyIterator> {
-        let keys = self.storage.list_keys(segment_range).await?;
+        let mut keys = BTreeSet::new();
+        for segment in self.segments.all() {
+            if !segment_range.contains(&segment.id()) {
+                continue;
+            }
+            let per_segment = self.storage.list_keys_in_segment(segment.id()).await?;
+            keys.extend(per_segment);
+        }
         Ok(LogKeyIterator::from_keys(keys))
     }
 
@@ -407,8 +491,12 @@ impl LogDbReader {
         )
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
+        let direct = LogDirect::maybe_from_storage_config(&config.storage)
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .map(Arc::new);
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, segments)));
+        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments)));
 
         let (shutdown_tx, refresh_task) =
             Self::spawn_refresh_task(Arc::clone(&read_view), config.refresh_interval);
@@ -421,6 +509,10 @@ impl LogDbReader {
     }
 
     /// Spawns a background task that periodically refreshes the segment cache.
+    ///
+    /// This path fully reloads segments from storage on each tick so a
+    /// standalone reader observes retention-driven `SegmentMeta` deletes as
+    /// well as newly created segments.
     fn spawn_refresh_task(
         read_view: Arc<RwLock<LogReadView>>,
         interval: Duration,
@@ -434,16 +526,9 @@ impl LogDbReader {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        // Get the latest segment ID for incremental refresh
-                        let after_segment_id = {
-                            let view = read_view.read().await;
-                            view.segments.latest().map(|s| s.id())
-                        };
-
-                        // Refresh the cache
                         let mut view = read_view.write().await;
                         let storage = Arc::clone(&view.storage);
-                        if let Err(e) = view.segments.refresh(storage.as_ref(), after_segment_id).await {
+                        if let Err(e) = view.segments.refresh(storage.as_ref(), None).await {
                             tracing::warn!("Failed to refresh segment cache: {}", e);
                         }
                     }
@@ -462,8 +547,26 @@ impl LogDbReader {
     /// Creates a LogDbReader from an existing storage implementation.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
+        Self::new_inner(storage, None).await
+    }
+
+    /// Creates a LogDbReader paired with a `LogDirect` handle so tests can
+    /// exercise the SST-walk count path through the reader.
+    #[cfg(test)]
+    pub(crate) async fn new_with_direct(
+        storage: Arc<dyn StorageRead>,
+        direct: Arc<LogDirect>,
+    ) -> Result<Self> {
+        Self::new_inner(storage, Some(direct)).await
+    }
+
+    #[cfg(test)]
+    async fn new_inner(
+        storage: Arc<dyn StorageRead>,
+        direct: Option<Arc<LogDirect>>,
+    ) -> Result<Self> {
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, segments)));
+        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments)));
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             read_view,
@@ -503,13 +606,10 @@ impl LogRead for LogDbReader {
         Ok(view.scan_with_options(key, seq_range, &options))
     }
 
-    async fn count_with_options(
-        &self,
-        _key: Bytes,
-        _seq_range: impl RangeBounds<Sequence> + Send,
-        _options: CountOptions,
-    ) -> Result<u64> {
-        todo!()
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
+        let seq_range = normalize_sequence(&seq_range);
+        let view = self.read_view.read().await;
+        view.count(key, seq_range).await
     }
 
     async fn list_keys(

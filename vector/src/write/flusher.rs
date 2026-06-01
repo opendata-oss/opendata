@@ -282,6 +282,7 @@ mod tests {
                 split_threshold_vectors: usize::MAX,
                 split_search_neighbourhood: 4,
                 indexed_fields: HashSet::new(),
+                text_fields: HashSet::new(),
             },
             state,
         );
@@ -308,6 +309,7 @@ mod tests {
                     external_id: format!("vec-{i}"),
                     values: values.clone(),
                     attributes: vec![("vector".to_string(), AttributeValue::Vector(values))],
+                    text_attribute_summaries: std::collections::HashMap::new(),
                 }
             })
             .collect()

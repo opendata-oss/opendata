@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use common::coordinator::Flusher;
 use common::storage::{RecordOp, Storage, StorageSnapshot, Ttl};
 
+use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::model::TimeBucket;
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
@@ -34,6 +35,9 @@ pub(crate) struct TsdbFlusher {
     /// shared expiration, operands written at different wall-clock times get
     /// different TTLs and never merge — see issue #342.
     pub(crate) retention: Option<Duration>,
+    /// Rolling HLL ring estimating unique series seen in the last ~15 min.
+    /// Refreshed on every flush — see `flush_delta`.
+    pub(crate) active_series: Arc<ActiveSeriesTracker>,
 }
 
 /// Compute the absolute expire-at timestamp (ms since epoch) shared by every
@@ -55,6 +59,12 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         frozen: FrozenTsdbDelta,
         _epoch_range: &Range<u64>,
     ) -> Result<Arc<dyn StorageSnapshot>, String> {
+        // Advance the active-series ring to the current minute and republish
+        // the gauge. Done unconditionally (even on empty deltas) so the window
+        // continues to slide for idle workloads.
+        let active_estimate = self.active_series.refresh(current_unix_minute());
+        ::metrics::gauge!(tsdb_metrics::TSDB_ACTIVE_SERIES).set(active_estimate as f64);
+
         if frozen.is_empty() {
             let snap_start = std::time::Instant::now();
             let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string());
@@ -282,11 +292,13 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
@@ -310,11 +322,13 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let delta = TsdbWriteDelta::init(ctx);
         let (frozen, _, _) = delta.freeze();
@@ -339,6 +353,7 @@ mod tests {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =
@@ -355,6 +370,7 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         storage.fail_apply(common::StorageError::Storage("test apply error".into()));
 
@@ -378,6 +394,7 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         // Apply succeeds, but snapshot after apply fails
         storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
@@ -402,6 +419,7 @@ mod tests {
         let flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         storage.fail_flush(common::StorageError::Storage("test flush error".into()));
 
@@ -423,11 +441,13 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let mut delta = TsdbWriteDelta::init(ctx);
         delta
@@ -454,6 +474,7 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let bucket = create_test_bucket();
 
@@ -462,6 +483,7 @@ mod tests {
                 bucket,
                 series_dict: Arc::new(HashMap::new()),
                 next_series_id: i as u32,
+                active_series: Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
             };
             let mut delta = TsdbWriteDelta::init(ctx);
             delta
@@ -506,11 +528,13 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let ctx = TsdbContext {
             bucket,
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let mut delta = TsdbWriteDelta::init(ctx);
         delta
@@ -537,11 +561,13 @@ mod tests {
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
+            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
         };
         let mut delta = TsdbWriteDelta::init(ctx);
         let series1 = create_test_series("metric_a", vec![("env", "prod")], create_test_sample());

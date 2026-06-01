@@ -1,6 +1,6 @@
 [package]
 name = "opendata-common"
-version = "0.1.14"
+version = "0.1.16"
 edition.workspace = true
 description = "Shared storage foundation for OpenData databases"
 license = "MIT"
@@ -29,6 +29,7 @@ mixtrics.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+ulid.workspace = true
 uuid.workspace = true
 serde.workspace = true
 arc-swap = { version = "1", optional = true }

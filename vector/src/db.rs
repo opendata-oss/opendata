@@ -13,6 +13,7 @@
 
 use crate::VectorDbReader;
 use crate::error::{Error, Result};
+use crate::metric_names::{VECTOR_DELETES_TOTAL, VECTOR_UPSERTS_TOTAL};
 use crate::model::{
     AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
     attributes_to_map,
@@ -29,7 +30,8 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::delta::{VectorDbOp, VectorDbOpDelta, VectorWrite};
+use crate::text;
+use crate::write::delta::{TextAttributeSummary, VectorDbOp, VectorDbOpDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
@@ -140,10 +142,18 @@ pub struct VectorDb {
 
 impl VectorDb {
     pub(crate) fn indexer_opts(config: &Config) -> IndexerOpts {
+        // Text fields use the FTS path, never the inverted index — drop them
+        // from `indexed_fields` even if a caller set `indexed: true`.
         let indexed_fields: HashSet<String> = config
             .metadata_fields
             .iter()
-            .filter(|s| s.indexed)
+            .filter(|s| s.indexed && s.field_type != crate::serde::FieldType::Text)
+            .map(|s| s.name.clone())
+            .collect();
+        let text_fields: HashSet<String> = config
+            .metadata_fields
+            .iter()
+            .filter(|s| s.field_type == crate::serde::FieldType::Text)
             .map(|s| s.name.clone())
             .collect();
         IndexerOpts {
@@ -154,6 +164,7 @@ impl VectorDb {
             split_threshold_vectors: config.split_threshold_vectors,
             split_search_neighbourhood: config.split_search_neighbourhood,
             indexed_fields,
+            text_fields,
         }
     }
 
@@ -466,9 +477,7 @@ impl VectorDb {
     ) -> Result<HashMap<String, VectorId>> {
         // Create prefix for all IdDictionary records
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::IdDictionary
-            .prefix()
-            .write_to(&mut prefix_buf);
+        crate::serde::RecordType::IdDictionary.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         // Scan all IdDictionary records
@@ -538,6 +547,8 @@ impl VectorDb {
             writes.push(self.prepare_vector_write(vector)?);
         }
 
+        metrics::counter!(VECTOR_UPSERTS_TOTAL).increment(writes.len() as u64);
+
         // Send all writes to coordinator in a single batch and wait to be applied
         let mut write_handle = self
             .write_coordinator
@@ -586,6 +597,8 @@ impl VectorDb {
         for vector in vectors {
             writes.push(self.prepare_vector_write(vector)?);
         }
+
+        metrics::counter!(VECTOR_UPSERTS_TOTAL).increment(writes.len() as u64);
 
         // Send all writes to coordinator in a single batch and wait to be applied
         let mut write_handle = self
@@ -653,6 +666,9 @@ impl VectorDb {
             self.validate_attributes(&attributes)?;
         }
 
+        // Tokenize any FieldType::Text attributes for FTS indexing.
+        let text_attribute_summaries = self.build_text_summaries(&attributes)?;
+
         // Convert attributes to vec of tuples for VectorWrite
         let attributes_vec: Vec<(String, AttributeValue)> = attributes.into_iter().collect();
 
@@ -660,7 +676,47 @@ impl VectorDb {
             external_id: vector.id,
             values,
             attributes: attributes_vec,
+            text_attribute_summaries,
         })
+    }
+
+    /// Walk `Text` schema fields, validate they're strings, and produce
+    /// `TextAttributeSummary` for each via the shared tokenizer (RFC-0006).
+    fn build_text_summaries(
+        &self,
+        attributes: &HashMap<String, AttributeValue>,
+    ) -> Result<HashMap<String, TextAttributeSummary>> {
+        let mut summaries = HashMap::new();
+        for spec in &self.config.metadata_fields {
+            if spec.field_type != crate::serde::FieldType::Text {
+                continue;
+            }
+            let Some(value) = attributes.get(&spec.name) else {
+                continue;
+            };
+            let text_value = match value {
+                AttributeValue::String(s) => s,
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "Text field '{}' must have type String, got {:?}",
+                        spec.name, other
+                    )));
+                }
+            };
+            let tokens = text::tokenize(text_value);
+            let mut terms = std::collections::BTreeMap::new();
+            for token in &tokens {
+                *terms.entry(token.clone()).or_insert(0usize) += 1;
+            }
+            summaries.insert(
+                spec.name.clone(),
+                TextAttributeSummary {
+                    terms,
+                    length: tokens.len(),
+                },
+            );
+        }
+        Ok(summaries)
     }
 
     /// Validates attributes against the configured schema.
@@ -682,7 +738,7 @@ impl VectorDb {
 
             match schema.get(field_name.as_str()) {
                 Some(expected_type) => {
-                    // Validate type matches
+                    // Validate type matches. Text fields accept String values.
                     let actual_type = match value {
                         AttributeValue::String(_) => crate::serde::FieldType::String,
                         AttributeValue::Int64(_) => crate::serde::FieldType::Int64,
@@ -691,7 +747,10 @@ impl VectorDb {
                         AttributeValue::Vector(_) => crate::serde::FieldType::Vector,
                     };
 
-                    if actual_type != *expected_type {
+                    let compatible = actual_type == *expected_type
+                        || (*expected_type == crate::serde::FieldType::Text
+                            && actual_type == crate::serde::FieldType::String);
+                    if !compatible {
                         return Err(Error::InvalidInput(format!(
                             "Type mismatch for field '{}': expected {:?}, got {:?}",
                             field_name, expected_type, actual_type
@@ -747,6 +806,8 @@ impl VectorDb {
             }
             collected.push(id);
         }
+
+        metrics::counter!(VECTOR_DELETES_TOTAL).increment(collected.len() as u64);
 
         let mut handle = self
             .write_coordinator
@@ -851,7 +912,16 @@ impl VectorDb {
     }
 
     pub async fn snapshot(&self) -> Box<dyn VectorDbRead> {
-        Box::new(VectorDbReader::new(self.query_engine())) as Box<dyn VectorDbRead>
+        let (snapshot, centroid_index) = {
+            let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
+            (guard.snapshot.clone(), guard.centroid_index.clone())
+        };
+        let options = QueryEngineOptions {
+            dimensions: self.config.dimensions,
+            distance_metric: self.config.distance_metric,
+            query_pruning_factor: self.config.query_pruning_factor,
+        };
+        Box::new(VectorDbReader::new(options, centroid_index, snapshot)) as Box<dyn VectorDbRead>
     }
 }
 
@@ -898,7 +968,6 @@ mod tests {
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
-            chunk_target: 4096,
             metadata_fields: vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
                 MetadataFieldSpec::new("price", FieldType::Int64, true),

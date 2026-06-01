@@ -1,5 +1,6 @@
 use crate::math::kmeans::Clustering;
 use crate::math::{distance, heuristics, kmeans};
+use crate::metric_names::INDEXER_ANN_SPLITS_TOTAL;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::vector_id::VectorId;
 use crate::write::indexer::drivers::AsyncBatchDriver;
@@ -417,6 +418,12 @@ impl SplitCentroids {
             })
         }
 
+        metrics::counter!(
+            INDEXER_ANN_SPLITS_TOTAL,
+            "level" => self.level.level().to_string(),
+        )
+        .increment(splits.len() as u64);
+
         // return reassign set
         let reassignments: Vec<_> = reassignments.values().cloned().collect();
         Ok(SplitCentroidsResult {
@@ -632,6 +639,7 @@ mod tests {
             split_threshold_vectors: SPLIT_THRESHOLD,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         })
     }
 
@@ -895,6 +903,7 @@ mod tests {
             split_threshold_vectors: SPLIT_THRESHOLD,
             split_search_neighbourhood: 1,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         });
         let id_b1 = h.storage.lookup_internal_id("b1").await.unwrap().unwrap();
         let depth = TreeDepth::of(h.state.centroids_meta().depth);
@@ -1081,6 +1090,7 @@ mod tests {
             split_threshold_vectors: 3,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         });
         let level = TreeLevel::inner(2, TreeDepth::of(4));
         let p0 = L2_CENTROID_A;

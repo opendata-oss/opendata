@@ -4,8 +4,12 @@ use super::*;
 use crate::model::{BucketSize, BucketStart, SeriesFingerprint, SeriesId};
 use bytes::{Bytes, BytesMut};
 use common::BytesRange;
-use common::serde::key_prefix::KeyPrefix;
+use common::serde::key_prefix::KEY_PREFIX_LEN;
 use common::serde::terminated_bytes;
+
+/// Offset of the first subsystem-defined field after the 2-byte common prefix
+/// plus the 1-byte timeseries tag.
+const PREFIX_AND_TAG_LEN: usize = KEY_PREFIX_LEN + 1;
 
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,12 +17,12 @@ pub struct BucketListKey;
 
 impl BucketListKey {
     pub fn encode(&self) -> Bytes {
-        RecordType::BucketList.prefix().to_bytes()
+        RecordType::BucketList.encode_prefix()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
+        let tag = parse_record_tag(buf)?;
+        let record_type = RecordType::from_id(tag.record_type())?;
         if record_type != RecordType::BucketList {
             return Err(EncodingError {
                 message: format!(
@@ -27,7 +31,7 @@ impl BucketListKey {
                 ),
             });
         }
-        if bucket_size_from_prefix(prefix).is_some() {
+        if bucket_size_from_tag(tag).is_some() {
             return Err(EncodingError {
                 message: "BucketListKey should be global-scoped (bucket_size should be None)"
                     .to_string(),
@@ -48,22 +52,20 @@ pub struct SeriesDictionaryKey {
 impl SeriesDictionaryKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        RecordType::SeriesDictionary
-            .prefix_with_bucket_size(self.bucket_size)
-            .write_to(&mut buf);
+        RecordType::SeriesDictionary.write_prefix_with_bucket_size(&mut buf, self.bucket_size);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_fingerprint.to_be_bytes());
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 3 + 4 + 16 {
+        if buf.len() < PREFIX_AND_TAG_LEN + 4 + 16 {
             return Err(EncodingError {
                 message: "Buffer too short for SeriesDictionaryKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
+        let tag = parse_record_tag(buf)?;
+        let record_type = RecordType::from_id(tag.record_type())?;
         if record_type != RecordType::SeriesDictionary {
             return Err(EncodingError {
                 message: format!(
@@ -72,14 +74,16 @@ impl SeriesDictionaryKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(tag).ok_or_else(|| EncodingError {
             message: "SeriesDictionaryKey should be bucket-scoped".to_string(),
         })?;
 
-        let time_bucket = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
+        let suffix = &buf[PREFIX_AND_TAG_LEN..];
+        let time_bucket = u32::from_be_bytes([suffix[0], suffix[1], suffix[2], suffix[3]]);
         let series_fingerprint = u128::from_be_bytes([
-            buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
-            buf[17], buf[18], buf[19], buf[20], buf[21], buf[22],
+            suffix[4], suffix[5], suffix[6], suffix[7], suffix[8], suffix[9], suffix[10],
+            suffix[11], suffix[12], suffix[13], suffix[14], suffix[15], suffix[16], suffix[17],
+            suffix[18], suffix[19],
         ]);
 
         Ok(SeriesDictionaryKey {
@@ -114,22 +118,20 @@ pub struct ForwardIndexKey {
 impl ForwardIndexKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        RecordType::ForwardIndex
-            .prefix_with_bucket_size(self.bucket_size)
-            .write_to(&mut buf);
+        RecordType::ForwardIndex.write_prefix_with_bucket_size(&mut buf, self.bucket_size);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         buf.extend_from_slice(&self.series_id.to_be_bytes());
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 3 + 4 + 4 {
+        if buf.len() < PREFIX_AND_TAG_LEN + 4 + 4 {
             return Err(EncodingError {
                 message: "Buffer too short for ForwardIndexKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
+        let tag = parse_record_tag(buf)?;
+        let record_type = RecordType::from_id(tag.record_type())?;
         if record_type != RecordType::ForwardIndex {
             return Err(EncodingError {
                 message: format!(
@@ -138,12 +140,13 @@ impl ForwardIndexKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(tag).ok_or_else(|| EncodingError {
             message: "ForwardIndexKey should be bucket-scoped".to_string(),
         })?;
 
-        let time_bucket = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
-        let series_id = u32::from_be_bytes([buf[7], buf[8], buf[9], buf[10]]);
+        let suffix = &buf[PREFIX_AND_TAG_LEN..];
+        let time_bucket = u32::from_be_bytes([suffix[0], suffix[1], suffix[2], suffix[3]]);
+        let series_id = u32::from_be_bytes([suffix[4], suffix[5], suffix[6], suffix[7]]);
 
         Ok(ForwardIndexKey {
             time_bucket,
@@ -178,9 +181,7 @@ pub struct InvertedIndexKey {
 impl InvertedIndexKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        RecordType::InvertedIndex
-            .prefix_with_bucket_size(self.bucket_size)
-            .write_to(&mut buf);
+        RecordType::InvertedIndex.write_prefix_with_bucket_size(&mut buf, self.bucket_size);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         // Attribute uses terminated encoding to delimit from value
         terminated_bytes::serialize(self.attribute.as_bytes(), &mut buf);
@@ -193,22 +194,20 @@ impl InvertedIndexKey {
     /// within a given bucket. This allows efficient scanning for all values of a label.
     pub fn attribute_range(bucket: &crate::model::TimeBucket, attribute: &str) -> BytesRange {
         let mut buf = BytesMut::new();
-        RecordType::InvertedIndex
-            .prefix_with_bucket_size(bucket.size)
-            .write_to(&mut buf);
+        RecordType::InvertedIndex.write_prefix_with_bucket_size(&mut buf, bucket.size);
         buf.extend_from_slice(&bucket.start.to_be_bytes());
         terminated_bytes::serialize(attribute.as_bytes(), &mut buf);
         BytesRange::prefix(buf.freeze())
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 3 + 4 {
+        if buf.len() < PREFIX_AND_TAG_LEN + 4 {
             return Err(EncodingError {
                 message: "Buffer too short for InvertedIndexKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
+        let tag = parse_record_tag(buf)?;
+        let record_type = RecordType::from_id(tag.record_type())?;
         if record_type != RecordType::InvertedIndex {
             return Err(EncodingError {
                 message: format!(
@@ -217,11 +216,11 @@ impl InvertedIndexKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(tag).ok_or_else(|| EncodingError {
             message: "InvertedIndexKey should be bucket-scoped".to_string(),
         })?;
 
-        let mut slice = &buf[3..];
+        let mut slice = &buf[PREFIX_AND_TAG_LEN..];
         let time_bucket = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
         slice = &slice[4..];
 
@@ -277,9 +276,7 @@ pub struct TimeSeriesKey {
 impl TimeSeriesKey {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        RecordType::TimeSeries
-            .prefix_with_bucket_size(self.bucket_size)
-            .write_to(&mut buf);
+        RecordType::TimeSeries.write_prefix_with_bucket_size(&mut buf, self.bucket_size);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
         terminated_bytes::serialize(self.metric_name.as_bytes(), &mut buf);
         buf.extend_from_slice(&self.series_id.to_be_bytes());
@@ -287,14 +284,14 @@ impl TimeSeriesKey {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        // Minimum: 3 (prefix) + 4 (bucket) + 1 (terminated empty metric_name = just 0x00) + 4 (series_id)
-        if buf.len() < 3 + 4 + 1 + 4 {
+        // Minimum: prefix+tag + 4 (bucket) + 1 (terminated empty metric_name = just 0x00) + 4 (series_id)
+        if buf.len() < PREFIX_AND_TAG_LEN + 4 + 1 + 4 {
             return Err(EncodingError {
                 message: "Buffer too short for TimeSeriesKey".to_string(),
             });
         }
-        let prefix = KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
+        let tag = parse_record_tag(buf)?;
+        let record_type = RecordType::from_id(tag.record_type())?;
         if record_type != RecordType::TimeSeries {
             return Err(EncodingError {
                 message: format!(
@@ -303,13 +300,19 @@ impl TimeSeriesKey {
                 ),
             });
         }
-        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
+        let bucket_size = bucket_size_from_tag(tag).ok_or_else(|| EncodingError {
             message: "TimeSeriesKey should be bucket-scoped".to_string(),
         })?;
 
-        let time_bucket = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
+        let bucket_offset = PREFIX_AND_TAG_LEN;
+        let time_bucket = u32::from_be_bytes([
+            buf[bucket_offset],
+            buf[bucket_offset + 1],
+            buf[bucket_offset + 2],
+            buf[bucket_offset + 3],
+        ]);
 
-        let mut slice = &buf[7..];
+        let mut slice = &buf[bucket_offset + 4..];
         let metric_name_bytes = terminated_bytes::deserialize(&mut slice)?;
         let metric_name =
             String::from_utf8(metric_name_bytes.to_vec()).map_err(|e| EncodingError {

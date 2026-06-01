@@ -1,6 +1,6 @@
 [package]
 name = "opendata-vector"
-version = "0.1.3"
+version = "0.2.1"
 edition.workspace = true
 description = "Vector similarity search database built on SlateDB"
 license = "MIT"
@@ -21,7 +21,7 @@ required-features = ["http-server"]
 
 [features]
 default = []
-http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with"]
+http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prost", "dep:serde_json", "dep:serde_with", "dep:metrics-exporter-prometheus"]
 embedded-reader = ["dep:reqwest", "dep:serde_json"]
 buffer = ["http-server", "dep:buffer"]
 bench-internals = []
@@ -31,12 +31,15 @@ avx512 = []
 anyhow.workspace = true
 async-trait.workspace = true
 common.workspace = true
+bitpacking.workspace = true
 bytemuck.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
+metrics.workspace = true
 fail.workspace = true
 figment.workspace = true
 futures.workspace = true
+icu_segmenter.workspace = true
 rayon = "1.11.0"
 usearch = "2"
 roaring.workspace = true
@@ -58,16 +61,13 @@ clap = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 # Embedded reader dependencies (optional, enabled by embedded-reader feature)
 reqwest = { workspace = true, optional = true, features = ["json"] }
 
 # Buffer consumer dependencies (optional, enabled by buffer feature)
 buffer = { workspace = true, optional = true }
-
-[[bin]]
-name = "gen_sift100k_groundtruth"
-path = "src/bin/gen_sift100k_groundtruth.rs"
 
 [[bin]]
 name = "embedded-reader"

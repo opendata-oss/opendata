@@ -12,6 +12,7 @@ use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use tokio::sync::RwLock;
 use tracing::error;
 
+use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
 use crate::error::QueryError;
 use crate::index::{ForwardIndexLookup, InvertedIndexLookup};
 use crate::minitsdb::{MiniQueryReader, MiniTsdb};
@@ -981,6 +982,10 @@ pub(crate) struct Tsdb {
 
     // Metadata catalog (keyed by metric name)
     pub(crate) metadata_catalog: RwLock<HashMap<String, Vec<MetricMetadata>>>,
+
+    /// Rolling HLL ring estimating unique series seen in the last ~15 min.
+    /// Updated and published to `tsdb_active_series` by the flusher.
+    active_series: Arc<ActiveSeriesTracker>,
 }
 
 impl Tsdb {
@@ -994,11 +999,14 @@ impl Tsdb {
             .time_to_idle(Duration::from_secs(15 * 60))
             .build();
 
+        let active_series = Arc::new(ActiveSeriesTracker::new(current_unix_minute()));
+
         Self {
             storage,
             ingest_cache,
             retention,
             metadata_catalog: RwLock::new(HashMap::new()),
+            active_series,
         }
     }
 
@@ -1020,7 +1028,15 @@ impl Tsdb {
         }
 
         // Load from storage and put in ingest cache
-        let mini = Arc::new(MiniTsdb::load(bucket, self.storage.clone(), self.retention).await?);
+        let mini = Arc::new(
+            MiniTsdb::load(
+                bucket,
+                self.storage.clone(),
+                self.retention,
+                self.active_series.clone(),
+            )
+            .await?,
+        );
         self.ingest_cache.insert(bucket, mini.clone()).await;
         Ok(mini)
     }

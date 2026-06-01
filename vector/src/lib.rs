@@ -37,6 +37,7 @@ pub mod admin;
 pub mod db;
 pub(crate) mod error;
 pub mod math;
+pub mod metric_names;
 pub mod model;
 pub(crate) mod query_engine;
 pub mod reader;
@@ -44,6 +45,7 @@ pub mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 pub(crate) mod storage;
+pub(crate) mod text;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -55,7 +57,8 @@ pub use admin::VectorDbAdmin;
 pub use db::{VectorDb, VectorDbRead};
 pub use error::{Error, Result};
 pub use model::{
-    Attribute, AttributeValue, Config, DistanceMetric, FieldSelection, FieldType, Filter,
-    MetadataFieldSpec, Query, ReaderConfig, SearchOptions, SearchResult, Vector, VectorBuilder,
+    Attribute, AttributeValue, Bm25Query, Config, DistanceMetric, FieldSelection, FieldType,
+    Filter, MetadataFieldSpec, Query, ReaderConfig, ScoreBy, SearchOptions, SearchResult, Vector,
+    VectorBuilder,
 };
 pub use reader::VectorDbReader;

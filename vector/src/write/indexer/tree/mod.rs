@@ -57,6 +57,14 @@ pub(crate) struct IndexerOpts {
     pub(crate) split_threshold_vectors: usize,
     pub(crate) split_search_neighbourhood: usize,
     pub(crate) indexed_fields: HashSet<String>,
+    /// Names of fields declared with `FieldType::Text` (RFC-0006).
+    ///
+    /// Currently informational: the Indexer drives FTS updates from each
+    /// `VectorWrite.text_attribute_summaries`, which is pre-populated by the
+    /// write path. Carrying the set here lets future milestones (e.g. delete
+    /// handling) discover text fields without re-reading `CollectionMeta`.
+    #[allow(dead_code)]
+    pub(crate) text_fields: HashSet<String>,
 }
 
 pub(crate) struct IndexUpdateResults {

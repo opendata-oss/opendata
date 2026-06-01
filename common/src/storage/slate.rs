@@ -66,6 +66,7 @@ fn default_scan_options() -> ScanOptions {
         cache_blocks: true,
         max_fetch_tasks: 4,
         order: IterationOrder::Ascending,
+        filter_context: None,
     }
 }
 
@@ -103,9 +104,13 @@ impl SlateDbStorage {
                 let mut slate_rx = slate_rx;
                 while slate_rx.changed().await.is_ok() {
                     let durable_seq = slate_rx.borrow_and_update().durable_seq;
-                    if tx.send(durable_seq).is_err() {
-                        break;
-                    }
+                    // Use send_replace rather than send: SlateDB may publish
+                    // a DbStatus change during `open` (e.g. manifest write)
+                    // before any consumer has subscribed, and `send` would
+                    // return Err on zero receivers — killing the bridge
+                    // permanently. send_replace doesn't care about receiver
+                    // count, so late subscribers still get future updates.
+                    tx.send_replace(durable_seq);
                 }
             }
         });
@@ -263,6 +268,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -285,6 +291,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -307,6 +314,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -491,7 +499,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and verify data
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let record = storage_reader.get(Bytes::from("key1")).await.unwrap();
@@ -531,7 +542,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and scan data
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let mut iter = storage_reader
@@ -573,7 +587,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader while writer is still open - this should NOT cause fencing error
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         // Reader can read the data
@@ -600,7 +617,7 @@ mod tests {
         let path = "/test/ttl_db";
         let clock = Arc::new(MockSystemClock::new());
 
-        let db = DbBuilder::new(path, object_store)
+        let db = DbBuilder::new(path, object_store.clone())
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()
@@ -677,7 +694,7 @@ mod tests {
 
         let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
         let slate_merge_op = SlateDbStorage::merge_operator_adapter(merge_op);
-        let db = DbBuilder::new(path, object_store)
+        let db = DbBuilder::new(path, object_store.clone())
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()

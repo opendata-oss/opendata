@@ -10,7 +10,8 @@ use tokio::signal;
 
 use super::config::VectorServerConfig;
 use super::handlers::{AppState, handle_get_vector, handle_healthy, handle_ready, handle_search};
-use super::middleware::TracingLayer;
+use super::metrics::{MetricsState, handle_metrics};
+use super::middleware::{MetricsLayer, TracingLayer};
 use crate::{FieldType, MetadataFieldSpec, VectorDbReader};
 
 /// HTTP server for the vector reader service (read-only).
@@ -18,6 +19,7 @@ pub struct VectorReaderServer {
     db: Arc<VectorDbReader>,
     config: VectorServerConfig,
     metadata_fields: Vec<MetadataFieldSpec>,
+    metrics: MetricsState,
 }
 
 impl VectorReaderServer {
@@ -26,11 +28,13 @@ impl VectorReaderServer {
         db: Arc<VectorDbReader>,
         config: VectorServerConfig,
         metadata_fields: Vec<MetadataFieldSpec>,
+        metrics: MetricsState,
     ) -> Self {
         Self {
             db,
             config,
             metadata_fields,
+            metrics,
         }
     }
 
@@ -40,11 +44,16 @@ impl VectorReaderServer {
             db,
             config,
             metadata_fields,
+            metrics,
         } = self;
         let state = AppState {
             db,
             metadata_fields: metadata_fields_by_name(&metadata_fields),
         };
+
+        let metrics_router = Router::new()
+            .route("/metrics", get(handle_metrics))
+            .with_state(metrics);
 
         let app = Router::new()
             .route(
@@ -57,8 +66,10 @@ impl VectorReaderServer {
             )
             .route("/-/healthy", get(handle_healthy))
             .route("/-/ready", get(handle_ready))
-            .layer(TracingLayer::new())
-            .with_state(state);
+            .with_state(state)
+            .merge(metrics_router)
+            .layer(MetricsLayer::new())
+            .layer(TracingLayer::new());
 
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         tracing::info!("Starting Vector Reader HTTP server on {}", addr);

@@ -767,3 +767,255 @@ fn open_with_local_slatedb() {
     assert_ok(unsafe { opendata_log_close(log) });
     assert_ok(unsafe { opendata_log_object_store_close(store) });
 }
+
+// ---- durable_sequence / subscription tests ----
+
+use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+/// Shared state used by `record_callback`: collects every value seen.
+struct CallbackSink {
+    values: Mutex<Vec<u64>>,
+}
+
+extern "C" fn record_callback(durable_sequence: u64, user_data: *mut c_void) {
+    // SAFETY: tests pass a leaked Arc<CallbackSink> as user_data and keep
+    // the original Arc alive for the duration of the subscription.
+    let sink: &CallbackSink = unsafe { &*(user_data as *const CallbackSink) };
+    sink.values.lock().unwrap().push(durable_sequence);
+}
+
+#[test]
+fn durable_sequence_initial_value_is_zero() {
+    let log = open_in_memory_log();
+    let mut seq: u64 = u64::MAX;
+    assert_ok(unsafe { opendata_log_durable_sequence(log, &mut seq) });
+    assert_eq!(seq, 0);
+    assert_ok(unsafe { opendata_log_close(log) });
+}
+
+#[test]
+fn durable_sequence_rejects_null_log() {
+    let mut seq: u64 = 0;
+    assert_error(
+        unsafe { opendata_log_durable_sequence(ptr::null(), &mut seq) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+}
+
+#[test]
+fn durable_sequence_rejects_null_out_pointer() {
+    let log = open_in_memory_log();
+    assert_error(
+        unsafe { opendata_log_durable_sequence(log, ptr::null_mut()) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+    assert_ok(unsafe { opendata_log_close(log) });
+}
+
+#[test]
+fn durable_sequence_advances_after_append_on_immediately_durable_storage() {
+    // Default InMemoryStorage marks writes immediately durable.
+    let log = open_in_memory_log();
+    unsafe { append_records(log, b"orders", 3) };
+
+    // Poll the snapshot until it advances; bounded by test runner timeout.
+    let mut seq: u64 = 0;
+    for _ in 0..200 {
+        assert_ok(unsafe { opendata_log_durable_sequence(log, &mut seq) });
+        if seq >= 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(seq >= 3, "durable_sequence did not advance: {seq}");
+
+    assert_ok(unsafe { opendata_log_close(log) });
+}
+
+#[test]
+fn subscribe_durable_fires_initial_value_on_registration() {
+    let log = open_in_memory_log();
+    let sink = Arc::new(CallbackSink {
+        values: Mutex::new(Vec::new()),
+    });
+    let ud = Arc::as_ptr(&sink) as *mut c_void;
+
+    let mut sub: *mut opendata_log_subscription_t = ptr::null_mut();
+    assert_ok(unsafe { opendata_log_subscribe_durable(log, Some(record_callback), ud, &mut sub) });
+    assert!(!sub.is_null());
+
+    // Wait for the initial fire.
+    for _ in 0..200 {
+        if !sink.values.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let observed = sink.values.lock().unwrap().clone();
+    assert!(
+        !observed.is_empty(),
+        "callback should have fired at least once on subscription"
+    );
+    assert_eq!(observed[0], 0, "initial fire should carry current value 0");
+
+    assert_ok(unsafe { opendata_log_unsubscribe_durable(sub) });
+    assert_ok(unsafe { opendata_log_close(log) });
+    drop(sink);
+}
+
+#[test]
+fn subscribe_durable_fires_on_advance() {
+    let log = open_in_memory_log();
+    let sink = Arc::new(CallbackSink {
+        values: Mutex::new(Vec::new()),
+    });
+    let ud = Arc::as_ptr(&sink) as *mut c_void;
+
+    let mut sub: *mut opendata_log_subscription_t = ptr::null_mut();
+    assert_ok(unsafe { opendata_log_subscribe_durable(log, Some(record_callback), ud, &mut sub) });
+
+    // Wait for the initial fire so we have a baseline.
+    for _ in 0..200 {
+        if !sink.values.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let initial_count = sink.values.lock().unwrap().len();
+
+    // Append should drive durable_sequence forward (InMemoryStorage is
+    // immediately durable by default).
+    unsafe { append_records(log, b"orders", 5) };
+
+    // Wait for a subsequent fire reflecting the advance.
+    for _ in 0..200 {
+        let v = sink.values.lock().unwrap();
+        if v.len() > initial_count && *v.last().unwrap() >= 5 {
+            break;
+        }
+        drop(v);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let observed = sink.values.lock().unwrap().clone();
+    assert!(
+        observed.last().copied().unwrap_or(0) >= 5,
+        "callback should observe durable_sequence >= 5, got: {observed:?}"
+    );
+
+    assert_ok(unsafe { opendata_log_unsubscribe_durable(sub) });
+    assert_ok(unsafe { opendata_log_close(log) });
+    drop(sink);
+}
+
+#[test]
+fn unsubscribe_rejects_null() {
+    assert_error(
+        unsafe { opendata_log_unsubscribe_durable(ptr::null_mut()) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+}
+
+#[test]
+fn subscribe_rejects_null_callback() {
+    let log = open_in_memory_log();
+    let mut sub: *mut opendata_log_subscription_t = ptr::null_mut();
+    assert_error(
+        unsafe { opendata_log_subscribe_durable(log, None, ptr::null_mut(), &mut sub) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+    assert_ok(unsafe { opendata_log_close(log) });
+}
+
+#[test]
+fn subscribe_rejects_null_out_pointer() {
+    let log = open_in_memory_log();
+    assert_error(
+        unsafe {
+            opendata_log_subscribe_durable(
+                log,
+                Some(record_callback),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+    assert_ok(unsafe { opendata_log_close(log) });
+}
+
+// ---- telemetry tests ----
+
+#[test]
+fn telemetry_captures_slatedb_metrics() {
+    // Install the recorder before opening the log so slatedb's metric
+    // describes land in our PrometheusRecorder. Idempotent across tests —
+    // the OnceLock makes repeat calls cheap and any order tolerable.
+    assert_ok(opendata_log_init_telemetry());
+
+    let dir = tempfile::tempdir().unwrap();
+    let os_path = CString::new(dir.path().to_str().unwrap()).unwrap();
+    let db_path = CString::new("telemetry-test").unwrap();
+
+    let mut store: *mut opendata_log_object_store_t = ptr::null_mut();
+    assert_ok(unsafe { opendata_log_object_store_local(os_path.as_ptr(), &mut store) });
+
+    let config = opendata_log_config_t {
+        storage_type: OPENDATA_LOG_STORAGE_SLATEDB,
+        slatedb_path: db_path.as_ptr(),
+        object_store: store,
+        settings_path: ptr::null(),
+        seal_interval_ms: -1,
+        read_visibility: OPENDATA_LOG_READ_VISIBILITY_MEMORY,
+    };
+    let mut log: *mut opendata_log_t = ptr::null_mut();
+    assert_ok(unsafe { opendata_log_open(&config, &mut log) });
+
+    unsafe { append_records(log, b"telemetry-key", 4) };
+    assert_ok(unsafe { opendata_log_flush(log) });
+
+    let mut data: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    assert_ok(unsafe { opendata_log_render_metrics(&mut data, &mut len) });
+    assert!(!data.is_null());
+    assert!(len > 0, "rendered metrics buffer must not be empty");
+
+    let text = unsafe { std::slice::from_raw_parts(data, len) };
+    let text = std::str::from_utf8(text).expect("metrics text is utf-8");
+    assert!(
+        text.contains("slatedb_db_"),
+        "expected slatedb_db_* metric in rendered output, got:\n{text}"
+    );
+
+    unsafe { opendata_log_bytes_free(data, len) };
+
+    // Render again to exercise the steady-state path and confirm the first
+    // release didn't poison the global state.
+    let mut data2: *mut u8 = ptr::null_mut();
+    let mut len2: usize = 0;
+    assert_ok(unsafe { opendata_log_render_metrics(&mut data2, &mut len2) });
+    assert!(!data2.is_null());
+    assert!(len2 > 0);
+    unsafe { opendata_log_bytes_free(data2, len2) };
+
+    // Repeat init must be a successful no-op.
+    assert_ok(opendata_log_init_telemetry());
+
+    assert_ok(unsafe { opendata_log_close(log) });
+    assert_ok(unsafe { opendata_log_object_store_close(store) });
+}
+
+#[test]
+fn render_metrics_rejects_null_out_params() {
+    let mut data: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    assert_error(
+        unsafe { opendata_log_render_metrics(ptr::null_mut(), &mut len) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+    assert_error(
+        unsafe { opendata_log_render_metrics(&mut data, ptr::null_mut()) },
+        opendata_log_error_kind_t::OPENDATA_LOG_ERROR_INVALID_INPUT,
+    );
+}

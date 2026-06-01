@@ -156,9 +156,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     #[allow(dead_code)]
     async fn scan_all_centroid_stats(&self) -> Result<Vec<(VectorId, CentroidStatsValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::CentroidStats
-            .prefix()
-            .write_to(&mut prefix_buf);
+        crate::serde::RecordType::CentroidStats.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         let range = common::BytesRange::prefix(prefix);
@@ -178,9 +176,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
 
     async fn scan_all_centroid_info(&self) -> Result<Vec<(VectorId, CentroidInfoValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::CentroidInfo
-            .prefix()
-            .write_to(&mut prefix_buf);
+        crate::serde::RecordType::CentroidInfo.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         let range = common::BytesRange::prefix(prefix);
@@ -200,9 +196,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         dimensions: usize,
     ) -> Result<Vec<(VectorId, PostingListValue)>> {
         let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::PostingList
-            .prefix()
-            .write_to(&mut prefix_buf);
+        crate::serde::RecordType::PostingList.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         let range = common::BytesRange::prefix(prefix);

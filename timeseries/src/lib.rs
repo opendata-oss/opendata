@@ -43,6 +43,7 @@
 #![allow(dead_code)]
 
 // Internal modules
+mod active_series;
 mod delta;
 mod flusher;
 mod index;

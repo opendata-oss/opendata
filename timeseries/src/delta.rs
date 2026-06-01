@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use common::coordinator::Delta;
 
+use crate::active_series::ActiveSeriesTracker;
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{Label, MetricType, Sample, Series, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::util::Fingerprint;
@@ -19,6 +20,7 @@ pub(crate) struct TsdbContext {
     pub(crate) bucket: TimeBucket,
     pub(crate) series_dict: Arc<HashMap<SeriesFingerprint, SeriesId>>,
     pub(crate) next_series_id: u32,
+    pub(crate) active_series: Arc<ActiveSeriesTracker>,
 }
 
 /// Frozen (immutable) delta data sent to the flusher.
@@ -51,16 +53,24 @@ pub(crate) struct TsdbWriteDelta {
     /// Samples keyed by series_id, with metric name for key encoding.
     samples: HashMap<SeriesId, SeriesSamples>,
     next_series_id: u32,
+    active_series: Arc<ActiveSeriesTracker>,
 }
 
 impl TsdbWriteDelta {
     fn ingest(&mut self, series: &Series) -> Result<(), String> {
         let mut sorted_labels = series.labels.clone();
         sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
+        let fingerprint = sorted_labels.fingerprint();
+
+        // Record the series in the active-series HLL once per ingest call.
+        // HLL inserts are idempotent (fetch_max), so repeated records of the
+        // same fingerprint across batches don't inflate the estimate.
+        self.active_series.record(fingerprint);
 
         for sample in &series.samples {
             self.ingest_sample(
                 &sorted_labels,
+                fingerprint,
                 &series.unit,
                 series.metric_type,
                 sample.clone(),
@@ -72,6 +82,7 @@ impl TsdbWriteDelta {
     fn ingest_sample(
         &mut self,
         labels: &[Label],
+        fingerprint: SeriesFingerprint,
         unit: &Option<String>,
         metric_type: Option<MetricType>,
         sample: Sample,
@@ -87,7 +98,6 @@ impl TsdbWriteDelta {
             ));
         }
 
-        let fingerprint = labels.fingerprint();
         let metric_name = labels
             .iter()
             .find(|l| l.name == "__name__")
@@ -154,6 +164,7 @@ impl Delta for TsdbWriteDelta {
             inverted_index: InvertedIndex::default(),
             samples: HashMap::new(),
             next_series_id: context.next_series_id,
+            active_series: context.active_series,
         }
     }
 
@@ -187,6 +198,7 @@ impl Delta for TsdbWriteDelta {
             bucket: self.bucket,
             series_dict: merged_dict,
             next_series_id: self.next_series_id,
+            active_series: self.active_series,
         };
 
         let frozen = FrozenTsdbDelta {
@@ -217,6 +229,7 @@ mod tests {
             bucket: create_test_bucket(),
             series_dict: Arc::new(HashMap::new()),
             next_series_id: 0,
+            active_series: Arc::new(ActiveSeriesTracker::new(0)),
         }
     }
 
@@ -359,6 +372,7 @@ mod tests {
             bucket: create_test_bucket(),
             series_dict: Arc::new(base),
             next_series_id: 1,
+            active_series: Arc::new(ActiveSeriesTracker::new(0)),
         };
         let delta = TsdbWriteDelta::init(ctx);
         let base_ptr = Arc::as_ptr(&delta.series_dict_base);
@@ -545,6 +559,7 @@ mod tests {
             bucket: create_test_bucket(),
             series_dict: Arc::new(base),
             next_series_id: 43,
+            active_series: Arc::new(ActiveSeriesTracker::new(0)),
         };
         let mut delta = TsdbWriteDelta::init(ctx);
         let series =

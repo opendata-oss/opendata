@@ -5,16 +5,21 @@ use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::collection_meta::DistanceMetric;
+use crate::serde::field_stats::FieldStatsValue;
 use crate::serde::key::{
-    CentroidInfoKey, CentroidStatsKey, CentroidsKey, PostingListKey, VectorDataKey,
+    CentroidInfoKey, CentroidStatsKey, CentroidsKey, FieldStatsKey, PostingListKey,
+    TermPostingsKey, TermStatsKey, VectorDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
+use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::serde::vector_index_data::VectorIndexDataValue;
 use crate::storage::record::put_vector_index_data;
 use crate::storage::{VectorDbStorageReadExt, record};
+use crate::write::delta::TextAttributeSummary;
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
     CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader, TreeDepth, TreeLevel,
@@ -591,10 +596,103 @@ impl SearchIndexDelta {
     }
 }
 
+/// Mutations to the full-text search index for a single batch (RFC-0006).
+///
+/// Accumulates per-(field, term) postings, per-term document-frequency
+/// deltas, and per-field corpus-stat deltas as the Indexer processes inserts.
+/// On freeze it emits merge operands so SlateDB concatenates new postings
+/// blocks in front of any existing ones and sums stat deltas.
+#[derive(Debug, Default)]
+pub(crate) struct FtsIndexDelta {
+    /// (field, term) -> postings appended in this batch.
+    term_postings: HashMap<(String, String), Vec<PostingEntry>>,
+    /// (field, term) -> signed delta to the term's document frequency.
+    term_doc_freq_delta: HashMap<(String, String), i64>,
+    /// field -> (doc-count delta, total-length delta).
+    field_stats_delta: HashMap<String, (i64, i64)>,
+}
+
+impl FtsIndexDelta {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append every `(field, term)` posting from a single document.
+    ///
+    /// Each `term` contributes one posting entry with the document's term
+    /// frequency in the field and a 1-byte length norm (length clamped to
+    /// `u8::MAX`; finer quantisation is deferred to a later milestone).
+    /// `term_doc_freq_delta` increments once per `(field, term)` even if the
+    /// term appears multiple times within the same document. Per-field
+    /// corpus stats receive `+1` to the document count and `+length` to the
+    /// total length once per field.
+    pub(crate) fn add_text_summaries(
+        &mut self,
+        vector_id: VectorId,
+        summaries: &HashMap<String, TextAttributeSummary>,
+    ) {
+        for (field, summary) in summaries {
+            let length = crate::math::norm::clamp_length(summary.length);
+            let norm = crate::math::norm::encode_length(length);
+            for (term, &freq) in &summary.terms {
+                let freq_u32 = freq.min(u32::MAX as usize) as u32;
+                let key = (field.clone(), term.clone());
+                self.term_postings
+                    .entry(key.clone())
+                    .or_default()
+                    .push(PostingEntry {
+                        doc_id: vector_id.id(),
+                        freq: freq_u32,
+                        norm,
+                    });
+                *self.term_doc_freq_delta.entry(key).or_default() += 1;
+            }
+            let entry = self.field_stats_delta.entry(field.clone()).or_default();
+            entry.0 += 1;
+            entry.1 += summary.length as i64;
+        }
+    }
+
+    fn freeze(self, output_ops: &mut Vec<RecordOp>) {
+        let FtsIndexDelta {
+            term_postings,
+            term_doc_freq_delta,
+            field_stats_delta,
+        } = self;
+
+        for ((field, term), entries) in term_postings {
+            let value = TermPostingsValue::from_postings(entries);
+            let key = TermPostingsKey::new(&field, &term).encode();
+            output_ops.push(RecordOp::Merge(
+                Record::new(key, value.encode_to_bytes()).into(),
+            ));
+        }
+
+        for ((field, term), delta) in term_doc_freq_delta {
+            if delta == 0 {
+                continue;
+            }
+            let key = TermStatsKey::new(&field, &term).encode();
+            let value = TermStatsValue::new(delta).encode_to_bytes();
+            output_ops.push(RecordOp::Merge(Record::new(key, value).into()));
+        }
+
+        for (field, (count_delta, total_delta)) in field_stats_delta {
+            if count_delta == 0 && total_delta == 0 {
+                continue;
+            }
+            let key = FieldStatsKey::new(&field).encode();
+            let value = FieldStatsValue::new(count_delta, total_delta, 0).encode_to_bytes();
+            output_ops.push(RecordOp::Merge(Record::new(key, value).into()));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct VectorIndexDelta {
     pub(crate) forward_index: ForwardIndexDelta,
     pub(crate) search_index: SearchIndexDelta,
+    pub(crate) fts_index: FtsIndexDelta,
 }
 
 impl VectorIndexDelta {
@@ -602,6 +700,7 @@ impl VectorIndexDelta {
         Self {
             forward_index: ForwardIndexDelta::new(state),
             search_index: SearchIndexDelta::new(state),
+            fts_index: FtsIndexDelta::new(),
         }
     }
 
@@ -609,6 +708,7 @@ impl VectorIndexDelta {
         let mut ops = vec![];
         self.forward_index.freeze(state, &mut ops);
         self.search_index.freeze(epoch, state, &mut ops);
+        self.fts_index.freeze(&mut ops);
         ops
     }
 }

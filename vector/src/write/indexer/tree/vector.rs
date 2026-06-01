@@ -1,5 +1,6 @@
 use crate::Error::Internal;
 use crate::Result;
+use crate::metric_names::{INDEXER_ANN_REASSIGNS_TOTAL, INDEXER_WRITES_TOTAL};
 use crate::model::AttributeValue;
 use crate::model::VECTOR_FIELD_NAME;
 use crate::serde::FieldValue;
@@ -63,6 +64,9 @@ impl WriteVectors {
         state: &VectorIndexState,
         delta: &mut VectorIndexDelta,
     ) -> Result<(usize, usize, usize)> {
+        let total_writes: usize = self.ops.iter().map(VectorDbOp::len).sum();
+        metrics::counter!(INDEXER_WRITES_TOTAL).increment(total_writes as u64);
+
         let (writes, delete_ids) = Self::collapse_ops(self.ops);
         if writes.is_empty() && delete_ids.is_empty() {
             return Ok((0, 0, 0));
@@ -177,6 +181,10 @@ impl WriteVectors {
                     .search_index
                     .add_to_inverted_index(attr_name.clone(), field_value, vector_id);
             }
+            // RFC-0006: index text fields into the FTS postings/statistics.
+            delta
+                .fts_index
+                .add_text_summaries(vector_id, &insert.text_attribute_summaries);
         }
 
         // Apply upserts to delta
@@ -225,6 +233,13 @@ impl WriteVectors {
                     .search_index
                     .add_to_inverted_index(attr_name.clone(), field_value, vector_id);
             }
+            // RFC-0006: index text fields for the new vector under its fresh
+            // internal id. Milestone 0 does not retract FTS postings or stats
+            // for the old vector — the query path tolerates stale postings by
+            // checking the forward index when resolving candidates.
+            delta
+                .fts_index
+                .add_text_summaries(vector_id, &write.text_attribute_summaries);
         }
 
         // Apply deletes to delta
@@ -419,7 +434,8 @@ impl ReassignVectors {
             reassignments
         };
 
-        if self.level.is_leaf() {
+        let level = self.level;
+        let reassigned = if level.is_leaf() {
             Self::execute_vector_reassignments(
                 &self.opts,
                 &self.snapshot,
@@ -428,7 +444,7 @@ impl ReassignVectors {
                 delta,
                 reassignments,
             )
-            .await
+            .await?
         } else {
             Self::execute_centroid_reassignments(
                 &self.snapshot,
@@ -437,8 +453,14 @@ impl ReassignVectors {
                 delta,
                 reassignments,
             )
-            .await
-        }
+            .await?
+        };
+        metrics::counter!(
+            INDEXER_ANN_REASSIGNS_TOTAL,
+            "level" => level.level().to_string(),
+        )
+        .increment(reassigned as u64);
+        Ok(reassigned)
     }
 
     async fn execute_centroid_reassignments(
@@ -576,6 +598,7 @@ mod tests {
             split_threshold_vectors: usize::MAX,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::from(["category".to_string()]),
+            text_fields: HashSet::new(),
         })
     }
 
@@ -594,6 +617,7 @@ mod tests {
                     AttributeValue::String(format!("{id} description")),
                 ),
             ],
+            text_attribute_summaries: HashMap::new(),
         }
     }
 

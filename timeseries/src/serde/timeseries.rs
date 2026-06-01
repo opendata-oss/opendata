@@ -180,12 +180,17 @@ impl TimeSeriesValue {
             return Ok(Bytes::new());
         }
 
+        // Gorilla delta encoding requires monotonically non-decreasing timestamps,
+        // so sort defensively to avoid a subtract-with-overflow panic on out-of-order input.
+        let mut points: Vec<&Sample> = self.points.iter().collect();
+        points.sort_by_key(|p| p.timestamp_ms);
+
         // Use Gorilla compression
         let w = BufferedWriter::new();
-        let start_time = self.points[0].timestamp_ms as u64;
+        let start_time = points[0].timestamp_ms as u64;
         let mut encoder = StdEncoder::new(start_time, w);
 
-        for point in &self.points {
+        for point in &points {
             let dp = DataPoint::new(point.timestamp_ms as u64, point.value);
             encoder.encode(dp);
         }
@@ -316,6 +321,41 @@ mod tests {
 
         // then
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn should_encode_when_points_are_out_of_order() {
+        // given
+        let value = TimeSeriesValue {
+            points: vec![
+                Sample {
+                    timestamp_ms: 2000,
+                    value: 20.0,
+                },
+                Sample {
+                    timestamp_ms: 1000,
+                    value: 10.0,
+                },
+                Sample {
+                    timestamp_ms: 3000,
+                    value: 30.0,
+                },
+            ],
+        };
+
+        // when
+        let encoded = value.encode().unwrap();
+        let decoded = TimeSeriesValue::decode(encoded.as_ref()).unwrap();
+
+        // then
+        assert_eq!(
+            decoded
+                .points
+                .iter()
+                .map(|p| p.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![1000, 2000, 3000]
+        );
     }
 
     #[test]

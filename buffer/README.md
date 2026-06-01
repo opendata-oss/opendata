@@ -117,6 +117,40 @@ while let Some(batch) = consumer.next_batch().await? {
 consumer.flush().await?;
 ```
 
+### Pipelined consumers
+
+For high-throughput consumers that need to overlap fetch I/O with decode CPU work, the consumer exposes a parallel-fetch path on top of the same epoch-fenced manifest:
+
+```rust
+let mut consumer = Consumer::new(ConsumerConfig::default(), clock)?;
+consumer.initialize(None).await?;
+
+let fetcher = consumer.fetch_handle(); // Clone + Send + Sync
+
+// Pull a run of descriptors from one manifest read:
+let descriptors = consumer.next_descriptors(K).await?;
+
+// Fan out across N workers using cloned handles:
+for d in descriptors {
+    let f = fetcher.clone();
+    tokio::spawn(async move {
+        let batch = f.fetch(d).await?;
+        // ...process...
+        Ok::<(), buffer::Error>(())
+    });
+}
+
+// Once a contiguous range is fully processed, ack the high watermark
+// in one manifest write:
+consumer.ack_through(high).await?;
+```
+
+`next_descriptors` reads the manifest once and returns up to `K` contiguous descriptors past an internal read-ahead cursor. `ConsumerFetchHandle::fetch` is stateless and safe to call concurrently across cloned handles. `ack_through` advances the durable frontier through `sequence` in one dequeue, dequeue-first (in-memory state moves only on success).
+
+The caller is responsible for tracking which sequences have actually completed and only calling `ack_through` with the highest fully-processed *contiguous* sequence; out-of-order completion is normal but the durable frontier only moves on a contiguous run. Full design, including the descriptor handout contract and failure modes, lives in [RFC 0003](rfcs/0003-consumer-read-ahead.md). The OpenData docs site has a [walkthrough with the pipelined-consumer pattern](.https://www.opendata.dev/docs/buffer/architecture#read-ahead-and-batched-acks). 
+
+opendata-contrib has a generic pipelined runtime built on top of the readahead APIs. Learn more about it [here](https://github.com/opendata-oss/opendata-contrib/tree/main/runtime/opendata-ingest-runtime).
+
 ## Delivery guarantees
 
 Exactly-once delivery is achievable when the caller atomically writes both the batch and its sequence number to the downstream database. After a failure, the consumer resumes from the last committed sequence — no data is processed twice.

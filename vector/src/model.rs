@@ -216,20 +216,6 @@ pub struct Config {
     /// Number of neighboring centroids to scan for reassignment candidates after a split.
     pub split_search_neighbourhood: usize,
 
-    /// The maximum number of centroids that require rebalancing before which backpressure
-    /// is applied by pausing ingestion of new vector writes.
-    pub max_pending_and_running_rebalance_tasks: usize,
-
-    /// After backpressure is applied, ingestion resumes after the total number of centroids
-    /// requiring rebalance drops below this value.
-    pub rebalance_backpressure_resume_threshold: usize,
-
-    /// The maximum number of rebalance tasks that the rebalancer will run concurrently.
-    pub max_rebalance_tasks: usize,
-
-    /// Target number of centroids per chunk.
-    pub chunk_target: u16,
-
     /// Query-aware dynamic pruning epsilon (ε₂ from SPANN paper).
     ///
     /// When set, a posting list is searched only if its centroid's distance
@@ -262,13 +248,9 @@ impl Default for Config {
             dimensions: 0, // Must be set explicitly
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
-            split_threshold_vectors: 2_000,
-            merge_threshold_vectors: 500,
+            split_threshold_vectors: 150,
+            merge_threshold_vectors: 50,
             split_search_neighbourhood: 0,
-            max_pending_and_running_rebalance_tasks: 16,
-            rebalance_backpressure_resume_threshold: 8,
-            max_rebalance_tasks: 8,
-            chunk_target: 4096,
             query_pruning_factor: None,
             metadata_fields: Vec::new(),
             #[cfg(feature = "buffer")]
@@ -434,20 +416,38 @@ impl From<Vec<String>> for FieldSelection {
     }
 }
 
+/// Parameters for a BM25 full-text-search query (RFC-0006).
+#[derive(Debug, Clone)]
+pub struct Bm25Query {
+    /// Text field to search against. Must be declared as `FieldType::Text`.
+    pub field: String,
+    /// Query text. Tokenized with the same tokenizer used at write time.
+    pub query: String,
+}
+
+/// How a query should score documents.
+#[derive(Debug, Clone)]
+pub enum ScoreBy {
+    /// Approximate-nearest-neighbour search on the embedding vector.
+    Ann(Vec<f32>),
+    /// BM25 full-text search on a `FieldType::Text` field.
+    Bm25(Bm25Query),
+}
+
 /// Query specification for vector search.
 ///
 /// Constructed using the builder pattern:
 ///
 /// ```ignore
-/// let query = Query::new(embedding)
+/// let ann = Query::ann(embedding)
 ///     .with_limit(10)
-///     .with_filter(Filter::eq("category", "shoes"))
-///     .with_fields(vec!["category", "price"]);
+///     .with_filter(Filter::eq("category", "shoes"));
+/// let bm25 = Query::bm25("body", "fox jumps").with_limit(5);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Query {
-    /// Query vector (required).
-    pub vector: Vec<f32>,
+    /// Method used to score documents (ANN or BM25).
+    pub score_by: ScoreBy,
     /// Maximum number of results to return (default: 10).
     pub limit: usize,
     /// Optional metadata filter.
@@ -457,10 +457,31 @@ pub struct Query {
 }
 
 impl Query {
-    /// Creates a new query with the given vector.
+    /// Creates a new ANN query with the given vector.
+    ///
+    /// Alias for [`Query::ann`]; kept for ergonomics so existing call sites
+    /// that read as `Query::new(vec)` continue to work.
     pub fn new(vector: Vec<f32>) -> Self {
+        Self::ann(vector)
+    }
+
+    /// Creates a new ANN query with the given vector.
+    pub fn ann(vector: Vec<f32>) -> Self {
         Self {
-            vector,
+            score_by: ScoreBy::Ann(vector),
+            limit: 10,
+            filter: None,
+            include_fields: FieldSelection::All,
+        }
+    }
+
+    /// Creates a new BM25 query for the given text field.
+    pub fn bm25(field: impl Into<String>, query: impl Into<String>) -> Self {
+        Self {
+            score_by: ScoreBy::Bm25(Bm25Query {
+                field: field.into(),
+                query: query.into(),
+            }),
             limit: 10,
             filter: None,
             include_fields: FieldSelection::All,
@@ -485,6 +506,14 @@ impl Query {
     pub fn with_fields(mut self, fields: impl Into<FieldSelection>) -> Self {
         self.include_fields = fields.into();
         self
+    }
+
+    /// Returns the ANN query vector, if this query scores by ANN.
+    pub fn ann_vector(&self) -> Option<&Vec<f32>> {
+        match &self.score_by {
+            ScoreBy::Ann(v) => Some(v),
+            ScoreBy::Bm25(_) => None,
+        }
     }
 }
 
@@ -530,6 +559,24 @@ impl Filter {
     /// Combines filters with logical OR.
     pub fn or(filters: Vec<Filter>) -> Self {
         Filter::Or(filters)
+    }
+
+    /// Evaluate this filter against an attribute map (CPU-side reference
+    /// semantics). Useful for computing filtered ground truth without going
+    /// through the index.
+    ///
+    /// Semantics for well-formed metadata (every row carries the indexed
+    /// fields): `Eq` matches when the field is present and equal; `Neq`
+    /// matches when the field is absent or not equal; `In` matches when the
+    /// field is present and its value is in the set; `And`/`Or` combine.
+    pub fn matches(&self, attributes: &HashMap<String, AttributeValue>) -> bool {
+        match self {
+            Filter::Eq(field, value) => attributes.get(field) == Some(value),
+            Filter::Neq(field, value) => attributes.get(field) != Some(value),
+            Filter::In(field, values) => attributes.get(field).is_some_and(|v| values.contains(v)),
+            Filter::And(filters) => filters.iter().all(|f| f.matches(attributes)),
+            Filter::Or(filters) => filters.iter().any(|f| f.matches(attributes)),
+        }
     }
 }
 

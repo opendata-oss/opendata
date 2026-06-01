@@ -23,6 +23,7 @@ default = []
 http-server = ["dep:axum", "dep:tower", "dep:clap", "dep:prometheus-client", "dep:metrics-exporter-prometheus", "dep:tikv-jemallocator"]
 
 [dependencies]
+arc-swap = "1"
 async-trait.workspace = true
 bytes.workspace = true
 common.workspace = true
@@ -33,6 +34,7 @@ serde_json.workspace = true
 serde_with.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
+ulid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

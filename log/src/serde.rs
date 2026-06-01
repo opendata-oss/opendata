@@ -8,16 +8,30 @@
 //!
 //! # Key Format
 //!
-//! All keys start with a subsystem byte, version byte, and record type discriminator:
+//! All log storage keys share a 7-byte segmented prefix:
 //!
 //! ```text
-//! | subsystem (u8) | version (u8) | type (u8) | ... record-specific fields ... |
+//! | subsystem (u8) | version (u8) | segment_id (u32 BE) | record_type (u8) | ... |
 //! ```
+//!
+//! Placing `segment_id` before `record_type` lets a SlateDB segment extractor
+//! recognize the segment boundary with a fixed 6-byte prefix
+//! `[subsystem, version, segment_id]`, routing all records for a given
+//! segment to the same SlateDB segment regardless of record type.
+//!
+//! # System Segment
+//!
+//! Segment id `0` is reserved as the **system segment**: it never holds user
+//! log entries. Records that are not bound to a specific user segment (the
+//! global sequence block, and per-segment metadata records describing other
+//! segments) live in segment `0`. Real user segments are numbered from `1`.
 //!
 //! # Record Types
 //!
-//! - `LogEntry` (0x10): User data entries with key and sequence number
-//! - `SeqBlock` (0x20): Sequence number block allocation tracking (value type in `common` crate)
+//! - `LogEntry`     (`0x10`): user data entry, in its owning segment
+//! - `SeqBlock`     (`0x20`): global sequence block, in the system segment
+//! - `SegmentMeta`  (`0x30`): per-segment metadata, in the system segment
+//! - `ListingEntry` (`0x40`): per-segment key listing, in its owning segment
 //!
 //! # TerminatedBytes Encoding
 //!
@@ -38,7 +52,7 @@ use std::ops::{Bound, Range};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::BytesRange;
-use common::serde::key_prefix::KeyPrefix;
+use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
 use common::serde::record_tag::RecordTag;
 use common::serde::terminated_bytes;
 use common::serde::varint::var_u64;
@@ -53,14 +67,30 @@ impl From<common::serde::DeserializeError> for Error {
     }
 }
 
-/// Key format version (currently 0x01)
+/// Key format version for log storage.
 pub const KEY_VERSION: u8 = 0x01;
 
-/// Subsystem-specific key prefix for log storage.
-pub const SUBSYSTEM: u8 = 0x03;
+/// Subsystem byte for log storage (see [`common::serde::subsystem`]).
+pub const SUBSYSTEM: u8 = common::serde::subsystem::LOG;
 
-/// Storage key for the SeqBlock record.
-pub const SEQ_BLOCK_KEY: [u8; 3] = [SUBSYSTEM, KEY_VERSION, 0x20]; // RecordType::SeqBlock
+/// Reserved segment id for system records (sequence block, per-segment
+/// metadata describing other segments). User log segments start at `1`.
+pub const SYSTEM_SEGMENT_ID: SegmentId = 0;
+
+/// First segment id assigned to user log data. Segment `0` is reserved as the
+/// system segment.
+pub const FIRST_USER_SEGMENT_ID: SegmentId = 1;
+
+/// Storage key for the SeqBlock record (lives in the system segment).
+pub const SEQ_BLOCK_KEY: [u8; 7] = [
+    SUBSYSTEM,
+    KEY_VERSION,
+    0,
+    0,
+    0,
+    0,    // SYSTEM_SEGMENT_ID encoded as u32 BE
+    0x20, // RecordType::SeqBlock tag byte
+];
 
 /// Record type discriminators for log storage.
 ///
@@ -99,28 +129,56 @@ impl RecordType {
         }
     }
 
-    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, Error> {
-        if prefix.subsystem() != SUBSYSTEM {
-            return Err(Error::Encoding(format!(
-                "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
-                SUBSYSTEM,
-                prefix.subsystem()
-            )));
-        }
-        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
-    }
-
     /// Creates a RecordTag for this record type.
     ///
     /// Log records use 0 for the reserved bits.
     pub fn tag(&self) -> RecordTag {
         RecordTag::new(self.id(), 0)
     }
+}
 
-    /// Creates a KeyPrefix for this record type with the current version.
-    pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
+/// Offset of the segment id (u32 BE) inside a log key, immediately after the
+/// 2-byte common prefix.
+const SEGMENT_ID_OFFSET: usize = KEY_PREFIX_LEN;
+
+/// Offset of the record-type tag byte inside a log key, after the segment id.
+const RECORD_TYPE_OFFSET: usize = SEGMENT_ID_OFFSET + 4;
+
+/// Length of the segmented key prefix: `[subsystem, version, seg_id(4), record_type]`.
+const SEGMENTED_PREFIX_LEN: usize = RECORD_TYPE_OFFSET + 1;
+
+/// Writes the segmented prefix into `buf`:
+/// `[subsystem, version, seg_id BE, record_type]`.
+fn write_segmented_prefix(buf: &mut BytesMut, segment_id: SegmentId, record_type: u8) {
+    KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
+    buf.put_u32(segment_id);
+    buf.put_u8(record_type);
+}
+
+/// Parses a segmented prefix, validating the subsystem/version/tag.
+/// Returns the segment id along with the remaining (post-prefix) bytes.
+fn parse_segmented_prefix(data: &[u8], expected_tag: u8) -> Result<(SegmentId, &[u8]), Error> {
+    KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
+    if data.len() < SEGMENTED_PREFIX_LEN {
+        return Err(Error::Encoding(format!(
+            "buffer too short for log key: need {} bytes, got {}",
+            SEGMENTED_PREFIX_LEN,
+            data.len()
+        )));
     }
+    let segment_id = u32::from_be_bytes([
+        data[SEGMENT_ID_OFFSET],
+        data[SEGMENT_ID_OFFSET + 1],
+        data[SEGMENT_ID_OFFSET + 2],
+        data[SEGMENT_ID_OFFSET + 3],
+    ]);
+    if data[RECORD_TYPE_OFFSET] != expected_tag {
+        return Err(Error::Encoding(format!(
+            "invalid record tag: expected 0x{:02x}, got 0x{:02x}",
+            expected_tag, data[RECORD_TYPE_OFFSET]
+        )));
+    }
+    Ok((segment_id, &data[SEGMENTED_PREFIX_LEN..]))
 }
 
 /// Key for a log entry record.
@@ -129,7 +187,7 @@ impl RecordType {
 /// that preserves lexicographic ordering:
 ///
 /// ```text
-/// | subsystem (u8) | version (u8) | type (u8) | segment_id (u32 BE) | terminated_key | relative_seq (var_u64) |
+/// | subsystem (u8) | version (u8) | segment_id (u32 BE) | record_type (u8=0x10) | terminated_key | relative_seq (var_u64) |
 /// ```
 ///
 /// The `relative_seq` is the entry's sequence number relative to the segment's `start_seq`
@@ -137,8 +195,9 @@ impl RecordType {
 /// relative offsets within a segment are small. The sequence number uses variable-length
 /// encoding (see [`common::serde::varint::var_u64`]).
 ///
-/// The ordering (segment_id before key) ensures entries are grouped by segment,
-/// enabling efficient scans within a single segment.
+/// Placing `segment_id` before `record_type` keeps every record for a given segment
+/// contiguous in storage, regardless of record type — the property a fixed-length
+/// SlateDB segment extractor relies on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntryKey {
     /// The segment this entry belongs to
@@ -166,8 +225,11 @@ impl LogEntryKey {
     pub fn serialize(&self, segment_start_seq: u64) -> Bytes {
         let relative_seq = self.sequence - segment_start_seq;
         let mut buf = BytesMut::new();
-        RecordType::LogEntry.prefix().write_to(&mut buf);
-        buf.put_u32(self.segment_id);
+        write_segmented_prefix(
+            &mut buf,
+            self.segment_id,
+            RecordType::LogEntry.tag().as_byte(),
+        );
         terminated_bytes::serialize(&self.key, &mut buf);
         var_u64::serialize(relative_seq, &mut buf);
         buf.freeze()
@@ -179,26 +241,10 @@ impl LogEntryKey {
     /// caller must provide the segment's start sequence to recover the absolute
     /// sequence number.
     pub fn deserialize(data: &[u8], segment_start_seq: u64) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
-        if record_type != RecordType::LogEntry {
-            return Err(Error::Encoding(format!(
-                "invalid record type: expected LogEntry, got {:?}",
-                record_type
-            )));
-        }
-
-        if data.len() < 7 {
-            return Err(Error::Encoding(
-                "buffer too short for log entry key".to_string(),
-            ));
-        }
-
-        let segment_id = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
-
-        let mut buf = &data[7..];
-        let key = terminated_bytes::deserialize(&mut buf)?;
-        let relative_seq = var_u64::deserialize(&mut buf)?;
+        let (segment_id, mut rest) =
+            parse_segmented_prefix(data, RecordType::LogEntry.tag().as_byte())?;
+        let key = terminated_bytes::deserialize(&mut rest)?;
+        let relative_seq = var_u64::deserialize(&mut rest)?;
         let sequence = segment_start_seq + relative_seq;
 
         Ok(LogEntryKey {
@@ -223,8 +269,7 @@ impl LogEntryKey {
     fn build_scan_key(segment: &LogSegment, key: &[u8], seq: u64) -> Bytes {
         let relative_seq = seq.saturating_sub(segment.meta().start_seq);
         let mut buf = BytesMut::new();
-        RecordType::LogEntry.prefix().write_to(&mut buf);
-        buf.put_u32(segment.id());
+        write_segmented_prefix(&mut buf, segment.id(), RecordType::LogEntry.tag().as_byte());
         terminated_bytes::serialize(key, &mut buf);
         var_u64::serialize(relative_seq, &mut buf);
         buf.freeze()
@@ -233,12 +278,16 @@ impl LogEntryKey {
 
 /// Key for a segment metadata record.
 ///
+/// `SegmentMeta` records describe user log segments. They are written into the
+/// system segment (seg_id `0`), with the described segment's id encoded as a
+/// suffix so the records sort by described segment:
+///
 /// ```text
-/// | subsystem (u8) | version (u8) | type (u8=0x30) | segment_id (u32 BE) |
+/// | subsystem (u8) | version (u8) | SYSTEM_SEGMENT_ID (u32 BE) | record_type (u8=0x30) | described_segment_id (u32 BE) |
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMetaKey {
-    /// The segment identifier
+    /// The user segment this metadata record describes.
     pub segment_id: SegmentId,
 }
 
@@ -250,35 +299,48 @@ impl SegmentMetaKey {
 
     /// Encodes the key to bytes for storage
     pub fn serialize(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(7);
-        RecordType::SegmentMeta.prefix().write_to(&mut buf);
+        let mut buf = BytesMut::with_capacity(SEGMENTED_PREFIX_LEN + 4);
+        write_segmented_prefix(
+            &mut buf,
+            SYSTEM_SEGMENT_ID,
+            RecordType::SegmentMeta.tag().as_byte(),
+        );
         buf.put_u32(self.segment_id);
         buf.freeze()
     }
 
-    /// Decodes a segment metadata key from bytes
+    /// Decodes a segment metadata key from bytes.
+    ///
+    /// Strict: rejects keys that aren't routed to the system segment, and
+    /// rejects trailing bytes past the described-segment-id suffix. The
+    /// caller has already validated subsystem / version / tag via
+    /// [`parse_segmented_prefix`].
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
-        if record_type != RecordType::SegmentMeta {
+        let (storage_segment_id, rest) =
+            parse_segmented_prefix(data, RecordType::SegmentMeta.tag().as_byte())?;
+        if storage_segment_id != SYSTEM_SEGMENT_ID {
             return Err(Error::Encoding(format!(
-                "invalid record type: expected SegmentMeta, got {:?}",
-                record_type
+                "SegmentMeta records must live in the system segment (got seg_id {})",
+                storage_segment_id
             )));
         }
-
-        if data.len() < 7 {
-            return Err(Error::Encoding(
-                "buffer too short for SegmentMeta key".to_string(),
-            ));
+        if rest.len() != 4 {
+            return Err(Error::Encoding(format!(
+                "SegmentMeta key has wrong described-segment-id suffix length: expected 4 bytes, got {}",
+                rest.len()
+            )));
         }
-
-        let segment_id = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
-
+        let segment_id = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
         Ok(SegmentMetaKey { segment_id })
     }
 
-    /// Creates a storage key range for scanning segment metadata within a segment ID range.
+    /// Creates a storage key range for scanning `SegmentMeta` records whose
+    /// *described* segment id falls in `range`.
+    ///
+    /// All records live in the system segment (storage seg_id `0`); the
+    /// described segment id is the fixed-width 4-byte suffix, so the range
+    /// endpoints encode `seg_id=0` at the front and the described range at
+    /// the back. The scan is contiguous within the system segment.
     pub fn scan_range(range: Range<SegmentId>) -> BytesRange {
         let start = Bound::Included(SegmentMetaKey::new(range.start).serialize());
         let end = Bound::Excluded(SegmentMetaKey::new(range.end).serialize());
@@ -342,15 +404,18 @@ impl SegmentMeta {
 /// Key for a listing entry record.
 ///
 /// Tracks key presence within a segment for efficient key enumeration.
-/// The key format places segment_id before the user key, ensuring all
-/// listing records for a segment are contiguous for efficient prefix scans.
+/// Listing records share the segment's 6-byte prefix `[sub, ver, segment_id]`
+/// with log entries, so they land in the same SlateDB segment under a
+/// segment extractor.
 ///
 /// ```text
-/// | subsystem (u8) | version (u8) | type (u8=0x40) | segment_id (u32 BE) | key (Bytes) |
+/// | subsystem (u8) | version (u8) | segment_id (u32 BE) | record_type (u8=0x40) | key (Bytes) |
 /// ```
 ///
 /// Unlike log entry keys, the user key is stored as raw bytes without
-/// terminated encoding since it occupies the suffix position.
+/// terminated encoding since it occupies the suffix position. Listings for a
+/// given segment are enumerated with a single contiguous prefix scan; cross-
+/// segment listings are stitched together by walking the segment cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListingEntryKey {
     /// The segment this listing entry belongs to
@@ -368,50 +433,40 @@ impl ListingEntryKey {
     /// Serializes the key to bytes for storage.
     pub fn serialize(&self) -> Bytes {
         let mut buf = BytesMut::new();
-        RecordType::ListingEntry.prefix().write_to(&mut buf);
-        buf.put_u32(self.segment_id);
+        write_segmented_prefix(
+            &mut buf,
+            self.segment_id,
+            RecordType::ListingEntry.tag().as_byte(),
+        );
         buf.put_slice(&self.key);
         buf.freeze()
     }
 
     /// Deserializes a listing entry key from bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        let prefix = KeyPrefix::from_bytes_with_validation(data, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
-        if record_type != RecordType::ListingEntry {
-            return Err(Error::Encoding(format!(
-                "invalid record type: expected ListingEntry, got {:?}",
-                record_type
-            )));
-        }
-
-        if data.len() < 7 {
-            return Err(Error::Encoding(
-                "buffer too short for listing entry key".to_string(),
-            ));
-        }
-
-        let segment_id = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
-        let key = Bytes::copy_from_slice(&data[7..]);
-
+        let (segment_id, rest) =
+            parse_segmented_prefix(data, RecordType::ListingEntry.tag().as_byte())?;
+        let key = Bytes::copy_from_slice(rest);
         Ok(ListingEntryKey { segment_id, key })
     }
 
-    /// Creates a storage key range for scanning listing entries across segments.
-    ///
-    /// Returns a range that matches all listing entries for segments within
-    /// the specified range [start, end).
-    pub fn scan_range(range: Range<SegmentId>) -> BytesRange {
-        let start = Bound::Included(Self::segment_prefix(range.start));
-        let end = Bound::Excluded(Self::segment_prefix(range.end));
-        BytesRange::new(start, end)
+    /// Creates a storage key range for scanning listing entries within a
+    /// single segment. Cross-segment iteration is the caller's responsibility:
+    /// the key layout interleaves listing records with log entries across
+    /// segment boundaries, so a wide cross-segment range scan is not safe.
+    pub fn scan_range_for_segment(segment_id: SegmentId) -> BytesRange {
+        BytesRange::prefix(Self::segment_prefix(segment_id))
     }
 
-    /// Returns the prefix key for a segment (smallest possible key for segment).
+    /// Returns the listing prefix for a segment (the smallest valid listing key
+    /// for that segment).
     fn segment_prefix(segment_id: SegmentId) -> Bytes {
-        let mut buf = BytesMut::with_capacity(7);
-        RecordType::ListingEntry.prefix().write_to(&mut buf);
-        buf.put_u32(segment_id);
+        let mut buf = BytesMut::with_capacity(SEGMENTED_PREFIX_LEN);
+        write_segmented_prefix(
+            &mut buf,
+            segment_id,
+            RecordType::ListingEntry.tag().as_byte(),
+        );
         buf.freeze()
     }
 }
@@ -508,15 +563,15 @@ mod tests {
         let serialized = key.serialize(segment_start_seq);
 
         // then
-        // subsystem (1) + version (1) + tag (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (varint, 2 bytes for 100) = 11
+        // subsystem (1) + version (1) + segment_id (4) + tag (1) + key "k" (1) + terminator (1) + relative_seq (varint, 2 bytes for 100) = 11
         assert_eq!(serialized.len(), 11);
         assert_eq!(serialized[0], SUBSYSTEM);
         assert_eq!(serialized[1], KEY_VERSION);
-        // Record tag: type 0x01 in high nibble, reserved 0x00 in low nibble = 0x10
-        assert_eq!(serialized[2], RecordType::LogEntry.tag().as_byte());
-        assert_eq!(serialized[2], 0x10);
         // segment_id = 1 in big endian
-        assert_eq!(&serialized[3..7], &[0, 0, 0, 1]);
+        assert_eq!(&serialized[2..6], &[0, 0, 0, 1]);
+        // Record tag: type 0x01 in high nibble, reserved 0x00 in low nibble = 0x10
+        assert_eq!(serialized[6], RecordType::LogEntry.tag().as_byte());
+        assert_eq!(serialized[6], 0x10);
         // key "k" + terminator
         assert_eq!(serialized[7], b'k');
         assert_eq!(serialized[8], 0x00); // terminator
@@ -537,7 +592,7 @@ mod tests {
 
         // then
         // relative_seq = 5 fits in 1 byte (length code 0)
-        // subsystem (1) + version (1) + type (1) + segment_id (4) + key "k" (1) + terminator (1) + relative_seq (1) = 10
+        // subsystem (1) + version (1) + segment_id (4) + tag (1) + key "k" (1) + terminator (1) + relative_seq (1) = 10
         assert_eq!(serialized.len(), 10);
         // relative_seq = 5 as varint: length code 0, value 5
         assert_eq!(serialized[9], 0x05);
@@ -545,25 +600,25 @@ mod tests {
 
     #[test]
     fn should_order_log_entries_by_segment_then_key_then_sequence() {
-        // given - all in segment 0 with start_seq 0
-        let segment_start_seq = 0;
-        let key1 = LogEntryKey::new(0, Bytes::from("a"), 1);
-        let key2 = LogEntryKey::new(0, Bytes::from("a"), 2);
-        let key3 = LogEntryKey::new(0, Bytes::from("b"), 1);
-        // segment 1 has its own start_seq
-        let segment1_start_seq = 100;
-        let key4 = LogEntryKey::new(1, Bytes::from("a"), 101);
+        // given - all in segment 1 with start_seq 0
+        let seg1_start_seq = 0;
+        let key1 = LogEntryKey::new(1, Bytes::from("a"), 1);
+        let key2 = LogEntryKey::new(1, Bytes::from("a"), 2);
+        let key3 = LogEntryKey::new(1, Bytes::from("b"), 1);
+        // segment 2 has its own start_seq
+        let seg2_start_seq = 100;
+        let key4 = LogEntryKey::new(2, Bytes::from("a"), 101);
 
         // when
-        let s1 = key1.serialize(segment_start_seq);
-        let s2 = key2.serialize(segment_start_seq);
-        let s3 = key3.serialize(segment_start_seq);
-        let s4 = key4.serialize(segment1_start_seq);
+        let s1 = key1.serialize(seg1_start_seq);
+        let s2 = key2.serialize(seg1_start_seq);
+        let s3 = key3.serialize(seg1_start_seq);
+        let s4 = key4.serialize(seg2_start_seq);
 
         // then - segment_id ordering takes precedence
         assert!(s1 < s2, "same segment/key, seq 1 < seq 2");
         assert!(s2 < s3, "same segment, key 'a' < key 'b'");
-        assert!(s3 < s4, "segment 0 < segment 1");
+        assert!(s3 < s4, "segment 1 < segment 2");
     }
 
     #[test]
@@ -583,15 +638,8 @@ mod tests {
 
     #[test]
     fn should_fail_deserialize_log_entry_key_too_short() {
-        // given
-        let data = vec![
-            SUBSYSTEM,
-            KEY_VERSION,
-            RecordType::LogEntry.tag().as_byte(),
-            0,
-            0,
-            0,
-        ]; // only 6 bytes
+        // given — 6 bytes (one short of the 7-byte segmented prefix)
+        let data = vec![SUBSYSTEM, KEY_VERSION, 0, 0, 0, 1];
 
         // when
         let result = LogEntryKey::deserialize(&data, 0);
@@ -623,15 +671,15 @@ mod tests {
         let serialized = key.serialize();
 
         // then
-        // subsystem (1) + version (1) + tag (1) + segment_id (4) + key "k" (1) = 8
+        // subsystem (1) + version (1) + segment_id (4) + tag (1) + key "k" (1) = 8
         assert_eq!(serialized.len(), 8);
         assert_eq!(serialized[0], SUBSYSTEM);
         assert_eq!(serialized[1], KEY_VERSION);
-        // Record tag: type 0x04 in high nibble, reserved 0x00 in low nibble = 0x40
-        assert_eq!(serialized[2], RecordType::ListingEntry.tag().as_byte());
-        assert_eq!(serialized[2], 0x40);
         // segment_id = 1 in big endian
-        assert_eq!(&serialized[3..7], &[0, 0, 0, 1]);
+        assert_eq!(&serialized[2..6], &[0, 0, 0, 1]);
+        // Record tag: type 0x04 in high nibble, reserved 0x00 in low nibble = 0x40
+        assert_eq!(serialized[6], RecordType::ListingEntry.tag().as_byte());
+        assert_eq!(serialized[6], 0x40);
         // key "k" (raw bytes, no terminator)
         assert_eq!(serialized[7], b'k');
     }
@@ -646,7 +694,7 @@ mod tests {
         let deserialized = ListingEntryKey::deserialize(&serialized).unwrap();
 
         // then
-        assert_eq!(serialized.len(), 7); // subsystem + version + tag + segment_id only
+        assert_eq!(serialized.len(), SEGMENTED_PREFIX_LEN); // sub + ver + segment_id + tag, no user key
         assert_eq!(deserialized.segment_id, 1);
         assert_eq!(deserialized.key, Bytes::new());
     }
@@ -654,9 +702,9 @@ mod tests {
     #[test]
     fn should_order_listing_entries_by_segment_then_key() {
         // given
-        let key1 = ListingEntryKey::new(0, Bytes::from("a"));
-        let key2 = ListingEntryKey::new(0, Bytes::from("b"));
-        let key3 = ListingEntryKey::new(1, Bytes::from("a"));
+        let key1 = ListingEntryKey::new(1, Bytes::from("a"));
+        let key2 = ListingEntryKey::new(1, Bytes::from("b"));
+        let key3 = ListingEntryKey::new(2, Bytes::from("a"));
 
         // when
         let s1 = key1.serialize();
@@ -665,24 +713,27 @@ mod tests {
 
         // then
         assert!(s1 < s2, "same segment, key 'a' < key 'b'");
-        assert!(s2 < s3, "segment 0 < segment 1");
+        assert!(s2 < s3, "segment 1 < segment 2");
     }
 
     #[test]
-    fn should_create_listing_entry_scan_range() {
+    fn should_create_listing_entry_scan_range_for_segment() {
         // given
-        let range = 1..3;
+        let segment_id = 7;
 
         // when
-        let scan_range = ListingEntryKey::scan_range(range);
+        let scan_range = ListingEntryKey::scan_range_for_segment(segment_id);
 
-        // then
-        let start_key = ListingEntryKey::new(1, Bytes::new()).serialize();
-        let end_key = ListingEntryKey::new(3, Bytes::new()).serialize();
-
-        // Range should be [segment 1 prefix, segment 3 prefix)
+        // then — start is the segment's listing prefix (= empty-key listing key)
+        let start_key = ListingEntryKey::new(segment_id, Bytes::new()).serialize();
         assert_eq!(scan_range.start_bound(), Bound::Included(&start_key));
-        assert_eq!(scan_range.end_bound(), Bound::Excluded(&end_key));
+        // end is the lex-incremented prefix — non-empty for a non-0xFF prefix
+        match scan_range.end_bound() {
+            Bound::Excluded(b) => {
+                assert!(b > &start_key, "end bound must be strictly after start");
+            }
+            other => panic!("expected Excluded end bound, got {:?}", other),
+        }
     }
 
     #[test]
@@ -713,15 +764,8 @@ mod tests {
 
     #[test]
     fn should_fail_deserialize_listing_entry_key_too_short() {
-        // given
-        let data = vec![
-            SUBSYSTEM,
-            KEY_VERSION,
-            RecordType::ListingEntry.tag().as_byte(),
-            0,
-            0,
-            0,
-        ]; // only 6 bytes
+        // given — 6 bytes, one short of the segmented prefix
+        let data = vec![SUBSYSTEM, KEY_VERSION, 0, 0, 0, 1];
 
         // when
         let result = ListingEntryKey::deserialize(&data);
@@ -739,8 +783,8 @@ mod tests {
             #[test]
             fn should_preserve_sequence_ordering(a: u64, b: u64) {
                 let segment_start_seq = 0;
-                let key_a = LogEntryKey::new(0, Bytes::from("key"), a);
-                let key_b = LogEntryKey::new(0, Bytes::from("key"), b);
+                let key_a = LogEntryKey::new(1, Bytes::from("key"), a);
+                let key_b = LogEntryKey::new(1, Bytes::from("key"), b);
 
                 let enc_a = key_a.serialize(segment_start_seq);
                 let enc_b = key_b.serialize(segment_start_seq);
@@ -754,28 +798,42 @@ mod tests {
             }
 
             #[test]
-            fn should_include_listing_entry_in_scan_range(
-                start in 0u32..1000,
-                range_size in 1u32..100,
-                offset in 0u32..100,
+            fn should_include_listing_entry_in_per_segment_scan_range(
+                segment_id in 1u32..100_000,
                 key_bytes in prop::collection::vec(any::<u8>(), 1..100),
             ) {
-                let end = start.saturating_add(range_size);
-                let segment_id = start.saturating_add(offset % range_size);
-
                 let key = ListingEntryKey::new(segment_id, Bytes::from(key_bytes));
                 let serialized = key.serialize();
 
-                let scan_range = ListingEntryKey::scan_range(start..end);
+                let scan_range = ListingEntryKey::scan_range_for_segment(segment_id);
 
                 prop_assert!(
                     scan_range.contains(&serialized),
-                    "listing entry for segment {} with key should be in range {}..{}, \
+                    "listing entry for segment {} should be in its per-segment range, \
                      serialized={:?}, range_start={:?}, range_end={:?}",
-                    segment_id, start, end,
+                    segment_id,
                     serialized.as_ref(),
                     scan_range.start_bound(),
                     scan_range.end_bound()
+                );
+            }
+
+            #[test]
+            fn should_exclude_other_segments_from_per_segment_scan_range(
+                segment_id in 1u32..100_000,
+                other_segment_id in 1u32..100_000,
+                key_bytes in prop::collection::vec(any::<u8>(), 0..100),
+            ) {
+                prop_assume!(segment_id != other_segment_id);
+                let key = ListingEntryKey::new(other_segment_id, Bytes::from(key_bytes));
+                let serialized = key.serialize();
+
+                let scan_range = ListingEntryKey::scan_range_for_segment(segment_id);
+
+                prop_assert!(
+                    !scan_range.contains(&serialized),
+                    "listing entry for segment {} should NOT be in segment {}'s range",
+                    other_segment_id, segment_id
                 );
             }
         }

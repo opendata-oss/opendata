@@ -6,49 +6,68 @@ pub mod centroid_info;
 pub mod centroid_stats;
 pub mod centroids;
 pub mod collection_meta;
+pub(crate) mod field_stats;
 pub mod id_dictionary;
 pub mod key;
 pub mod metadata_index;
 pub mod posting_list;
+pub(crate) mod term_postings;
+pub(crate) mod term_stats;
 pub mod vector_bitmap;
 pub mod vector_data;
 pub(crate) mod vector_id;
 pub mod vector_index_data;
 
-use bytes::BytesMut;
+use bytes::{BufMut, Bytes, BytesMut};
 
 // Re-export encoding utilities from common
 pub use common::serde::encoding::{
     EncodingError, decode_optional_utf8, decode_utf8, encode_optional_utf8, encode_utf8,
 };
-use common::serde::key_prefix::KeyPrefix;
+use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
 use common::serde::record_tag::RecordTag;
+
+/// Offset of the first subsystem-defined field after the 2-byte common prefix
+/// plus the 1-byte vector tag.
+pub const PREFIX_AND_TAG_LEN: usize = KEY_PREFIX_LEN + 1;
 
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
 
-/// Subsystem-specific key prefix for vector storage.
-pub const SUBSYSTEM: u8 = 0x02;
+/// Subsystem byte for vector storage (see [`common::serde::subsystem`]).
+pub const SUBSYSTEM: u8 = common::serde::subsystem::VECTOR;
 
 /// Record type enumeration for vector database records.
+///
+/// Tag `0x0c` is reserved for `Deletions` and tags `0x0d`-`0x0f` are reserved
+/// for FTS records per RFC-0006. `VectorIndexData` and `CentroidSeqBlock` were
+/// moved out of that range to make room (storage compatibility is pre-1.0).
+///
+/// `FtsTerm` (`0x0d`) covers both `TermPostings` and `TermStats`; the two are
+/// disambiguated by the trailing discriminator byte in the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
     CollectionMeta = 0x01,
-    // TODO: reset these IDs
+    CentroidSeqBlock = 0x02,
+    VectorIndexData = 0x03,
     PostingList = 0x04,
     IdDictionary = 0x05,
     VectorData = 0x06,
-    VectorIndexData = 0x0D,
     MetadataIndex = 0x07,
     SeqBlock = 0x08,
     CentroidStats = 0x09,
     Centroids = 0x0A,
     CentroidInfo = 0x0B,
-    CentroidSeqBlock = 0x0C,
+    /// FTS term postings or term stats (discriminated by trailing key byte).
+    FtsTerm = 0x0D,
+    /// FTS per-vector field length stats.
+    FtsVectorFieldStats = 0x0E,
+    /// FTS per-field corpus stats.
+    FtsFieldStats = 0x0F,
 }
 
 impl RecordType {
-    /// Returns the ID of this record type (1-15).
+    /// Returns the ID of this record type.
     pub fn id(&self) -> u8 {
         *self as u8
     }
@@ -57,33 +76,30 @@ impl RecordType {
     pub fn from_id(id: u8) -> Result<Self, EncodingError> {
         match id {
             0x01 => Ok(RecordType::CollectionMeta),
+            0x02 => Ok(RecordType::CentroidSeqBlock),
+            0x03 => Ok(RecordType::VectorIndexData),
             0x04 => Ok(RecordType::PostingList),
             0x05 => Ok(RecordType::IdDictionary),
             0x06 => Ok(RecordType::VectorData),
-            0x0D => Ok(RecordType::VectorIndexData),
             0x07 => Ok(RecordType::MetadataIndex),
             0x08 => Ok(RecordType::SeqBlock),
             0x09 => Ok(RecordType::CentroidStats),
             0x0A => Ok(RecordType::Centroids),
             0x0B => Ok(RecordType::CentroidInfo),
-            0x0C => Ok(RecordType::CentroidSeqBlock),
+            0x0D => Ok(RecordType::FtsTerm),
+            0x0E => Ok(RecordType::FtsVectorFieldStats),
+            0x0F => Ok(RecordType::FtsFieldStats),
             _ => Err(EncodingError {
                 message: format!("Invalid record type: 0x{:02x}", id),
             }),
         }
     }
 
-    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, EncodingError> {
-        if prefix.subsystem() != SUBSYSTEM {
-            return Err(EncodingError {
-                message: format!(
-                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
-                    SUBSYSTEM,
-                    prefix.subsystem()
-                ),
-            });
-        }
-        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
+    /// Decodes the record type from the tag byte that follows the 2-byte key
+    /// prefix in a vector key.
+    pub fn from_tag_byte(byte: u8) -> Result<Self, EncodingError> {
+        let tag = RecordTag::from_byte(byte)?;
+        RecordType::from_id(tag.record_type())
     }
 
     /// Creates a RecordTag for this record type (reserved bits = 0).
@@ -91,10 +107,30 @@ impl RecordType {
         RecordTag::new(self.id(), 0)
     }
 
-    /// Creates a KeyPrefix with the current version for this record type.
-    pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
+    /// Writes the 3-byte vector record prefix `[subsystem, version, tag]`.
+    pub fn write_prefix(&self, buf: &mut BytesMut) {
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
+        buf.put_u8(self.tag().as_byte());
     }
+
+    /// Encodes the 3-byte vector record prefix into a fresh `Bytes`.
+    pub fn encode_prefix(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
+        self.write_prefix(&mut buf);
+        buf.freeze()
+    }
+}
+
+/// Reads the tag byte that follows the 2-byte key prefix, validating that the
+/// preceding 2 bytes are the vector subsystem and current key version.
+pub fn parse_record_tag(buf: &[u8]) -> Result<RecordTag, EncodingError> {
+    KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
+    if buf.len() < PREFIX_AND_TAG_LEN {
+        return Err(EncodingError {
+            message: "Buffer too short for record tag".to_string(),
+        });
+    }
+    Ok(RecordTag::from_byte(buf[KEY_PREFIX_LEN])?)
 }
 
 /// Trait for record keys that have a record type.
@@ -115,6 +151,9 @@ pub enum FieldType {
     Int64 = 1,
     Float64 = 2,
     Bool = 3,
+    /// Full-text-searchable string. Stored as `AttributeValue::String`, always
+    /// indexed for BM25 regardless of `indexed` flag (RFC-0006).
+    Text = 4,
     /// Vector type (tag 255) - used internally to store vectors as a special field.
     /// Not valid in collection metadata schemas.
     Vector = 255,
@@ -127,6 +166,7 @@ impl FieldType {
             1 => Ok(FieldType::Int64),
             2 => Ok(FieldType::Float64),
             3 => Ok(FieldType::Bool),
+            4 => Ok(FieldType::Text),
             255 => Ok(FieldType::Vector),
             _ => Err(EncodingError {
                 message: format!("Invalid field type: {}", byte),
@@ -273,6 +313,11 @@ impl FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(value))
             }
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
             FieldType::Vector => Err(EncodingError {
                 message: "Vector values cannot be used in sortable key encoding".to_string(),
             }),
@@ -583,6 +628,11 @@ impl Decode for FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(v))
             }
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
             FieldType::Vector => Err(EncodingError {
                 message: "Vector type requires dimensions context; use decode_with_dimensions"
                     .to_string(),
@@ -659,6 +709,11 @@ impl FieldValue {
                 *buf = &buf[1..];
                 Ok(FieldValue::Bool(v))
             }
+            FieldType::Text => Err(EncodingError {
+                message: "Text values are stored as String values, not as a distinct \
+                          FieldValue variant"
+                    .to_string(),
+            }),
             FieldType::Vector => {
                 let expected_bytes = dimensions * 4;
                 if buf.len() < expected_bytes {
@@ -706,16 +761,19 @@ mod tests {
         // given
         let types = [
             RecordType::CollectionMeta,
+            RecordType::CentroidSeqBlock,
+            RecordType::VectorIndexData,
             RecordType::PostingList,
             RecordType::IdDictionary,
             RecordType::VectorData,
-            // VectorMeta (0x07) was removed - data merged into VectorData
             RecordType::MetadataIndex,
             RecordType::SeqBlock,
             RecordType::CentroidStats,
             RecordType::Centroids,
             RecordType::CentroidInfo,
-            RecordType::CentroidSeqBlock,
+            RecordType::FtsTerm,
+            RecordType::FtsVectorFieldStats,
+            RecordType::FtsFieldStats,
         ];
 
         for record_type in types {
