@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, vivek/hack]
+    branches: [main]
   pull_request:
-    branches: [main, vivek/hack]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
