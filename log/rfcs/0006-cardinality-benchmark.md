@@ -131,27 +131,58 @@ letting us tune it, is the point of the benchmark.
 
 ## Design
 
+### System-under-test interface
+
+The workload is specified against a narrow interface rather than LogDb's APIs directly,
+so the same offered load and the same metrics can later be replayed against other
+systems users reach for — a comparison this RFC aims to *enable*, not to carry out:
+
+```rust
+trait LogStore {
+    // Append one record to a key's log; the arrival path.
+    async fn append(&self, key: Key, payload: Bytes) -> Result<()>;
+
+    // Read up to `max` records for `key` after `cursor`; the follow path.
+    // Returns the records and the opaque cursor to resume from next time.
+    async fn poll(&self, key: Key, cursor: Cursor, max: usize)
+        -> Result<(Vec<Record>, Cursor)>;
+}
+```
+
+`Cursor` is opaque: the benchmark stores whatever the implementation returns and hands
+it back on the next poll, never interpreting it (a global sequence for LogDb, an offset
+for a partitioned log, a stream ID for an in-memory cache, a row id for a relational
+table). Likewise, **lag is defined in terms of the offered load, not any backend's
+addressing**: the benchmark generates the arrivals, so it knows how many records it has
+appended to each key and how many each consumer has acknowledged, and lag is their
+difference in records. The primary analysis axis is therefore backend-agnostic.
+
+LogDb is the first and primary implementation (`append` → `try_append`, `poll` →
+`scan(key, cursor..)`). The rest of this Design analyzes how LogDb serves the workload;
+the interface exists so comparison is possible without re-specifying it. Choosing,
+tuning, and running competitor implementations — and the cross-system cost model that
+would require — is out of scope (see Non-Goals).
+
 ### Workload model
 
-A run drives two concurrent processes against a single live database in real time, for
-a fixed wall-clock duration.
+A run drives two concurrent processes against a single live `LogStore` in real time,
+for a fixed wall-clock duration.
 
-- **Arrivals.** A writer appends records to keys at a target arrival rate, advancing
-  each key's tail. The aggregate write rate is `cardinality × arrival_rate_per_key` and
-  must stay within LogDb's ingest capacity — at high cardinality this forces a low
-  per-key rate (e.g. a message every few minutes), which is realistic for the target
-  use cases. Arrival is uniform across keys in the first pass; per-key skew is a
-  possible later knob.
-- **Polls.** Each key has a consumer holding a `cursor` — the last sequence it has read
-  for that key. A consumer polls on its own schedule, drawn from the polling-frequency
-  distribution. A poll executes `scan(key, cursor..tail)` for up to `page_size`
-  records, then advances `cursor` by what it read; a deeply lagged consumer drains over
-  several polls rather than one unbounded scan. An offline event pauses a consumer's
-  polling for a span, letting lag accumulate before it resumes and catches up.
+- **Arrivals.** A writer `append`s records to keys at a target arrival rate. The
+  aggregate write rate is `cardinality × arrival_rate_per_key` and must stay within the
+  system's ingest capacity — at high cardinality this forces a low per-key rate (e.g. a
+  message every few minutes), which is realistic for the target use cases. Arrival is
+  uniform across keys in the first pass; per-key skew is a possible later knob.
+- **Polls.** Each key has a consumer holding a `cursor`. A consumer polls on its own
+  schedule, drawn from the polling-frequency distribution, calling
+  `poll(key, cursor, page_size)` and storing the returned cursor; a deeply lagged
+  consumer drains over several polls rather than one unbounded read. An offline event
+  pauses a consumer's polling for a span, letting lag accumulate before it resumes and
+  catches up.
 
-The benchmark owns every cursor, so it always knows each consumer's **lag** =
-`tail − cursor` in records. The arrival rate converts lag-in-records to lag-in-seconds
-for interpretation. Poll latency and GETs/poll are bucketed by lag at poll time — the
+Because the benchmark tracks appended-minus-acknowledged per key, it always knows each
+consumer's **lag** in records, and the arrival rate converts that to lag-in-seconds for
+interpretation. Poll latency and GETs/poll are bucketed by lag at poll time — the
 analysis axis that replaces any notion of imposed query "age," and which needs no time
 index and no deterministic segment boundaries.
 
@@ -198,19 +229,25 @@ run-to-run; it is not a prerequisite. Until it lands the benchmark can use the e
 wall-clock `seal_interval`, accepting that segment boundaries land at ingest-dependent
 sequence positions.
 
-### Storage backend
+### Object store and the GET metric
 
-The cost metric is the number of object-store GET requests per poll, since that is what
-a user pays for on object storage. GET *counts* depend only on the access pattern and
-storage layout, not on the backend, so we run the parameter sweeps against the
-`InMemory` object store (deterministic counts, fast iteration, zero S3 variance) and
-reserve a `Local`-filesystem or real-S3 run for representative latency. The cache effect
-falls out of the same metric: caught-up consumers reading the shared hot tail report
-GETs/poll well below one, while deep catch-ups approach one GET per dense block.
+For LogDb, the cost metric is the number of object-store GET requests per poll, since
+that is what a user pays for on object storage. GET *counts* depend only on the access
+pattern and storage layout, not on the object-store implementation, so we run the
+parameter sweeps against the `InMemory` object store (deterministic counts, fast
+iteration, zero S3 variance) and reserve a `Local`-filesystem or real-S3 run for
+representative latency. The cache effect falls out of the same metric: caught-up
+consumers reading the shared hot tail report GETs/poll well below one, while deep
+catch-ups approach one GET per dense block.
+
+GETs/poll is specific to LogDb's object-store backend; it is an internal cost probe, not
+part of the backend-agnostic comparison surface (see Metrics).
 
 ### Parameters
 
-Ranked by relevance to the thesis:
+Ranked by relevance to the thesis. The workload parameters (`key_cardinality`,
+`poll_freq_dist`, `arrival_rate`, `page_size`) define the offered load and apply to any
+`LogStore`; `cache_size`, `seal_size`, and `compaction` are LogDb storage tuning.
 
 **Primary**
 - `key_cardinality` ∈ {1K, 100K, 1M} — the number of independently followed logs; the
@@ -257,10 +294,15 @@ A run proceeds in three stages over the same live database:
   completion (includes queueing) and as service time. Tail percentiles matter because
   fan-out drives the tail.
 - **Sustainable throughput** — the offered load at which scheduling lag diverges.
-- **GETs per poll** — bucketed by lag. The primary cost metric.
+- **GETs per poll** — bucketed by lag. LogDb's primary cost metric (LogDb-specific).
 - **Throughput** — polls/s, records consumed/s, and arrivals/s.
 - **Ingest throughput** — records/s and bytes/s during pre-fill (existing `ingest`
   conventions).
+
+Poll latency, sustainable throughput, and the throughput counts are universal — they
+apply to any `LogStore` and form the cross-system comparison surface. GETs/poll is
+specific to LogDb's object-store backend; a cross-system *cost* comparison would need a
+per-system resource/$ denominator, which is out of scope here.
 
 These are emitted through the existing `bencher` counter/histogram/summary API
 (RFC 0003); the lag bucket is carried as a metric label.
@@ -317,4 +359,3 @@ Three scenarios tell the story rather than enumerating the full cross-product:
 | Date       | Description |
 |------------|-------------|
 | 2026-06-01 | Initial draft |
-| 2026-06-02 | Reframe around a real-time, open-loop consumer-follow (mailbox) workload |
