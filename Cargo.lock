@@ -2456,6 +2456,7 @@ name = "log-bench"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "bencher",
  "bytes",
@@ -2463,6 +2464,7 @@ dependencies = [
  "opendata-log",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

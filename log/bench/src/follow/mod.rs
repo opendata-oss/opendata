@@ -1,37 +1,64 @@
 //! The follow (poll) benchmark for LogDb — RFC 0006's cardinality benchmark.
 //!
-//! Milestone M0: the [`LogStore`] interface and its LogDb adapter, per-key lag
-//! tracking, and a trivial **single-threaded** driver that exercises the
-//! append/poll/cursor/lag machinery end to end. There is no open-loop scheduler
-//! yet (M2), no lag-bucketed metrics yet (M3), and object-store GET counting is
-//! deferred. This driver's purpose is to validate the read/cursor/lag path on a
-//! tiny run before the concurrent harness is built on top of it.
+//! Milestone M2: an open-loop, sharded poll scheduler feeding a bounded execution
+//! pool, plus an arrivals writer, driven concurrently against one live database
+//! for the run's duration. Latency is recorded coordinated-omission-correct, and
+//! the dispatch backlog / scheduling lag surface saturation.
+//!
+//! Still to come: the three formal phases with metric gating, and lag-bucketed
+//! metrics carrying the lag bucket as a label (M3). Object-store GET counting is
+//! deferred. For now a basic pre-fill gives consumers a backlog, and metrics are
+//! recorded for the whole run unbucketed.
 
 mod lag;
+mod metrics;
+mod scheduler;
 mod store;
+mod writer;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
-use lag::LagTracker;
 use log::{Config, LogDb};
-use store::{Cursor, LogDbStore, LogStore};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-const MICROS_PER_SEC: f64 = 1_000_000.0;
+use lag::LagTracker;
+use metrics::FollowMetrics;
+use scheduler::{PollDist, PollJob, run_shard, run_worker};
+use store::{LogDbStore, LogStore};
+use writer::run_writer;
 
-fn make_params(
-    key_cardinality: usize,
-    key_length: usize,
-    value_size: usize,
+/// State shared (read-only or via atomics) across the scheduler shards, the
+/// execution-pool workers, and the arrivals writer. Child modules access its
+/// fields directly.
+struct FollowState {
+    store: Arc<dyn LogStore>,
+    keys: Vec<Bytes>,
+    /// Per-key resume position (next sequence). A key is only ever accessed by one
+    /// in-flight poll at a time (enforced by `in_flight`), so relaxed is sufficient.
+    cursors: Vec<AtomicU64>,
+    /// Per-key guard: set while a poll for that key is in flight, so a consumer
+    /// never runs two concurrent polls.
+    in_flight: Vec<AtomicBool>,
+    lag: LagTracker,
+    metrics: FollowMetrics,
+    /// Readable scheduling-outcome totals for the end-of-run summary. The
+    /// `metrics` counters mirror these for the live reporter, but `metrics` handles
+    /// are write-only, so we keep our own readable totals here. Every scheduled
+    /// poll resolves to exactly one of: completed, coalesced (consumer's prior poll
+    /// still in flight), or dropped (bounded pool full).
+    polls_completed: AtomicU64,
+    polls_coalesced: AtomicU64,
+    polls_dropped: AtomicU64,
     page_size: usize,
-    prefill_per_key: usize,
-) -> Params {
-    let mut params = Params::new();
-    params.insert("key_cardinality", key_cardinality.to_string());
-    params.insert("key_length", key_length.to_string());
-    params.insert("value_size", value_size.to_string());
-    params.insert("page_size", page_size.to_string());
-    params.insert("prefill_per_key", prefill_per_key.to_string());
-    params
+    /// Run-wide scheduling constants, shared by every shard.
+    dist: PollDist,
+    start: Instant,
+    seed: u64,
 }
 
 /// The follow/poll benchmark.
@@ -49,6 +76,28 @@ impl Default for FollowBenchmark {
     }
 }
 
+/// The single fast smoke parameter set; full scenario grids come via `--config`.
+fn smoke_params() -> Params {
+    let mut p = Params::new();
+    // Workload (backend-agnostic).
+    p.insert("key_cardinality", "1000");
+    p.insert("key_length", "16");
+    p.insert("value_size", "128");
+    p.insert("page_size", "32");
+    p.insert("prefill_per_key", "16");
+    p.insert("arrival_rate_per_key", "5.0");
+    p.insert("poll_interval_mean_ms", "200");
+    p.insert("offline_prob", "0.05");
+    p.insert("offline_duration_ms", "2000");
+    p.insert("seed", "42");
+    // Harness sizing.
+    p.insert("num_scheduler_shards", "4");
+    p.insert("exec_concurrency", "8");
+    p.insert("num_writer_tasks", "2");
+    p.insert("dispatch_queue_capacity", "4096");
+    p
+}
+
 #[async_trait::async_trait]
 impl Benchmark for FollowBenchmark {
     fn name(&self) -> &str {
@@ -56,93 +105,178 @@ impl Benchmark for FollowBenchmark {
     }
 
     fn default_params(&self) -> Vec<Params> {
-        // A single fast smoke set: small cardinality and a per-key backlog larger
-        // than the page size, so the driver exercises multi-poll catch-up drains.
-        vec![make_params(256, 16, 128, 32, 64)]
+        vec![smoke_params()]
     }
 
     async fn run(&self, bench: Bench) -> anyhow::Result<()> {
-        let cardinality: usize = bench.spec().params().get_parse("key_cardinality")?;
-        let key_length: usize = bench.spec().params().get_parse("key_length")?;
-        let value_size: usize = bench.spec().params().get_parse("value_size")?;
-        let page_size: usize = bench.spec().params().get_parse("page_size")?;
-        let prefill_per_key: usize = bench.spec().params().get_parse("prefill_per_key")?;
+        let params = bench.spec().params();
+        let cardinality: usize = params.get_parse("key_cardinality")?;
+        let key_length: usize = params.get_parse("key_length")?;
+        let value_size: usize = params.get_parse("value_size")?;
+        let page_size: usize = params.get_parse("page_size")?;
+        let prefill_per_key: usize = params.get_parse("prefill_per_key")?;
+        let arrival_rate_per_key: f64 = params.get_parse("arrival_rate_per_key")?;
+        let poll_interval_mean_ms: u64 = params.get_parse("poll_interval_mean_ms")?;
+        let offline_prob: f64 = params.get_parse("offline_prob")?;
+        let offline_duration_ms: u64 = params.get_parse("offline_duration_ms")?;
+        let seed: u64 = params.get_parse("seed")?;
+        let num_shards: usize = params.get_parse("num_scheduler_shards")?;
+        let exec_concurrency: usize = params.get_parse("exec_concurrency")?;
+        let num_writers: usize = params.get_parse::<usize>("num_writer_tasks")?.max(1);
+        let dispatch_queue_capacity: usize = params.get_parse("dispatch_queue_capacity")?;
 
         let config = Config {
             storage: bench.spec().data().storage.clone(),
             ..Default::default()
         };
-        let store = LogDbStore::new(LogDb::open(config).await?);
+        let logdb_store = Arc::new(LogDbStore::new(LogDb::open(config).await?));
+        let queue_full = logdb_store.queue_full_counter();
 
-        // Dense integer keys, formatted like the ingest benchmark.
         let keys: Vec<Bytes> = (0..cardinality)
             .map(|i| Bytes::from(format!("{:0>width$}", i, width = key_length)))
             .collect();
         let value = Bytes::from(vec![b'x'; value_size]);
 
         let lag = LagTracker::new(cardinality);
-        // Per-key resume position; each key is touched by only this thread.
-        let mut cursors = vec![Cursor::default(); cardinality];
+        let follow_metrics = FollowMetrics::new(&bench);
 
-        // Pre-fill: give every key a backlog behind the tail.
+        // Pre-fill: give every key a backlog behind the tail so consumers have
+        // something to catch up on (a basic version; formal phasing is M3).
         for (id, key) in keys.iter().enumerate() {
             for _ in 0..prefill_per_key {
-                store.append(key.clone(), value.clone()).await?;
+                logdb_store.append(key.clone(), value.clone()).await?;
             }
             lag.record_appended(id, prefill_per_key as u64);
         }
+        logdb_store.db().flush().await?;
 
-        // Live metrics.
-        let polls = bench.counter("polls");
-        let records_consumed = bench.counter("records_consumed");
-        let arrivals = bench.counter("arrivals");
-        let poll_service = bench.histogram("poll_service_us");
+        let dist = PollDist {
+            mean: Duration::from_millis(poll_interval_mean_ms),
+            offline_prob,
+            offline: Duration::from_millis(offline_duration_ms),
+        };
+        let store_dyn: Arc<dyn LogStore> = logdb_store.clone();
+        let state = Arc::new(FollowState {
+            store: store_dyn,
+            keys,
+            cursors: (0..cardinality).map(|_| AtomicU64::new(0)).collect(),
+            in_flight: (0..cardinality).map(|_| AtomicBool::new(false)).collect(),
+            lag,
+            metrics: follow_metrics,
+            polls_completed: AtomicU64::new(0),
+            polls_coalesced: AtomicU64::new(0),
+            polls_dropped: AtomicU64::new(0),
+            page_size,
+            dist,
+            start: Instant::now(),
+            seed,
+        });
 
-        let runner = bench.start();
-        let mut tick: usize = 0;
-        let mut total_polls: u64 = 0;
-        while runner.keep_running() {
-            let id = tick % cardinality;
-            let key = &keys[id];
+        let (tx, rx) = async_channel::bounded::<PollJob>(dispatch_queue_capacity);
+        let cancel = CancellationToken::new();
 
-            // One arrival, then one poll for the same key (single-threaded model).
-            store.append(key.clone(), value.clone()).await?;
-            lag.record_appended(id, 1);
-            arrivals.increment(1);
-
-            let start = std::time::Instant::now();
-            let out = store.poll(key.clone(), cursors[id], page_size).await?;
-            poll_service.record(start.elapsed().as_secs_f64() * MICROS_PER_SEC);
-
-            cursors[id] = out.cursor;
-            // The per-key lag at poll time (`lag.lag(id)`) is the analysis axis:
-            // from M3 it will label the latency and GETs/poll histograms so backend
-            // cost is reported as a function of lag. M0 records only aggregate
-            // counters, so lag is updated here but not yet bucketed.
-            lag.record_acked(id, out.n_records as u64);
-            records_consumed.increment(out.n_records as u64);
-            polls.increment(1);
-            total_polls += 1;
-            tick += 1;
+        // Execution pool: `exec_concurrency` workers pulling from the bounded queue.
+        let mut worker_handles = Vec::with_capacity(exec_concurrency);
+        for _ in 0..exec_concurrency {
+            worker_handles.push(tokio::spawn(run_worker(rx.clone(), state.clone())));
         }
-        store.db().flush().await?;
+        drop(rx);
 
+        // Scheduler shards: partition keys round-robin across shards.
+        let mut shard_handles = Vec::with_capacity(num_shards);
+        for s in 0..num_shards {
+            let key_ids: Vec<usize> = (s..cardinality).step_by(num_shards).collect();
+            shard_handles.push(tokio::spawn(run_shard(
+                s,
+                key_ids,
+                tx.clone(),
+                state.clone(),
+                cancel.clone(),
+            )));
+        }
+        // Keep one sender as a backlog probe; the shards hold the rest.
+        let backlog_probe = tx.clone();
+        drop(tx);
+
+        // Arrivals writers.
+        let per_writer_rate = (cardinality as f64 * arrival_rate_per_key) / num_writers as f64;
+        let mut writer_handles = Vec::with_capacity(num_writers);
+        for w in 0..num_writers {
+            writer_handles.push(tokio::spawn(run_writer(
+                w,
+                num_writers,
+                per_writer_rate,
+                value.clone(),
+                state.clone(),
+                cancel.clone(),
+            )));
+        }
+
+        // Run for the configured duration, sampling the dispatch backlog.
+        let runner = bench.start();
+        while runner.keep_running() {
+            state
+                .metrics
+                .dispatch_backlog
+                .set(backlog_probe.len() as f64);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let elapsed_secs = runner.elapsed().as_secs_f64();
-        // Residual backlog is a drain sanity-check, not a performance result: it
-        // confirms the harness consumed roughly what it appended. Lag is a workload
-        // condition (see the `lag` module), so we never report it as a score.
-        let residual_backlog = lag.total_lag();
+
+        // Shut down: stop the clocks and writers, then let the pool drain.
+        cancel.cancel();
+        for h in shard_handles {
+            h.await?;
+        }
+        for h in writer_handles {
+            h.await??;
+        }
+        // All shard senders are now dropped; dropping the probe closes the channel,
+        // so workers drain any queued jobs and exit.
+        drop(backlog_probe);
+        for h in worker_handles {
+            h.await??;
+        }
+
+        logdb_store.db().flush().await?;
+
+        let polls_total = state.polls_completed.load(Ordering::Relaxed);
+        let coalesced = state.polls_coalesced.load(Ordering::Relaxed);
+        let dropped = state.polls_dropped.load(Ordering::Relaxed);
+        let residual_backlog = state.lag.total_lag();
+        let queue_full_total = queue_full.load(Ordering::Relaxed);
+
+        // Every scheduled poll is completed, coalesced, or dropped. The drop
+        // fraction is the keeping-up signal: drops happen only when the bounded
+        // execution pool is full, so a low fraction means the backend is generally
+        // servicing the offered poll load. We report the fraction rather than a
+        // pass/fail threshold — interpreting it is left to external analysis.
+        let scheduled = polls_total + coalesced + dropped;
+        let drop_fraction = if scheduled > 0 {
+            dropped as f64 / scheduled as f64
+        } else {
+            0.0
+        };
         bench
             .summarize(
                 Summary::new()
-                    .add("polls_per_sec", total_polls as f64 / elapsed_secs)
-                    .add("total_polls", total_polls as f64)
+                    .add("total_polls", polls_total as f64)
+                    .add("polls_per_sec", polls_total as f64 / elapsed_secs)
+                    .add("scheduled_polls", scheduled as f64)
+                    .add("dispatch_drop_fraction", drop_fraction)
+                    .add("dispatch_dropped", dropped as f64)
+                    .add("polls_coalesced", coalesced as f64)
                     .add("residual_backlog_records", residual_backlog as f64)
+                    .add("append_queue_full_total", queue_full_total as f64)
                     .add("elapsed_ms", runner.elapsed().as_millis() as f64),
             )
             .await?;
 
-        store.into_db().close().await?;
+        // Drop the shared state so `logdb_store` is the sole owner, then close.
+        drop(state);
+        if let Ok(store) = Arc::try_unwrap(logdb_store) {
+            store.into_db().close().await?;
+        }
         bench.close().await?;
         Ok(())
     }

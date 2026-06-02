@@ -6,6 +6,9 @@
 //! other systems. LogDb is the first and primary implementation
 //! (`append` -> `try_append`, `poll` -> `scan(key, cursor..)`).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use log::{AppendError, LogDb, LogRead, Record};
@@ -47,16 +50,28 @@ pub trait LogStore: Send + Sync {
 /// LogDb implementation of [`LogStore`].
 pub struct LogDbStore {
     db: LogDb,
+    /// Count of `QueueFull` retries seen on the arrival path. This is the
+    /// ingest-capacity ceiling the RFC warns about: when offered write load
+    /// exceeds what the writer can absorb, appends spin here until space frees.
+    queue_full: Arc<AtomicU64>,
 }
 
 impl LogDbStore {
     pub fn new(db: LogDb) -> Self {
-        Self { db }
+        Self {
+            db,
+            queue_full: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Borrow the underlying database (e.g. to flush or close it).
     pub fn db(&self) -> &LogDb {
         &self.db
+    }
+
+    /// A shared handle to the `QueueFull`-retry counter, for reporting.
+    pub fn queue_full_counter(&self) -> Arc<AtomicU64> {
+        self.queue_full.clone()
     }
 
     /// Recover the underlying database, consuming the store.
@@ -80,6 +95,7 @@ impl LogStore for LogDbStore {
             match self.db.try_append(records).await {
                 Ok(_) => return Ok(()),
                 Err(AppendError::QueueFull(returned)) => {
+                    self.queue_full.fetch_add(1, Ordering::Relaxed);
                     records = returned;
                     tokio::task::yield_now().await;
                 }
