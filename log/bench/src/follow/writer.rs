@@ -11,10 +11,52 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use log::Record;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::FollowState;
+use super::lag::LagTracker;
+use super::store::LogDbStore;
+
+/// Pre-fill every key with `prefill_per_key` records, in parallel across
+/// `concurrency` tasks (key ids partitioned by stride). Each key is appended as a
+/// single batch, so this scales to large cardinalities instead of one round-trip
+/// per record.
+pub async fn run_prefill(
+    store: Arc<LogDbStore>,
+    keys: Arc<Vec<Bytes>>,
+    value: Bytes,
+    prefill_per_key: usize,
+    concurrency: usize,
+    lag: Arc<LagTracker>,
+) -> anyhow::Result<()> {
+    let concurrency = concurrency.max(1);
+    let n = keys.len();
+    let mut handles = Vec::with_capacity(concurrency);
+    for shard in 0..concurrency {
+        let (store, keys, value, lag) = (store.clone(), keys.clone(), value.clone(), lag.clone());
+        handles.push(tokio::spawn(async move {
+            let mut id = shard;
+            while id < n {
+                let batch: Vec<Record> = (0..prefill_per_key)
+                    .map(|_| Record {
+                        key: keys[id].clone(),
+                        value: value.clone(),
+                    })
+                    .collect();
+                store.append_batch(batch).await?;
+                lag.record_appended(id, prefill_per_key as u64);
+                id += concurrency;
+            }
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    for h in handles {
+        h.await??;
+    }
+    Ok(())
+}
 
 /// Run one arrivals writer until cancelled.
 ///
@@ -54,8 +96,12 @@ pub async fn run_writer(
             .store
             .append(state.keys[id].clone(), value.clone())
             .await?;
+        // Appends drive lag in every phase (workload state); the arrivals metric is
+        // recorded only in the measure phase.
         state.lag.record_appended(id, 1);
-        state.metrics.arrivals.increment(1);
+        if state.recording() {
+            state.metrics.arrivals.increment(1);
+        }
 
         next += period;
     }

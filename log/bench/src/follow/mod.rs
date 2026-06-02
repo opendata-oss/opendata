@@ -1,14 +1,14 @@
 //! The follow (poll) benchmark for LogDb — RFC 0006's cardinality benchmark.
 //!
-//! Milestone M2: an open-loop, sharded poll scheduler feeding a bounded execution
-//! pool, plus an arrivals writer, driven concurrently against one live database
-//! for the run's duration. Latency is recorded coordinated-omission-correct, and
-//! the dispatch backlog / scheduling lag surface saturation.
+//! Milestone M3: the run proceeds through three phases over one live database —
+//! **pre-fill** (build a per-key backlog and report ingest throughput),
+//! **warm-up** (run arrivals and polls but discard metrics while the cache reaches
+//! steady state), and **measure** (record everything). Poll latency and service
+//! time are bucketed by lag at poll time, carrying the lag bucket as a metric
+//! label. The measure window is the bencher `--duration`; warm-up is its own
+//! parameter.
 //!
-//! Still to come: the three formal phases with metric gating, and lag-bucketed
-//! metrics carrying the lag bucket as a label (M3). Object-store GET counting is
-//! deferred. For now a basic pre-fill gives consumers a backlog, and metrics are
-//! recorded for the whole run unbucketed.
+//! Object-store GET counting is still deferred, so `poll_gets` is not yet recorded.
 
 mod lag;
 mod metrics;
@@ -17,7 +17,7 @@ mod store;
 mod writer;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bencher::{Bench, Benchmark, Params, Summary};
@@ -26,25 +26,36 @@ use log::{Config, LogDb};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use lag::LagTracker;
+use lag::{LAG_BUCKET_LABELS, LagTracker, NUM_LAG_BUCKETS};
 use metrics::FollowMetrics;
 use scheduler::{PollDist, PollJob, run_shard, run_worker};
 use store::{LogDbStore, LogStore};
-use writer::run_writer;
+use writer::{run_prefill, run_writer};
+
+/// Phase while warming up: workload runs, metrics are discarded.
+const PHASE_WARMUP: u8 = 0;
+/// Phase while measuring: all metrics are recorded.
+const PHASE_MEASURE: u8 = 1;
+/// Phase after the measure window: recording stops again, so polls that complete
+/// while the dispatch queue drains during shutdown are not counted.
+const PHASE_DONE: u8 = 2;
 
 /// State shared (read-only or via atomics) across the scheduler shards, the
 /// execution-pool workers, and the arrivals writer. Child modules access its
 /// fields directly.
 struct FollowState {
     store: Arc<dyn LogStore>,
-    keys: Vec<Bytes>,
+    keys: Arc<Vec<Bytes>>,
     /// Per-key resume position (next sequence). A key is only ever accessed by one
-    /// in-flight poll at a time (enforced by `in_flight`), so relaxed is sufficient.
+    /// in-flight poll at a time (enforced by `in_flight`). The handshake that hands
+    /// a key to the next poll — the worker's `in_flight` release, the shard's
+    /// acquiring claim, and the channel send/recv — establishes happens-before from
+    /// one poll's cursor write to the next poll's read, so relaxed access is safe.
     cursors: Vec<AtomicU64>,
     /// Per-key guard: set while a poll for that key is in flight, so a consumer
     /// never runs two concurrent polls.
     in_flight: Vec<AtomicBool>,
-    lag: LagTracker,
+    lag: Arc<LagTracker>,
     metrics: FollowMetrics,
     /// Readable scheduling-outcome totals for the end-of-run summary. The
     /// `metrics` counters mirror these for the live reporter, but `metrics` handles
@@ -54,11 +65,23 @@ struct FollowState {
     polls_completed: AtomicU64,
     polls_coalesced: AtomicU64,
     polls_dropped: AtomicU64,
+    /// Completed polls per lag bucket (measure phase only), for the lag
+    /// distribution in the summary.
+    bucket_polls: Vec<AtomicU64>,
     page_size: usize,
+    /// Current phase ([`PHASE_WARMUP`] or [`PHASE_MEASURE`]); gates metric recording.
+    phase: AtomicU8,
     /// Run-wide scheduling constants, shared by every shard.
     dist: PollDist,
     start: Instant,
     seed: u64,
+}
+
+impl FollowState {
+    /// Whether metrics should be recorded now (true only in the measure phase).
+    fn recording(&self) -> bool {
+        self.phase.load(Ordering::Relaxed) == PHASE_MEASURE
+    }
 }
 
 /// The follow/poll benchmark.
@@ -85,6 +108,8 @@ fn smoke_params() -> Params {
     p.insert("value_size", "128");
     p.insert("page_size", "32");
     p.insert("prefill_per_key", "16");
+    p.insert("prefill_concurrency", "8");
+    p.insert("warmup_secs", "2");
     p.insert("arrival_rate_per_key", "5.0");
     p.insert("poll_interval_mean_ms", "200");
     p.insert("offline_prob", "0.05");
@@ -115,6 +140,8 @@ impl Benchmark for FollowBenchmark {
         let value_size: usize = params.get_parse("value_size")?;
         let page_size: usize = params.get_parse("page_size")?;
         let prefill_per_key: usize = params.get_parse("prefill_per_key")?;
+        let prefill_concurrency: usize = params.get_parse("prefill_concurrency")?;
+        let warmup_secs: f64 = params.get_parse("warmup_secs")?;
         let arrival_rate_per_key: f64 = params.get_parse("arrival_rate_per_key")?;
         let poll_interval_mean_ms: u64 = params.get_parse("poll_interval_mean_ms")?;
         let offline_prob: f64 = params.get_parse("offline_prob")?;
@@ -132,23 +159,36 @@ impl Benchmark for FollowBenchmark {
         let logdb_store = Arc::new(LogDbStore::new(LogDb::open(config).await?));
         let queue_full = logdb_store.queue_full_counter();
 
-        let keys: Vec<Bytes> = (0..cardinality)
-            .map(|i| Bytes::from(format!("{:0>width$}", i, width = key_length)))
-            .collect();
+        let keys = Arc::new(
+            (0..cardinality)
+                .map(|i| Bytes::from(format!("{:0>width$}", i, width = key_length)))
+                .collect::<Vec<Bytes>>(),
+        );
         let value = Bytes::from(vec![b'x'; value_size]);
 
-        let lag = LagTracker::new(cardinality);
+        let lag = Arc::new(LagTracker::new(cardinality));
         let follow_metrics = FollowMetrics::new(&bench);
 
-        // Pre-fill: give every key a backlog behind the tail so consumers have
-        // something to catch up on (a basic version; formal phasing is M3).
-        for (id, key) in keys.iter().enumerate() {
-            for _ in 0..prefill_per_key {
-                logdb_store.append(key.clone(), value.clone()).await?;
-            }
-            lag.record_appended(id, prefill_per_key as u64);
-        }
+        // Phase 1 — Pre-fill: give every key a backlog behind the tail so consumers
+        // have something to catch up on, and segments/compaction exist before
+        // measurement. Parallel + batched so it scales to large cardinalities.
+        // Timed to report ingest throughput (ingest conventions).
+        let record_size = (key_length + value_size) as u64;
+        let prefill_records = (cardinality * prefill_per_key) as u64;
+        let prefill_start = Instant::now();
+        run_prefill(
+            logdb_store.clone(),
+            keys.clone(),
+            value.clone(),
+            prefill_per_key,
+            prefill_concurrency,
+            lag.clone(),
+        )
+        .await?;
         logdb_store.db().flush().await?;
+        let prefill_secs = prefill_start.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+        let prefill_records_per_sec = prefill_records as f64 / prefill_secs;
+        let prefill_bytes_per_sec = (prefill_records * record_size) as f64 / prefill_secs;
 
         let dist = PollDist {
             mean: Duration::from_millis(poll_interval_mean_ms),
@@ -166,7 +206,9 @@ impl Benchmark for FollowBenchmark {
             polls_completed: AtomicU64::new(0),
             polls_coalesced: AtomicU64::new(0),
             polls_dropped: AtomicU64::new(0),
+            bucket_polls: (0..NUM_LAG_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
             page_size,
+            phase: AtomicU8::new(PHASE_WARMUP),
             dist,
             start: Instant::now(),
             seed,
@@ -212,7 +254,15 @@ impl Benchmark for FollowBenchmark {
             )));
         }
 
-        // Run for the configured duration, sampling the dispatch backlog.
+        // Phase 2 — Warm-up: workload runs but metrics are discarded (phase is still
+        // PHASE_WARMUP) while the block cache reaches steady state.
+        tokio::time::sleep(Duration::from_secs_f64(warmup_secs)).await;
+
+        // Phase 3 — Measure: flip the phase so workers/shards/writers begin recording,
+        // and measure for the bencher `--duration` window. Snapshot the queue-full
+        // counter so the summary reflects only the measure window.
+        let queue_full_at_measure = queue_full.load(Ordering::Relaxed);
+        state.phase.store(PHASE_MEASURE, Ordering::Relaxed);
         let runner = bench.start();
         while runner.keep_running() {
             state
@@ -222,6 +272,10 @@ impl Benchmark for FollowBenchmark {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let elapsed_secs = runner.elapsed().as_secs_f64();
+
+        // Stop recording before shutting down: polls that complete while the
+        // dispatch queue drains must not be counted past the measure window.
+        state.phase.store(PHASE_DONE, Ordering::Relaxed);
 
         // Shut down: stop the clocks and writers, then let the pool drain.
         cancel.cancel();
@@ -244,7 +298,9 @@ impl Benchmark for FollowBenchmark {
         let coalesced = state.polls_coalesced.load(Ordering::Relaxed);
         let dropped = state.polls_dropped.load(Ordering::Relaxed);
         let residual_backlog = state.lag.total_lag();
-        let queue_full_total = queue_full.load(Ordering::Relaxed);
+        let queue_full_total = queue_full
+            .load(Ordering::Relaxed)
+            .saturating_sub(queue_full_at_measure);
 
         // Every scheduled poll is completed, coalesced, or dropped. The drop
         // fraction is the keeping-up signal: drops happen only when the bounded
@@ -257,20 +313,31 @@ impl Benchmark for FollowBenchmark {
         } else {
             0.0
         };
-        bench
-            .summarize(
-                Summary::new()
-                    .add("total_polls", polls_total as f64)
-                    .add("polls_per_sec", polls_total as f64 / elapsed_secs)
-                    .add("scheduled_polls", scheduled as f64)
-                    .add("dispatch_drop_fraction", drop_fraction)
-                    .add("dispatch_dropped", dropped as f64)
-                    .add("polls_coalesced", coalesced as f64)
-                    .add("residual_backlog_records", residual_backlog as f64)
-                    .add("append_queue_full_total", queue_full_total as f64)
-                    .add("elapsed_ms", runner.elapsed().as_millis() as f64),
-            )
-            .await?;
+
+        let mut summary = Summary::new()
+            .add("prefill_records_per_sec", prefill_records_per_sec)
+            .add("prefill_bytes_per_sec", prefill_bytes_per_sec)
+            .add("total_polls", polls_total as f64)
+            .add("polls_per_sec", polls_total as f64 / elapsed_secs)
+            .add("scheduled_polls", scheduled as f64)
+            .add("dispatch_drop_fraction", drop_fraction)
+            // `*_total` to avoid colliding with the same-named live counters when a
+            // reporter is configured (those are cumulative series, these are scalars).
+            .add("dispatch_dropped_total", dropped as f64)
+            .add("polls_coalesced_total", coalesced as f64)
+            .add("residual_backlog_records", residual_backlog as f64)
+            .add("append_queue_full_total", queue_full_total as f64)
+            .add("elapsed_ms", runner.elapsed().as_millis() as f64);
+
+        // Lag distribution: completed polls per lag bucket over the measure window.
+        // This characterizes the workload (which lag regimes were exercised); the
+        // per-bucket latency quantiles come from the labeled histograms via a
+        // configured reporter. Bucket labels carry a `polls_lag_` prefix.
+        for (b, label) in LAG_BUCKET_LABELS.iter().enumerate() {
+            let count = state.bucket_polls[b].load(Ordering::Relaxed);
+            summary = summary.add(format!("polls_lag_{label}"), count as f64);
+        }
+        bench.summarize(summary).await?;
 
         // Drop the shared state so `logdb_store` is the sole owner, then close.
         drop(state);

@@ -22,6 +22,29 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Lag buckets, labeled in records. Reads are bucketed by lag at poll time
+/// (RFC 0006): backend cost — poll latency and, later, GETs/poll — is reported as
+/// a function of how far behind the consumer was. The bucket string is carried as
+/// a metric label so the per-bucket series share one metric name.
+pub const LAG_BUCKET_LABELS: [&str; 7] =
+    ["0", "1-9", "10-99", "100-999", "1k-9k", "10k-99k", "100k+"];
+
+/// Number of lag buckets.
+pub const NUM_LAG_BUCKETS: usize = LAG_BUCKET_LABELS.len();
+
+/// Map a lag (in records) to its bucket index in [`LAG_BUCKET_LABELS`].
+pub fn lag_bucket(lag: u64) -> usize {
+    match lag {
+        0 => 0,
+        1..=9 => 1,
+        10..=99 => 2,
+        100..=999 => 3,
+        1_000..=9_999 => 4,
+        10_000..=99_999 => 5,
+        _ => 6,
+    }
+}
+
 /// Tracks appended-minus-acknowledged record counts for a dense key population.
 ///
 /// Keys are dense integer ids `0..cardinality`. Counters use relaxed ordering:
@@ -98,5 +121,18 @@ mod tests {
         t.record_acked(0, 5);
         assert_eq!(t.lag(0), 0);
         assert_eq!(t.total_lag(), 0);
+    }
+
+    #[test]
+    fn lag_bucket_boundaries() {
+        assert_eq!(lag_bucket(0), 0);
+        assert_eq!(lag_bucket(1), 1);
+        assert_eq!(lag_bucket(9), 1);
+        assert_eq!(lag_bucket(10), 2);
+        assert_eq!(lag_bucket(999), 3);
+        assert_eq!(lag_bucket(1_000), 4);
+        assert_eq!(lag_bucket(99_999), 5);
+        assert_eq!(lag_bucket(100_000), 6);
+        assert_eq!(lag_bucket(u64::MAX), NUM_LAG_BUCKETS - 1);
     }
 }

@@ -189,6 +189,25 @@ impl Bench {
         )
     }
 
+    /// Like [`histogram`](Bench::histogram), but attaches additional labels to the
+    /// metric key. Use this to carry a dimension (e.g. a lag bucket) as a label, so
+    /// a family of related series shares one metric name and is distinguished by the
+    /// label when exported.
+    pub fn histogram_labeled(
+        &self,
+        name: &'static str,
+        labels: &[(&'static str, &'static str)],
+    ) -> metrics::Histogram {
+        let labels: Vec<metrics::Label> = labels
+            .iter()
+            .map(|(k, v)| metrics::Label::new(*k, *v))
+            .collect();
+        self.recorder.register_histogram(
+            &metrics::Key::from_parts(name, labels),
+            &metrics::Metadata::new("bench", metrics::Level::INFO, None),
+        )
+    }
+
     /// Write summary metrics.
     ///
     /// Use this for final results or computed aggregates at the end of a benchmark

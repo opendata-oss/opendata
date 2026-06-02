@@ -78,19 +78,10 @@ impl LogDbStore {
     pub fn into_db(self) -> LogDb {
         self.db
     }
-}
 
-#[async_trait]
-impl LogStore for LogDbStore {
-    async fn append(&self, key: Bytes, payload: Bytes) -> anyhow::Result<()> {
-        // `try_append` is non-blocking and surfaces backpressure as `QueueFull`,
-        // returning the batch so we can retry without recloning. Awaiting durability
-        // is not required on the arrival path; a later milestone's writer will treat
-        // queue pressure as a first-class capacity signal.
-        let mut records = vec![Record {
-            key,
-            value: payload,
-        }];
+    /// Append a batch of records, retrying on `QueueFull`. Used for bulk pre-fill,
+    /// where batching amortizes the write path and avoids one round-trip per record.
+    pub async fn append_batch(&self, mut records: Vec<Record>) -> anyhow::Result<()> {
         loop {
             match self.db.try_append(records).await {
                 Ok(_) => return Ok(()),
@@ -103,13 +94,27 @@ impl LogStore for LogDbStore {
             }
         }
     }
+}
+
+#[async_trait]
+impl LogStore for LogDbStore {
+    async fn append(&self, key: Bytes, payload: Bytes) -> anyhow::Result<()> {
+        // `try_append` is non-blocking and surfaces backpressure as `QueueFull`;
+        // `append_batch` retries on it. Awaiting durability is not required on the
+        // arrival path; the writer treats queue pressure as a capacity signal.
+        self.append_batch(vec![Record {
+            key,
+            value: payload,
+        }])
+        .await
+    }
 
     async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput> {
         // `scan` lower bound is inclusive; we store `last_sequence + 1` as the next
         // cursor so a resumed poll never re-reads an entry. The scan API has no page
         // limit, so we bound the drain to `max` here — a deep catch-up resumes from
         // the returned cursor over several polls.
-        let mut iter = self.db.scan(key.clone(), cursor.0..).await?;
+        let mut iter = self.db.scan(key, cursor.0..).await?;
         let mut n_records = 0;
         let mut n_bytes = 0;
         let mut next = cursor.0;

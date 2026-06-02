@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::FollowState;
+use super::lag::lag_bucket;
 use super::store::Cursor;
 
 /// A small, fast, seedable PRNG (SplitMix64). Used to generate the workload's
@@ -132,15 +133,17 @@ pub async fn run_shard(
                     // Saturation: no room in the bounded pool. Release the claim and
                     // count the drop; the consumer retries at its next due time.
                     state.in_flight[key_id].store(false, Ordering::Release);
-                    state.polls_dropped.fetch_add(1, Ordering::Relaxed);
-                    state.metrics.dispatch_dropped.increment(1);
+                    if state.recording() {
+                        state.polls_dropped.fetch_add(1, Ordering::Relaxed);
+                        state.metrics.dispatch_dropped.increment(1);
+                    }
                 }
                 Err(async_channel::TrySendError::Closed(_)) => {
                     state.in_flight[key_id].store(false, Ordering::Release);
                     break;
                 }
             }
-        } else {
+        } else if state.recording() {
             state.polls_coalesced.fetch_add(1, Ordering::Relaxed);
             state.metrics.polls_coalesced.increment(1);
         }
@@ -166,6 +169,9 @@ pub async fn run_worker(
         let scheduling_lag = service_start.saturating_duration_since(job.scheduled_due);
 
         let cursor = Cursor(state.cursors[id].load(Ordering::Relaxed));
+        // The lag this poll faces, captured before acking the records it drains —
+        // this is "lag at poll time", the axis the read cost is bucketed by.
+        let lag_at_poll = state.lag.lag(id);
         let result = state
             .store
             .poll(state.keys[id].clone(), cursor, state.page_size)
@@ -181,29 +187,36 @@ pub async fn run_worker(
         };
         state.cursors[id].store(out.cursor.0, Ordering::Relaxed);
         state.in_flight[id].store(false, Ordering::Release);
-
-        let completed = Instant::now();
+        // Acknowledgement is workload state, tracked in every phase so lag stays
+        // correct across the warm-up/measure boundary.
         state.lag.record_acked(id, out.n_records as u64);
-        state.polls_completed.fetch_add(1, Ordering::Relaxed);
-        state
-            .metrics
-            .records_consumed
-            .increment(out.n_records as u64);
-        state.metrics.polls.increment(1);
-        state.metrics.poll_latency_us.record(
-            completed
-                .saturating_duration_since(job.scheduled_due)
-                .as_micros() as f64,
-        );
-        state.metrics.poll_service_us.record(
-            completed
-                .saturating_duration_since(service_start)
-                .as_micros() as f64,
-        );
-        state
-            .metrics
-            .scheduling_lag_us
-            .record(scheduling_lag.as_micros() as f64);
+
+        // Metrics are recorded only in the measure phase; warm-up is discarded.
+        if state.recording() {
+            let completed = Instant::now();
+            let bucket = lag_bucket(lag_at_poll);
+            state.polls_completed.fetch_add(1, Ordering::Relaxed);
+            state.bucket_polls[bucket].fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .records_consumed
+                .increment(out.n_records as u64);
+            state.metrics.polls.increment(1);
+            state.metrics.poll_latency_us[bucket].record(
+                completed
+                    .saturating_duration_since(job.scheduled_due)
+                    .as_micros() as f64,
+            );
+            state.metrics.poll_service_us[bucket].record(
+                completed
+                    .saturating_duration_since(service_start)
+                    .as_micros() as f64,
+            );
+            state
+                .metrics
+                .scheduling_lag_us
+                .record(scheduling_lag.as_micros() as f64);
+        }
     }
     Ok(())
 }
