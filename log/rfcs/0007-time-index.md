@@ -51,11 +51,12 @@ RFC develops.
 
 ## Goals
 
-- **Per-key time-bounded reads.** Support querying a single key over a wall-clock time
-  range (`Window`) and over a trailing duration (`TailByTime`), as the time-expressed
-  analogues of the sequence `Window`/`TailN` queries in RFC 0006.
-- **Exact range edges.** A `[t0, t1]` query returns exactly the records whose timestamp
-  falls in the range, not an approximation rounded to index granularity.
+- **Per-key time seek.** Map a `(key, time)` to the sequence of that key's first record at
+  or after `time`, so a caller can start an existing `scan` at a wall-clock position and
+  read forward — for a window or a trailing duration.
+- **Exact lower bound, caller-driven end.** The seek returns the key's first record with
+  `create_ts ≥ time` exactly — no index-granularity rounding leaks to the caller — and the
+  caller terminates the read at its upper bound by reading `create_ts` on returned entries.
 - **No new clock, no duplicate timestamp.** Reuse SlateDB's per-record `create_ts` as
   the authoritative record time rather than minting or storing a parallel timestamp.
 - **Restart-safe by construction.** Preserve timestamp monotonicity across writer
@@ -158,18 +159,17 @@ The index is **two-level**, both levels derived purely from observed `create_ts`
 1. **Coarse, eager — per-segment lower bound.** Each segment's `base_ts` lives in its
    `SegmentMeta` (see Segment metadata) and is already resident in the in-memory segment
    cache; a segment's time range runs up to the *next* segment's `base_ts`. Because
-   segments are time-ordered, a `[t0, t1]` query selects the segments it touches directly
-   from the cache, with no extra I/O — the time analogue of the existing sequence-based
-   covering (RFC 0002).
+   segments are time-ordered, a time `t` lands in its owning segment directly from the
+   cache, with no extra I/O — the time analogue of the existing sequence-based covering
+   (RFC 0002).
 2. **Fine, lazy — per-segment index records.** Each segment stores a coarse, sorted set
    of `(relative_seq → create_ts)` samples — one small record per sample — appended as the
-   write loop crosses each `index_step`. For a touched segment the samples are
-   range-scanned and binary-searched (directional rounding — low bound down, high bound up)
-   to turn the time bound into a local sequence bound. The mapping is monotonic, so binary
-   search suffices.
+   write loop crosses each `index_step`. For the owning segment the samples are loaded and
+   binary-searched to the greatest sample at or before `t` — a sequence floor, rounded down
+   so it is never past a valid record. The mapping is monotonic, so binary search suffices.
 
 The split matches the workload (RFC 0006): the coarse bounds are tiny and always in
-memory, while the fine samples load only for the segments a query actually touches, so a
+memory, while the fine samples load only for the segment a seek resolves in, so a
 recency-biased query stream keeps hot segments' samples cached and leaves cold segments'
 on disk until needed.
 
@@ -225,29 +225,42 @@ flush, no rebuild.
 **Loading.** A segment's index is a single contiguous prefix scan over its `0x50`
 records, decoded into a sorted in-memory array and cached on first touch.
 
-### Query path
+### Query API
 
-A time-bounded per-key query resolves against the two levels:
+The index is exposed as a single seek primitive; everything else reuses the existing
+`scan(key, seq_range)`:
 
-```
-[t0, t1]
-  → segments whose [base_ts, next base_ts) overlaps [t0, t1] (coarse, in-memory cache)
-  → per segment: scan index records, binary-search to a local seq bound
-                 (round t0 down, t1 up)                      (new, fine level)
-  → per segment: scan(key, local_seq_range)                 (existing, RFC 0001)
-  → trim partial edges by per-record create_ts              (new, exact edges)
+```rust
+// on the reader; async + fallible (it may load the key's boundary block)
+fn find_sequence(&self, key: &Key, time: Timestamp) -> Result<Option<Sequence>>
 ```
 
-The coarse bounds select the candidate segments; each segment's index records translate
-the time bound into that segment's local sequence range; the existing per-key segment
-scan then runs unchanged.
+`find_sequence` returns the smallest `Sequence` at which `key` has a record with
+`create_ts ≥ time`, or `None` if the key has no record at or after `time`. A time-window
+read composes from it:
 
-The fine index brackets a local sequence range that may be slightly wider than `[t0, t1]`
-at the edges. Because the scan reads records that carry `create_ts`, the boundary records
-are trimmed exactly against `t0`/`t1`, giving exact range semantics without a denser
-index. `TailByTime(d)` is simply the window `[t_now − d, t_now]`. (Edge trimming needs the
-read path to carry `create_ts` internally; whether to also expose it on returned entries
-is an API question — see Open Questions.)
+```
+start = find_sequence(key, t0)?      // exact lower bound; None ⇒ nothing to read
+scan(key, start..)                   // read forward, stop at the first create_ts > t1
+```
+
+The lower bound is exact and the caller terminates at the upper bound, so no
+index-granularity rounding is visible to the caller, and there is no separate tail
+concept — a trailing duration is just `find_sequence(key, now − d)`.
+
+It resolves in the two index levels, then refines per key:
+
+1. **Coarse** — locate the segment whose `[base_ts, next base_ts)` contains `time`.
+2. **Fine** — binary-search that segment's index records to the sequence floor at or before
+   `time` (rounded down, so never past a valid record).
+3. **Refine** — seek `key` from that floor and advance over its records, skipping any with
+   `create_ts < time`; return the first with `create_ts ≥ time`. This per-key skip is what
+   makes the bound exact and spares the caller from filtering the leading edge — and it is
+   cheap: one key's records within a single `index_step` window, contiguous in storage and
+   left warm in cache for the follow-up `scan`.
+
+`create_ts` is surfaced on returned scan entries — it is the caller's upper-bound stop
+condition, and a time-oriented consumer wants `(time, value)` back regardless.
 
 ### Segment metadata
 
@@ -280,9 +293,9 @@ pre-write wall clock.
   before the write requires reading a clock at assignment time and recovering a
   high-water timestamp on restart. The reactive model trades those away for the
   straggler, which costs nothing on correctness.
-- **A dense, per-record time index.** Rejected as unnecessary: a coarse index plus exact
-  trimming against per-record `create_ts` already yields exact edges, so a dense index
-  would only add cost.
+- **A dense, per-record time index.** Rejected as unnecessary: a coarse index gets the
+  seek close, and the short per-key forward skip lands it exactly on `create_ts ≥ time`, so
+  a dense index would only add cost for no gain in precision.
 - **A merge-accumulated per-segment blob instead of per-sample records (deferred).**
   Folding a segment's samples into a *single* record grown by SlateDB `merge` operands
   drops the repeated per-sample key framing and packs the timestamps into a
@@ -301,11 +314,6 @@ pre-write wall clock.
   precision against index size, and should it also admit a record-count trigger ("emit
   every `index_step` ms *or* every N records") to bound sample spacing under bursty
   writes? Refinements like downsampling are deferred.
-- **Query API surface.** The concrete shape of the time-bounded query (e.g.
-  `scan_by_time(key, time_range)` plus a `TailByTime(duration)` kind), mirroring the
-  existing `scan(key, seq_range)`. Exposing `create_ts` on returned entries is a lean
-  *yes* — it is already plumbed for edge trimming and time-series-style consumers want
-  `(time, value)` back — pending confirmation.
 
 ## Updates
 
