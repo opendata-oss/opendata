@@ -38,6 +38,8 @@ use metrics::FollowMetrics;
 use store::{LogDbStore, LogStore};
 use writer::{run_prefill, run_writer};
 
+use crate::workload;
+
 /// Phase while warming up: workload runs, metrics are discarded.
 const PHASE_WARMUP: u8 = 0;
 /// Phase while measuring: all metrics are recorded.
@@ -148,12 +150,8 @@ impl Benchmark for FollowBenchmark {
         let logdb_store = Arc::new(LogDbStore::new(LogDb::open(config).await?));
         let queue_full = logdb_store.queue_full_counter();
 
-        let keys = Arc::new(
-            (0..cardinality)
-                .map(|i| Bytes::from(format!("{:0>width$}", i, width = key_length)))
-                .collect::<Vec<Bytes>>(),
-        );
-        let value = Bytes::from(vec![b'x'; value_size]);
+        let keys = Arc::new(workload::keys(cardinality, key_length));
+        let value = workload::value_template(value_size);
 
         let lag = Arc::new(LagTracker::new(cardinality));
         let follow_metrics = FollowMetrics::new(&bench);
@@ -161,7 +159,7 @@ impl Benchmark for FollowBenchmark {
         // Phase 1 — Pre-fill: give every key a backlog behind the tail so followers
         // have something to catch up on, and segments/compaction exist before
         // measurement. Parallel + batched so it scales to large cardinalities.
-        let record_size = (key_length + value_size) as u64;
+        let record_size = workload::record_size(key_length, value_size) as u64;
         let prefill_records = (cardinality * prefill_per_key) as u64;
         let prefill_start = Instant::now();
         run_prefill(

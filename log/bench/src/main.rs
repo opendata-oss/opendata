@@ -6,6 +6,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod follow;
 mod ingest;
+mod workload;
 
 use bencher::Benchmark;
 

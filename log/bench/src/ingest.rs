@@ -1,8 +1,9 @@
 //! Ingest throughput benchmark for the log database.
 
 use bencher::{Bench, Benchmark, Params, Summary};
-use bytes::Bytes;
 use log::{Config, LogDb, Record};
+
+use crate::workload;
 
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 
@@ -68,17 +69,9 @@ impl Benchmark for IngestBenchmark {
         };
         let log = LogDb::open(config).await?;
 
-        // Generate keys
-        let keys: Vec<Bytes> = (0..num_keys)
-            .map(|i| {
-                let key = format!("{:0>width$}", i, width = key_length);
-                Bytes::from(key)
-            })
-            .collect();
-
-        // Generate value template
-        let value = Bytes::from(vec![b'x'; value_size]);
-        let record_size = key_length + value_size;
+        let keys = workload::keys(num_keys, key_length);
+        let value = workload::value_template(value_size);
+        let record_size = workload::record_size(key_length, value_size);
 
         // Start the timed benchmark
         let runner = bench.start();
