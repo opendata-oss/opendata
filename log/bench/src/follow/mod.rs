@@ -258,9 +258,9 @@ impl Benchmark for FollowBenchmark {
         let mut summary = Summary::new()
             .add("prefill_records_per_sec", prefill_records_per_sec)
             .add("prefill_bytes_per_sec", prefill_bytes_per_sec)
-            .add("arrivals_per_sec", arrivals_total as f64 / elapsed_secs)
+            .add("records_per_sec", arrivals_total as f64 / elapsed_secs)
             .add(
-                "arrivals_bytes_per_sec",
+                "bytes_per_sec",
                 (arrivals_total * record_size) as f64 / elapsed_secs,
             )
             .add("total_polls", polls_total as f64)
