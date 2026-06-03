@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{AppendError, LogDb, LogRead, Record};
+use log::{AppendError, LogDb, LogDbReader, LogRead, Record};
 
 /// An opaque resume position handed back on the next poll.
 ///
@@ -47,9 +47,28 @@ pub trait LogStore: Send + Sync {
     async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput>;
 }
 
+/// Where the follow path's reads are served from.
+///
+/// `append` always goes to the writer; only the read path varies:
+/// - [`ReadSource::Writer`] — polls go through the writer's own [`LogDb`] handle
+///   (MEMORY visibility, read concurrency bounded by the one instance).
+/// - [`ReadSource::Readers`] — polls are served by a pool of independent
+///   [`LogDbReader`]s over the shared object store, which scales read
+///   concurrency past the writer at the cost of refresh-interval visibility lag.
+///   Keys are sharded across the pool by hash, so a key is always read by the
+///   same reader (stable cache locality, like partitioned read replicas).
+enum ReadSource {
+    Writer,
+    Readers(Vec<LogDbReader>),
+}
+
 /// LogDb implementation of [`LogStore`].
+///
+/// Holds the single writer [`LogDb`] (the only handle that can append) plus the
+/// read source used for polls.
 pub struct LogDbStore {
-    db: LogDb,
+    writer: LogDb,
+    readers: ReadSource,
     /// Count of `QueueFull` retries seen on the arrival path. This is the
     /// ingest-capacity ceiling the RFC warns about: when offered write load
     /// exceeds what the writer can absorb, appends spin here until space frees.
@@ -57,16 +76,31 @@ pub struct LogDbStore {
 }
 
 impl LogDbStore {
-    pub fn new(db: LogDb) -> Self {
+    /// Serve both appends and polls from the writer (MEMORY visibility; read
+    /// concurrency bounded by the single instance).
+    pub fn new(writer: LogDb) -> Self {
         Self {
-            db,
+            writer,
+            readers: ReadSource::Writer,
             queue_full: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Borrow the underlying database (e.g. to flush or close it).
+    /// Append through `writer` but serve polls from a pool of independent
+    /// readers over the shared object store. Requires a shared (Local/Aws)
+    /// object store — an in-memory store is per-handle, so a reader would never
+    /// observe the writer's data.
+    pub fn with_readers(writer: LogDb, readers: Vec<LogDbReader>) -> Self {
+        Self {
+            writer,
+            readers: ReadSource::Readers(readers),
+            queue_full: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Borrow the writer (e.g. to flush it).
     pub fn db(&self) -> &LogDb {
-        &self.db
+        &self.writer
     }
 
     /// A shared handle to the `QueueFull`-retry counter, for reporting.
@@ -74,16 +108,56 @@ impl LogDbStore {
         self.queue_full.clone()
     }
 
-    /// Recover the underlying database, consuming the store.
-    pub fn into_db(self) -> LogDb {
-        self.db
+    /// Close the store: shut down any reader pool, then close the writer.
+    pub async fn close(self) -> anyhow::Result<()> {
+        if let ReadSource::Readers(readers) = self.readers {
+            for reader in readers {
+                reader.close().await;
+            }
+        }
+        self.writer.close().await?;
+        Ok(())
+    }
+
+    /// Drain up to `max` records for `key` starting at `cursor`, using `reader`
+    /// (either the writer's [`LogDb`] or a pooled [`LogDbReader`] — both
+    /// implement [`LogRead`]).
+    async fn drain<R: LogRead + Sync>(
+        reader: &R,
+        key: Bytes,
+        cursor: Cursor,
+        max: usize,
+    ) -> anyhow::Result<PollOutput> {
+        // `scan` lower bound is inclusive; we store `last_sequence + 1` as the next
+        // cursor so a resumed poll never re-reads an entry. The scan API has no page
+        // limit, so we bound the drain to `max` here — a deep catch-up resumes from
+        // the returned cursor over several polls.
+        let mut iter = reader.scan(key, cursor.0..).await?;
+        let mut n_records = 0;
+        let mut n_bytes = 0;
+        let mut next = cursor.0;
+        while n_records < max {
+            match iter.next().await? {
+                Some(entry) => {
+                    n_records += 1;
+                    n_bytes += entry.value.len();
+                    next = entry.sequence + 1;
+                }
+                None => break,
+            }
+        }
+        Ok(PollOutput {
+            n_records,
+            n_bytes,
+            cursor: Cursor(next),
+        })
     }
 
     /// Append a batch of records, retrying on `QueueFull`. Used for bulk pre-fill,
     /// where batching amortizes the write path and avoids one round-trip per record.
     pub async fn append_batch(&self, mut records: Vec<Record>) -> anyhow::Result<()> {
         loop {
-            match self.db.try_append(records).await {
+            match self.writer.try_append(records).await {
                 Ok(_) => return Ok(()),
                 Err(AppendError::QueueFull(returned)) => {
                     self.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -110,30 +184,23 @@ impl LogStore for LogDbStore {
     }
 
     async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput> {
-        // `scan` lower bound is inclusive; we store `last_sequence + 1` as the next
-        // cursor so a resumed poll never re-reads an entry. The scan API has no page
-        // limit, so we bound the drain to `max` here — a deep catch-up resumes from
-        // the returned cursor over several polls.
-        let mut iter = self.db.scan(key, cursor.0..).await?;
-        let mut n_records = 0;
-        let mut n_bytes = 0;
-        let mut next = cursor.0;
-        while n_records < max {
-            match iter.next().await? {
-                Some(entry) => {
-                    n_records += 1;
-                    n_bytes += entry.value.len();
-                    next = entry.sequence + 1;
-                }
-                None => break,
+        match &self.readers {
+            ReadSource::Writer => Self::drain(&self.writer, key, cursor, max).await,
+            ReadSource::Readers(readers) => {
+                let idx = reader_index(&key, readers.len());
+                Self::drain(&readers[idx], key, cursor, max).await
             }
         }
-        Ok(PollOutput {
-            n_records,
-            n_bytes,
-            cursor: Cursor(next),
-        })
     }
+}
+
+/// Choose which pooled reader serves `key`, sharding by key hash so a key is
+/// always read by the same reader.
+fn reader_index(key: &Bytes, n: usize) -> usize {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(key.as_ref());
+    (hasher.finish() % n as u64) as usize
 }
 
 #[cfg(test)]

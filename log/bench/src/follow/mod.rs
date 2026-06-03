@@ -26,9 +26,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
+use anyhow::bail;
 use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
-use log::{Config, LogDb};
+use common::StorageConfig;
+use common::storage::config::ObjectStoreConfig;
+use log::{Config, LogDb, LogDbReader, ReaderConfig};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -143,11 +146,51 @@ impl Benchmark for FollowBenchmark {
         let reader_concurrency: usize = params.get_parse::<usize>("reader_concurrency")?.max(1);
         let num_writers: usize = params.get_parse::<usize>("num_writer_tasks")?.max(1);
 
+        // Read-path knobs (optional; default to reading through the writer).
+        // `read_path = writer` polls the writer's own handle; `read_path = reader`
+        // serves polls from a pool of `reader_instances` independent readers over
+        // the shared object store, each refreshing every `refresh_interval_ms`.
+        let read_path = params.get("read_path").unwrap_or("writer").to_string();
+        let reader_instances = match params.get("reader_instances") {
+            Some(v) => v.parse::<usize>()?.max(1),
+            None => 1,
+        };
+        let refresh_interval_ms = match params.get("refresh_interval_ms") {
+            Some(v) => v.parse::<u64>()?,
+            None => 1000,
+        };
+
+        let storage_config = bench.spec().data().storage.clone();
         let config = Config {
-            storage: bench.spec().data().storage.clone(),
+            storage: storage_config.clone(),
             ..Default::default()
         };
-        let logdb_store = Arc::new(LogDbStore::new(LogDb::open(config).await?));
+        let writer = LogDb::open(config).await?;
+        let logdb_store = match read_path.as_str() {
+            "writer" => Arc::new(LogDbStore::new(writer)),
+            "reader" => {
+                if !object_store_is_shared(&storage_config) {
+                    bail!(
+                        "read_path=reader requires a shared object store (Local or Aws); \
+                         the configured store is in-memory and per-handle, so readers \
+                         would observe none of the writer's data"
+                    );
+                }
+                let refresh = Duration::from_millis(refresh_interval_ms);
+                let mut readers = Vec::with_capacity(reader_instances);
+                for _ in 0..reader_instances {
+                    readers.push(
+                        LogDbReader::open(ReaderConfig {
+                            storage: storage_config.clone(),
+                            refresh_interval: refresh,
+                        })
+                        .await?,
+                    );
+                }
+                Arc::new(LogDbStore::with_readers(writer, readers))
+            }
+            other => bail!("unknown read_path '{other}' (expected 'writer' or 'reader')"),
+        };
         let queue_full = logdb_store.queue_full_counter();
 
         let keys = Arc::new(workload::keys(cardinality, key_length));
@@ -277,12 +320,23 @@ impl Benchmark for FollowBenchmark {
         }
         bench.summarize(summary).await?;
 
-        // Drop the shared state so `logdb_store` is the sole owner, then close.
+        // Drop the shared state so `logdb_store` is the sole owner, then close
+        // (shuts down the reader pool, if any, then the writer).
         drop(state);
         if let Ok(store) = Arc::try_unwrap(logdb_store) {
-            store.into_db().close().await?;
+            store.close().await?;
         }
         bench.close().await?;
         Ok(())
+    }
+}
+
+/// Whether `storage` uses a shared object store (Local/Aws) that an independent
+/// [`LogDbReader`] can observe. An in-memory object store is per-handle, so the
+/// reader pool would see none of the writer's data.
+fn object_store_is_shared(storage: &StorageConfig) -> bool {
+    match storage {
+        StorageConfig::InMemory => false,
+        StorageConfig::SlateDb(c) => !matches!(c.object_store, ObjectStoreConfig::InMemory),
     }
 }

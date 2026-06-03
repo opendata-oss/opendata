@@ -105,6 +105,21 @@ Phase / harness sizing:
 | `reader_concurrency` | number of follower runners (the read concurrency the db sees; keys partitioned round-robin, one poll in flight per runner) |
 | `num_writer_tasks` | arrivals writer tasks |
 
+Read path (optional; default reads through the writer):
+
+| Param | Meaning |
+|-------|---------|
+| `read_path` | `writer` (default) polls the writer's own `LogDb` handle (MEMORY visibility, read concurrency bounded by the one instance); `reader` serves polls from a pool of independent `LogDbReader`s over the shared object store, scaling read concurrency past the writer at the cost of refresh-interval visibility lag |
+| `reader_instances` | size of the reader pool when `read_path=reader` (keys are sharded across it by hash); default 1 |
+| `refresh_interval_ms` | how often each reader polls the object store for new data when `read_path=reader`; default 1000 |
+
+> `read_path=reader` requires a **shared** object store (`Local` or `Aws`) — an
+> in-memory store is per-handle, so a reader would observe none of the writer's
+> data (the bench errors out in that case). Note also that a reader only sees
+> records once the writer has flushed them to the object store, so under
+> `read_path=reader` live arrivals are not visible until the next writer flush;
+> tunable write-visibility/flush cadence is a later milestone.
+
 ### Scenarios
 
 - **A — Cardinality scaling** (`configs/scenario-a-cardinality.toml`): scale
