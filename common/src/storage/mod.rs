@@ -1,4 +1,5 @@
 pub mod config;
+pub mod counting;
 pub mod factory;
 pub mod in_memory;
 pub mod loader;

@@ -13,6 +13,7 @@ pub use serde::seq_block::SeqBlock;
 pub use storage::config::{
     BlockCacheConfig, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
 };
+pub use storage::counting::{object_store_get_bytes, object_store_gets};
 pub use storage::factory::{
     CompactorBuilder, DbBuilder, StorageBuilder, StorageReaderRuntime, StorageSemantics,
     create_object_store, create_storage_read,

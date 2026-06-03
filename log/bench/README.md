@@ -77,14 +77,19 @@ ingest throughput (`records_per_sec` / `bytes_per_sec`, the offered write load
 actually achieved), and **per-lag-bucket read-service latency percentiles**
 (`service_us_lag_<bucket>_p50/p90/p99/max`, microseconds — emitted only for
 buckets that saw polls); comparing the same bucket across cardinalities shows
-whether per-poll read cost stays flat. The keeping-up signal is the lag
-distribution shifting into deeper buckets (with `scheduling_lag_us` growing) when
-runners can't keep followers near the tail. The fuller per-bucket histogram set
-(`poll_latency_us`, `poll_service_us`, `scheduling_lag_us`) still requires a
-configured `[reporter]`.
+whether per-poll read cost stays flat. It also reports object-store GET activity
+over the measure window — `object_store_gets`, **`gets_per_poll`** (the RFC's
+LogDb cost metric), and `get_bytes_total` — which is the signal for whether
+adding readers buys proportional S3 work or just thrashes shared block caches.
+The keeping-up signal is the lag distribution shifting into deeper buckets (with
+`scheduling_lag_us` growing) when runners can't keep followers near the tail. The
+fuller per-bucket histogram set (`poll_latency_us`, `poll_service_us`,
+`scheduling_lag_us`) still requires a configured `[reporter]`.
 
-> GETs/poll (the RFC's LogDb cost metric) is **not yet recorded** — object-store
-> GET counting is deferred to a later milestone.
+> GET counts are process-global over the measure window: in `read_path=reader`
+> mode they're dominated by the reader pool, plus the writer's background
+> compaction reads (independent of `reader_instances`). Per-component GET
+> attribution and cache hit/miss are a later refinement.
 
 ### Parameters
 

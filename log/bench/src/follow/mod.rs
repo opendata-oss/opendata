@@ -289,6 +289,8 @@ impl Benchmark for FollowBenchmark {
         // measure for the bencher `--duration` window. Snapshot the queue-full
         // counter so the summary reflects only the measure window.
         let queue_full_at_measure = queue_full.load(Ordering::Relaxed);
+        let gets_at_measure = common::object_store_gets();
+        let get_bytes_at_measure = common::object_store_get_bytes();
         state.phase.store(PHASE_MEASURE, Ordering::Relaxed);
         let runner = bench.start();
         while runner.keep_running() {
@@ -298,6 +300,11 @@ impl Benchmark for FollowBenchmark {
 
         // Stop recording before shutting down, then stop the runners and writers.
         state.phase.store(PHASE_DONE, Ordering::Relaxed);
+        // Snapshot object-store GETs over the measure window (process-global; in
+        // reader mode this is dominated by the reader pool, plus the writer's
+        // background compaction reads, which are independent of reader_instances).
+        let gets_total = common::object_store_gets().saturating_sub(gets_at_measure);
+        let get_bytes_total = common::object_store_get_bytes().saturating_sub(get_bytes_at_measure);
         cancel.cancel();
         for h in follower_handles {
             h.await??;
@@ -325,6 +332,16 @@ impl Benchmark for FollowBenchmark {
             )
             .add("total_polls", polls_total as f64)
             .add("polls_per_sec", polls_total as f64 / elapsed_secs)
+            .add("object_store_gets", gets_total as f64)
+            .add(
+                "gets_per_poll",
+                if polls_total > 0 {
+                    gets_total as f64 / polls_total as f64
+                } else {
+                    0.0
+                },
+            )
+            .add("get_bytes_total", get_bytes_total as f64)
             .add("residual_backlog_records", residual_backlog as f64)
             .add("append_queue_full_total", queue_full_total as f64)
             .add("elapsed_ms", runner.elapsed().as_millis() as f64);
