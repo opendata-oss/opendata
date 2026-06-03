@@ -287,8 +287,8 @@ impl StorageSemantics {
 /// This is useful for cleanup operations where you need to access the object store
 /// after the database has been closed.
 pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
-    match config {
-        ObjectStoreConfig::InMemory => Ok(Arc::new(object_store::memory::InMemory::new())),
+    let store: Arc<dyn ObjectStore> = match config {
+        ObjectStoreConfig::InMemory => Arc::new(object_store::memory::InMemory::new()),
         ObjectStoreConfig::Aws(aws_config) => {
             let store = object_store::aws::AmazonS3Builder::from_env()
                 .with_region(&aws_config.region)
@@ -297,7 +297,7 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
                 .map_err(|e| {
                     StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
                 })?;
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
         ObjectStoreConfig::Local(local_config) => {
             std::fs::create_dir_all(&local_config.path).map_err(|e| {
@@ -310,9 +310,12 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
                 .map_err(|e| {
                 StorageError::Storage(format!("Failed to create local filesystem store: {}", e))
             })?;
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
-    }
+    };
+    // Wrap so object-store GET requests are tallied (the benchmark's GETs/poll
+    // signal). Transparent delegation; negligible overhead.
+    Ok(super::counting::count_object_store(store))
 }
 
 /// Creates a read-only storage instance based on configuration.
