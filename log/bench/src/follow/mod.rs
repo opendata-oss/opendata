@@ -23,6 +23,7 @@ mod store;
 mod writer;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -31,7 +32,8 @@ use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
 use common::StorageConfig;
 use common::storage::config::ObjectStoreConfig;
-use log::{Config, LogDb, LogDbReader, ReaderConfig};
+use log::{Config, LogDb, LogDbReader, ReadVisibility, ReaderConfig};
+use metrics_util::Summary as Sketch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -72,6 +74,10 @@ struct FollowState {
     /// Completed polls per lag bucket (measure phase only), for the lag
     /// distribution in the summary.
     bucket_polls: Vec<AtomicU64>,
+    /// Per-lag-bucket read-service latency (microseconds), measure phase only.
+    /// Kept alongside `metrics.poll_service_us` so percentiles can be printed in
+    /// the console summary without a configured reporter.
+    service_us: Vec<Mutex<Sketch>>,
     page_size: usize,
     /// Delay before a caught-up follower re-polls (the only polling cadence).
     idle_interval: Duration,
@@ -160,9 +166,19 @@ impl Benchmark for FollowBenchmark {
             None => 1000,
         };
 
+        // Writer read visibility (only relevant when `read_path = writer`; pooled
+        // readers always read the object store). `remote` restricts the writer's
+        // own reads to object-store-durable data instead of MEMORY-visible writes.
+        let read_visibility = match params.get("read_visibility").unwrap_or("memory") {
+            "memory" => ReadVisibility::Memory,
+            "remote" => ReadVisibility::Remote,
+            other => bail!("unknown read_visibility '{other}' (expected 'memory' or 'remote')"),
+        };
+
         let storage_config = bench.spec().data().storage.clone();
         let config = Config {
             storage: storage_config.clone(),
+            read_visibility,
             ..Default::default()
         };
         let writer = LogDb::open(config).await?;
@@ -229,6 +245,9 @@ impl Benchmark for FollowBenchmark {
             polls_completed: AtomicU64::new(0),
             arrivals_completed: AtomicU64::new(0),
             bucket_polls: (0..NUM_LAG_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+            service_us: (0..NUM_LAG_BUCKETS)
+                .map(|_| Mutex::new(Sketch::with_defaults()))
+                .collect(),
             page_size,
             idle_interval: Duration::from_millis(idle_poll_interval_ms),
             phase: AtomicU8::new(PHASE_WARMUP),
@@ -317,6 +336,23 @@ impl Benchmark for FollowBenchmark {
         for (b, label) in LAG_BUCKET_LABELS.iter().enumerate() {
             let count = state.bucket_polls[b].load(Ordering::Relaxed);
             summary = summary.add(format!("polls_lag_{label}"), count as f64);
+        }
+
+        // Per-lag-bucket read-service latency percentiles (microseconds). The lag
+        // bucket is the RFC's read-cost axis — comparing the same bucket across
+        // cardinalities shows whether per-poll cost stays flat. Only buckets that
+        // saw polls are emitted.
+        for (b, label) in LAG_BUCKET_LABELS.iter().enumerate() {
+            let sketch = state.service_us[b].lock().expect("service latency mutex");
+            if sketch.count() == 0 {
+                continue;
+            }
+            let q = |quantile: f64| sketch.quantile(quantile).unwrap_or(0.0);
+            summary = summary
+                .add(format!("service_us_lag_{label}_p50"), q(0.5))
+                .add(format!("service_us_lag_{label}_p90"), q(0.9))
+                .add(format!("service_us_lag_{label}_p99"), q(0.99))
+                .add(format!("service_us_lag_{label}_max"), sketch.max());
         }
         bench.summarize(summary).await?;
 

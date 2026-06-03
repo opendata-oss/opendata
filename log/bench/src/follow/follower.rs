@@ -83,11 +83,14 @@ pub async fn run_follower(
             state.metrics.polls.increment(1);
             state.metrics.poll_latency_us[bucket]
                 .record(completed.saturating_duration_since(due).as_micros() as f64);
-            state.metrics.poll_service_us[bucket].record(
-                completed
-                    .saturating_duration_since(service_start)
-                    .as_micros() as f64,
-            );
+            let service_us = completed
+                .saturating_duration_since(service_start)
+                .as_micros() as f64;
+            state.metrics.poll_service_us[bucket].record(service_us);
+            state.service_us[bucket]
+                .lock()
+                .expect("service latency mutex")
+                .add(service_us);
             state
                 .metrics
                 .scheduling_lag_us

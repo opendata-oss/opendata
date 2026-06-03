@@ -72,12 +72,16 @@ Poll latency and service time are bucketed by **lag at poll time** (the lag buck
 is carried as a `lag` metric label) — the analysis axis the read cost is reported
 against. Lag itself is a workload consequence (how far a follower fell behind), not
 a backend result. The console summary reports throughput, the lag distribution
-(`polls_lag_*`), residual backlog, pre-fill ingest throughput, and the
-measure-phase ingest throughput (`records_per_sec` / `bytes_per_sec`, the
-offered write load actually achieved); the keeping-up
-signal is the lag distribution shifting into deeper buckets (with `scheduling_lag_us`
-growing) when runners can't keep followers near the tail. Per-bucket latency
-percentiles require a configured `[reporter]`.
+(`polls_lag_*`), residual backlog, pre-fill ingest throughput, the measure-phase
+ingest throughput (`records_per_sec` / `bytes_per_sec`, the offered write load
+actually achieved), and **per-lag-bucket read-service latency percentiles**
+(`service_us_lag_<bucket>_p50/p90/p99/max`, microseconds — emitted only for
+buckets that saw polls); comparing the same bucket across cardinalities shows
+whether per-poll read cost stays flat. The keeping-up signal is the lag
+distribution shifting into deeper buckets (with `scheduling_lag_us` growing) when
+runners can't keep followers near the tail. The fuller per-bucket histogram set
+(`poll_latency_us`, `poll_service_us`, `scheduling_lag_us`) still requires a
+configured `[reporter]`.
 
 > GETs/poll (the RFC's LogDb cost metric) is **not yet recorded** — object-store
 > GET counting is deferred to a later milestone.
@@ -109,7 +113,8 @@ Read path (optional; default reads through the writer):
 
 | Param | Meaning |
 |-------|---------|
-| `read_path` | `writer` (default) polls the writer's own `LogDb` handle (MEMORY visibility, read concurrency bounded by the one instance); `reader` serves polls from a pool of independent `LogDbReader`s over the shared object store, scaling read concurrency past the writer at the cost of refresh-interval visibility lag |
+| `read_path` | `writer` (default) polls the writer's own `LogDb` handle; `reader` serves polls from a pool of independent `LogDbReader`s over the shared object store, scaling read concurrency past the writer at the cost of refresh-interval visibility lag |
+| `read_visibility` | `memory` (default) exposes the writer's reads as soon as writes are in memory; `remote` restricts them to object-store-durable data. Only affects `read_path=writer` (pooled readers always read the object store) |
 | `reader_instances` | size of the reader pool when `read_path=reader` (keys are sharded across it by hash); default 1 |
 | `refresh_interval_ms` | how often each reader polls the object store for new data when `read_path=reader`; default 1000 |
 
