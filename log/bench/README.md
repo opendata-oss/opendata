@@ -72,7 +72,9 @@ Poll latency and service time are bucketed by **lag at poll time** (the lag buck
 is carried as a `lag` metric label) — the analysis axis the read cost is reported
 against. Lag itself is a workload consequence (how far a follower fell behind), not
 a backend result. The console summary reports throughput, the lag distribution
-(`polls_lag_*`), residual backlog, and pre-fill ingest throughput; the keeping-up
+(`polls_lag_*`), residual backlog, pre-fill ingest throughput, and the
+measure-phase arrivals throughput (`arrivals_per_sec` / `arrivals_bytes_per_sec`,
+the offered write load actually achieved); the keeping-up
 signal is the lag distribution shifting into deeper buckets (with `scheduling_lag_us`
 growing) when runners can't keep followers near the tail. Per-bucket latency
 percentiles require a configured `[reporter]`.

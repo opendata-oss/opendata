@@ -60,6 +60,10 @@ struct FollowState {
     /// is the live counter for the reporter, but `metrics` handles are write-only,
     /// so we keep our own total here for the summary.
     polls_completed: AtomicU64,
+    /// Readable running total of records appended by the arrivals writers
+    /// (measure phase). Mirrors `metrics.arrivals` for the same reason
+    /// `polls_completed` mirrors `metrics.polls`.
+    arrivals_completed: AtomicU64,
     /// Completed polls per lag bucket (measure phase only), for the lag
     /// distribution in the summary.
     bucket_polls: Vec<AtomicU64>,
@@ -182,6 +186,7 @@ impl Benchmark for FollowBenchmark {
             lag,
             metrics: follow_metrics,
             polls_completed: AtomicU64::new(0),
+            arrivals_completed: AtomicU64::new(0),
             bucket_polls: (0..NUM_LAG_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
             page_size,
             idle_interval: Duration::from_millis(idle_poll_interval_ms),
@@ -244,6 +249,7 @@ impl Benchmark for FollowBenchmark {
         logdb_store.db().flush().await?;
 
         let polls_total = state.polls_completed.load(Ordering::Relaxed);
+        let arrivals_total = state.arrivals_completed.load(Ordering::Relaxed);
         let residual_backlog = state.lag.total_lag();
         let queue_full_total = queue_full
             .load(Ordering::Relaxed)
@@ -252,6 +258,11 @@ impl Benchmark for FollowBenchmark {
         let mut summary = Summary::new()
             .add("prefill_records_per_sec", prefill_records_per_sec)
             .add("prefill_bytes_per_sec", prefill_bytes_per_sec)
+            .add("arrivals_per_sec", arrivals_total as f64 / elapsed_secs)
+            .add(
+                "arrivals_bytes_per_sec",
+                (arrivals_total * record_size) as f64 / elapsed_secs,
+            )
             .add("total_polls", polls_total as f64)
             .add("polls_per_sec", polls_total as f64 / elapsed_secs)
             .add("residual_backlog_records", residual_backlog as f64)

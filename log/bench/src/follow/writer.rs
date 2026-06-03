@@ -8,6 +8,7 @@
 //! database happened to accept.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -101,6 +102,7 @@ pub async fn run_writer(
         state.lag.record_appended(id, 1);
         if state.recording() {
             state.metrics.arrivals.increment(1);
+            state.arrivals_completed.fetch_add(1, Ordering::Relaxed);
         }
 
         next += period;
