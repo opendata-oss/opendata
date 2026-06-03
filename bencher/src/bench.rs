@@ -251,18 +251,23 @@ impl Bench {
         Ok(())
     }
 
+    /// Print the run's parameter/label header. Called when the point begins, so
+    /// the configuration is visible up front; [`summarize`](Self::summarize) then
+    /// prints the metrics when it completes.
+    pub fn print_params(&self) {
+        let all_labels = self.spec.all_labels();
+        if all_labels.is_empty() {
+            return;
+        }
+        let labels_str: Vec<_> = all_labels
+            .iter()
+            .map(|l| format!("{}={}", l.name, l.value))
+            .collect();
+        println!("  [{}]", labels_str.join(", "));
+    }
+
     /// Print summary to console with nice formatting.
     fn print_summary(&self, summary: &Summary) {
-        // Print labels header
-        let all_labels = self.spec.all_labels();
-        if !all_labels.is_empty() {
-            let labels_str: Vec<_> = all_labels
-                .iter()
-                .map(|l| format!("{}={}", l.name, l.value))
-                .collect();
-            println!("  [{}]", labels_str.join(", "));
-        }
-
         // Find max metric name length for alignment
         let max_name_len = summary
             .metrics
