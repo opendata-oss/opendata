@@ -305,6 +305,20 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
     Ok(super::counting::count_object_store(store))
 }
 
+/// Build a standalone in-memory block cache (foyer, memory-only) that can be
+/// shared across multiple storage handles.
+///
+/// Injected via [`StorageReaderRuntime::with_block_cache`], one shared cache
+/// lets a pool of readers serve the same immutable SST blocks from a single
+/// cache instead of each re-fetching and re-caching them — avoiding the
+/// redundant object-store GETs that per-handle caches incur.
+pub fn create_in_memory_block_cache(capacity_bytes: u64) -> Arc<dyn DbCache> {
+    Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: capacity_bytes,
+        ..Default::default()
+    }))
+}
+
 /// Creates a read-only storage instance based on configuration.
 ///
 /// This function creates a storage backend that only supports read operations.

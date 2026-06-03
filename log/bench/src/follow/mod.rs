@@ -165,6 +165,13 @@ impl Benchmark for FollowBenchmark {
             Some(v) => v.parse::<u64>()?,
             None => 1000,
         };
+        // Size of a single in-memory block cache *shared* across the reader pool
+        // (MiB). 0 (default) keeps the current behavior: each reader builds its
+        // own cache, so the pool re-fetches shared SST blocks per reader.
+        let block_cache_mb = match params.get("block_cache_mb") {
+            Some(v) => v.parse::<u64>()?,
+            None => 0,
+        };
 
         // Writer read visibility (only relevant when `read_path = writer`; pooled
         // readers always read the object store). `remote` restricts the writer's
@@ -193,15 +200,28 @@ impl Benchmark for FollowBenchmark {
                     );
                 }
                 let refresh = Duration::from_millis(refresh_interval_ms);
+                // One shared block cache for the whole pool when requested, so a
+                // block fetched by any reader is reused by the rest.
+                let shared_cache = if block_cache_mb > 0 {
+                    Some(common::create_in_memory_block_cache(
+                        block_cache_mb * 1024 * 1024,
+                    ))
+                } else {
+                    None
+                };
                 let mut readers = Vec::with_capacity(reader_instances);
                 for _ in 0..reader_instances {
-                    readers.push(
-                        LogDbReader::open(ReaderConfig {
-                            storage: storage_config.clone(),
-                            refresh_interval: refresh,
-                        })
-                        .await?,
-                    );
+                    let reader_config = ReaderConfig {
+                        storage: storage_config.clone(),
+                        refresh_interval: refresh,
+                    };
+                    let reader = match &shared_cache {
+                        Some(cache) => {
+                            LogDbReader::open_with_block_cache(reader_config, cache.clone()).await?
+                        }
+                        None => LogDbReader::open(reader_config).await?,
+                    };
+                    readers.push(reader);
                 }
                 Arc::new(LogDbStore::with_readers(writer, readers))
             }

@@ -25,7 +25,7 @@ use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::serde::LogEntryKey;
 use crate::storage::{LogStorageRead as _, SegmentIterator};
-use common::storage::factory::create_storage_read;
+use common::storage::factory::{DbCache, create_storage_read};
 use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
 
 /// Trait for read operations on the log.
@@ -479,13 +479,42 @@ impl LogDbReader {
     /// # }
     /// ```
     pub async fn open(config: ReaderConfig) -> Result<Self> {
+        Self::open_with_runtime(config, StorageReaderRuntime::new()).await
+    }
+
+    /// Opens a read-only view that shares the given block cache instead of
+    /// building its own.
+    ///
+    /// Pass the same `block_cache` to a pool of readers so they serve the same
+    /// immutable SST blocks from one cache, rather than each re-fetching and
+    /// re-caching them — which otherwise multiplies object-store GETs by the
+    /// number of readers. The cache is kept alive for as long as the readers
+    /// that hold it.
+    pub async fn open_with_block_cache(
+        config: ReaderConfig,
+        block_cache: Arc<dyn DbCache>,
+    ) -> Result<Self> {
+        Self::open_with_runtime(
+            config,
+            StorageReaderRuntime::new().with_block_cache(block_cache),
+        )
+        .await
+    }
+
+    /// Shared body of [`open`](Self::open) and
+    /// [`open_with_block_cache`](Self::open_with_block_cache): build the
+    /// read-only storage from `runtime` and spawn the refresh task.
+    async fn open_with_runtime(
+        config: ReaderConfig,
+        runtime: StorageReaderRuntime,
+    ) -> Result<Self> {
         let reader_options = slatedb::config::DbReaderOptions {
             manifest_poll_interval: config.refresh_interval,
             ..Default::default()
         };
         let storage: Arc<dyn StorageRead> = create_storage_read(
             &config.storage,
-            StorageReaderRuntime::new(),
+            runtime,
             StorageSemantics::new(),
             reader_options,
         )

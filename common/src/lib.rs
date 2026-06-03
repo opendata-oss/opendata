@@ -15,8 +15,8 @@ pub use storage::config::{
 };
 pub use storage::counting::{object_store_get_bytes, object_store_gets};
 pub use storage::factory::{
-    CompactorBuilder, DbBuilder, StorageBuilder, StorageReaderRuntime, StorageSemantics,
-    create_object_store, create_storage_read,
+    CompactorBuilder, DbBuilder, DbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics,
+    create_in_memory_block_cache, create_object_store, create_storage_read,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::sst_blocks::{BlockOpCounts, CountResult, count_in_range};
