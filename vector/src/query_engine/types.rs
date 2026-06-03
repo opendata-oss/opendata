@@ -1,30 +1,39 @@
-//! Shared query-driver types.
+//! Shared query types.
 //!
-//! A *driver* (see `ann.rs` / `bm25.rs`) executes one scoring strategy and
-//! pushes [`ScoredVectorId`]s into a [`Collector`](super::collectors::Collector).
-//! The collector owns ranking and top-k selection; the driver only produces
-//! scored document ids.
 
 use crate::serde::vector_id::VectorId;
 use crate::{SearchResult, Vector};
 
-/// A single scored document produced by a query driver.
+/// A score with a defined "better" direction.
 ///
-/// Drivers emit these as they score candidates; ordering and top-k selection
-/// are the collector's responsibility.
-pub(crate) struct Scored<T> {
-    pub(crate) val: T,
-    pub(crate) score: f32,
+/// Implementors order from **best to worst**, so a *better* score compares as
+/// [`Ordering::Less`](std::cmp::Ordering::Less). This lets ranking machinery
+/// (e.g. [`TopK`](super::collectors::TopK)) stay metric-agnostic — it always
+/// keeps the best scores. [`score`](Score::score) returns the raw `f32`
+/// surfaced to callers (`SearchResult.score`), independent of ordering
+/// direction.
+pub(crate) trait Score: Ord + PartialOrd + Eq + PartialEq + Copy {
+    fn score(&self) -> f32;
 }
 
-pub(crate) type ScoredVectorId = Scored<VectorId>;
+/// A single scored document produced by a query source.
+///
+/// Sources emit these as they score candidates; ordering and top-k selection
+/// are the collector's responsibility. `S` is the [`Score`] type and carries
+/// the metric's ordering direction.
+pub(crate) struct Scored<T, S> {
+    pub(crate) val: T,
+    pub(crate) score: S,
+}
 
-pub(crate) type ScoredVector = Scored<Vector>;
+pub(crate) type ScoredVectorId<S> = Scored<VectorId, S>;
 
-impl From<ScoredVector> for SearchResult {
-    fn from(val: ScoredVector) -> SearchResult {
+pub(crate) type ScoredVector<S> = Scored<Vector, S>;
+
+impl<S: Score> From<ScoredVector<S>> for SearchResult {
+    fn from(val: ScoredVector<S>) -> SearchResult {
         SearchResult {
-            score: val.score,
+            score: val.score.score(),
             vector: val.val,
         }
     }

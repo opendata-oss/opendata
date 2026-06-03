@@ -3,38 +3,42 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use crate::query_engine::types::ScoredVectorId;
+use crate::query_engine::types::{Score, ScoredVectorId};
 use crate::serde::vector_id::VectorId;
 
 /// Consumes scored documents and produces the final ranked document set.
-pub(crate) trait Collector {
+///
+/// Generic over the [`Score`] type `S`, which defines the ranking direction
+/// (better scores compare as [`Ordering::Less`]).
+pub(crate) trait Collector<S: Score> {
     /// Offer one scored document to the collector.
-    fn collect(&mut self, scored: ScoredVectorId);
+    fn collect(&mut self, scored: ScoredVectorId<S>);
 
-    /// The minimum score a new document must beat to enter the result set, or
+    /// The raw score a new document must beat to enter the result set, or
     /// `None` while any score is still competitive (the collector is not full).
     ///
-    /// Drivers can use this to prune work. The scalar BM25 driver does not yet,
+    /// Sources can use this to prune work. The scalar BM25 source does not yet,
     /// but BlockMaxScore will, so it is part of the trait contract today.
     #[allow(dead_code)]
-    fn min_competitive_score(&self) -> Option<f32>;
+    fn min_competitive_score(&self) -> Option<S>;
 
     /// Consume the collector and return the ranked documents, best first.
-    fn finish(self) -> Vec<ScoredVectorId>;
+    fn finish(self) -> Vec<ScoredVectorId<S>>;
 }
 
 /// Streaming top-k collector.
 ///
-/// Keeps at most `limit` documents in a min-heap ordered so the worst
-/// (lowest-score, then highest-doc-id) candidate sits at the top and is evicted
-/// first. [`finish`](Collector::finish) returns them sorted by descending
-/// score, ties broken by ascending doc id.
-pub(crate) struct TopK {
+/// Keeps at most `limit` documents in a heap ordered so the worst candidate
+/// sits at the top and is evicted first. Because [`Score`] orders best-first
+/// (better = lesser), "worst" means the *greatest* score, ties broken by the
+/// highest doc id. [`finish`](Collector::finish) returns the survivors sorted
+/// best first (ascending score), ties broken by ascending doc id.
+pub(crate) struct TopK<S: Score> {
     limit: usize,
-    heap: BinaryHeap<WorstFirst>,
+    heap: BinaryHeap<WorstFirst<S>>,
 }
 
-impl TopK {
+impl<S: Score> TopK<S> {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit,
@@ -43,8 +47,8 @@ impl TopK {
     }
 }
 
-impl Collector for TopK {
-    fn collect(&mut self, document: ScoredVectorId) {
+impl<S: Score> Collector<S> for TopK<S> {
+    fn collect(&mut self, document: ScoredVectorId<S>) {
         if self.limit == 0 {
             return;
         }
@@ -54,7 +58,7 @@ impl Collector for TopK {
         // worst entry; otherwise just push.
         if self.heap.len() == self.limit {
             if let Some(worst) = self.heap.peek()
-                && !is_better(score, id, worst.score, worst.id)
+                && !is_better(&score, &id, &worst.score, &worst.id)
             {
                 return;
             }
@@ -63,7 +67,7 @@ impl Collector for TopK {
         self.heap.push(WorstFirst { score, id });
     }
 
-    fn min_competitive_score(&self) -> Option<f32> {
+    fn min_competitive_score(&self) -> Option<S> {
         if self.heap.len() == self.limit {
             self.heap.peek().map(|worst| worst.score)
         } else {
@@ -71,8 +75,8 @@ impl Collector for TopK {
         }
     }
 
-    fn finish(self) -> Vec<ScoredVectorId> {
-        let mut docs: Vec<ScoredVectorId> = self
+    fn finish(self) -> Vec<ScoredVectorId<S>> {
+        let mut docs: Vec<ScoredVectorId<S>> = self
             .heap
             .into_iter()
             .map(|entry| ScoredVectorId {
@@ -80,85 +84,88 @@ impl Collector for TopK {
                 score: entry.score,
             })
             .collect();
-        // Descending score, ties broken by ascending doc id.
-        docs.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.val.cmp(&b.val))
-        });
+        // Best first: ascending score (better = lesser), ties by ascending id.
+        docs.sort_by(|a, b| a.score.cmp(&b.score).then_with(|| a.val.cmp(&b.val)));
         docs
     }
 }
 
-/// Top-K heap entry ordered so `BinaryHeap::peek()` returns the worst
-/// (lowest-score, highest-doc-id) entry — the next to evict.
-struct WorstFirst {
-    score: f32,
+/// Top-K heap entry ordered so `BinaryHeap::peek()` returns the worst entry —
+/// the next to evict.
+struct WorstFirst<S: Score> {
+    score: S,
     id: VectorId,
 }
 
-impl PartialEq for WorstFirst {
+impl<S: Score> PartialEq for WorstFirst<S> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl Eq for WorstFirst {}
+impl<S: Score> Eq for WorstFirst<S> {}
 
-impl PartialOrd for WorstFirst {
+impl<S: Score> PartialOrd for WorstFirst<S> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for WorstFirst {
+impl<S: Score> Ord for WorstFirst<S> {
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap is a max-heap; we want the worst candidate at the top, so a
-        // candidate that is *worse* must compare *greater*. Worse means lower
-        // score, or — on a score tie — higher doc id (final results are sorted
-        // by ascending doc id on ties).
-        other
-            .score
-            .total_cmp(&self.score)
+        // candidate that is *worse* must compare *greater*. `Score` orders
+        // best-first, so worse means a greater score, or — on a tie — a higher
+        // doc id (final results are sorted by ascending doc id on ties).
+        self.score
+            .cmp(&other.score)
             .then_with(|| self.id.cmp(&other.id))
     }
 }
 
 /// Returns `true` when `(new_score, new_doc_id)` would rank ahead of
-/// `(other_score, other_doc_id)`: descending score, ties broken by ascending
-/// doc id.
-fn is_better(new_score: f32, new_id: VectorId, other_score: f32, other_id: VectorId) -> bool {
-    match new_score.partial_cmp(&other_score) {
-        Some(Ordering::Greater) => true,
-        Some(Ordering::Less) => false,
-        Some(Ordering::Equal) | None => new_id < other_id,
+/// `(other_score, other_doc_id)`: better (lesser) score, ties broken by
+/// ascending doc id.
+fn is_better<S: Score>(
+    new_score: &S,
+    new_id: &VectorId,
+    other_score: &S,
+    other_id: &VectorId,
+) -> bool {
+    match new_score.cmp(other_score) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => new_id < other_id,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_engine::bm25::BM25Score;
 
-    fn doc(id: u64, score: f32) -> ScoredVectorId {
+    // `BM25Score` (higher raw value = better) exercises the full `Score`
+    // contract, including its order inversion: a numerically higher score must
+    // rank ahead, so these tests read as "higher score wins".
+    fn doc(id: u64, score: f32) -> ScoredVectorId<BM25Score> {
         ScoredVectorId {
             val: VectorId::from_raw(id),
-            score,
+            score: BM25Score(score),
         }
     }
 
-    fn collect_all(collector: &mut TopK, docs: Vec<ScoredVectorId>) {
+    fn collect_all(collector: &mut TopK<BM25Score>, docs: Vec<ScoredVectorId<BM25Score>>) {
         for d in docs {
             collector.collect(d);
         }
     }
 
-    /// Final ordering is by descending score, with ties broken by ascending id.
-    fn ranked(collector: TopK) -> Vec<(u64, f32)> {
+    /// Final ordering is best first (highest BM25 score), ties by ascending id.
+    fn ranked(collector: TopK<BM25Score>) -> Vec<(u64, f32)> {
         collector
             .finish()
             .into_iter()
-            .map(|d| (d.val.id(), d.score))
+            .map(|d| (d.val.id(), d.score.score()))
             .collect()
     }
 
@@ -208,8 +215,8 @@ mod tests {
         assert_eq!(top.min_competitive_score(), None);
         top.collect(doc(2, 5.0));
         // Full now: the worst (lowest) score is the bar to beat.
-        assert_eq!(top.min_competitive_score(), Some(3.0));
+        assert_eq!(top.min_competitive_score().map(|s| s.score()), Some(3.0));
         top.collect(doc(3, 4.0)); // evicts score 3.0
-        assert_eq!(top.min_competitive_score(), Some(4.0));
+        assert_eq!(top.min_competitive_score().map(|s| s.score()), Some(4.0));
     }
 }

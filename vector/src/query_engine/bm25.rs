@@ -18,7 +18,7 @@ use crate::model::Bm25Query;
 use crate::query_engine::collectors::{Collector, TopK};
 use crate::query_engine::filter::PreparedFilter;
 use crate::query_engine::operator::Operator;
-use crate::query_engine::types::ScoredVectorId;
+use crate::query_engine::types::{Score, ScoredVectorId};
 use crate::serde::field_stats::FieldStatsValue;
 use crate::serde::key::{FieldStatsKey, TermPostingsKey, TermStatsKey};
 use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
@@ -26,6 +26,42 @@ use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::VectorId;
 use crate::text;
+
+/// A BM25 relevance score, where a higher raw value is more relevant.
+///
+/// Wraps the raw score so it participates in the generic [`Score`] ordering,
+/// which ranks better scores *first* (`Ordering::Less`). BM25 is "higher is
+/// better", so the natural `f32` order is inverted here; `score` still returns
+/// the raw value for the public `SearchResult.score`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BM25Score(pub(crate) f32);
+
+impl Score for BM25Score {
+    fn score(&self) -> f32 {
+        self.0
+    }
+}
+
+impl PartialEq for BM25Score {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for BM25Score {}
+
+impl PartialOrd for BM25Score {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BM25Score {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Higher relevance ranks first, so invert the natural f32 order.
+        other.0.total_cmp(&self.0)
+    }
+}
 
 /// Scores a BM25 query: walks the union of the query terms' posting lists and
 /// produces the ranked `ScoredVectorId`s.
@@ -109,9 +145,9 @@ impl BM25Operator {
 }
 
 #[async_trait::async_trait]
-impl Operator<Vec<ScoredVectorId>> for BM25Operator {
-    async fn execute(&self) -> Result<Vec<ScoredVectorId>> {
-        let mut collector = TopK::new(self.limit);
+impl Operator<Vec<ScoredVectorId<BM25Score>>> for BM25Operator {
+    async fn execute(&self) -> Result<Vec<ScoredVectorId<BM25Score>>> {
+        let mut collector: TopK<BM25Score> = TopK::new(self.limit);
 
         let terms = dedupe_query_terms(&self.query.query);
         if terms.is_empty() {
@@ -185,7 +221,10 @@ impl Operator<Vec<ScoredVectorId>> for BM25Operator {
             }
 
             let score = bm25::score(&hits, avgdl);
-            collector.collect(ScoredVectorId { val: id, score });
+            collector.collect(ScoredVectorId {
+                val: id,
+                score: BM25Score(score),
+            });
         }
 
         Ok(collector.finish())
@@ -312,7 +351,7 @@ mod tests {
         query: &str,
         filter: Option<&Filter>,
         limit: usize,
-    ) -> Vec<ScoredVectorId> {
+    ) -> Vec<ScoredVectorId<BM25Score>> {
         let engine = db.query_engine();
         let filter = PreparedFilter::build(filter, engine.storage.as_ref())
             .await
@@ -333,7 +372,7 @@ mod tests {
     }
 
     /// Resolve scored internal ids back to external doc ids (rank order kept).
-    async fn external_ids(db: &VectorDb, scored: &[ScoredVectorId]) -> Vec<String> {
+    async fn external_ids(db: &VectorDb, scored: &[ScoredVectorId<BM25Score>]) -> Vec<String> {
         let engine = db.query_engine();
         let dims = engine.options.dimensions as usize;
         let mut ids = Vec::with_capacity(scored.len());
@@ -364,7 +403,7 @@ mod tests {
 
         // then - only docs containing "fox", with the denser match ranked first
         assert_eq!(external_ids(&db, &results).await, vec!["d2", "d1"]);
-        assert!(results[0].score >= results[1].score);
+        assert!(results[0].score.score() >= results[1].score.score());
     }
 
     #[tokio::test]

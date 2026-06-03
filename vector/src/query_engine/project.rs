@@ -5,25 +5,30 @@
 
 use crate::Vector;
 use crate::error::Result;
-use crate::model::{FieldSelection, SearchResult};
+use crate::model::FieldSelection;
 use crate::query_engine::operator::{BoxedOperator, Operator};
-use crate::query_engine::types::ScoredVector;
+use crate::query_engine::types::{Score, ScoredVector};
 
 /// Projects (field-selects) the vectors produced by a child operator.
-pub(crate) struct ProjectOperator {
+///
+/// Generic over the [`Score`] type `S`, which it passes through unchanged.
+pub(crate) struct ProjectOperator<S: Score> {
     selection: FieldSelection,
-    child: BoxedOperator<Vec<ScoredVector>>,
+    child: BoxedOperator<Vec<ScoredVector<S>>>,
 }
 
-impl ProjectOperator {
-    pub(crate) fn new(selection: FieldSelection, child: BoxedOperator<Vec<ScoredVector>>) -> Self {
+impl<S: Score> ProjectOperator<S> {
+    pub(crate) fn new(
+        selection: FieldSelection,
+        child: BoxedOperator<Vec<ScoredVector<S>>>,
+    ) -> Self {
         Self { selection, child }
     }
 }
 
 #[async_trait::async_trait]
-impl Operator<Vec<ScoredVector>> for ProjectOperator {
-    async fn execute(&self) -> Result<Vec<ScoredVector>> {
+impl<S: Score + Send + Sync + 'static> Operator<Vec<ScoredVector<S>>> for ProjectOperator<S> {
+    async fn execute(&self) -> Result<Vec<ScoredVector<S>>> {
         let mut scored = self.child.execute().await?;
         for vector in &mut scored {
             project_vector(&mut vector.val, &self.selection);
@@ -43,26 +48,20 @@ fn project_vector(vector: &mut Vector, selection: &FieldSelection) {
     }
 }
 
-/// Apply field projection to search results in place.
-///
-/// Shared with the ANN path, which is not yet expressed as an operator chain.
-pub(crate) fn apply_field_selection(results: &mut [SearchResult], selection: &FieldSelection) {
-    for result in results.iter_mut() {
-        project_vector(&mut result.vector, selection);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_engine::bm25::BM25Score;
     use crate::{Attribute, AttributeValue};
 
-    /// A child operator that yields a fixed list of scored vectors.
-    struct Fixed(Vec<ScoredVector>);
+    /// A child operator that yields a fixed list of scored vectors. Uses
+    /// `BM25Score` as an arbitrary concrete [`Score`]; `ProjectOperator` only
+    /// touches `val`, so the choice does not affect what is exercised here.
+    struct Fixed(Vec<ScoredVector<BM25Score>>);
 
     #[async_trait::async_trait]
-    impl Operator<Vec<ScoredVector>> for Fixed {
-        async fn execute(&self) -> Result<Vec<ScoredVector>> {
+    impl Operator<Vec<ScoredVector<BM25Score>>> for Fixed {
+        async fn execute(&self) -> Result<Vec<ScoredVector<BM25Score>>> {
             Ok(self
                 .0
                 .iter()
@@ -91,10 +90,10 @@ mod tests {
         names
     }
 
-    async fn project(selection: FieldSelection) -> Vec<ScoredVector> {
+    async fn project(selection: FieldSelection) -> Vec<ScoredVector<BM25Score>> {
         let child = Fixed(vec![ScoredVector {
             val: vector("d1"),
-            score: 1.0,
+            score: BM25Score(1.0),
         }]);
         ProjectOperator::new(selection, Box::new(child))
             .execute()
@@ -118,17 +117,5 @@ mod tests {
     async fn should_retain_only_selected_fields() {
         let out = project(FieldSelection::Fields(vec!["a".to_string()])).await;
         assert_eq!(sorted_attr_names(&out[0].val), vec!["a"]);
-    }
-
-    #[test]
-    fn should_apply_field_selection_to_search_results() {
-        let mut results = vec![SearchResult {
-            score: 1.0,
-            vector: vector("d1"),
-        }];
-
-        apply_field_selection(&mut results, &FieldSelection::Fields(vec!["b".to_string()]));
-
-        assert_eq!(sorted_attr_names(&results[0].vector), vec!["b"]);
     }
 }

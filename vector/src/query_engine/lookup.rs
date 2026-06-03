@@ -11,23 +11,26 @@ use tracing::warn;
 
 use crate::error::Result;
 use crate::query_engine::operator::{BoxedOperator, Operator};
-use crate::query_engine::types::{ScoredVector, ScoredVectorId};
+use crate::query_engine::types::{Score, ScoredVector, ScoredVectorId};
 use crate::serde::vector_data::VectorDataValue;
 use crate::storage::VectorDbStorageReadExt;
 use crate::{Attribute, Vector};
 
 /// Resolves ranked vector ids to their forward-index data.
-pub(crate) struct LookupOperator {
+///
+/// Generic over the [`Score`] type `S`, which it passes through unchanged from
+/// each [`ScoredVectorId`] to the produced [`ScoredVector`].
+pub(crate) struct LookupOperator<S: Score> {
     storage: Arc<dyn StorageRead>,
     dimensions: usize,
-    child: BoxedOperator<Vec<ScoredVectorId>>,
+    child: BoxedOperator<Vec<ScoredVectorId<S>>>,
 }
 
-impl LookupOperator {
+impl<S: Score> LookupOperator<S> {
     pub(crate) fn new(
         storage: Arc<dyn StorageRead>,
         dimensions: usize,
-        child: BoxedOperator<Vec<ScoredVectorId>>,
+        child: BoxedOperator<Vec<ScoredVectorId<S>>>,
     ) -> Self {
         Self {
             storage,
@@ -38,14 +41,14 @@ impl LookupOperator {
 }
 
 #[async_trait::async_trait]
-impl Operator<Vec<ScoredVector>> for LookupOperator {
+impl<S: Score + Send + Sync + 'static> Operator<Vec<ScoredVector<S>>> for LookupOperator<S> {
     /// Loads the forward-index data for each scored id, preserving order.
     ///
     /// Assumes every id still exists in the forward index — deletes are resolved
     /// upstream by the scoring operator — so a missing entry (e.g. a concurrent
     /// compaction) is logged as a warning and skipped rather than treated as a
     /// normal delete.
-    async fn execute(&self) -> Result<Vec<ScoredVector>> {
+    async fn execute(&self) -> Result<Vec<ScoredVector<S>>> {
         let scored = self.child.execute().await?;
 
         let loaded = futures::future::join_all(
@@ -91,17 +94,20 @@ mod tests {
     use crate::AttributeValue;
     use crate::db::VectorDb;
     use crate::model::{Config, MetadataFieldSpec, Vector};
+    use crate::query_engine::bm25::BM25Score;
     use crate::serde::FieldType;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::serde::vector_id::VectorId;
     use common::StorageConfig;
 
-    /// A child operator that yields a fixed list of scored ids.
-    struct Fixed(Vec<ScoredVectorId>);
+    /// A child operator that yields a fixed list of scored ids. Uses `BM25Score`
+    /// as an arbitrary concrete [`Score`]; `LookupOperator` only passes it
+    /// through, so the choice does not affect what is exercised here.
+    struct Fixed(Vec<ScoredVectorId<BM25Score>>);
 
     #[async_trait::async_trait]
-    impl Operator<Vec<ScoredVectorId>> for Fixed {
-        async fn execute(&self) -> Result<Vec<ScoredVectorId>> {
+    impl Operator<Vec<ScoredVectorId<BM25Score>>> for Fixed {
+        async fn execute(&self) -> Result<Vec<ScoredVectorId<BM25Score>>> {
             Ok(self
                 .0
                 .iter()
@@ -148,7 +154,10 @@ mod tests {
     }
 
     /// Build a `LookupOperator` from the db's storage snapshot, fed `child` ids.
-    fn lookup_op(db: &VectorDb, child: Vec<ScoredVectorId>) -> LookupOperator {
+    fn lookup_op(
+        db: &VectorDb,
+        child: Vec<ScoredVectorId<BM25Score>>,
+    ) -> LookupOperator<BM25Score> {
         let engine = db.query_engine();
         LookupOperator::new(
             engine.storage.clone(),
@@ -169,11 +178,11 @@ mod tests {
             vec![
                 ScoredVectorId {
                     val: d2,
-                    score: 2.0,
+                    score: BM25Score(2.0),
                 },
                 ScoredVectorId {
                     val: d1,
-                    score: 1.0,
+                    score: BM25Score(1.0),
                 },
             ],
         )
@@ -184,13 +193,13 @@ mod tests {
         // order + scores preserved, ids resolved, attributes loaded
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].val.id, "d2");
-        assert_eq!(results[0].score, 2.0);
+        assert_eq!(results[0].score.score(), 2.0);
         assert_eq!(
             results[0].val.attribute("category"),
             Some(&AttributeValue::String("b".to_string()))
         );
         assert_eq!(results[1].val.id, "d1");
-        assert_eq!(results[1].score, 1.0);
+        assert_eq!(results[1].score.score(), 1.0);
     }
 
     #[tokio::test]
@@ -204,11 +213,11 @@ mod tests {
             vec![
                 ScoredVectorId {
                     val: missing,
-                    score: 5.0,
+                    score: BM25Score(5.0),
                 },
                 ScoredVectorId {
                     val: d1,
-                    score: 1.0,
+                    score: BM25Score(1.0),
                 },
             ],
         )
