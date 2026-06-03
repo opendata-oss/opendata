@@ -1,28 +1,29 @@
 # Scenario A — Cardinality scaling (RFC 0006 centerpiece).
 #
-# Scale `key_cardinality` 1K -> 100K -> 1M at a FIXED aggregate offered load
-# (~5000 polls/s and ~5000 arrivals/s). Because the aggregate is held constant,
-# the per-key poll interval and arrival rate scale DOWN as cardinality grows —
-# realistic for millions of intermittently-followed logs (a message every few
-# minutes per key at the high end). The thesis: per-poll latency and throughput
-# stay approximately flat as the population grows.
+# Scale `key_cardinality` 1K -> 100K -> 1M with all logs actively followed
+# (closed-loop). Aggregate offered load is held roughly fixed (~5000 polls/s and
+# ~5000 arrivals/s) by scaling the per-key arrival rate DOWN and the idle re-poll
+# interval UP as cardinality grows — realistic for millions of followed logs (a
+# caught-up follower checks back every few minutes at the high end). The thesis:
+# per-poll latency and throughput stay approximately flat as the population grows.
+#
+# Caught-up poll rate ~= key_cardinality / idle_poll_interval, so idle interval is
+# set to key_cardinality / 5000 to hold the aggregate near 5000 polls/s.
 #
 # How to run:
 #   cargo run -p log-bench --release -- \
 #       --config log/bench/configs/scenario-a-cardinality.toml \
 #       --benchmark follow --duration 600
 #
-# The `--duration` is the MEASURE window and applies to every point, so set it to
-# several of the LARGEST point's poll intervals (the 1M point polls each key every
-# ~200s, so a few hundred seconds minimum). The high-cardinality points are long
-# runs by nature — their warm-up alone is set to roughly one poll interval. To run
-# a single point, comment out the others.
+# The `--duration` is the MEASURE window and applies to every point; set it to
+# several idle intervals of the LARGEST point (the 1M point's caught-up followers
+# re-poll every ~200s, so a few hundred seconds minimum). The high-cardinality
+# points are long runs. To run a single point, comment out the others.
 #
 # Per-poll latency percentiles (bucketed by lag) are emitted as `poll_latency_us`
 # / `poll_service_us` histograms with a `lag` label; observing the flat-latency
-# result requires a configured `[reporter]` (a TimeSeriesDb sink) plus external
-# analysis. The console summary reports throughput, the drop fraction, and the lag
-# distribution. GETs/poll is not yet recorded (deferred).
+# result requires a configured `[reporter]`. The console summary reports
+# throughput and the lag distribution. GETs/poll is not yet recorded (deferred).
 #
 # Storage: SlateDB over an in-memory object store, so the real LSM read path
 # (segments/blocks) is exercised with deterministic, S3-variance-free behavior.
@@ -34,59 +35,44 @@ path = "follow-scenario-a"
 [data.storage.object_store]
 type = "InMemory"
 
-# --- 1K keys: 5 polls/s/key, 5 arrivals/s/key  -> ~5K/s aggregate ---
+# --- 1K keys: 5 arrivals/s/key, caught-up re-poll every 200ms -> ~5K/s aggregate ---
 [[params.follow]]
 key_cardinality = "1000"
 key_length = "16"
 value_size = "128"
 page_size = "32"
+arrival_rate_per_key = "5.0"
+idle_poll_interval_ms = "200"
 prefill_per_key = "32"
 prefill_concurrency = "16"
 warmup_secs = "2"
-arrival_rate_per_key = "5.0"
-poll_interval_mean_ms = "200"
-offline_prob = "0.05"
-offline_duration_ms = "2000"
-seed = "42"
-num_scheduler_shards = "8"
-exec_concurrency = "16"
+reader_concurrency = "16"
 num_writer_tasks = "4"
-dispatch_queue_capacity = "8192"
 
-# --- 100K keys: 0.05 polls/s/key, 0.05 arrivals/s/key  -> ~5K/s aggregate ---
+# --- 100K keys: 0.05 arrivals/s/key, caught-up re-poll every 20s -> ~5K/s aggregate ---
 [[params.follow]]
 key_cardinality = "100000"
 key_length = "16"
 value_size = "128"
 page_size = "32"
+arrival_rate_per_key = "0.05"
+idle_poll_interval_ms = "20000"
 prefill_per_key = "32"
 prefill_concurrency = "16"
 warmup_secs = "30"
-arrival_rate_per_key = "0.05"
-poll_interval_mean_ms = "20000"
-offline_prob = "0.05"
-offline_duration_ms = "200000"
-seed = "42"
-num_scheduler_shards = "8"
-exec_concurrency = "16"
+reader_concurrency = "16"
 num_writer_tasks = "4"
-dispatch_queue_capacity = "8192"
 
-# --- 1M keys: 0.005 polls/s/key, 0.005 arrivals/s/key  -> ~5K/s aggregate ---
+# --- 1M keys: 0.005 arrivals/s/key, caught-up re-poll every 200s -> ~5K/s aggregate ---
 [[params.follow]]
 key_cardinality = "1000000"
 key_length = "16"
 value_size = "128"
 page_size = "32"
+arrival_rate_per_key = "0.005"
+idle_poll_interval_ms = "200000"
 prefill_per_key = "16"
 prefill_concurrency = "16"
 warmup_secs = "300"
-arrival_rate_per_key = "0.005"
-poll_interval_mean_ms = "200000"
-offline_prob = "0.05"
-offline_duration_ms = "2000000"
-seed = "42"
-num_scheduler_shards = "8"
-exec_concurrency = "16"
+reader_concurrency = "16"
 num_writer_tasks = "4"
-dispatch_queue_capacity = "8192"
