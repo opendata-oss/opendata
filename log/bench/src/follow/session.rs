@@ -19,7 +19,7 @@
 //! pool slot.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -29,6 +29,18 @@ use tokio_util::sync::CancellationToken;
 use super::FollowState;
 use super::lag::lag_bucket;
 use super::store::Cursor;
+
+/// Releases a key's one-session-per-key claim when the session ends, on every exit
+/// path (normal, error, or cancel-before-slot). The generator sets the claim; this
+/// clears it. The `Release` store pairs with the generator's `AcqRel` claim swap to
+/// hand the per-key cursor off cleanly to the next session.
+struct KeyClaim<'a>(&'a AtomicBool);
+
+impl Drop for KeyClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Execute one session: acquire a pool slot (queueing here is session scheduling
 /// lag), poll the key until the session duration elapses, then release the slot.
@@ -41,6 +53,9 @@ pub async fn run_one_session(
     semaphore: Arc<Semaphore>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    // Release this key's one-session-per-key claim on every exit path.
+    let _claim = KeyClaim(&state.key_busy[id]);
+
     // Acquire a pool slot. The wait here — scheduled arrival to slot acquisition —
     // is the session's scheduling lag; it stays ~0 while the pool has headroom and
     // diverges once offered load exceeds `max_active_sessions`.

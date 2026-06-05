@@ -110,7 +110,18 @@ pub async fn run_generator(
             continue;
         }
 
+        // Enforce one session per key: claim the key (false -> true). If it is
+        // already being followed, drop this arrival (uniform selection preserved;
+        // realized rate = offered rate minus these skips). The session clears the
+        // claim when it ends; the AcqRel/Release pair also orders the per-key cursor
+        // handoff from one session to the next.
         let id = (rng.next_u64() % cardinality) as usize;
+        if state.key_busy[id].swap(true, Ordering::AcqRel) {
+            if state.recording() {
+                state.skipped_busy_sessions.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
         sessions.spawn(run_one_session(
             id,
             scheduled_due,

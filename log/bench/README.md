@@ -76,6 +76,11 @@ The model is **open-loop across the population, closed-loop within a session**:
   each picking a **uniform-random** key. Open-loop means sessions wake on schedule
   regardless of how busy the database is — a slow database shows up as session
   scheduling lag, not as suppressed load (no coordinated omission).
+- **One session per key** is enforced: if an arrival lands on a key that already has
+  an active session, it is dropped and counted (`skipped_busy_sessions`) rather than
+  doubling up. So occupancy is "distinct keys being read right now," each key's
+  cursor has a single reader at a time, and realized rate = `session_rate` − skips −
+  refusals.
 - **Within a session**, polling is closed-loop: a real reader blocks on each
   response before issuing the next poll.
 - Each arrival executes on a bounded pool of `max_active_sessions` slots — the read
@@ -117,8 +122,9 @@ The console summary reports:
 - **Per-poll service latency** — `service_us_lag_<bucket>_p50/p90/p99/max`
   (microseconds), bucketed by lag at poll time (the RFC read-cost axis). Comparing
   the same bucket across cardinalities shows whether per-poll cost stays flat.
-- **Saturation** — `session_sched_lag_us_*` (scheduled-arrival → slot-acquisition)
-  and `refused_sessions` (overflowed the in-flight backstop).
+- **Saturation** — `session_sched_lag_us_*` (scheduled-arrival → slot-acquisition),
+  `refused_sessions` (overflowed the in-flight backstop), and `skipped_busy_sessions`
+  (arrivals dropped because the key already had an active session).
 - **Object-store GET activity** — `object_store_gets`, **`gets_per_poll`** (the
   RFC's LogDb cost metric), `get_bytes_total`.
 - Pre-fill and measure-phase ingest throughput (`records_per_sec` / `bytes_per_sec`,
@@ -130,10 +136,10 @@ The console summary reports:
 The fuller per-bucket histogram set (`poll_service_us`, `session_sched_lag_us`)
 still requires a configured `[reporter]`.
 
-> GET counts are process-global over the measure window: in `read_path=reader`
-> mode they're dominated by the reader pool, plus the writer's background
-> compaction reads (independent of `reader_instances`). Per-component GET
-> attribution and cache hit/miss are a later refinement.
+> GET counts are process-global over the measure window: the writer's poll-path
+> reads (when they miss the in-memory state — e.g. under `read_visibility=remote`)
+> plus its background compaction reads. Per-component GET attribution and cache
+> hit/miss are a later refinement.
 
 ### Parameters
 
@@ -162,22 +168,19 @@ Phase / harness sizing:
 | `warmup_secs` | warm-up window (metrics discarded) |
 | `num_writer_tasks` | arrivals writer tasks |
 
-Read path (optional; default reads through the writer):
+Read path (optional):
 
 | Param | Meaning |
 |-------|---------|
-| `read_path` | `writer` (default) polls the writer's own `LogDb` handle; `reader` serves polls from a pool of independent `LogDbReader`s over the shared object store, scaling read concurrency past the writer at the cost of refresh-interval visibility lag |
-| `read_visibility` | `memory` (default) exposes the writer's reads as soon as writes are in memory; `remote` restricts them to object-store-durable data. Only affects `read_path=writer` (pooled readers always read the object store) |
-| `reader_instances` | size of the reader pool when `read_path=reader` (keys are sharded across it by hash); default 1 |
-| `refresh_interval_ms` | how often each reader polls the object store for new data when `read_path=reader`; default 1000 |
-| `block_cache_mb` | size of a single in-memory block cache **shared** across the reader pool (MiB). `0` (default) gives each reader its own cache, so the pool re-fetches shared SST blocks per reader (GETs grow with `reader_instances`); a shared cache serves each block once. Only applies to `read_path=reader` |
+| `read_visibility` | `memory` (default) serves polls from the writer's in-memory state as soon as writes land; `remote` restricts reads to object-store-durable data, forcing the poll path through the object store — the lever for exercising real GET / read-amplification cost on a single node |
 
-> `read_path=reader` requires a **shared** object store (`Local` or `Aws`) — an
-> in-memory store is per-handle, so a reader would observe none of the writer's
-> data (the bench errors out in that case). Note also that a reader only sees
-> records once the writer has flushed them to the object store, so under
-> `read_path=reader` live arrivals are not visible until the next writer flush;
-> tunable write-visibility/flush cadence is a later milestone.
+> Polls are always served by the writer's own `LogDb` handle (a single node serves
+> many concurrent scans). An earlier version could fan polls out to a pool of
+> independent `LogDbReader`s over the shared object store; that was removed, since on
+> one node a separate reader pool just multiplies cache/GET work without modeling
+> anything the writer's own reads don't already. Under `read_visibility=remote`,
+> note that reads only see object-store-durable data, so live arrivals are not
+> visible until the writer's next flush; tunable flush cadence is a later milestone.
 
 ### Scenarios
 

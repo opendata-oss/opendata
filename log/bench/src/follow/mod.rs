@@ -37,15 +37,13 @@ mod writer;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::bail;
 use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
-use common::StorageConfig;
-use common::storage::config::ObjectStoreConfig;
-use log::{Config, LogDb, LogDbReader, ReadVisibility, ReaderConfig};
+use log::{Config, LogDb, ReadVisibility};
 use metrics_util::Summary as Sketch;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -73,13 +71,16 @@ pub struct FollowState {
     store: Arc<dyn LogStore>,
     keys: Arc<Vec<Bytes>>,
     /// Per-key resume position (next sequence), **persistent across sessions** so a
-    /// returning session resumes where the last one left off. With short sessions a
-    /// key is almost never drained by two sessions at once (uniform-random arrivals
-    /// make a concurrent repeat rare); under a long `session_duration` two sessions can share
-    /// a key, but the cursor is only ever advanced — overlapping reads at worst
-    /// re-read a few records, which is harmless for a read benchmark — so relaxed
-    /// access is safe.
+    /// returning session resumes where the last one left off. One session per key is
+    /// enforced (see `key_busy`), so a key's cursor is only ever touched by one
+    /// session at a time; relaxed access is safe, with the handoff between successive
+    /// sessions ordered by `key_busy`'s release/acquire.
     cursors: Vec<AtomicU64>,
+    /// Per-key "currently followed" flag enforcing **one session per key**: the
+    /// generator claims a key (false -> true) before spawning its session, drops the
+    /// arrival if it is already set, and the session clears it on exit. Its
+    /// release/acquire also orders each key's cursor handoff between sessions.
+    key_busy: Vec<AtomicBool>,
     lag: Arc<LagTracker>,
     metrics: FollowMetrics,
 
@@ -108,6 +109,9 @@ pub struct FollowState {
     sessions_completed: AtomicU64,
     /// Sessions refused because the in-flight cap was hit (overload backstop).
     refused_sessions: AtomicU64,
+    /// Arrivals dropped because the chosen key already had an active session
+    /// (one-session-per-key enforcement). Offered rate = realized + these + refused.
+    skipped_busy_sessions: AtomicU64,
 
     // ---- Occupancy (the headline "active sessions") ----
     /// Currently active sessions (holding a pool slot).
@@ -229,70 +233,23 @@ impl Benchmark for FollowBenchmark {
             None => max_active_sessions.saturating_mul(16).max(1024),
         };
 
-        // Read-path knobs (optional; default to reading through the writer).
-        let read_path = params.get("read_path").unwrap_or("writer").to_string();
-        let reader_instances = match params.get("reader_instances") {
-            Some(v) => v.parse::<usize>()?.max(1),
-            None => 1,
-        };
-        let refresh_interval_ms = match params.get("refresh_interval_ms") {
-            Some(v) => v.parse::<u64>()?,
-            None => 1000,
-        };
-        let block_cache_mb = match params.get("block_cache_mb") {
-            Some(v) => v.parse::<u64>()?,
-            None => 0,
-        };
-
+        // Read visibility: `memory` (default) lets the follower see the writer's
+        // in-memory writes immediately; `remote` restricts reads to object-store-
+        // durable data, forcing the read path through the object store (the lever
+        // for exercising real GET/read-amplification cost on a single node).
         let read_visibility = match params.get("read_visibility").unwrap_or("memory") {
             "memory" => ReadVisibility::Memory,
             "remote" => ReadVisibility::Remote,
             other => bail!("unknown read_visibility '{other}' (expected 'memory' or 'remote')"),
         };
 
-        let storage_config = bench.spec().data().storage.clone();
         let config = Config {
-            storage: storage_config.clone(),
+            storage: bench.spec().data().storage.clone(),
             read_visibility,
             ..Default::default()
         };
         let writer = LogDb::open(config).await?;
-        let logdb_store = match read_path.as_str() {
-            "writer" => Arc::new(LogDbStore::new(writer)),
-            "reader" => {
-                if !object_store_is_shared(&storage_config) {
-                    bail!(
-                        "read_path=reader requires a shared object store (Local or Aws); \
-                         the configured store is in-memory and per-handle, so readers \
-                         would observe none of the writer's data"
-                    );
-                }
-                let refresh = Duration::from_millis(refresh_interval_ms);
-                let shared_cache = if block_cache_mb > 0 {
-                    Some(common::create_in_memory_block_cache(
-                        block_cache_mb * 1024 * 1024,
-                    ))
-                } else {
-                    None
-                };
-                let mut readers = Vec::with_capacity(reader_instances);
-                for _ in 0..reader_instances {
-                    let reader_config = ReaderConfig {
-                        storage: storage_config.clone(),
-                        refresh_interval: refresh,
-                    };
-                    let reader = match &shared_cache {
-                        Some(cache) => {
-                            LogDbReader::open_with_block_cache(reader_config, cache.clone()).await?
-                        }
-                        None => LogDbReader::open(reader_config).await?,
-                    };
-                    readers.push(reader);
-                }
-                Arc::new(LogDbStore::with_readers(writer, readers))
-            }
-            other => bail!("unknown read_path '{other}' (expected 'writer' or 'reader')"),
-        };
+        let logdb_store = Arc::new(LogDbStore::new(writer));
         let queue_full = logdb_store.queue_full_counter();
 
         let keys = Arc::new(workload::keys(cardinality, key_length));
@@ -331,6 +288,7 @@ impl Benchmark for FollowBenchmark {
             store: store_dyn,
             keys,
             cursors: (0..cardinality).map(|_| AtomicU64::new(0)).collect(),
+            key_busy: (0..cardinality).map(|_| AtomicBool::new(false)).collect(),
             lag,
             metrics: follow_metrics,
             page_size,
@@ -344,6 +302,7 @@ impl Benchmark for FollowBenchmark {
             bytes_consumed: AtomicU64::new(0),
             sessions_completed: AtomicU64::new(0),
             refused_sessions: AtomicU64::new(0),
+            skipped_busy_sessions: AtomicU64::new(0),
             active_sessions: AtomicU64::new(0),
             peak_active: AtomicU64::new(0),
             active_time_us: AtomicU64::new(0),
@@ -521,6 +480,10 @@ fn build_summary(inp: SummaryInputs<'_>) -> Summary {
             "refused_sessions",
             s.refused_sessions.load(Ordering::Relaxed) as f64,
         )
+        .add(
+            "skipped_busy_sessions",
+            s.skipped_busy_sessions.load(Ordering::Relaxed) as f64,
+        )
         // Polls and object-store cost.
         .add("total_polls", polls_total as f64)
         .add("polls_per_sec", polls_total as f64 / elapsed)
@@ -626,14 +589,4 @@ fn build_summary(inp: SummaryInputs<'_>) -> Summary {
     }
 
     summary
-}
-
-/// Whether `storage` uses a shared object store (Local/Aws) that an independent
-/// [`LogDbReader`] can observe. An in-memory object store is per-handle, so the
-/// reader pool would see none of the writer's data.
-fn object_store_is_shared(storage: &StorageConfig) -> bool {
-    match storage {
-        StorageConfig::InMemory => false,
-        StorageConfig::SlateDb(c) => !matches!(c.object_store, ObjectStoreConfig::InMemory),
-    }
 }
