@@ -672,6 +672,10 @@ pub struct LogIterator {
     seq_range: Range<Sequence>,
     current_segment_idx: usize,
     current_iter: Option<SegmentIterator>,
+    /// Entries yielded by the segment currently being scanned. Used to flag a
+    /// scan that returned nothing for the key (`read_stats::empty_segment_scans`)
+    /// once that segment is exhausted.
+    current_segment_yielded: u64,
 }
 
 impl LogIterator {
@@ -690,6 +694,7 @@ impl LogIterator {
             seq_range,
             current_segment_idx: 0,
             current_iter: None,
+            current_segment_yielded: 0,
         }
     }
 
@@ -708,6 +713,7 @@ impl LogIterator {
             seq_range,
             current_segment_idx: 0,
             current_iter: None,
+            current_segment_yielded: 0,
         }
     }
 
@@ -717,9 +723,15 @@ impl LogIterator {
             // If we have a current iterator, try to get the next entry
             if let Some(iter) = &mut self.current_iter {
                 if let Some(entry) = iter.next().await? {
+                    self.current_segment_yielded += 1;
                     return Ok(Some(entry));
                 }
-                // Current segment exhausted, move to next
+                // Current segment exhausted. A scan that produced nothing for
+                // the key is pure read amplification — the segment covered the
+                // sequence range but held no records for it.
+                if self.current_segment_yielded == 0 {
+                    crate::read_stats::record_empty_segment_scan();
+                }
                 self.current_iter = None;
                 self.current_segment_idx += 1;
             }
@@ -744,6 +756,8 @@ impl LogIterator {
             .storage
             .scan_entries(segment, &self.key, self.seq_range.clone())
             .await?;
+        crate::read_stats::record_segment_scan();
+        self.current_segment_yielded = 0;
         self.current_iter = Some(iter);
         Ok(true)
     }

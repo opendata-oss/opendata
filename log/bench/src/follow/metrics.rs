@@ -1,19 +1,23 @@
-//! The metric handles shared across the follower runners and the arrivals writer.
+//! The metric handles shared across the session runners and the arrivals writer.
 //!
 //! Metric handles from the `metrics` crate are cheap `Arc`-backed clones, so a
 //! `FollowMetrics` is cloned freely into every spawned task.
 //!
-//! Latency is recorded two ways and **bucketed by lag at poll time** (RFC 0006),
-//! carrying the lag bucket as a metric label so the per-bucket series share one
-//! name and the reporter's quantiles come out per bucket:
-//! - `poll_latency_us` — from when a poll became due to completion (includes any
-//!   time the runner was busy with other keys; coordinated-omission-correct).
-//! - `poll_service_us` — from when the poll started executing to completion (the
-//!   database's intrinsic cost).
+//! The follow workload is a population of **sessions**: a session wakes for one
+//! key, drains its backlog to the tail closed-loop (fetch → process → fetch), and
+//! ends. Latency has two levels:
 //!
-//! `scheduling_lag_us` (due-to-start delay) is the saturation signal: as runners
-//! fall behind their keys' due times it grows, alongside the lag distribution
-//! shifting into deeper buckets.
+//! - `poll_service_us` — per-poll service time (start → completion), the
+//!   database's intrinsic read cost, **bucketed by lag at poll time** (RFC 0006):
+//!   how per-poll cost depends on how far behind the reader was. The lag bucket is
+//!   carried as a metric label so the per-bucket series share one name.
+//! - `session_sched_lag_us` — a session's scheduled-arrival → execution-start delay
+//!   (queueing in the bounded session pool). This is the hard-saturation backstop:
+//!   it diverges when offered session load exceeds the pool ceiling.
+//!
+//! Session-level *progress* (per-session goodput, time-to-catch-up) is reported
+//! through the console summary from sketches held in `FollowState`, since those
+//! are bucketed by backlog-at-session-start rather than the per-poll lag label.
 
 use bencher::{Bench, Counter, Histogram};
 
@@ -21,39 +25,36 @@ use super::lag::{LAG_BUCKET_LABELS, NUM_LAG_BUCKETS};
 
 #[derive(Clone)]
 pub struct FollowMetrics {
-    /// Polls completed.
+    /// Polls completed (across all sessions).
     pub polls: Counter,
     /// Records returned to consumers.
     pub records_consumed: Counter,
     /// Records appended by the arrivals writer.
     pub arrivals: Counter,
-    /// Due-to-completion latency, microseconds, per lag bucket
-    /// (coordinated-omission-correct).
-    pub poll_latency_us: Vec<Histogram>,
-    /// Service-start-to-completion latency, microseconds, per lag bucket
-    /// (intrinsic db cost).
+    /// Sessions completed.
+    pub sessions: Counter,
+    /// Per-poll service time, microseconds, per lag bucket (intrinsic db cost).
     pub poll_service_us: Vec<Histogram>,
-    /// Due-to-service-start delay, microseconds (runner falling behind).
-    pub scheduling_lag_us: Histogram,
+    /// Session scheduled-arrival → execution-start delay, microseconds (the
+    /// bounded pool queueing; the hard-saturation signal).
+    pub session_sched_lag_us: Histogram,
 }
 
 impl FollowMetrics {
     pub fn new(bench: &Bench) -> Self {
-        let per_bucket = |name: &'static str| -> Vec<Histogram> {
-            LAG_BUCKET_LABELS
-                .iter()
-                .map(|bucket| bench.histogram_labeled(name, &[("lag", *bucket)]))
-                .collect()
-        };
+        let poll_service_us: Vec<Histogram> = LAG_BUCKET_LABELS
+            .iter()
+            .map(|bucket| bench.histogram_labeled("poll_service_us", &[("lag", *bucket)]))
+            .collect();
         let metrics = Self {
             polls: bench.counter("polls"),
             records_consumed: bench.counter("records_consumed"),
             arrivals: bench.counter("arrivals"),
-            poll_latency_us: per_bucket("poll_latency_us"),
-            poll_service_us: per_bucket("poll_service_us"),
-            scheduling_lag_us: bench.histogram("scheduling_lag_us"),
+            sessions: bench.counter("sessions"),
+            poll_service_us,
+            session_sched_lag_us: bench.histogram("session_sched_lag_us"),
         };
-        debug_assert_eq!(metrics.poll_latency_us.len(), NUM_LAG_BUCKETS);
+        debug_assert_eq!(metrics.poll_service_us.len(), NUM_LAG_BUCKETS);
         metrics
     }
 }

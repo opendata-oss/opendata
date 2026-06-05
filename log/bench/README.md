@@ -46,45 +46,89 @@ bucket = "my-bucket"
 ## Benchmarks
 
 - **ingest** — Measures log append throughput with various batch sizes and value sizes.
-- **follow** — RFC 0006 cardinality benchmark: many independent per-key logs, each
-  followed by its own consumer polling for what is new since it last read. Measures
-  poll latency and throughput as a function of consumer lag and key cardinality.
+- **follow** — RFC 0006 cardinality benchmark: many independent per-key logs
+  followed by a population of **sessions** that wake, catch a log up to its tail,
+  and sleep. Measures how many concurrent sessions a store sustains, and per-poll
+  read cost, as key cardinality scales.
 
 ## follow
 
 Models a large population of key-addressable logs (mailboxes, per-entity event
-streams, agent transcripts) where each key is **actively followed** by a consumer
-that tracks a cursor and tails it. Following is **closed-loop**: a reader issues a
-poll, waits for the response, and polls again — immediately if a full page came
-back (a backlog remains, so drain as fast as possible), or after `idle_poll_interval`
-once caught up to the tail. The idle delay is the only polling cadence and keeps
-caught-up followers from busy-spinning empty reads.
+streams, agent transcripts) followed not by permanent per-key consumers but by
+**sessions**. A session is one reader waking for one log: it picks up where the
+last session on that key left off (the per-key cursor persists across sessions, as
+a mailbox remembers what you last read) and polls it for a while.
+
+The session itself is **bare bones** — a poll loop bounded by a duration:
+
+```text
+while within session_duration: poll(key, cursor, page_size); wait poll_interval
+```
+
+There is no catch-up / tail detection: a poll drains up to `page_size`, and the
+session just keeps polling until `session_duration` elapses. Richer behavior
+(end-on-catch-up, idle backoff, deep-catch-up handling) is intentionally left out,
+to be built up as the benchmark needs it.
+
+The model is **open-loop across the population, closed-loop within a session**:
+
+- **Session arrivals** are a global open-loop Poisson stream at `session_rate`,
+  each picking a **uniform-random** key. Open-loop means sessions wake on schedule
+  regardless of how busy the database is — a slow database shows up as session
+  scheduling lag, not as suppressed load (no coordinated omission).
+- **Within a session**, polling is closed-loop: a real reader blocks on each
+  response before issuing the next poll.
+- Each arrival executes on a bounded pool of `max_active_sessions` slots — the read
+  concurrency the database sees. This is the point of the model: **the number of
+  concurrently active sessions can meet a target bound even as the key population
+  grows to millions.** Time waiting for a slot is the session's scheduling lag.
+
+`session_duration = -1` polls forever; continuous following is that case with
+`max_active_sessions ≥ key_cardinality` and `poll_interval = 0`, so every key
+acquires a permanent session.
 
 A run proceeds through three phases over one live database:
 
 1. **Pre-fill** — append a per-key backlog (parallel + batched); reports ingest
    throughput.
-2. **Warm-up** — run arrivals and follows for `warmup_secs`, discarding metrics
+2. **Warm-up** — run arrivals and sessions for `warmup_secs`, discarding metrics
    while the cache reaches steady state.
 3. **Measure** — record everything for the `--duration` window.
 
-Poll latency and service time are bucketed by **lag at poll time** (the lag bucket
-is carried as a `lag` metric label) — the analysis axis the read cost is reported
-against. Lag itself is a workload consequence (how far a follower fell behind), not
-a backend result. The console summary reports throughput, the lag distribution
-(`polls_lag_*`), residual backlog, pre-fill ingest throughput, the measure-phase
-ingest throughput (`records_per_sec` / `bytes_per_sec`, the offered write load
-actually achieved), and **per-lag-bucket read-service latency percentiles**
-(`service_us_lag_<bucket>_p50/p90/p99/max`, microseconds — emitted only for
-buckets that saw polls); comparing the same bucket across cardinalities shows
-whether per-poll read cost stays flat. It also reports object-store GET activity
-over the measure window — `object_store_gets`, **`gets_per_poll`** (the RFC's
-LogDb cost metric), and `get_bytes_total` — which is the signal for whether
-adding readers buys proportional S3 work or just thrashes shared block caches.
-The keeping-up signal is the lag distribution shifting into deeper buckets (with
-`scheduling_lag_us` growing) when runners can't keep followers near the tail. The
-fuller per-bucket histogram set (`poll_latency_us`, `poll_service_us`,
-`scheduling_lag_us`) still requires a configured `[reporter]`.
+**"Sustain"** is the active-session occupancy at the **aggregate-goodput knee**:
+sweep `session_rate` up at fixed cardinality; aggregate read goodput climbs with
+occupancy, then plateaus as sessions contend (per-session goodput falling as
+~1/occupancy). The occupancy at the knee is the sustainable number of concurrent
+sessions. Session scheduling lag diverging is the hard-saturation backstop.
+
+The console summary reports:
+
+- **Occupancy** — `mean_active_sessions` (time-integral of active sessions ÷
+  elapsed, i.e. Little's law) and `peak_active_sessions`. The headline "how many
+  sessions can we sustain" number.
+- **Aggregate goodput** — `aggregate_goodput_records_per_sec` / `_bytes_per_sec`
+  (records drained across all sessions). The knee axis.
+- **Per-session progress, bucketed by backlog at session start** — `db_rate_*`
+  (records/s over DB-poll time, the contention signal: as sessions contend each poll
+  takes longer and this drops), plus `sessions_backlog_*` and
+  `avg_polls_per_session_backlog_*`. Backlog buckets reuse the lag-bucket boundaries.
+  Bucketing by backlog removes the fixed-overhead confound (a near-tail session
+  draining a handful of records shows a low rate from scan setup, not contention).
+- **Per-poll service latency** — `service_us_lag_<bucket>_p50/p90/p99/max`
+  (microseconds), bucketed by lag at poll time (the RFC read-cost axis). Comparing
+  the same bucket across cardinalities shows whether per-poll cost stays flat.
+- **Saturation** — `session_sched_lag_us_*` (scheduled-arrival → slot-acquisition)
+  and `refused_sessions` (overflowed the in-flight backstop).
+- **Object-store GET activity** — `object_store_gets`, **`gets_per_poll`** (the
+  RFC's LogDb cost metric), `get_bytes_total`.
+- Pre-fill and measure-phase ingest throughput (`records_per_sec` / `bytes_per_sec`,
+  the offered write load actually achieved), the per-poll lag distribution
+  (`polls_lag_*`), and `residual_backlog_records` — kept only as a drain
+  sanity-check, **not** a health signal (it is dominated by idle keys that no
+  session visited).
+
+The fuller per-bucket histogram set (`poll_service_us`, `session_sched_lag_us`)
+still requires a configured `[reporter]`.
 
 > GET counts are process-global over the measure window: in `read_path=reader`
 > mode they're dominated by the reader pool, plus the writer's background
@@ -100,9 +144,14 @@ Workload (backend-agnostic):
 | `key_cardinality` | number of independently followed logs |
 | `key_length` | width of the zero-padded key strings |
 | `value_size` | record payload size in bytes |
-| `page_size` | max records returned per poll (bounds per-poll cost; a backlog drains over several back-to-back polls) |
+| `page_size` | max records returned per poll (bounds per-poll cost; a backlog drains over several back-to-back polls within a session) |
 | `arrival_rate_per_key` | per-key append rate (records/s); aggregate is `cardinality × this` |
-| `idle_poll_interval_ms` | delay before a caught-up follower re-polls (the only polling cadence) |
+| `session_rate` | aggregate rate (sessions/s) of the global open-loop arrival stream; each session picks a uniform-random key |
+| `max_active_sessions` | bounded session pool size — the read concurrency the db sees, and the ceiling on active sessions regardless of cardinality |
+| `session_duration_ms` | how long a session keeps polling, from session start (default `100`); `-1` polls forever (with a pool ≥ cardinality and `poll_interval = 0`, reduces to continuous following) |
+| `poll_interval_ms` | gap between successive polls within a session (default `0` = poll back-to-back) |
+| `seed` | PRNG seed for arrivals + key selection (default `1`); workload is seed-reproducible |
+| `max_inflight_sessions` | overload backstop on queued-but-not-yet-running sessions (default `16 × max_active_sessions`); overflow counts as `refused_sessions` |
 
 Phase / harness sizing:
 
@@ -111,7 +160,6 @@ Phase / harness sizing:
 | `prefill_per_key` | records pre-loaded per key before measurement |
 | `prefill_concurrency` | parallel tasks used during pre-fill |
 | `warmup_secs` | warm-up window (metrics discarded) |
-| `reader_concurrency` | number of follower runners (the read concurrency the db sees; keys partitioned round-robin, one poll in flight per runner) |
 | `num_writer_tasks` | arrivals writer tasks |
 
 Read path (optional; default reads through the writer):
@@ -122,6 +170,7 @@ Read path (optional; default reads through the writer):
 | `read_visibility` | `memory` (default) exposes the writer's reads as soon as writes are in memory; `remote` restricts them to object-store-durable data. Only affects `read_path=writer` (pooled readers always read the object store) |
 | `reader_instances` | size of the reader pool when `read_path=reader` (keys are sharded across it by hash); default 1 |
 | `refresh_interval_ms` | how often each reader polls the object store for new data when `read_path=reader`; default 1000 |
+| `block_cache_mb` | size of a single in-memory block cache **shared** across the reader pool (MiB). `0` (default) gives each reader its own cache, so the pool re-fetches shared SST blocks per reader (GETs grow with `reader_instances`); a shared cache serves each block once. Only applies to `read_path=reader` |
 
 > `read_path=reader` requires a **shared** object store (`Local` or `Aws`) — an
 > in-memory store is per-handle, so a reader would observe none of the writer's
@@ -133,15 +182,23 @@ Read path (optional; default reads through the writer):
 ### Scenarios
 
 - **A — Cardinality scaling** (`configs/scenario-a-cardinality.toml`): scale
-  cardinality 1K → 1M at a fixed aggregate load (per-key arrival rate scaled down
-  and `idle_poll_interval` scaled up with cardinality); per-poll latency and
-  throughput should stay approximately flat. The high-cardinality points are long
-  runs (set `--duration` to several idle intervals of the largest point). Example:
+  cardinality 1K → 1M at a **fixed** `session_rate` and fixed aggregate write rate
+  (per-key arrival scaled down with cardinality). Because the backlog a session
+  wakes with is `aggregate_writes / session_rate` — independent of cardinality —
+  the sustainable occupancy (`mean_active_sessions`) and per-session progress
+  should stay approximately flat as the population grows, while the wall-clock gap
+  between a key's visits widens (the segment-fan-out effect on `gets_per_poll`).
+  `max_active_sessions` is set generously so the knee, not the ceiling, governs.
+  The high-cardinality points are long runs (a key is visited rarely, so run long
+  enough to accumulate sessions per backlog bucket). Example:
 
   ```sh
   cargo run -p log-bench --release -- \
       -c log/bench/configs/scenario-a-cardinality.toml -b follow -d 600
   ```
+
+  To find the knee directly, fix cardinality and sweep `session_rate` up until
+  `aggregate_goodput_records_per_sec` plateaus and `session_sched_lag_us` diverges.
 
 Scenarios B (lag asymmetry) and C (seal-size) are deferred until GET counting
 lands, since their headline result is GETs/poll.
