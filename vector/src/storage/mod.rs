@@ -22,6 +22,7 @@ use std::ops::Bound::Included;
 
 pub(crate) mod merge_operator;
 pub(crate) mod record;
+pub(crate) mod segment_extractor;
 
 /// Extension trait for StorageRead that provides vector database-specific loading methods.
 ///
@@ -157,7 +158,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Returns a list of `(level, centroid_id)` to accumulated vector count.
     #[allow(dead_code)]
     async fn scan_all_centroid_stats(&self) -> Result<Vec<(VectorId, CentroidStatsValue)>> {
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
         crate::serde::RecordType::CentroidStats.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
@@ -177,7 +178,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     async fn scan_all_centroid_info(&self) -> Result<Vec<(VectorId, CentroidInfoValue)>> {
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
         crate::serde::RecordType::CentroidInfo.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
@@ -197,7 +198,7 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         &self,
         dimensions: usize,
     ) -> Result<Vec<(VectorId, PostingListValue)>> {
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
         crate::serde::RecordType::PostingList.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
