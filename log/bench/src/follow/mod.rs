@@ -43,7 +43,9 @@ use std::time::Duration;
 use anyhow::bail;
 use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
-use log::{Config, LogDb, ReadVisibility};
+use common::StorageConfig;
+use common::storage::config::ObjectStoreConfig;
+use log::{Config, LogDb, LogDbReader, ReadVisibility, ReaderConfig};
 use metrics_util::Summary as Sketch;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -233,23 +235,66 @@ impl Benchmark for FollowBenchmark {
             None => max_active_sessions.saturating_mul(16).max(1024),
         };
 
-        // Read visibility: `memory` (default) lets the follower see the writer's
-        // in-memory writes immediately; `remote` restricts reads to object-store-
-        // durable data, forcing the read path through the object store (the lever
-        // for exercising real GET/read-amplification cost on a single node).
+        // Read path. `writer` (default) serves polls from the writer's own handle;
+        // `reader` serves them from a single standalone `LogDbReader` over the
+        // shared object store — a read replica decoupled from the writer, with its
+        // own block cache and refresh-interval visibility lag. (A *pool* of readers
+        // is intentionally not supported: multi-reader cost derives from the
+        // single-reader numbers; running many just multiplies cache/GET work.)
+        let read_path = params.get("read_path").unwrap_or("writer").to_string();
+        let refresh_interval_ms = match params.get("refresh_interval_ms") {
+            Some(v) => v.parse::<u64>()?,
+            None => 1000,
+        };
+        // Block cache size for the standalone reader (MiB); 0 = reader's default.
+        let block_cache_mb = match params.get("block_cache_mb") {
+            Some(v) => v.parse::<u64>()?,
+            None => 0,
+        };
+
+        // Read visibility (only meaningful for `read_path = writer`; a standalone
+        // reader always reads object-store-durable data). `memory` (default) lets
+        // the follower see the writer's in-memory writes immediately; `remote`
+        // restricts the writer's reads to durable data, forcing them through the
+        // object store (the lever for exercising real GET/read-amp cost on the
+        // writer path on a single node).
         let read_visibility = match params.get("read_visibility").unwrap_or("memory") {
             "memory" => ReadVisibility::Memory,
             "remote" => ReadVisibility::Remote,
             other => bail!("unknown read_visibility '{other}' (expected 'memory' or 'remote')"),
         };
 
+        let storage_config = bench.spec().data().storage.clone();
         let config = Config {
-            storage: bench.spec().data().storage.clone(),
+            storage: storage_config.clone(),
             read_visibility,
             ..Default::default()
         };
         let writer = LogDb::open(config).await?;
-        let logdb_store = Arc::new(LogDbStore::new(writer));
+        let logdb_store = match read_path.as_str() {
+            "writer" => Arc::new(LogDbStore::new(writer)),
+            "reader" => {
+                if !object_store_is_shared(&storage_config) {
+                    bail!(
+                        "read_path=reader requires a shared object store (Local or Aws); \
+                         the configured store is in-memory and per-handle, so the reader \
+                         would observe none of the writer's data"
+                    );
+                }
+                let reader_config = ReaderConfig {
+                    storage: storage_config,
+                    refresh_interval: Duration::from_millis(refresh_interval_ms),
+                };
+                let reader = if block_cache_mb > 0 {
+                    let cache = common::create_in_memory_block_cache(block_cache_mb * 1024 * 1024);
+                    LogDbReader::open_with_block_cache(reader_config, cache).await?
+                } else {
+                    LogDbReader::open(reader_config).await?
+                };
+                Arc::new(LogDbStore::with_reader(writer, reader))
+            }
+            other => bail!("unknown read_path '{other}' (expected 'writer' or 'reader')"),
+        };
         let queue_full = logdb_store.queue_full_counter();
 
         let keys = Arc::new(workload::keys(cardinality, key_length));
@@ -589,4 +634,14 @@ fn build_summary(inp: SummaryInputs<'_>) -> Summary {
     }
 
     summary
+}
+
+/// Whether `storage` uses a shared object store (Local/Aws) that a standalone
+/// [`LogDbReader`] can observe. An in-memory object store is per-handle, so the
+/// reader would see none of the writer's data.
+fn object_store_is_shared(storage: &StorageConfig) -> bool {
+    match storage {
+        StorageConfig::InMemory => false,
+        StorageConfig::SlateDb(c) => !matches!(c.object_store, ObjectStoreConfig::InMemory),
+    }
 }

@@ -136,10 +136,12 @@ The console summary reports:
 The fuller per-bucket histogram set (`poll_service_us`, `session_sched_lag_us`)
 still requires a configured `[reporter]`.
 
-> GET counts are process-global over the measure window: the writer's poll-path
-> reads (when they miss the in-memory state — e.g. under `read_visibility=remote`)
-> plus its background compaction reads. Per-component GET attribution and cache
-> hit/miss are a later refinement.
+> GET counts are process-global over the measure window: under `read_path=reader`
+> they're dominated by the standalone reader's poll-path fetches; under
+> `read_path=writer` they come from the writer's poll-path reads when they miss the
+> in-memory state (e.g. `read_visibility=remote`). Both also include the writer's
+> background compaction reads. Per-component GET attribution and cache hit/miss are
+> a later refinement.
 
 ### Parameters
 
@@ -168,19 +170,25 @@ Phase / harness sizing:
 | `warmup_secs` | warm-up window (metrics discarded) |
 | `num_writer_tasks` | arrivals writer tasks |
 
-Read path (optional):
+Read path (optional; default reads through the writer):
 
 | Param | Meaning |
 |-------|---------|
-| `read_visibility` | `memory` (default) serves polls from the writer's in-memory state as soon as writes land; `remote` restricts reads to object-store-durable data, forcing the poll path through the object store — the lever for exercising real GET / read-amplification cost on a single node |
+| `read_path` | `writer` (default) serves polls from the writer's own `LogDb` handle; `reader` serves them from a single standalone `LogDbReader` over the shared object store — a read replica decoupled from the writer, with its own block cache and refresh-interval visibility lag |
+| `read_visibility` | `memory` (default) serves the writer's reads from in-memory state as soon as writes land; `remote` restricts them to object-store-durable data, forcing the writer's poll path through the object store. Only affects `read_path=writer` (a standalone reader always reads the object store) |
+| `refresh_interval_ms` | how often the standalone reader polls the object store for new data when `read_path=reader`; default 1000 |
+| `block_cache_mb` | block cache size for the standalone reader (MiB) when `read_path=reader`; `0` (default) uses the reader's default cache. The lever for the caught-up-cheap (cache hit) vs. lagged-miss read-cost asymmetry |
 
-> Polls are always served by the writer's own `LogDb` handle (a single node serves
-> many concurrent scans). An earlier version could fan polls out to a pool of
-> independent `LogDbReader`s over the shared object store; that was removed, since on
-> one node a separate reader pool just multiplies cache/GET work without modeling
-> anything the writer's own reads don't already. Under `read_visibility=remote`,
-> note that reads only see object-store-durable data, so live arrivals are not
-> visible until the writer's next flush; tunable flush cadence is a later milestone.
+> Only a **single** standalone reader is supported, not a pool. One node serves many
+> concurrent scans from one handle, and the cost of N independent readers is
+> derivable from the single-reader numbers (modulo shared-cache effects) — running a
+> real pool just multiplies cache/GET work without modeling anything new.
+>
+> `read_path=reader` requires a **shared** object store (`Local` or `Aws`) — an
+> in-memory store is per-handle, so the reader would observe none of the writer's
+> data (the bench errors out in that case). Note also that the reader only sees
+> records once the writer has flushed them, so live arrivals are not visible until
+> the next writer flush; tunable flush cadence is a later milestone.
 
 ### Scenarios
 

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{AppendError, LogDb, LogRead, Record};
+use log::{AppendError, LogDb, LogDbReader, LogRead, Record};
 
 /// An opaque resume position handed back on the next poll.
 ///
@@ -47,15 +47,31 @@ pub trait LogStore: Send + Sync {
     async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput>;
 }
 
+/// Where the follow path's reads are served from.
+///
+/// `append` always goes to the writer; only polls vary:
+/// - [`ReadSource::Writer`] — polls go through the writer's own [`LogDb`] handle,
+///   serving the writer's process state (subject to `read_visibility`).
+/// - [`ReadSource::Reader`] — polls go through one standalone [`LogDbReader`] over
+///   the shared object store: a read replica decoupled from the writer, with its
+///   own block cache and refresh-interval visibility lag.
+///
+/// Deliberately a *single* reader, not a pool. One node serves many concurrent
+/// scans from one handle, and the cost of N independent readers is derivable from
+/// the single-reader numbers (modulo shared-cache effects) — running a real pool
+/// just multiplies cache/GET work without modeling anything new.
+enum ReadSource {
+    Writer,
+    Reader(LogDbReader),
+}
+
 /// LogDb implementation of [`LogStore`].
 ///
-/// Holds the single writer [`LogDb`] — the only handle, used for both appends and
-/// polls. (An earlier version could serve polls from a pool of independent
-/// `LogDbReader`s over the shared object store; that was dropped, since on a single
-/// node a separate reader pool just multiplies cache/GET work without modeling
-/// anything the writer's own reads don't already.)
+/// Holds the writer [`LogDb`] (the only handle that can append) plus the read
+/// source used for polls.
 pub struct LogDbStore {
     writer: LogDb,
+    read_source: ReadSource,
     /// Count of `QueueFull` retries seen on the arrival path. This is the
     /// ingest-capacity ceiling the RFC warns about: when offered write load
     /// exceeds what the writer can absorb, appends spin here until space frees.
@@ -67,6 +83,19 @@ impl LogDbStore {
     pub fn new(writer: LogDb) -> Self {
         Self {
             writer,
+            read_source: ReadSource::Writer,
+            queue_full: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Append through `writer` but serve polls from a standalone `reader` over the
+    /// shared object store. Requires a shared (Local/Aws) object store — an
+    /// in-memory store is per-handle, so the reader would never observe the
+    /// writer's data.
+    pub fn with_reader(writer: LogDb, reader: LogDbReader) -> Self {
+        Self {
+            writer,
+            read_source: ReadSource::Reader(reader),
             queue_full: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -81,15 +110,20 @@ impl LogDbStore {
         self.queue_full.clone()
     }
 
-    /// Close the store.
+    /// Close the store: shut down the reader (if any), then the writer.
     pub async fn close(self) -> anyhow::Result<()> {
+        if let ReadSource::Reader(reader) = self.read_source {
+            reader.close().await;
+        }
         self.writer.close().await?;
         Ok(())
     }
 
-    /// Drain up to `max` records for `key` starting at `cursor`.
-    async fn drain(
-        reader: &LogDb,
+    /// Drain up to `max` records for `key` starting at `cursor`, using `reader`
+    /// (either the writer's [`LogDb`] or a standalone [`LogDbReader`] — both
+    /// implement [`LogRead`]).
+    async fn drain<R: LogRead + Sync>(
+        reader: &R,
         key: Bytes,
         cursor: Cursor,
         max: usize,
@@ -150,7 +184,10 @@ impl LogStore for LogDbStore {
     }
 
     async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput> {
-        Self::drain(&self.writer, key, cursor, max).await
+        match &self.read_source {
+            ReadSource::Writer => Self::drain(&self.writer, key, cursor, max).await,
+            ReadSource::Reader(reader) => Self::drain(reader, key, cursor, max).await,
+        }
     }
 }
 
