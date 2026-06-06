@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -42,31 +41,25 @@ impl Drop for KeyClaim<'_> {
     }
 }
 
-/// Execute one session: acquire a pool slot (queueing here is session scheduling
-/// lag), poll the key until the session duration elapses, then release the slot.
-/// `scheduled_due` is the open-loop arrival time the generator assigned, used to
-/// measure scheduling lag.
+/// Execute one session: poll the key until the session duration elapses, then end.
+/// There is no concurrency cap — a session runs as soon as the runtime schedules
+/// it, so concurrency (occupancy) is emergent: `session_rate × session_duration`
+/// (Little's law). `scheduled_due` is the open-loop arrival time the generator
+/// assigned; the gap to actual start is the dispatch lag (a harness/runtime
+/// saturation signal, ~0 unless the runtime can't keep up).
 pub async fn run_one_session(
     id: usize,
     scheduled_due: Instant,
     state: Arc<FollowState>,
-    semaphore: Arc<Semaphore>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     // Release this key's one-session-per-key claim on every exit path.
     let _claim = KeyClaim(&state.key_busy[id]);
 
-    // Acquire a pool slot. The wait here — scheduled arrival to slot acquisition —
-    // is the session's scheduling lag; it stays ~0 while the pool has headroom and
-    // diverges once offered load exceeds `max_active_sessions`.
-    let permit: OwnedSemaphorePermit = tokio::select! {
-        p = semaphore.acquire_owned() => p.expect("session semaphore is never closed"),
-        _ = cancel.cancelled() => return Ok(()),
-    };
     let acquired = Instant::now();
     let sched_lag = acquired.saturating_duration_since(scheduled_due);
 
-    // Occupancy: count this session as active for the pool-occupancy (Little's-law)
+    // Occupancy: count this session as active for the occupancy (Little's-law)
     // measurement. `record` is latched at start so a session contributes wholly or
     // not at all to the measure window.
     let active = state.active_sessions.fetch_add(1, Ordering::Relaxed) + 1;
@@ -76,7 +69,6 @@ pub async fn run_one_session(
     let result = poll_for_duration(id, &state, record, &cancel, sched_lag, acquired).await;
 
     state.active_sessions.fetch_sub(1, Ordering::Relaxed);
-    drop(permit);
     result
 }
 

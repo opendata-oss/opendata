@@ -8,13 +8,13 @@
 //! session scheduling lag rather than as suppressed arrivals (no coordinated
 //! omission; see RFC 0006 "Scheduling").
 //!
-//! Each arrival is dispatched onto a bounded pool of `max_active_sessions` slots
-//! (a [`Semaphore`]); that ceiling is the read concurrency the database sees, and
-//! it bounds active sessions even as the key population grows — the headline of
-//! the session model. The generator never blocks on the pool: it spawns the
-//! session and the *session* waits for a slot, so arrivals keep coming and the
-//! wait is recorded as scheduling lag. A `max_inflight` cap backstops true
-//! overload (unboundedly many queued sessions), counting refusals.
+//! Each arrival is spawned as its own session task; there is no concurrency cap, so
+//! the read concurrency the database sees is emergent — `session_rate ×
+//! session_duration` (Little's law) — and stays bounded by those two knobs even as
+//! the key population grows. (A session's lifetime is a fixed wall-clock deadline,
+//! so occupancy is independent of DB speed; no pool ceiling is needed to control
+//! it.) `max_inflight` is only a runaway safety backstop against a fat-fingered
+//! `rate × duration`, counting refusals if it ever trips.
 //!
 //! Inter-arrival times are exponential (a Poisson process — the superposition of
 //! independent per-user wakeups), drawn from a small seeded PRNG so the workload
@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -67,15 +66,13 @@ impl SplitMix64 {
 
 /// Run the open-loop session generator until cancelled.
 ///
-/// Spawns one session per arrival onto `semaphore`'s bounded pool; on shutdown,
-/// drains outstanding sessions, surfacing the first error (a failed poll aborts
-/// the benchmark).
+/// Spawns one session task per arrival; on shutdown, drains outstanding sessions,
+/// surfacing the first error (a failed poll aborts the benchmark).
 pub async fn run_generator(
     state: Arc<FollowState>,
     cancel: CancellationToken,
     session_rate: f64,
     seed: u64,
-    semaphore: Arc<Semaphore>,
     max_inflight: usize,
 ) -> anyhow::Result<()> {
     let cardinality = state.keys.len() as u64;
@@ -102,7 +99,9 @@ pub async fn run_generator(
             joined??;
         }
 
-        // Backstop against unbounded queued sessions under sustained overload.
+        // Runaway safety backstop only: in-flight self-bounds at ~rate*duration
+        // since sessions retire on their deadline, so this trips only on a
+        // fat-fingered rate*duration.
         if sessions.len() >= max_inflight {
             if state.recording() {
                 state.refused_sessions.fetch_add(1, Ordering::Relaxed);
@@ -126,7 +125,6 @@ pub async fn run_generator(
             id,
             scheduled_due,
             state.clone(),
-            semaphore.clone(),
             cancel.clone(),
         ));
     }

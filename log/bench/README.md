@@ -83,14 +83,17 @@ The model is **open-loop across the population, closed-loop within a session**:
   refusals.
 - **Within a session**, polling is closed-loop: a real reader blocks on each
   response before issuing the next poll.
-- Each arrival executes on a bounded pool of `max_active_sessions` slots — the read
-  concurrency the database sees. This is the point of the model: **the number of
-  concurrently active sessions can meet a target bound even as the key population
-  grows to millions.** Time waiting for a slot is the session's scheduling lag.
+- **No concurrency cap.** A session runs as soon as the runtime schedules it, and
+  its lifetime is a fixed wall-clock deadline (`session_duration`), so the read
+  concurrency the database sees is *emergent and controlled directly by the two
+  knobs*: **occupancy ≈ `session_rate × session_duration`** (Little's law),
+  independent of DB speed. This is the point of the model: **the number of
+  concurrently active sessions stays bounded — by your choice of rate and duration —
+  even as the key population grows to millions.** To vary occupancy, change rate or
+  duration; to find the sustainable point, push it up until goodput/latency degrade.
 
 `session_duration = -1` polls forever; continuous following is that case with
-`max_active_sessions ≥ key_cardinality` and `poll_interval = 0`, so every key
-acquires a permanent session.
+`poll_interval = 0`, so every key acquires a permanent session.
 
 A run proceeds through three phases over one live database:
 
@@ -122,9 +125,10 @@ The console summary reports:
 - **Per-poll service latency** — `service_us_lag_<bucket>_p50/p90/p99/max`
   (microseconds), bucketed by lag at poll time (the RFC read-cost axis). Comparing
   the same bucket across cardinalities shows whether per-poll cost stays flat.
-- **Saturation** — `session_sched_lag_us_*` (scheduled-arrival → slot-acquisition),
-  `refused_sessions` (overflowed the in-flight backstop), and `skipped_busy_sessions`
-  (arrivals dropped because the key already had an active session).
+- **Dispatch / safety** — `session_sched_lag_us_*` (scheduled-arrival → task start;
+  ~0 unless the runtime can't keep up with the arrival rate), `skipped_busy_sessions`
+  (arrivals dropped because the key already had an active session), and
+  `refused_sessions` (the runaway safety backstop; should be 0 in normal use).
 - **Object-store GET activity** — `object_store_gets`, **`gets_per_poll`** (the
   RFC's LogDb cost metric), `get_bytes_total`.
 - Pre-fill and measure-phase ingest throughput (`records_per_sec` / `bytes_per_sec`,
@@ -154,12 +158,11 @@ Workload (backend-agnostic):
 | `value_size` | record payload size in bytes |
 | `page_size` | max records returned per poll (bounds per-poll cost; a backlog drains over several back-to-back polls within a session) |
 | `arrival_rate_per_key` | per-key append rate (records/s); aggregate is `cardinality × this` |
-| `session_rate` | aggregate rate (sessions/s) of the global open-loop arrival stream; each session picks a uniform-random key |
-| `max_active_sessions` | bounded session pool size — the read concurrency the db sees, and the ceiling on active sessions regardless of cardinality |
-| `session_duration_ms` | how long a session keeps polling, from session start (default `100`); `-1` polls forever (with a pool ≥ cardinality and `poll_interval = 0`, reduces to continuous following) |
+| `session_rate` | aggregate rate (sessions/s) of the global open-loop arrival stream; each session picks a uniform-random key. With `session_duration` this sets occupancy (≈ `rate × duration`) — the read concurrency the db sees |
+| `session_duration_ms` | how long a session keeps polling, from session start (default `100`); `-1` polls forever (with `poll_interval = 0`, reduces to continuous following) |
 | `poll_interval_ms` | gap between successive polls within a session (default `0` = poll back-to-back) |
 | `seed` | PRNG seed for arrivals + key selection (default `1`); workload is seed-reproducible |
-| `max_inflight_sessions` | overload backstop on queued-but-not-yet-running sessions (default `16 × max_active_sessions`); overflow counts as `refused_sessions` |
+| `max_inflight_sessions` | runaway safety backstop on concurrent sessions (default `100000`); occupancy self-bounds at ≈ `rate × duration`, so this only trips on a fat-fingered `rate × duration`, counting `refused_sessions` |
 
 Phase / harness sizing:
 
@@ -199,7 +202,7 @@ Read path (optional; default reads through the writer):
   the sustainable occupancy (`mean_active_sessions`) and per-session progress
   should stay approximately flat as the population grows, while the wall-clock gap
   between a key's visits widens (the segment-fan-out effect on `gets_per_poll`).
-  `max_active_sessions` is set generously so the knee, not the ceiling, governs.
+  Occupancy is emergent (`session_rate × session_duration`); there's no cap to set.
   The high-cardinality points are long runs (a key is visited rarely, so run long
   enough to accumulate sessions per backlog bucket). Example:
 
@@ -208,8 +211,9 @@ Read path (optional; default reads through the writer):
       -c log/bench/configs/scenario-a-cardinality.toml -b follow -d 600
   ```
 
-  To find the knee directly, fix cardinality and sweep `session_rate` up until
-  `aggregate_goodput_records_per_sec` plateaus and `session_sched_lag_us` diverges.
+  To find the knee directly, fix cardinality and sweep `session_rate` (or
+  `session_duration`) up — raising occupancy — until
+  `aggregate_goodput_records_per_sec` plateaus and per-poll service latency climbs.
 
 Scenarios B (lag asymmetry) and C (seal-size) are deferred until GET counting
 lands, since their headline result is GETs/poll.

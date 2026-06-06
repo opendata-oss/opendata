@@ -4,16 +4,18 @@
 //! Models a large population of key-addressable logs followed not by permanent
 //! per-key consumers but by **sessions**: a session wakes for one key, polls it for
 //! a while, and closes. Session arrivals are a **global open-loop** Poisson stream
-//! at `session_rate`, each picking a uniform-random key and executing on a bounded
-//! pool of `max_active_sessions` slots. Decoupling read load from the key population
-//! this way is the point: the number of concurrently active sessions can meet a
-//! target bound even as `key_cardinality` grows to millions.
+//! at `session_rate`, each picking a uniform-random key. Decoupling read load from
+//! the key population this way is the point: the number of concurrently active
+//! sessions stays bounded even as `key_cardinality` grows to millions.
 //!
 //! A session is a bare poll loop: it polls its key every `poll_interval` for
-//! `session_duration`, then closes. `session_duration = -1` polls forever;
-//! continuous following is that case with `max_active_sessions ≥ key_cardinality`
-//! and `poll_interval = 0`, so every key acquires a permanent session. (Catch-up /
-//! idle behavior is left out for now, to be built up as needed.)
+//! `session_duration`, then closes. There is **no concurrency cap** — a session's
+//! lifetime is a fixed wall-clock deadline, so concurrency (occupancy) is emergent
+//! and controlled directly by the two knobs: `occupancy ≈ session_rate ×
+//! session_duration` (Little's law), independent of DB speed. `session_duration =
+//! -1` polls forever; continuous following is that case with `poll_interval = 0`,
+//! so every key acquires a permanent session. (Catch-up / idle behavior is left out
+//! for now, to be built up as needed.)
 //!
 //! "Sustain" is the active-session occupancy at the aggregate-goodput knee: sweep
 //! `session_rate` up at fixed cardinality, and where aggregate read goodput
@@ -47,7 +49,6 @@ use common::StorageConfig;
 use common::storage::config::ObjectStoreConfig;
 use log::{Config, LogDb, LogDbReader, ReadVisibility, ReaderConfig};
 use metrics_util::Summary as Sketch;
-use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -109,14 +110,15 @@ pub struct FollowState {
     bytes_consumed: AtomicU64,
     /// Sessions completed in the measure window.
     sessions_completed: AtomicU64,
-    /// Sessions refused because the in-flight cap was hit (overload backstop).
+    /// Sessions refused by the runaway safety backstop (`max_inflight`); should be
+    /// 0 in normal use.
     refused_sessions: AtomicU64,
     /// Arrivals dropped because the chosen key already had an active session
     /// (one-session-per-key enforcement). Offered rate = realized + these + refused.
     skipped_busy_sessions: AtomicU64,
 
-    // ---- Occupancy (the headline "active sessions") ----
-    /// Currently active sessions (holding a pool slot).
+    // ---- Occupancy (the headline "active sessions"), emergent = rate × duration ----
+    /// Currently active (running) sessions.
     active_sessions: AtomicU64,
     /// High-water mark of `active_sessions`.
     peak_active: AtomicU64,
@@ -137,7 +139,8 @@ pub struct FollowState {
     /// Per-session goodput over DB-poll time (records/s); the contention signal.
     db_rate: Vec<Mutex<Sketch>>,
 
-    /// Session scheduling lag (scheduled arrival → slot acquisition), microseconds.
+    /// Dispatch lag (scheduled arrival → session task start), microseconds. ~0
+    /// unless the runtime can't keep up with the arrival rate (harness saturation).
     session_sched_lag_us: Mutex<Sketch>,
 }
 
@@ -174,7 +177,6 @@ fn smoke_params() -> Params {
     p.insert("arrival_rate_per_key", "5.0");
     // Session model.
     p.insert("session_rate", "500.0");
-    p.insert("max_active_sessions", "256");
     p.insert("session_duration_ms", "100");
     p.insert("poll_interval_ms", "10");
     p.insert("seed", "1");
@@ -208,9 +210,9 @@ impl Benchmark for FollowBenchmark {
         let warmup_secs: f64 = params.get_parse("warmup_secs")?;
         let num_writers: usize = params.get_parse::<usize>("num_writer_tasks")?.max(1);
 
-        // Session model.
+        // Session model. Concurrency (occupancy) is emergent — `session_rate ×
+        // session_duration` — so there is no concurrency cap to set.
         let session_rate: f64 = params.get_parse("session_rate")?;
-        let max_active_sessions: usize = params.get_parse::<usize>("max_active_sessions")?.max(1);
         // Gap between successive polls within a session (`0` = back-to-back).
         let poll_interval_ms: u64 = match params.get("poll_interval_ms") {
             Some(v) => v.parse()?,
@@ -229,10 +231,11 @@ impl Benchmark for FollowBenchmark {
             Some(v) => v.parse()?,
             None => 1,
         };
-        // Backstop against unbounded queued sessions under overload.
+        // Runaway safety backstop only (occupancy self-bounds at rate*duration);
+        // generous default so it never trips in normal use.
         let max_inflight: usize = match params.get("max_inflight_sessions") {
             Some(v) => v.parse::<usize>()?.max(1),
-            None => max_active_sessions.saturating_mul(16).max(1024),
+            None => 100_000,
         };
 
         // Read path. `writer` (default) serves polls from the writer's own handle;
@@ -361,14 +364,12 @@ impl Benchmark for FollowBenchmark {
 
         let cancel = CancellationToken::new();
 
-        // Session generator: open-loop arrivals onto a bounded pool.
-        let semaphore = Arc::new(Semaphore::new(max_active_sessions));
+        // Session generator: open-loop arrivals, one task per session (no cap).
         let generator_handle = tokio::spawn(run_generator(
             state.clone(),
             cancel.clone(),
             session_rate,
             seed,
-            semaphore,
             max_inflight,
         ));
 
@@ -556,7 +557,8 @@ fn build_summary(inp: SummaryInputs<'_>) -> Summary {
         .add("append_queue_full_total", inp.queue_full_total as f64)
         .add("elapsed_ms", inp.elapsed_ms);
 
-    // Session scheduling lag — the hard-saturation backstop.
+    // Dispatch lag (scheduled arrival → task start) — ~0 unless the runtime can't
+    // keep up with the arrival rate.
     {
         let sketch = s.session_sched_lag_us.lock().expect("sched lag mutex");
         if sketch.count() > 0 {
