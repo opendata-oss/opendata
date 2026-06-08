@@ -252,6 +252,13 @@ impl Benchmark for IngestBenchmark {
             Some(v) => v.parse()?,
             None => false,
         };
+        // Automatic segment seal interval (ms). Absent ⇒ None: sealing disabled,
+        // everything stays in segment 0. Time-based sealing controls how often a
+        // new segment is cut, which shapes the write/compaction path.
+        let seal_interval = match params.get("seal_interval_ms") {
+            Some(v) => Some(Duration::from_millis(v.parse()?)),
+            None => None,
+        };
 
         let live = LiveMetrics {
             records: bench.counter("records"),
@@ -265,6 +272,7 @@ impl Benchmark for IngestBenchmark {
             ..Default::default()
         };
         config.compaction.l0_only = l0_only;
+        config.segmentation.seal_interval = seal_interval;
         let log = Arc::new(LogDb::open(config).await?);
 
         // Deterministic key space, shared (read-only) across all writer tasks.
@@ -334,6 +342,10 @@ impl Benchmark for IngestBenchmark {
         let mut summary = Summary::new()
             .add("num_writer_tasks", num_writer_tasks as f64)
             .add("l0_only", if l0_only { 1.0 } else { 0.0 })
+            .add(
+                "seal_interval_ms",
+                seal_interval.map_or(0.0, |d| d.as_millis() as f64),
+            )
             .add("target_records_per_sec", target_records_per_sec)
             .add("target_bytes_per_sec", target_bytes_per_sec)
             .add("throughput_ops", ops_per_sec)
