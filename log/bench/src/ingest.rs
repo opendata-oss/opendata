@@ -245,6 +245,13 @@ impl Benchmark for IngestBenchmark {
             None => 1,
         }
         .min(num_keys);
+        // Compaction policy: when set, LogDb skips the one-shot consolidation of
+        // sealed steady-state segments and keeps only L0 relief (RFC 0005). A
+        // write-path lever worth sweeping alongside cardinality.
+        let l0_only: bool = match params.get("l0_only") {
+            Some(v) => v.parse()?,
+            None => false,
+        };
 
         let live = LiveMetrics {
             records: bench.counter("records"),
@@ -253,10 +260,11 @@ impl Benchmark for IngestBenchmark {
         };
 
         // Initialize log with fresh storage from the bench's data config.
-        let config = Config {
+        let mut config = Config {
             storage: bench.spec().data().storage.clone(),
             ..Default::default()
         };
+        config.compaction.l0_only = l0_only;
         let log = Arc::new(LogDb::open(config).await?);
 
         // Deterministic key space, shared (read-only) across all writer tasks.
@@ -325,6 +333,7 @@ impl Benchmark for IngestBenchmark {
 
         let mut summary = Summary::new()
             .add("num_writer_tasks", num_writer_tasks as f64)
+            .add("l0_only", if l0_only { 1.0 } else { 0.0 })
             .add("target_records_per_sec", target_records_per_sec)
             .add("target_bytes_per_sec", target_bytes_per_sec)
             .add("throughput_ops", ops_per_sec)
