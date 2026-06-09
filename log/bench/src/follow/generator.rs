@@ -74,8 +74,12 @@ pub async fn run_generator(
     session_rate: f64,
     seed: u64,
     max_inflight: usize,
+    session_key_range: usize,
 ) -> anyhow::Result<()> {
-    let cardinality = state.keys.len() as u64;
+    // Sessions select uniformly from the first `session_key_range` keys (a hot
+    // subrange); the writer still populates all `state.keys`. Clamp to the key
+    // count so an over-large value just means "the whole keyspace".
+    let cardinality = (session_key_range as u64).min(state.keys.len() as u64);
     if cardinality == 0 || session_rate <= 0.0 {
         cancel.cancelled().await;
         return Ok(());

@@ -237,6 +237,19 @@ impl Benchmark for FollowBenchmark {
             Some(v) => v.parse::<usize>()?.max(1),
             None => 100_000,
         };
+        // Restrict session key selection to the first `session_key_range` keys (a
+        // contiguous hot subrange), while the writer still populates all
+        // `key_cardinality` keys. Lets us hold the LSM large/sparse but shrink the
+        // read working set so it fits the block cache — isolating cache-thrashing
+        // from intrinsic block sparsity. Omitted/0 ⇒ full keyspace.
+        let session_key_range: usize = match params.get("session_key_range") {
+            // 0 (or omitted, or ≥ cardinality) ⇒ the full keyspace.
+            Some(v) => match v.parse::<usize>()? {
+                0 => cardinality,
+                n => n.min(cardinality),
+            },
+            None => cardinality,
+        };
 
         // Read path. `writer` (default) serves polls from the writer's own handle;
         // `reader` serves them from a single standalone `LogDbReader` over the
@@ -371,6 +384,7 @@ impl Benchmark for FollowBenchmark {
             session_rate,
             seed,
             max_inflight,
+            session_key_range,
         ));
 
         // Arrivals writers.
