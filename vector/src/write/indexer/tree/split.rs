@@ -387,6 +387,7 @@ impl SplitCentroids {
                             p.id(),
                             vec![c_id],
                             index_data.indexed_fields.clone(),
+                            index_data.fts_fields.clone(),
                         );
                     } else {
                         // if this is a non-leaf level, then the posting vectors are centroids,
