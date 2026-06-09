@@ -351,6 +351,30 @@ fn default_buffer_gc_grace_period() -> Duration {
 pub struct SearchOptions {
     /// Number of centroids to probe during search.
     pub nprobe: Option<usize>,
+    /// BM25 scoring algorithm override (default: [`Bm25Scorer::BlockMax`]).
+    pub bm25_scorer: Option<Bm25Scorer>,
+}
+
+/// Which scoring algorithm the BM25 query path uses.
+///
+/// `BlockMax` (the default) prunes non-competitive documents with
+/// BlockMaxScore (RFC-0006 Milestone 3). `Exhaustive` scores every document
+/// in the union of the query terms' posting lists; it exists as a reference
+/// implementation and for benchmarking the pruned path against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bm25Scorer {
+    /// Score every candidate document (RFC-0006 Milestone 0 path).
+    Exhaustive,
+    /// Skip non-competitive documents using BlockMaxScore, accumulating
+    /// essential clauses in a dense doc-id-indexed window buffer. Fastest
+    /// when doc ids are dense.
+    #[default]
+    BlockMax,
+    /// BlockMaxScore with posting-count-sized windows and sort-merge
+    /// accumulation. Holds up when the doc id space is sparse (heavy
+    /// delete/update churn leaves permanent id gaps), where `BlockMax`'s
+    /// dense window buffer degrades.
+    BlockMaxSparse,
 }
 
 /// Configuration for a read-only vector database client.
