@@ -250,6 +250,18 @@ impl Benchmark for FollowBenchmark {
             },
             None => cardinality,
         };
+        // Automatic segment seal interval (ms). With no sealing (the default) all
+        // writes land in one ever-growing segment, so every poll scans the full
+        // sequence history. A short interval time-windows the log, so a tail
+        // follower only scans the recent segment(s) — bounding read scope by time.
+        let seal_interval = match params.get("seal_interval_ms") {
+            // 0 (or omitted) ⇒ no sealing (one ever-growing segment).
+            Some(v) => match v.parse::<u64>()? {
+                0 => None,
+                n => Some(Duration::from_millis(n)),
+            },
+            None => None,
+        };
 
         // Read path. `writer` (default) serves polls from the writer's own handle;
         // `reader` serves them from a single standalone `LogDbReader` over the
@@ -281,11 +293,12 @@ impl Benchmark for FollowBenchmark {
         };
 
         let storage_config = bench.spec().data().storage.clone();
-        let config = Config {
+        let mut config = Config {
             storage: storage_config.clone(),
             read_visibility,
             ..Default::default()
         };
+        config.segmentation.seal_interval = seal_interval;
         let writer = LogDb::open(config).await?;
         let logdb_store = match read_path.as_str() {
             "writer" => Arc::new(LogDbStore::new(writer)),
