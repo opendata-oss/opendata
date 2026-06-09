@@ -10,13 +10,14 @@ mod types;
 use crate::Vector;
 use crate::error::{Error, Result};
 use crate::metric_names::QUERY_SEARCH_DURATION_SECONDS;
-use crate::model::{Bm25Query, Query, ScoreBy, SearchOptions, SearchResult};
+use crate::model::{Bm25Query, Bm25Scorer, Query, ScoreBy, SearchOptions, SearchResult};
 use crate::query_engine::ann::{ANNOperator, ExhaustiveNNOperator};
-use crate::query_engine::bm25::BM25Operator;
+use crate::query_engine::bm25::{BM25Operator, BM25Score, BlockMaxBM25Operator, EssentialStrategy};
 use crate::query_engine::filter::PreparedFilter;
 use crate::query_engine::lookup::LookupOperator;
 use crate::query_engine::operator::{BoxedOperator, Operator};
 use crate::query_engine::project::ProjectOperator;
+use crate::query_engine::types::ScoredVectorId;
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::storage::VectorDbStorageReadExt;
@@ -161,7 +162,7 @@ impl QueryEngine {
     ) -> Result<BoxedOperator<Vec<SearchResult>>> {
         match &query.score_by {
             ScoreBy::Ann(vector) => self.plan_ann(vector, query, options).await,
-            ScoreBy::Bm25(bm25) => self.plan_bm25(bm25, query).await,
+            ScoreBy::Bm25(bm25) => self.plan_bm25(bm25, query, options).await,
         }
     }
 
@@ -196,30 +197,52 @@ impl QueryEngine {
         Ok(Box::new(plan))
     }
 
-    /// BM25 search path (RFC-0006 Milestone 0).
+    /// BM25 search path (RFC-0006).
     ///
     /// Assembles the operator chain `bm25 -> lookup -> project` and runs it.
-    /// The BM25 operator scores and ranks ids (metadata filtering and FTS delete
-    /// resolution happen there, before scoring); lookup/project then materialize
-    /// the forward-index data and apply field selection.
+    /// The BM25 source scores and ranks ids (metadata filtering and FTS delete
+    /// resolution happen there, before collection); lookup/project then
+    /// materialize the forward-index data and apply field selection. The
+    /// source defaults to the BlockMaxScore scorer; `options.bm25_scorer`
+    /// selects the exhaustive reference scorer instead (Milestone 0 path).
     async fn plan_bm25(
         &self,
         bm25: &Bm25Query,
         query: &Query,
+        options: SearchOptions,
     ) -> Result<BoxedOperator<Vec<SearchResult>>> {
         // TODO: defer filter resolution to execution time
         let filter = PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
-        let source = BM25Operator::new(
-            self.storage.clone(),
-            bm25.clone(),
-            filter,
-            self.deletions.clone(),
-            query.limit,
-        );
+        let source: BoxedOperator<Vec<ScoredVectorId<BM25Score>>> =
+            match options.bm25_scorer.unwrap_or_default() {
+                Bm25Scorer::Exhaustive => Box::new(BM25Operator::new(
+                    self.storage.clone(),
+                    bm25.clone(),
+                    filter,
+                    self.deletions.clone(),
+                    query.limit,
+                )),
+                Bm25Scorer::BlockMax => Box::new(BlockMaxBM25Operator::new(
+                    self.storage.clone(),
+                    bm25.clone(),
+                    filter,
+                    self.deletions.clone(),
+                    query.limit,
+                    EssentialStrategy::DenseWindow,
+                )),
+                Bm25Scorer::BlockMaxSparse => Box::new(BlockMaxBM25Operator::new(
+                    self.storage.clone(),
+                    bm25.clone(),
+                    filter,
+                    self.deletions.clone(),
+                    query.limit,
+                    EssentialStrategy::SortMerge,
+                )),
+            };
         let lookup = LookupOperator::new(
             self.storage.clone(),
             self.options.dimensions as usize,
-            Box::new(source),
+            source,
         );
         let project = ProjectOperator::new(query.include_fields.clone(), Box::new(lookup));
         let plan = LeafOperator::new(project);

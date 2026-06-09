@@ -59,6 +59,7 @@ async fn warm(
                 &q,
                 SearchOptions {
                     nprobe: Some(dataset.nprobe),
+                    ..Default::default()
                 },
             )
             .await?;
@@ -133,6 +134,7 @@ async fn warm(
                             &q,
                             SearchOptions {
                                 nprobe: Some(nprobe),
+                                ..Default::default()
                             },
                         )
                         .await?;

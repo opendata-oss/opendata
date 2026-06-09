@@ -6,10 +6,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use bencher::Benchmark;
 use tracing_subscriber::EnvFilter;
+use vector_bench::fts::FtsBenchmark;
 use vector_bench::recall::RecallBenchmark;
 
 fn benchmarks() -> Vec<Box<dyn Benchmark>> {
-    vec![Box::new(RecallBenchmark::new())]
+    vec![
+        Box::new(RecallBenchmark::new()),
+        Box::new(FtsBenchmark::new()),
+    ]
 }
 
 #[tokio::main]
