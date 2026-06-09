@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use super::config::{BlockCacheConfig, ObjectStoreConfig, StorageConfig};
+use super::config::{BlockCacheConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
@@ -74,15 +74,7 @@ impl StorageBuilder {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
                 let object_store = create_object_store(&slate_config.object_store)?;
-                let settings = match &slate_config.settings_path {
-                    Some(path) => Settings::from_file(path).map_err(|e| {
-                        StorageError::Storage(format!(
-                            "Failed to load SlateDB settings from {}: {}",
-                            path, e
-                        ))
-                    })?,
-                    None => Settings::load().unwrap_or_default(),
-                };
+                let settings = load_slatedb_settings(slate_config)?;
                 info!(
                     "create slatedb storage with config: {:?}, settings: {:?}",
                     slate_config, settings
@@ -244,6 +236,37 @@ impl StorageSemantics {
     pub fn with_merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
         self.merge_operator = Some(op);
         self
+    }
+}
+
+pub fn new_slatedb_compactor_builder(
+    config: &StorageConfig,
+) -> StorageResult<Option<CompactorBuilder<String>>> {
+    match config {
+        StorageConfig::InMemory => Ok(None),
+        StorageConfig::SlateDb(slate_config) => {
+            let object_store = create_object_store(&slate_config.object_store)?;
+            let settings = load_slatedb_settings(slate_config)?;
+            match settings.compactor_options {
+                Some(compactor_options) => Ok(Some(
+                    CompactorBuilder::new(slate_config.path.clone(), object_store)
+                        .with_options(compactor_options),
+                )),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+fn load_slatedb_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings> {
+    match &slate_config.settings_path {
+        Some(path) => Ok(Settings::from_file(path).map_err(|e| {
+            StorageError::Storage(format!(
+                "Failed to load SlateDB settings from {}: {}",
+                path, e
+            ))
+        })?),
+        None => Ok(Settings::load().unwrap_or_default()),
     }
 }
 
@@ -833,5 +856,28 @@ mod tests {
         let storage = StorageBuilder::new(&config).await.unwrap().build().await;
 
         assert!(storage.is_ok());
+    }
+
+    #[test]
+    fn new_slatedb_compactor_builder_should_be_none_for_in_memory() {
+        // given / when - the in-memory backend has no compactor to configure
+        let builder = new_slatedb_compactor_builder(&StorageConfig::InMemory).unwrap();
+
+        // then
+        assert!(builder.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_slatedb_compactor_builder_should_be_some_for_slatedb() {
+        // given - a SlateDb config (default settings enable compaction)
+        let tmp = tempfile::tempdir().unwrap();
+        let config = slatedb_config_with_local_dir(tmp.path());
+
+        // when
+        let builder = new_slatedb_compactor_builder(&config).unwrap();
+
+        // then - a compactor builder is produced for consumers to configure and
+        // install via `StorageBuilder::map_slatedb`.
+        assert!(builder.is_some());
     }
 }
