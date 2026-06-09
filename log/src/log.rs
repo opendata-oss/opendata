@@ -17,6 +17,7 @@ use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
 use common::storage::config::StorageConfig;
 use common::{CompactorBuilder, StorageBuilder, create_object_store};
+use slatedb::SstBlockSize;
 use slatedb::compactor::CompactionSchedulerSupplier;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
@@ -533,6 +534,7 @@ impl LogRead for LogDb {
 pub struct LogDbBuilder {
     config: crate::config::Config,
     clock: Option<Arc<dyn Clock>>,
+    sst_block_size: Option<usize>,
 }
 
 impl LogDbBuilder {
@@ -541,7 +543,20 @@ impl LogDbBuilder {
         Self {
             config,
             clock: None,
+            sst_block_size: None,
         }
+    }
+
+    /// Overrides the SlateDB SST block size, in bytes. This is a `DbBuilder`-time
+    /// setting (not part of SlateDB `Settings`), so it can only be set here.
+    ///
+    /// Must be one of SlateDB's supported sizes — 1, 2, 4, 8, 16, 32, or 64 KiB
+    /// (1024…65536 bytes); [`build`](Self::build) errors on any other value. A
+    /// no-op for the in-memory backend. `None` (the default) leaves SlateDB's own
+    /// default of 4 KiB.
+    pub fn with_sst_block_size(mut self, bytes: Option<usize>) -> Self {
+        self.sst_block_size = bytes;
+        self
     }
 
     /// Overrides the wall-clock source. Test-only — production callers always
@@ -593,6 +608,15 @@ impl LogDbBuilder {
         } else {
             sb
         };
+        // SST block size is a DbBuilder-time setting (not part of SlateDB Settings);
+        // apply it here when requested. No-op for the in-memory backend.
+        let sb = match self.sst_block_size {
+            Some(bytes) => {
+                let size = sst_block_size_from_bytes(bytes)?;
+                sb.map_slatedb(move |db| db.with_sst_block_size(size))
+            }
+            None => sb,
+        };
         let storage = sb
             .build()
             .await
@@ -620,6 +644,26 @@ impl LogDbBuilder {
         )
         .await
     }
+}
+
+/// Map a byte count to SlateDB's fixed [`SstBlockSize`] ladder (1–64 KiB).
+/// Errors on any value not on the ladder, since SlateDB only supports those.
+fn sst_block_size_from_bytes(bytes: usize) -> Result<SstBlockSize> {
+    Ok(match bytes {
+        1024 => SstBlockSize::Block1Kib,
+        2048 => SstBlockSize::Block2Kib,
+        4096 => SstBlockSize::Block4Kib,
+        8192 => SstBlockSize::Block8Kib,
+        16384 => SstBlockSize::Block16Kib,
+        32768 => SstBlockSize::Block32Kib,
+        65536 => SstBlockSize::Block64Kib,
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "sst_block_size {other} bytes is unsupported; use one of \
+                 1024, 2048, 4096, 8192, 16384, 32768, 65536"
+            )));
+        }
+    })
 }
 
 /// Applies a written view directly to the read view (used in Memory mode where

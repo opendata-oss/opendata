@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use bencher::{Bench, Benchmark, Counter, Histogram, Params, Summary};
 use bytes::Bytes;
-use log::{AppendError, Config, LogDb, Record};
+use log::{AppendError, Config, LogDb, LogDbBuilder, Record};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -259,6 +259,13 @@ impl Benchmark for IngestBenchmark {
             Some(v) => Some(Duration::from_millis(v.parse()?)),
             None => None,
         };
+        // SlateDB SST block size, in bytes. A DbBuilder-time setting (not part of
+        // SlateDB Settings), so it is applied via LogDbBuilder below. Must be on
+        // SlateDB's ladder (1/2/4/8/16/32/64 KiB); absent ⇒ SlateDB default (4 KiB).
+        let block_size: Option<usize> = match params.get("block_size") {
+            Some(v) => Some(v.parse()?),
+            None => None,
+        };
 
         let live = LiveMetrics {
             records: bench.counter("records"),
@@ -273,7 +280,12 @@ impl Benchmark for IngestBenchmark {
         };
         config.compaction.l0_only = l0_only;
         config.segmentation.seal_interval = seal_interval;
-        let log = Arc::new(LogDb::open(config).await?);
+        let log = Arc::new(
+            LogDbBuilder::new(config)
+                .with_sst_block_size(block_size)
+                .build()
+                .await?,
+        );
 
         // Deterministic key space, shared (read-only) across all writer tasks.
         let keys = Arc::new(
@@ -342,6 +354,7 @@ impl Benchmark for IngestBenchmark {
         let mut summary = Summary::new()
             .add("num_writer_tasks", num_writer_tasks as f64)
             .add("l0_only", if l0_only { 1.0 } else { 0.0 })
+            .add("block_size", block_size.map_or(0.0, |b| b as f64))
             .add(
                 "seal_interval_ms",
                 seal_interval.map_or(0.0, |d| d.as_millis() as f64),
