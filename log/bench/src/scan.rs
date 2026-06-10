@@ -52,6 +52,7 @@ fn make_params(
     params.insert("scans", scans.to_string());
     params.insert("scan_lag", scan_lag.to_string());
     params.insert("scan_path", scan_path.to_string());
+    params.insert("settle_secs", "0".to_string());
     params
 }
 
@@ -132,6 +133,7 @@ impl Benchmark for ScanBenchmark {
             Some("range") => ScanPath::Range,
             other => anyhow::bail!("scan_path must be 'prefix' or 'range', got {:?}", other),
         };
+        let settle_secs: u64 = bench.spec().params().get_parse("settle_secs")?;
         let total_records = num_keys * entries_per_key;
         anyhow::ensure!(scans <= num_keys, "scans must be <= num_keys");
 
@@ -211,6 +213,15 @@ impl Benchmark for ScanBenchmark {
             }
         }
         db.flush().await?;
+        // Compaction runs inside the writer; an aggressive prefill outpaces
+        // it and leaves the tree as a pile of small sorted runs. A settle
+        // window lets the compactor consolidate before we measure, so the
+        // run can target the steady-state LSM shape rather than the
+        // mid-ingest one. The per-scan GET counts reveal which shape a run
+        // actually measured.
+        if settle_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(settle_secs)).await;
+        }
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
         let prefill_gets = (common::object_store_gets() - prefill_gets_base) as f64;
 

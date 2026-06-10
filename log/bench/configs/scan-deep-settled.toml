@@ -1,0 +1,56 @@
+# Deep per-key histories measured after a compaction settle window, so the
+# scans run against a consolidated tree (each key's history in dense
+# contiguous blocks) instead of the mid-ingest pile of small sorted runs.
+# This is the shape where the cursor position matters: a prefix scan reads a
+# key's blocks from entry 0, a range scan starts at the cursor.
+#
+#   cargo run --release -p log-bench -- -b scan -c log/bench/configs/scan-deep-settled.toml -d 120
+
+[data.storage]
+type = "SlateDb"
+path = "bench-data"
+settings_path = "log/bench/configs/slatedb-small-sst.toml"
+
+[data.storage.object_store]
+type = "Local"
+path = "/tmp/opendata-scan-bench"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "5"
+scan_path = "range"
+settle_secs = "45"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "18446744073709551615"
+scan_path = "range"
+settle_secs = "45"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "5"
+scan_path = "prefix"
+settle_secs = "45"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "18446744073709551615"
+scan_path = "prefix"
+settle_secs = "45"
