@@ -15,6 +15,8 @@
 //! ```text
 //! log-inspect --data-dir ./.data segments
 //! log-inspect --data-dir ./.data keys
+//! log-inspect --data-dir ./.data tree
+//! log-inspect --data-dir ./.data tree --segment 1
 //! log-inspect --data-dir ./.data count orders
 //! log-inspect --data-dir ./.data scan orders --limit 20
 //! log-inspect --config reader.yaml scan orders --from 100 --to 200 --hex
@@ -27,7 +29,7 @@ use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use common::StorageConfig;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
-use log::{LogDbReader, LogRead, ReaderConfig};
+use log::{LogDbReader, LogRead, ReaderConfig, SegmentTree, TreeSummary};
 
 /// Inspect an OpenData log through a read-only [`LogDbReader`].
 #[derive(Debug, Parser)]
@@ -82,6 +84,7 @@ impl StorageArgs {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         Ok(ReaderConfig {
@@ -121,6 +124,18 @@ enum Command {
         /// Exclusive upper bound on sequence number.
         #[arg(long)]
         to: Option<u64>,
+    },
+    /// Summarize how data is distributed across the SlateDB LSM tree.
+    ///
+    /// With no flags, prints the manifest header and a per-segment
+    /// distribution table. Pass `--segment <ID>` to drill into one LogDb
+    /// segment's run-by-run breakdown. Reads only manifest metadata, never
+    /// SST files.
+    Tree {
+        /// Show the run-by-run breakdown for a single LogDb segment id
+        /// (`0` is the system segment).
+        #[arg(long, value_name = "ID")]
+        segment: Option<u32>,
     },
     /// Scan and print entries for a key within a sequence range.
     Scan {
@@ -172,6 +187,7 @@ async fn run(reader: &LogDbReader, command: Command) -> Result<()> {
             segment_start,
             segment_end,
         } => keys(reader, segment_start, segment_end).await,
+        Command::Tree { segment } => tree(reader, segment).await,
         Command::Count { key, from, to } => count(reader, key, from, to).await,
         Command::Scan {
             key,
@@ -229,6 +245,135 @@ async fn keys(
         println!("\n{count} key(s)");
     }
     Ok(())
+}
+
+async fn tree(reader: &LogDbReader, segment: Option<u32>) -> Result<()> {
+    let Some(summary) = reader.tree_summary().await.context("summarizing tree")? else {
+        println!("(no manifest; the in-memory backend has no LSM tree)");
+        return Ok(());
+    };
+
+    print_manifest_header(&summary);
+    match segment {
+        Some(id) => print_segment_detail(&summary, id),
+        None => print_segment_table(&summary),
+    }
+    Ok(())
+}
+
+/// Prints the manifest-level header common to both tree views.
+fn print_manifest_header(summary: &TreeSummary) {
+    println!(
+        "manifest #{}  writer_epoch={}  compactor_epoch={}  last_l0_seq={}",
+        summary.manifest_id, summary.writer_epoch, summary.compactor_epoch, summary.last_l0_seq,
+    );
+    println!(
+        "extractor: {}",
+        summary.extractor.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "total estimated size: {}",
+        format_bytes(summary.estimated_bytes())
+    );
+    println!();
+}
+
+/// Prints one row per segment: L0 SSTs, sorted-run count, total SSTs, and size.
+fn print_segment_table(summary: &TreeSummary) {
+    // Top-level tree first (usually empty once the extractor routes writes),
+    // then segments ordered by id with any undecodable prefixes last.
+    let mut rows: Vec<(String, &SegmentTree)> = Vec::new();
+    if !summary.unsegmented.is_empty() {
+        rows.push(("(top-level)".to_string(), &summary.unsegmented));
+    }
+    let mut segments: Vec<&SegmentTree> = summary.segments.iter().collect();
+    segments.sort_by(|a, b| match (a.segment_id, b.segment_id) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    rows.extend(segments.into_iter().map(|t| (segment_label(t), t)));
+
+    if rows.is_empty() {
+        println!("(empty tree; no SSTs)");
+        return;
+    }
+
+    println!(
+        "{:>12}  {:>8}  {:>6}  {:>10}  {:>12}",
+        "SEGMENT", "L0_SSTS", "RUNS", "TOTAL_SSTS", "EST_SIZE",
+    );
+    for (label, t) in &rows {
+        println!(
+            "{:>12}  {:>8}  {:>6}  {:>10}  {:>12}",
+            label,
+            t.l0.num_ssts,
+            t.runs.len(),
+            t.total_ssts(),
+            format_bytes(t.estimated_bytes()),
+        );
+    }
+    println!("\n{} segment(s)", rows.len());
+}
+
+/// Prints the run-by-run breakdown for a single segment.
+fn print_segment_detail(summary: &TreeSummary, id: u32) {
+    let Some(t) = summary.segments.iter().find(|t| t.segment_id == Some(id)) else {
+        println!("segment {id} not found in manifest");
+        return;
+    };
+
+    println!(
+        "segment {}  (prefix {})",
+        segment_label(t),
+        render(&t.prefix, true)
+    );
+    println!("{:>8}  {:>6}  {:>12}", "LEVEL", "SSTS", "EST_SIZE");
+    println!(
+        "{:>8}  {:>6}  {:>12}",
+        "L0",
+        t.l0.num_ssts,
+        format_bytes(t.l0.estimated_bytes),
+    );
+    for (i, run) in t.runs.iter().enumerate() {
+        println!(
+            "{:>8}  {:>6}  {:>12}",
+            format!("run[{i}]"),
+            run.num_ssts,
+            format_bytes(run.estimated_bytes),
+        );
+    }
+    println!(
+        "\ntotal: {} ssts, {}",
+        t.total_ssts(),
+        format_bytes(t.estimated_bytes()),
+    );
+}
+
+/// Human label for a segment: `system` for id 0, the id for user segments,
+/// or the hex prefix when the routing prefix did not decode.
+fn segment_label(t: &SegmentTree) -> String {
+    match t.segment_id {
+        Some(0) => "system".to_string(),
+        Some(id) => id.to_string(),
+        None => render(&t.prefix, true),
+    }
+}
+
+/// Formats a byte count as a human-readable size (binary units).
+fn format_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut size = n as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
 }
 
 async fn count(
