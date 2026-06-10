@@ -95,14 +95,26 @@ impl Benchmark for ScanBenchmark {
     }
 
     fn default_params(&self) -> Vec<Params> {
-        // Defaults: ~400k records over 20k keys (~110 MB raw), 20 flushes.
-        // The cross product that tells the story: each scan path at a
-        // shallow lag (read the last 5 of ~20 entries) and at full catch-up
-        // (read the key's whole history).
+        // Two data shapes, each scanned by both paths at a shallow lag
+        // (read the last 5 entries) and at full catch-up (read the key's
+        // whole history):
+        //
+        // - Shallow histories: 20k keys x 20 entries (~110 MB). A key's
+        //   entire history fits in a block or two, so the cost of a scan is
+        //   dominated by locating the key, not by how far back it reads.
+        // - Deep histories: 2k keys x 1000 entries (~560 MB raw, ~256 KB =
+        //   dozens of blocks per key). The cursor position matters: a
+        //   prefix scan reads the key's blocks from entry 0 regardless of
+        //   the cursor, while a range scan starts at the cursor.
         let mut sets = Vec::new();
         for scan_path in ["range", "prefix"] {
             for scan_lag in [5, usize::MAX] {
                 sets.push(make_params(20_000, 20, 256, 20_000, 200, scan_lag, scan_path));
+            }
+        }
+        for scan_path in ["range", "prefix"] {
+            for scan_lag in [5, usize::MAX] {
+                sets.push(make_params(2_000, 1_000, 256, 20_000, 200, scan_lag, scan_path));
             }
         }
         sets
