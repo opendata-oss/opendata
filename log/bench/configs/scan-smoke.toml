@@ -1,5 +1,6 @@
 # Smoke config for the scan benchmark: tiny dataset, slatedb over an
-# in-memory object store so GET counts are exercised end to end.
+# in-memory object store so GET counts are exercised end to end. Each cell
+# measures both scan paths interleaved over the same store.
 
 [data.storage]
 type = "SlateDb"
@@ -15,13 +16,3 @@ value_size = "128"
 flush_every = "4000"
 scans = "50"
 scan_lag = "3"
-scan_path = "range"
-
-[[params.scan]]
-num_keys = "2000"
-entries_per_key = "10"
-value_size = "128"
-flush_every = "4000"
-scans = "50"
-scan_lag = "3"
-scan_path = "prefix"

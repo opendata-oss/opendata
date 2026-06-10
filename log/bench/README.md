@@ -57,7 +57,13 @@ distinct keys starting `scan_lag` entries behind each key's tail. It reports
 latency percentiles and object-store GETs per scan, diffed around each scan
 for exact attribution.
 
-The `scan_path` parameter selects the access path under comparison:
+Each cell measures both access paths interleaved **over the same store**
+(even sample slots scan with `range`, odd with `prefix`), reporting
+`range_*` and `prefix_*` metrics side by side. Comparing paths across
+separately prefilled cells does not work: per-scan cost is dominated by the
+number of sources (L0 SSTs + sorted runs) in the segments the cursor
+covers, and independently prefilled stores settle into different shapes
+depending on ingest/seal/compaction timing.
 
 - `range` — bounded range scan; the backend prunes SSTs/blocks by key-range
   metadata and starts at the cursor, but consults no bloom filters.

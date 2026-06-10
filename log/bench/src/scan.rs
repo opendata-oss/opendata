@@ -1,29 +1,37 @@
 //! Single-key catch-up scan benchmark for the log database.
 //!
 //! Measures the cost of `scan(key, cursor..)` — the follow path of RFC 0006 —
-//! as a function of the storage access path ([`ScanPath`]) and how far behind
-//! the cursor is. The point of the benchmark is to compare scan strategies
-//! over identical data:
+//! comparing both storage access paths ([`ScanPath`]) **over the same store**:
 //!
-//! - `scan_path=range` (variant A): bounded range scan; the backend prunes
-//!   SSTs/blocks by key-range metadata and starts at the cursor, but consults
-//!   no bloom filters.
-//! - `scan_path=prefix` (variant B): prefix scan over `(segment, key)`;
-//!   prefix bloom filters skip SSTs without the key, but the scan reads the
-//!   key's entries from the start of each segment regardless of the cursor.
+//! - `range` (variant A): bounded range scan; the backend prunes SSTs/blocks
+//!   by key-range metadata and starts at the cursor, but consults no bloom
+//!   filters.
+//! - `prefix` (variant B): prefix scan over `(segment, key)`; prefix bloom
+//!   filters skip SSTs without the key, but the scan reads the key's entries
+//!   from the start of each segment regardless of the cursor.
 //!
-//! The cost signal is object-store GETs per scan (deterministic for a given
-//! data layout; see RFC 0006), measured by diffing the process-global GET
-//! counter around each scan — scans run sequentially so the attribution is
-//! exact. Latency is recorded as a secondary signal.
+//! Each cell prefills once and then interleaves the two paths across its
+//! scans (even sample slots scan with `range`, odd with `prefix` — disjoint
+//! keys, identical tree). Per-cell prefill would not work for an A/B
+//! comparison: the LSM shape after prefill is a race between ingest, seal
+//! timing, and compaction, and per-scan cost is dominated by the number of
+//! sources (L0 SSTs + sorted runs) in the segments the cursor covers — two
+//! independently prefilled stores routinely settle into different shapes.
+//!
+//! The cost signal is object-store GETs per scan, measured by diffing the
+//! process-global GET counter around each scan — scans run sequentially so
+//! the attribution is exact. Latency is recorded as a secondary signal.
 //!
 //! Prefill appends records to keys drawn from a seeded PRNG, so each flushed
 //! SST contains a random subset of the keyspace — the regime where bloom
 //! filters can help. (Round-robin arrivals would put every key in every SST
-//! and filters could never skip anything.) An explicit flush every
-//! `flush_every` records controls how many L0 SSTs the prefill produces.
-//! Every scan targets a distinct key, so no scan is served from blocks a
-//! previous scan already cached.
+//! and filters could never skip anything.) Note the absent-key probability is
+//! e^(-records_per_source / num_keys): at low cardinality every source
+//! contains every key and filters cannot skip anything, so filter benefits
+//! only show at high `num_keys`. An explicit flush every `flush_every`
+//! records controls how many L0 SSTs the prefill produces. Every scan
+//! targets a distinct key, so no scan is served from blocks a previous scan
+//! already cached.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -42,7 +50,6 @@ fn make_params(
     flush_every: usize,
     scans: usize,
     scan_lag: usize,
-    scan_path: &str,
 ) -> Params {
     let mut params = Params::new();
     params.insert("num_keys", num_keys.to_string());
@@ -51,10 +58,18 @@ fn make_params(
     params.insert("flush_every", flush_every.to_string());
     params.insert("scans", scans.to_string());
     params.insert("scan_lag", scan_lag.to_string());
-    params.insert("scan_path", scan_path.to_string());
     params.insert("settle_secs", "0".to_string());
     params.insert("seal_interval_ms", "0".to_string());
     params
+}
+
+/// Per-path accumulators for the interleaved measure loop.
+#[derive(Default)]
+struct PathStats {
+    latencies_us: Vec<f64>,
+    gets: Vec<f64>,
+    entries_read: usize,
+    completed: usize,
 }
 
 /// xorshift64* PRNG — deterministic arrivals without an extra dependency.
@@ -109,15 +124,11 @@ impl Benchmark for ScanBenchmark {
         //   prefix scan reads the key's blocks from entry 0 regardless of
         //   the cursor, while a range scan starts at the cursor.
         let mut sets = Vec::new();
-        for scan_path in ["range", "prefix"] {
-            for scan_lag in [5, usize::MAX] {
-                sets.push(make_params(20_000, 20, 256, 20_000, 200, scan_lag, scan_path));
-            }
+        for scan_lag in [5, usize::MAX] {
+            sets.push(make_params(20_000, 20, 256, 20_000, 200, scan_lag));
         }
-        for scan_path in ["range", "prefix"] {
-            for scan_lag in [5, usize::MAX] {
-                sets.push(make_params(2_000, 1_000, 256, 20_000, 200, scan_lag, scan_path));
-            }
+        for scan_lag in [5, usize::MAX] {
+            sets.push(make_params(2_000, 1_000, 256, 20_000, 200, scan_lag));
         }
         sets
     }
@@ -129,11 +140,6 @@ impl Benchmark for ScanBenchmark {
         let flush_every: usize = bench.spec().params().get_parse("flush_every")?;
         let scans: usize = bench.spec().params().get_parse("scans")?;
         let scan_lag: usize = bench.spec().params().get_parse("scan_lag")?;
-        let scan_path = match bench.spec().params().get("scan_path") {
-            Some("prefix") => ScanPath::Prefix,
-            Some("range") => ScanPath::Range,
-            other => anyhow::bail!("scan_path must be 'prefix' or 'range', got {:?}", other),
-        };
         let settle_secs: u64 = bench.spec().params().get_parse("settle_secs")?;
         let seal_interval_ms: u64 = bench.spec().params().get_parse("seal_interval_ms")?;
         let total_records = num_keys * entries_per_key;
@@ -141,8 +147,10 @@ impl Benchmark for ScanBenchmark {
 
         // Live metrics - updated during the benchmark
         let scans_counter = bench.counter("scans");
-        let scan_latency = bench.histogram("scan_latency_us");
-        let scan_gets = bench.histogram("scan_gets");
+        let range_latency = bench.histogram("range_scan_latency_us");
+        let range_gets = bench.histogram("range_scan_gets");
+        let prefix_latency = bench.histogram("prefix_scan_latency_us");
+        let prefix_gets = bench.histogram("prefix_scan_gets");
 
         // Sealing matters for LSM shape: the compaction scheduler only
         // relieves L0 pressure on the active segment (sorted runs pile up
@@ -235,13 +243,13 @@ impl Benchmark for ScanBenchmark {
         // settling. Together with the post-reopen scan assertions this
         // brackets where entries disappear: write path, settle-window
         // compaction, or reopen/recovery.
-        verify_key0(&db, &keys[0], &sampled_seqs[0], scan_path, "post-prefill").await?;
+        verify_key0(&db, &keys[0], &sampled_seqs[0], ScanPath::Range, "post-prefill").await?;
         if settle_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(settle_secs)).await;
         }
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
         let prefill_gets = (common::object_store_gets() - prefill_gets_base) as f64;
-        verify_key0(&db, &keys[0], &sampled_seqs[0], scan_path, "pre-close").await?;
+        verify_key0(&db, &keys[0], &sampled_seqs[0], ScanPath::Range, "pre-close").await?;
 
         // When the object store is durable, reopen the database so the
         // measured scans start from a cold block cache instead of reading
@@ -261,12 +269,13 @@ impl Benchmark for ScanBenchmark {
         };
 
         // Measure: sequential scans, one distinct key each, diffing the
-        // global GET counter around each scan for exact attribution.
+        // global GET counter around each scan for exact attribution. The two
+        // paths alternate by sample slot (even = range, odd = prefix) so
+        // they run over the identical tree on disjoint keys, with any cache
+        // warm-up spread evenly across both.
         let runner = bench.start();
-        let mut latencies_us: Vec<f64> = Vec::with_capacity(scans);
-        let mut gets_per_scan: Vec<f64> = Vec::with_capacity(scans);
-        let mut entries_read = 0usize;
-        let mut completed = 0usize;
+        let mut range_stats = PathStats::default();
+        let mut prefix_stats = PathStats::default();
 
         for (slot, seqs) in sampled_seqs.iter().enumerate() {
             if !runner.keep_running() {
@@ -277,6 +286,11 @@ impl Benchmark for ScanBenchmark {
                 // The PRNG never drew this key; nothing to scan.
                 continue;
             }
+            let scan_path = if slot % 2 == 0 {
+                ScanPath::Range
+            } else {
+                ScanPath::Prefix
+            };
             let start_pos = seqs.len().saturating_sub(scan_lag);
             let start_seq = seqs[start_pos];
             let expected = seqs.len() - start_pos;
@@ -314,9 +328,10 @@ impl Benchmark for ScanBenchmark {
                     .map(|s| (s.id, s.start_seq))
                     .collect();
                 anyhow::bail!(
-                    "scan of key {} returned {} entries, expected {}; \
+                    "{:?} scan of key {} returned {} entries, expected {}; \
                      {} missing seqs (first 20: {:?}); expected range {}..={}; \
                      segments (id, start_seq): {:?}",
+                    scan_path,
                     key_idx,
                     n,
                     expected,
@@ -329,23 +344,40 @@ impl Benchmark for ScanBenchmark {
             }
 
             scans_counter.increment(1);
-            scan_latency.record(elapsed.as_secs_f64() * MICROS_PER_SEC);
-            scan_gets.record(gets as f64);
-            latencies_us.push(elapsed.as_secs_f64() * MICROS_PER_SEC);
-            gets_per_scan.push(gets as f64);
-            entries_read += n;
-            completed += 1;
+            let latency_us = elapsed.as_secs_f64() * MICROS_PER_SEC;
+            let stats = match scan_path {
+                ScanPath::Range => {
+                    range_latency.record(latency_us);
+                    range_gets.record(gets as f64);
+                    &mut range_stats
+                }
+                ScanPath::Prefix => {
+                    prefix_latency.record(latency_us);
+                    prefix_gets.record(gets as f64);
+                    &mut prefix_stats
+                }
+            };
+            stats.latencies_us.push(latency_us);
+            stats.gets.push(gets as f64);
+            stats.entries_read += n;
+            stats.completed += 1;
         }
         let elapsed_secs = runner.elapsed().as_secs_f64();
+        let completed = range_stats.completed + prefix_stats.completed;
 
         let mut summary = Summary::new()
             .add("prefill_secs", prefill_secs)
             .add("prefill_gets", prefill_gets)
             .add("scans_completed", completed as f64)
-            .add("entries_read", entries_read as f64)
+            .add(
+                "entries_read",
+                (range_stats.entries_read + prefix_stats.entries_read) as f64,
+            )
             .add("scans_per_sec", completed as f64 / elapsed_secs);
-        summary = add_percentiles(summary, "latency_us", &mut latencies_us);
-        summary = add_percentiles(summary, "gets", &mut gets_per_scan);
+        summary = add_percentiles(summary, "range_latency_us", &mut range_stats.latencies_us);
+        summary = add_percentiles(summary, "range_gets", &mut range_stats.gets);
+        summary = add_percentiles(summary, "prefix_latency_us", &mut prefix_stats.latencies_us);
+        summary = add_percentiles(summary, "prefix_gets", &mut prefix_stats.gets);
         bench.summarize(summary).await?;
 
         db.close().await?;
