@@ -4,3 +4,11 @@
 # is measurable. The default (64 MiB) would leave a benchmark-sized
 # dataset in one or two SSTs.
 l0_sst_size_bytes = 1048576
+
+# Small SSTs + segment sealing pile up L0s far faster than the default
+# gate (8) tolerates: memtable flush dispatch blocks on sealed segments'
+# pending L0s and prefill throughput collapses while consolidation
+# rewrites whole segments. Raise the gate so the benchmark's write phase
+# is not artificially serialized against compaction.
+l0_max_ssts = 128
+l0_max_ssts_per_key = 128
