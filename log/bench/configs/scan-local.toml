@@ -1,0 +1,17 @@
+# Scan benchmark over a local-filesystem object store.
+#
+# Local FS gives durable storage, so the benchmark reopens the database
+# after prefill and the measured scans run from a cold block cache with
+# exact object-store GET counts. Run from the repo root (settings_path is
+# resolved relative to the working directory):
+#
+#   cargo run --release -p log-bench -- -b scan -c log/bench/configs/scan-local.toml -d 120
+
+[data.storage]
+type = "SlateDb"
+path = "bench-data"
+settings_path = "log/bench/configs/slatedb-small-sst.toml"
+
+[data.storage.object_store]
+type = "Local"
+path = "/tmp/opendata-scan-bench"

@@ -132,7 +132,7 @@ impl Benchmark for ScanBenchmark {
             storage: bench.spec().data().storage.clone(),
             ..Default::default()
         };
-        let db = LogDb::open(config).await?;
+        let db = LogDb::open(config.clone()).await?;
 
         let keys: Vec<Bytes> = (0..num_keys)
             .map(|i| Bytes::from(format!("key-{:08}", i)))
@@ -201,6 +201,23 @@ impl Benchmark for ScanBenchmark {
         db.flush().await?;
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
         let prefill_gets = (common::object_store_gets() - prefill_gets_base) as f64;
+
+        // When the object store is durable, reopen the database so the
+        // measured scans start from a cold block cache instead of reading
+        // back blocks the prefill left in memory. (An in-memory object store
+        // is per-handle — reopening would lose the data — so those runs keep
+        // the warm handle and measure mostly cache behavior.)
+        let durable = matches!(
+            &config.storage,
+            common::StorageConfig::SlateDb(c)
+                if !matches!(c.object_store, common::ObjectStoreConfig::InMemory)
+        );
+        let db = if durable {
+            db.close().await?;
+            LogDb::open(config.clone()).await?
+        } else {
+            db
+        };
 
         // Measure: sequential scans, one distinct key each, diffing the
         // global GET counter around each scan for exact attribution.

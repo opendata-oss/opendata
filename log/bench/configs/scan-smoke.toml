@@ -1,0 +1,27 @@
+# Smoke config for the scan benchmark: tiny dataset, slatedb over an
+# in-memory object store so GET counts are exercised end to end.
+
+[data.storage]
+type = "SlateDb"
+path = "bench-data"
+
+[data.storage.object_store]
+type = "InMemory"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "10"
+value_size = "128"
+flush_every = "4000"
+scans = "50"
+scan_lag = "3"
+scan_path = "range"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "10"
+value_size = "128"
+flush_every = "4000"
+scans = "50"
+scan_lag = "3"
+scan_path = "prefix"

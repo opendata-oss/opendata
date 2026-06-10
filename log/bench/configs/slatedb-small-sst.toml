@@ -1,0 +1,6 @@
+# SlateDB settings for the scan benchmark: a small L0 SST size so the
+# prefill's memtable freezes frequently and the data spreads across many
+# SSTs — the regime where SST pruning (bloom filters, range metadata)
+# is measurable. The default (64 MiB) would leave a benchmark-sized
+# dataset in one or two SSTs.
+l0_sst_size_bytes = 1048576

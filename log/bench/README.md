@@ -46,3 +46,35 @@ bucket = "my-bucket"
 ## Benchmarks
 
 - **ingest** - Measures log append throughput with various batch sizes and value sizes
+- **scan** - Measures single-key catch-up scans (`scan(key, cursor..)`), comparing
+  storage access paths over identical data
+
+### scan
+
+The scan benchmark prefills records to keys drawn from a seeded PRNG (so each
+SST holds a random subset of the keyspace), then issues sequential scans of
+distinct keys starting `scan_lag` entries behind each key's tail. It reports
+latency percentiles and object-store GETs per scan, diffed around each scan
+for exact attribution.
+
+The `scan_path` parameter selects the access path under comparison:
+
+- `range` — bounded range scan; the backend prunes SSTs/blocks by key-range
+  metadata and starts at the cursor, but consults no bloom filters.
+- `prefix` — prefix scan over `(segment, key)`; prefix bloom filters skip
+  SSTs without the key, but reads start at the key's first entry in each
+  segment regardless of the cursor.
+
+Run it against a local-filesystem object store so the database is reopened
+after prefill and scans run from a cold block cache:
+
+```sh
+cargo run --release -p log-bench -- -b scan -c log/bench/configs/scan-local.toml -d 120
+```
+
+`configs/scan-local.toml` points `settings_path` at
+`configs/slatedb-small-sst.toml`, which lowers `l0_sst_size_bytes` so the
+prefill spreads across many SSTs; run from the repo root so the relative
+path resolves. With an in-memory object store (`configs/scan-smoke.toml`)
+the data cannot survive a reopen, so scans stay on the warm handle and GET
+counts read ~0; use that config only as a correctness smoke test.
