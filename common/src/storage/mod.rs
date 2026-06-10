@@ -240,6 +240,24 @@ pub trait StorageRead: Send + Sync {
         range: BytesRange,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>>;
 
+    /// Returns an iterator over records whose key starts with `prefix`.
+    ///
+    /// Backends that support prefix-aware bloom filters (e.g. SlateDB with a
+    /// configured `PrefixExtractor`) consult those filters here, allowing
+    /// SSTs that contain no matching keys to be skipped without a block
+    /// read. Backends without such filters fall back to a range scan over
+    /// the prefix.
+    ///
+    /// The default implementation delegates to [`Self::scan_iter`] with
+    /// the range derived from the prefix, which preserves correctness for
+    /// any backend; backends that can do better should override this.
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        self.scan_iter(BytesRange::prefix(prefix)).await
+    }
+
     /// Collects all records in the range into a Vec.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn scan(&self, range: BytesRange) -> StorageResult<Vec<Record>> {

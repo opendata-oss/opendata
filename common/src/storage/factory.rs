@@ -10,7 +10,6 @@ use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
-use slatedb::DbReader;
 use slatedb::config::Settings;
 pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
@@ -18,6 +17,7 @@ pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 pub use slatedb::db_cache::{CachedEntry, CachedKey};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
+use slatedb::{DbReader, FilterPolicy};
 use tracing::info;
 use uuid::Uuid;
 
@@ -162,6 +162,9 @@ impl StorageBuilder {
                     let adapter = SlateDbStorage::merge_operator_adapter(op);
                     db_builder = db_builder.with_merge_operator(Arc::new(adapter));
                 }
+                if let Some(policies) = self.semantics.filter_policies {
+                    db_builder = db_builder.with_filter_policies(policies);
+                }
                 let db = db_builder.build().await.map_err(|e| {
                     StorageError::Storage(format!("Failed to create SlateDB: {}", e))
                 })?;
@@ -251,6 +254,7 @@ impl StorageReaderRuntime {
 #[derive(Default)]
 pub struct StorageSemantics {
     pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
+    pub(crate) filter_policies: Option<Vec<Arc<dyn FilterPolicy>>>,
 }
 
 impl StorageSemantics {
@@ -265,6 +269,15 @@ impl StorageSemantics {
     /// Each system (timeseries, vector) defines its own merge semantics.
     pub fn with_merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
         self.merge_operator = Some(op);
+        self
+    }
+
+    /// Sets the filter policies for SlateDB writers and readers.
+    ///
+    /// System crates use this to keep the writer, compactor, and standalone
+    /// reader paths aligned on SST filter encoding/decoding behavior.
+    pub fn with_filter_policies(mut self, policies: Vec<Arc<dyn FilterPolicy>>) -> Self {
+        self.filter_policies = Some(policies);
         self
     }
 }
@@ -350,6 +363,9 @@ pub async fn create_storage_read(
             if let Some(op) = semantics.merge_operator {
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
                 builder = builder.with_merge_operator(Arc::new(adapter));
+            }
+            if let Some(policies) = semantics.filter_policies {
+                builder = builder.with_filter_policies(policies);
             }
             // Prefer runtime-provided cache, fall back to config. The
             // runtime-provided cache is owned by the caller, so we don't hold
