@@ -230,11 +230,18 @@ impl Benchmark for ScanBenchmark {
         // run can target the steady-state LSM shape rather than the
         // mid-ingest one. The per-scan GET counts reveal which shape a run
         // actually measured.
+        // Verify key 0 on the warm writer handle at two points: right after
+        // prefill (before the settle window's compaction) and again after
+        // settling. Together with the post-reopen scan assertions this
+        // brackets where entries disappear: write path, settle-window
+        // compaction, or reopen/recovery.
+        verify_key0(&db, &keys[0], &sampled_seqs[0], scan_path, "post-prefill").await?;
         if settle_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(settle_secs)).await;
         }
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
         let prefill_gets = (common::object_store_gets() - prefill_gets_base) as f64;
+        verify_key0(&db, &keys[0], &sampled_seqs[0], scan_path, "pre-close").await?;
 
         // When the object store is durable, reopen the database so the
         // measured scans start from a cold block cache instead of reading
@@ -284,19 +291,42 @@ impl Benchmark for ScanBenchmark {
                 )
                 .await?;
             let mut n = 0usize;
-            while let Some(_entry) = iter.next().await? {
+            let mut returned = Vec::with_capacity(expected);
+            while let Some(entry) = iter.next().await? {
                 n += 1;
+                returned.push(entry.sequence);
             }
             let elapsed = scan_start.elapsed();
             let gets = common::object_store_gets() - gets_before;
 
-            anyhow::ensure!(
-                n == expected,
-                "scan of key {} returned {} entries, expected {}",
-                key_idx,
-                n,
-                expected
-            );
+            if n != expected {
+                let returned_set: std::collections::HashSet<u64> =
+                    returned.iter().copied().collect();
+                let missing: Vec<u64> = seqs[start_pos..]
+                    .iter()
+                    .copied()
+                    .filter(|s| !returned_set.contains(s))
+                    .collect();
+                let segments: Vec<(u32, u64)> = db
+                    .list_segments(..)
+                    .await?
+                    .iter()
+                    .map(|s| (s.id, s.start_seq))
+                    .collect();
+                anyhow::bail!(
+                    "scan of key {} returned {} entries, expected {}; \
+                     {} missing seqs (first 20: {:?}); expected range {}..={}; \
+                     segments (id, start_seq): {:?}",
+                    key_idx,
+                    n,
+                    expected,
+                    missing.len(),
+                    &missing[..missing.len().min(20)],
+                    seqs[start_pos],
+                    seqs[seqs.len() - 1],
+                    segments,
+                );
+            }
 
             scans_counter.increment(1);
             scan_latency.record(elapsed.as_secs_f64() * MICROS_PER_SEC);
@@ -322,6 +352,34 @@ impl Benchmark for ScanBenchmark {
         bench.close().await?;
         Ok(())
     }
+}
+
+/// Scan all of key 0's entries on the given handle and report how many of
+/// the expected set came back. A debugging probe, not a measurement.
+async fn verify_key0(
+    db: &LogDb,
+    key: &Bytes,
+    seqs: &[u64],
+    scan_path: ScanPath,
+    label: &str,
+) -> anyhow::Result<()> {
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    let mut iter = db
+        .scan_with_options(key.clone(), seqs[0].., ScanOptions { scan_path })
+        .await?;
+    let mut n = 0usize;
+    while iter.next().await?.is_some() {
+        n += 1;
+    }
+    println!(
+        "    {} verify: key 0 returned {} of {} expected entries",
+        label,
+        n,
+        seqs.len()
+    );
+    Ok(())
 }
 
 /// Append a batch, retrying on `QueueFull`/`Timeout` backpressure.
