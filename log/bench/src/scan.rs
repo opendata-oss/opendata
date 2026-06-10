@@ -140,8 +140,16 @@ impl Benchmark for ScanBenchmark {
         let flush_every: usize = bench.spec().params().get_parse("flush_every")?;
         let scans: usize = bench.spec().params().get_parse("scans")?;
         let scan_lag: usize = bench.spec().params().get_parse("scan_lag")?;
-        let settle_secs: u64 = bench.spec().params().get_parse("settle_secs")?;
-        let seal_interval_ms: u64 = bench.spec().params().get_parse("seal_interval_ms")?;
+        // Optional knobs — config-file param sets replace the defaults
+        // wholesale, so absent labels mean "off" rather than an error.
+        let settle_secs: u64 = match bench.spec().params().get("settle_secs") {
+            Some(v) => v.parse()?,
+            None => 0,
+        };
+        let seal_interval_ms: u64 = match bench.spec().params().get("seal_interval_ms") {
+            Some(v) => v.parse()?,
+            None => 0,
+        };
         let total_records = num_keys * entries_per_key;
         anyhow::ensure!(scans <= num_keys, "scans must be <= num_keys");
 
