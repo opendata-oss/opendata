@@ -98,6 +98,7 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
         object_store,
         settings_path: None,
         block_cache: None,
+        meta_cache: None,
     });
     let storage = StorageBuilder::new(&config)
         .await

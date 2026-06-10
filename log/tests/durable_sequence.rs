@@ -21,6 +21,7 @@ fn slatedb_config(dir: &TempDir, read_visibility: ReadVisibility) -> Config {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         }),
         read_visibility,
         ..Default::default()

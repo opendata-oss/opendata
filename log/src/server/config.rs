@@ -49,6 +49,7 @@ impl CliArgs {
                 }),
                 settings_path: None,
                 block_cache: None,
+                meta_cache: None,
             })
         } else {
             // Local filesystem storage
@@ -59,6 +60,7 @@ impl CliArgs {
                 }),
                 settings_path: None,
                 block_cache: None,
+                meta_cache: None,
             })
         };
 

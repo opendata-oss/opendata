@@ -775,6 +775,7 @@ async fn setup_slatedb_test_app() -> Router {
             object_store: ObjectStoreConfig::InMemory,
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         }),
         ..Default::default()
     };

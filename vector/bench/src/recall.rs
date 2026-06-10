@@ -661,6 +661,7 @@ impl Dataset {
                     object_store: writer.object_store.clone(),
                     settings_path: reader.settings_path,
                     block_cache: reader.block_cache,
+                    meta_cache: reader.meta_cache,
                 }))
             }
             (_, storage) => Ok(storage),

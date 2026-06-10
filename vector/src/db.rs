@@ -1182,6 +1182,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         let config = Config {
@@ -1229,6 +1230,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         let config = Config {
@@ -1742,6 +1744,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
         let config = Config {
             storage: storage_config.clone(),

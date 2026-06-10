@@ -18,6 +18,7 @@ fn local_storage_config(dir: &TempDir) -> StorageConfig {
         }),
         settings_path: None,
         block_cache: None,
+        meta_cache: None,
     })
 }
 

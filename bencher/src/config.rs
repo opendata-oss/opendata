@@ -59,6 +59,7 @@ impl ReporterConfig {
             object_store: self.object_store.clone(),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         })
     }
 }

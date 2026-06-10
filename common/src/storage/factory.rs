@@ -15,28 +15,11 @@ use slatedb::config::Settings;
 pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
-pub use slatedb::db_cache::{CachedEntry, CachedKey};
+pub use slatedb::db_cache::{CachedEntry, CachedKey, SplitCache};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
 use uuid::Uuid;
-
-/// Handle to a foyer hybrid cache that we own and must close explicitly on
-/// shutdown. Cloneable because foyer's `HybridCache` is Arc-backed.
-///
-/// TODO(slatedb 0.13): remove this and the surrounding plumbing. SlateDB 0.13
-/// adds a `close()` hook to the `DbCache` trait and drives cache shutdown from
-/// `Db::close()` / `DbReader::close()`, so callers won't need to hold a side
-/// handle to the hybrid cache just to close it deterministically.
-pub(crate) type OwnedHybridCache = foyer::HybridCache<CachedKey, CachedEntry>;
-
-/// Block cache we constructed internally — keep the `HybridCache` handle so
-/// we can call `close().await` from `StorageRead::close()` instead of relying
-/// on foyer's Drop-based close, which races the runtime shutdown.
-struct ManagedBlockCache {
-    db_cache: Arc<dyn DbCache>,
-    hybrid: OwnedHybridCache,
-}
 
 /// Builder for creating storage instances from configuration.
 ///
@@ -70,7 +53,6 @@ struct ManagedBlockCache {
 pub struct StorageBuilder {
     inner: StorageBuilderInner,
     semantics: StorageSemantics,
-    managed_cache: Option<OwnedHybridCache>,
 }
 
 enum StorageBuilderInner {
@@ -82,11 +64,12 @@ impl StorageBuilder {
     /// Creates a new `StorageBuilder` from a [`StorageConfig`].
     ///
     /// For SlateDB configs this creates a [`DbBuilder`] with the configured
-    /// path, object store, settings, and block cache (if configured). For
-    /// InMemory configs it stores a sentinel so that `build()` returns an
-    /// `InMemoryStorage`.
+    /// path, object store, settings, and caches (if configured). When either
+    /// `block_cache` or `meta_cache` is set, the two are combined into a
+    /// [`SplitCache`] so data blocks and SST metadata can use independent
+    /// policies. For InMemory configs it stores a sentinel so that `build()`
+    /// returns an `InMemoryStorage`.
     pub async fn new(config: &StorageConfig) -> StorageResult<Self> {
-        let mut managed_cache: Option<OwnedHybridCache> = None;
         let inner = match config {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
@@ -106,11 +89,10 @@ impl StorageBuilder {
                 );
                 let mut db_builder =
                     DbBuilder::new(slate_config.path.clone(), object_store).with_settings(settings);
-                if let Some(managed) =
-                    create_block_cache_from_config(&slate_config.block_cache).await?
+                if let Some(cache) =
+                    build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
                 {
-                    db_builder = db_builder.with_db_cache(managed.db_cache);
-                    managed_cache = Some(managed.hybrid);
+                    db_builder = db_builder.with_db_cache(cache);
                 }
                 StorageBuilderInner::SlateDb(Box::new(db_builder))
             }
@@ -118,7 +100,6 @@ impl StorageBuilder {
         Ok(Self {
             inner,
             semantics: StorageSemantics::default(),
-            managed_cache,
         })
     }
 
@@ -165,10 +146,7 @@ impl StorageBuilder {
                 let db = db_builder.build().await.map_err(|e| {
                     StorageError::Storage(format!("Failed to create SlateDB: {}", e))
                 })?;
-                Ok(Arc::new(SlateDbStorage::new_with_managed_cache(
-                    Arc::new(db),
-                    self.managed_cache,
-                )))
+                Ok(Arc::new(SlateDbStorage::new(Arc::new(db))))
             }
         }
     }
@@ -351,36 +329,59 @@ pub async fn create_storage_read(
                 let adapter = SlateDbStorage::merge_operator_adapter(op);
                 builder = builder.with_merge_operator(Arc::new(adapter));
             }
-            // Prefer runtime-provided cache, fall back to config. The
-            // runtime-provided cache is owned by the caller, so we don't hold
-            // a handle to close it on shutdown.
-            let mut managed_cache: Option<OwnedHybridCache> = None;
+            // Prefer the runtime-provided cache (owned by the caller); fall
+            // back to the config-driven split cache. SlateDB drives cache
+            // shutdown from `DbReader::close()`, so we don't hold a handle.
             if let Some(cache) = runtime.block_cache {
                 builder = builder.with_db_cache(cache);
-            } else if let Some(managed) =
-                create_block_cache_from_config(&slate_config.block_cache).await?
+            } else if let Some(cache) =
+                build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
             {
-                builder = builder.with_db_cache(managed.db_cache);
-                managed_cache = Some(managed.hybrid);
+                builder = builder.with_db_cache(cache);
             }
             let reader = builder.build().await.map_err(|e| {
                 StorageError::Storage(format!("Failed to create SlateDB reader: {}", e))
             })?;
-            Ok(Arc::new(SlateDbStorageReader::new_with_managed_cache(
-                Arc::new(reader),
-                managed_cache,
-            )))
+            Ok(Arc::new(SlateDbStorageReader::new(Arc::new(reader))))
         }
     }
 }
 
-/// Creates a block cache from the serializable config, if present. Returns
-/// both the `DbCache` trait object handed to SlateDB and a `HybridCache`
-/// handle the caller keeps so it can close the cache deterministically on
-/// shutdown.
-async fn create_block_cache_from_config(
+/// Builds the combined SlateDB cache from the serializable data- and
+/// metadata-cache configs.
+///
+/// When either side is configured, both are built (a `None` side caches
+/// nothing for its block class) and wrapped in a [`SplitCache`] that routes
+/// data blocks to the data cache and index/filter/stats blocks to the meta
+/// cache. Returns `None` only when neither side is configured, so callers can
+/// skip `with_db_cache` entirely.
+///
+/// SlateDB drives cache shutdown from `Db::close()` / `DbReader::close()`, so
+/// callers do not need to retain a handle to close the cache themselves.
+async fn build_split_cache(
+    data: &Option<BlockCacheConfig>,
+    meta: &Option<BlockCacheConfig>,
+) -> StorageResult<Option<Arc<dyn DbCache>>> {
+    if data.is_none() && meta.is_none() {
+        return Ok(None);
+    }
+    let data_cache = build_cache(data, "data").await?;
+    let meta_cache = build_cache(meta, "meta").await?;
+    let split = SplitCache::new()
+        .with_block_cache(data_cache)
+        .with_meta_cache(meta_cache)
+        .build();
+    Ok(Some(Arc::new(split) as Arc<dyn DbCache>))
+}
+
+/// Builds a single [`DbCache`] from one cache config, or `None` when absent.
+///
+/// `label` distinguishes the data vs metadata cache in logs and in the foyer
+/// cache name.
+async fn build_cache(
     config: &Option<BlockCacheConfig>,
-) -> StorageResult<Option<ManagedBlockCache>> {
+    label: &str,
+) -> StorageResult<Option<Arc<dyn DbCache>>> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -442,7 +443,7 @@ async fn create_block_cache_from_config(
             };
 
             let cache = HybridCacheBuilder::new()
-                .with_name("slatedb_block_cache")
+                .with_name(format!("slatedb_{label}_cache"))
                 .with_metrics_registry(Box::new(MetricsRsRegistry))
                 .with_policy(policy)
                 .memory(memory_capacity)
@@ -462,6 +463,7 @@ async fn create_block_cache_from_config(
                 })?;
 
             info!(
+                cache = label,
                 memory_mb = foyer_config.memory_capacity / (1024 * 1024),
                 disk_mb = foyer_config.disk_capacity / (1024 * 1024),
                 disk_path = %foyer_config.disk_path,
@@ -470,15 +472,34 @@ async fn create_block_cache_from_config(
                 buffer_pool_mb = foyer_config.effective_buffer_pool_size() / (1024 * 1024),
                 submit_queue_threshold_mb =
                     foyer_config.submit_queue_size_threshold / (1024 * 1024),
-                "hybrid block cache enabled"
+                "hybrid cache enabled"
             );
 
-            let db_cache =
-                Arc::new(FoyerHybridCache::new_with_cache(cache.clone())) as Arc<dyn DbCache>;
-            Ok(Some(ManagedBlockCache {
-                db_cache,
-                hybrid: cache,
-            }))
+            Ok(Some(
+                Arc::new(FoyerHybridCache::new_with_cache(cache)) as Arc<dyn DbCache>
+            ))
+        }
+        BlockCacheConfig::FoyerMemory(mem_config) => {
+            let max_capacity = mem_config.capacity;
+            let opts = match mem_config.shards {
+                Some(shards) => FoyerCacheOptions {
+                    max_capacity,
+                    shards,
+                },
+                None => FoyerCacheOptions {
+                    max_capacity,
+                    ..FoyerCacheOptions::default()
+                },
+            };
+            info!(
+                cache = label,
+                capacity_mb = max_capacity / (1024 * 1024),
+                shards = opts.shards,
+                "in-memory cache enabled"
+            );
+            Ok(Some(
+                Arc::new(FoyerCache::new_with_opts(opts)) as Arc<dyn DbCache>
+            ))
         }
     }
 }
@@ -487,7 +508,8 @@ async fn create_block_cache_from_config(
 mod tests {
     use super::*;
     use crate::storage::config::{
-        FoyerHybridCacheConfig, LocalObjectStoreConfig, SlateDbStorageConfig,
+        FoyerHybridCacheConfig, FoyerMemoryCacheConfig, LocalObjectStoreConfig,
+        SlateDbStorageConfig,
     };
 
     fn foyer_cache_config(
@@ -514,6 +536,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         })
     }
 
@@ -534,6 +557,7 @@ mod tests {
                 4 * 1024 * 1024,
                 cache_dir.to_str().unwrap().to_string(),
             ))),
+            meta_cache: None,
         });
 
         let storage = StorageBuilder::new(&config).await.unwrap().build().await;
@@ -542,6 +566,47 @@ mod tests {
             storage.is_ok(),
             "expected config-driven block cache to work"
         );
+    }
+
+    #[tokio::test]
+    async fn should_create_storage_with_split_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("data-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Hybrid data cache + in-memory meta cache combined into a SplitCache.
+        let config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp.path().join("obj").to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
+                1024 * 1024,
+                4 * 1024 * 1024,
+                cache_dir.to_str().unwrap().to_string(),
+            ))),
+            meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+                capacity: 1024 * 1024,
+                shards: None,
+            })),
+        });
+
+        let storage = StorageBuilder::new(&config).await.unwrap().build().await;
+
+        assert!(storage.is_ok(), "expected split cache to build");
+    }
+
+    #[tokio::test]
+    async fn should_build_split_cache_with_only_meta_cache() {
+        // A meta-only config still produces a SplitCache (data side caches
+        // nothing); build_split_cache returns Some.
+        let meta = Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+            capacity: 1024 * 1024,
+            shards: Some(1),
+        }));
+        let cache = build_split_cache(&None, &meta).await.unwrap();
+        assert!(cache.is_some(), "meta-only config should yield a cache");
     }
 
     #[tokio::test]
@@ -561,6 +626,7 @@ mod tests {
                 4 * 1024 * 1024,
                 cache_dir.to_str().unwrap().to_string(),
             ))),
+            meta_cache: None,
         };
 
         // First open a writer so the reader has a manifest to read
@@ -598,7 +664,7 @@ mod tests {
             "/tmp/unused".to_string(),
         ));
 
-        let result = create_block_cache_from_config(&Some(config)).await;
+        let result = build_cache(&Some(config), "data").await;
         assert!(result.is_err());
     }
 
@@ -619,6 +685,7 @@ mod tests {
                 4 * 1024 * 1024,
                 bad_disk_path.to_string(),
             ))),
+            meta_cache: None,
         })
     }
 
@@ -665,6 +732,7 @@ mod tests {
                 4 * 1024 * 1024,
                 bad_path.to_str().unwrap().to_string(),
             ))),
+            meta_cache: None,
         };
 
         // First open a writer (without cache) so the reader has a manifest
@@ -713,6 +781,7 @@ mod tests {
                 4 * 1024 * 1024,
                 bad_path.to_str().unwrap().to_string(),
             ))),
+            meta_cache: None,
         };
 
         // First open a writer (without cache) so the reader has a manifest
@@ -749,9 +818,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_return_none_when_no_block_cache_configured() {
-        let result = create_block_cache_from_config(&None).await.unwrap();
+    async fn should_return_none_when_no_cache_configured() {
+        let result = build_split_cache(&None, &None).await.unwrap();
         assert!(result.is_none());
+        // And the single-cache builder returns None for an absent config.
+        assert!(build_cache(&None, "data").await.unwrap().is_none());
     }
 
     #[tokio::test]

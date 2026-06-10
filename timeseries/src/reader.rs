@@ -591,6 +591,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         // 1. Open writer and write data
@@ -705,6 +706,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         let writer = TimeSeriesDb::open(Config {
@@ -874,6 +876,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         let writer = TimeSeriesDb::open(Config {

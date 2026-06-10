@@ -329,6 +329,7 @@ pub(crate) unsafe fn build_storage_config(
                 object_store: os_config,
                 settings_path: settings,
                 block_cache: None,
+                meta_cache: None,
             }))
         }
         _ => Err(error_result(
