@@ -53,6 +53,7 @@ fn make_params(
     params.insert("scan_lag", scan_lag.to_string());
     params.insert("scan_path", scan_path.to_string());
     params.insert("settle_secs", "0".to_string());
+    params.insert("seal_interval_ms", "0".to_string());
     params
 }
 
@@ -134,6 +135,7 @@ impl Benchmark for ScanBenchmark {
             other => anyhow::bail!("scan_path must be 'prefix' or 'range', got {:?}", other),
         };
         let settle_secs: u64 = bench.spec().params().get_parse("settle_secs")?;
+        let seal_interval_ms: u64 = bench.spec().params().get_parse("seal_interval_ms")?;
         let total_records = num_keys * entries_per_key;
         anyhow::ensure!(scans <= num_keys, "scans must be <= num_keys");
 
@@ -142,8 +144,17 @@ impl Benchmark for ScanBenchmark {
         let scan_latency = bench.histogram("scan_latency_us");
         let scan_gets = bench.histogram("scan_gets");
 
+        // Sealing matters for LSM shape: the compaction scheduler only
+        // relieves L0 pressure on the active segment (sorted runs pile up
+        // and are never merged with each other); full consolidation into a
+        // single dense sorted run happens only after a segment seals. A
+        // nonzero seal interval lets the prefill produce sealed segments
+        // that consolidate during the settle window.
+        let seal_interval = (seal_interval_ms > 0)
+            .then(|| std::time::Duration::from_millis(seal_interval_ms));
         let config = Config {
             storage: bench.spec().data().storage.clone(),
+            segmentation: log::SegmentConfig { seal_interval },
             ..Default::default()
         };
         let db = LogDb::open(config.clone()).await?;

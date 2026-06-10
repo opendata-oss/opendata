@@ -23,6 +23,7 @@ flush_every = "20000"
 scans = "200"
 scan_lag = "5"
 scan_path = "range"
+seal_interval_ms = "500"
 settle_secs = "45"
 
 [[params.scan]]
@@ -33,6 +34,7 @@ flush_every = "20000"
 scans = "200"
 scan_lag = "18446744073709551615"
 scan_path = "range"
+seal_interval_ms = "500"
 settle_secs = "45"
 
 [[params.scan]]
@@ -43,6 +45,7 @@ flush_every = "20000"
 scans = "200"
 scan_lag = "5"
 scan_path = "prefix"
+seal_interval_ms = "500"
 settle_secs = "45"
 
 [[params.scan]]
@@ -53,4 +56,5 @@ flush_every = "20000"
 scans = "200"
 scan_lag = "18446744073709551615"
 scan_path = "prefix"
+seal_interval_ms = "500"
 settle_secs = "45"
