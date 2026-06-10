@@ -8,6 +8,7 @@ publish = false
 bencher.workspace = true
 bytes.workspace = true
 log = { path = "..", package = "opendata-log" }
+common.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
