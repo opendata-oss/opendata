@@ -28,6 +28,63 @@ use crate::storage::{LogStorageRead as _, SegmentIterator};
 use common::storage::factory::create_storage_read;
 use common::{StorageRead, StorageReaderRuntime, StorageSemantics};
 
+/// Per-segment LSM read-amplification statistics, produced by the
+/// `count_in_range` walk over persisted SSTs.
+///
+/// Present only when the read went through the SST-walk path (a
+/// `LogDirect` handle is available). A scan fallback — the in-memory
+/// backend, or a SlateDB config whose object store is in-memory — reports
+/// `None` via [`SegmentInspection::reads`], since no manifest walk occurs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentReadStats {
+    /// SST views opened while counting this segment's slice. Includes every
+    /// L0 SST (L0 is not range-partitioned, so each must be consulted) plus
+    /// the sorted-run views covering the query.
+    pub ssts_opened: u32,
+    /// Opened SSTs that held at least one in-range row for this key — i.e.
+    /// how many SSTs the key's records were physically spread across.
+    pub ssts_contributing: u32,
+    /// Data blocks read to count this segment's slice precisely. Blocks
+    /// resolved via the cheap stats/last-entry path do not count here.
+    pub blocks_read: u32,
+}
+
+/// How a single covering segment contributed to an [`Inspection`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentInspection {
+    /// The segment that produced these records.
+    pub segment_id: SegmentId,
+    /// Records for the key found in this segment's slice of the query.
+    pub count: u64,
+    /// Records counted by the memtable/lagging-snapshot tail scan rather
+    /// than the SST walk — writes not yet reflected in persisted SSTs. Kept
+    /// separate so `reads` stays an honest account of persisted-tree I/O.
+    pub tail_scanned: u64,
+    /// LSM read-amplification for the SST walk, or `None` when the count was
+    /// produced entirely by a scan (no `LogDirect`; see [`SegmentReadStats`]).
+    pub reads: Option<SegmentReadStats>,
+}
+
+/// Result of [`LogRead::inspect`]: the record count for a key/range plus a
+/// breakdown of how the query flowed through the LSM tree.
+///
+/// [`total`](Inspection::total) is exactly what [`LogRead::count`] returns;
+/// the remaining fields expose the tree shape and per-segment read
+/// amplification the walk observed, for tuning segmentation and compaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inspection {
+    /// Total records for the key in the queried range.
+    pub total: u64,
+    /// L0 SSTs in the manifest at query time (whole-DB tree shape, not
+    /// scoped to the query). `0` when no SST walk ran.
+    pub l0_ssts: u32,
+    /// Sorted runs in the manifest at query time (whole-DB tree shape).
+    /// `0` when no SST walk ran.
+    pub sorted_runs: u32,
+    /// Per covering-segment breakdown, in ascending segment order.
+    pub segments: Vec<SegmentInspection>,
+}
+
 /// Trait for read operations on the log.
 ///
 /// This trait defines the common read interface shared by [`LogDb`](crate::LogDb)
@@ -115,6 +172,11 @@ pub trait LogRead {
     /// Returns the exact number of entries in the specified range. Useful
     /// for computing lag (how far behind a consumer is) or progress metrics.
     ///
+    /// This is a thin wrapper over [`inspect`](LogRead::inspect), returning
+    /// only [`Inspection::total`]. The two do identical work; use `inspect`
+    /// when you also want the per-segment distribution and read-amplification
+    /// breakdown.
+    ///
     /// # Arguments
     ///
     /// * `key` - The key identifying the log stream to count.
@@ -123,7 +185,32 @@ pub trait LogRead {
     /// # Errors
     ///
     /// Returns an error if the count fails due to storage issues.
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64>;
+    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
+        Ok(self.inspect(key, seq_range).await?.total)
+    }
+
+    /// Inspects entries for a key within a sequence number range, returning
+    /// the record count plus a breakdown of how the query flowed through the
+    /// LSM tree.
+    ///
+    /// Like [`count`](LogRead::count) but also reports, per covering segment,
+    /// the record distribution and the read amplification the underlying
+    /// SST walk incurred (SSTs opened, SSTs that contributed rows, data
+    /// blocks read), along with the manifest's tree shape. See [`Inspection`].
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key identifying the log stream to inspect.
+    /// * `seq_range` - The sequence number range to inspect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails due to storage issues.
+    async fn inspect(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> Result<Inspection>;
 
     /// Lists distinct keys within a segment range.
     ///
@@ -221,6 +308,15 @@ fn segment_window(segments: &[LogSegment], i: usize, query: &Range<Sequence>) ->
     lo..hi
 }
 
+/// Internal result of inspecting one segment: the public per-segment
+/// breakdown plus the global tree-shape counters (lifted to the top-level
+/// [`Inspection`] by the caller, since they're identical across segments).
+struct SegmentWalk {
+    inspection: SegmentInspection,
+    l0_ssts: u32,
+    sorted_runs: u32,
+}
+
 /// Shared read component used by both `LogDb` and `LogDbReader`.
 ///
 /// Contains the storage and segment cache needed for read operations.
@@ -281,67 +377,112 @@ impl LogReadView {
         LogIterator::open(Arc::clone(&self.storage), &self.segments, key, seq_range)
     }
 
-    /// Counts entries for `key` in `seq_range`, exact.
+    /// Inspects entries for `key` in `seq_range`: exact count plus the
+    /// per-segment read-amplification breakdown.
     ///
     /// Fans out across overlapping segments — clipped to each segment's
     /// window. When [`LogDirect`] is available, walks persisted SSTs via
-    /// `count_in_range` for the bulk count and scans `(covered_to, seg_hi)`
-    /// to pick up anything still in the memtable. Otherwise falls back to
-    /// a plain scan tally.
-    pub(crate) async fn count(&self, key: Bytes, seq_range: Range<Sequence>) -> Result<u64> {
+    /// `count_in_range` (capturing traversal stats) for the bulk count and
+    /// scans `(covered_to, seg_hi)` to pick up anything still in the
+    /// memtable. Otherwise falls back to a plain scan tally with no
+    /// SST-level detail.
+    pub(crate) async fn inspect(
+        &self,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+    ) -> Result<Inspection> {
         let segments = self.segments.find_covering(&seq_range);
-        let mut total = 0u64;
+        let mut inspection = Inspection {
+            total: 0,
+            l0_ssts: 0,
+            sorted_runs: 0,
+            segments: Vec::new(),
+        };
         for (i, segment) in segments.iter().enumerate() {
             let window = segment_window(&segments, i, &seq_range);
             if window.start >= window.end {
                 continue;
             }
-            let n = match self.direct.as_deref() {
+            let seg = match self.direct.as_deref() {
                 Some(direct) => {
-                    self.count_segment_via_direct(direct, segment, &key, window)
+                    self.inspect_segment_via_direct(direct, segment, &key, window)
                         .await?
                 }
-                None => self.storage.count_entries(segment, &key, window).await?,
+                None => {
+                    let count = self.storage.count_entries(segment, &key, window).await?;
+                    SegmentWalk {
+                        inspection: SegmentInspection {
+                            segment_id: segment.id(),
+                            count,
+                            tail_scanned: 0,
+                            reads: None,
+                        },
+                        // No manifest walk on the scan-fallback path.
+                        l0_ssts: 0,
+                        sorted_runs: 0,
+                    }
+                }
             };
-            total = total.saturating_add(n);
+            inspection.total = inspection.total.saturating_add(seg.inspection.count);
+            // Tree shape is global to the DB, so it's identical across every
+            // segment that walked the manifest — take the largest seen.
+            inspection.l0_ssts = inspection.l0_ssts.max(seg.l0_ssts);
+            inspection.sorted_runs = inspection.sorted_runs.max(seg.sorted_runs);
+            inspection.segments.push(seg.inspection);
         }
-        Ok(total)
+        Ok(inspection)
     }
 
-    /// Counts entries in a single segment slice using [`LogDirect`].
+    /// Inspects entries in a single segment slice using [`LogDirect`].
     ///
     /// Walks persisted SSTs via `count_in_range` and tops up with a tail
     /// scan above the witness key. The tail scan covers two cases at once:
     /// writes still in the memtable, and writes flushed since `direct`'s
     /// manifest snapshot was taken (the DbReader polls, so its view can lag
-    /// the writer).
-    async fn count_segment_via_direct(
+    /// the writer). The tail's contribution is reported separately as
+    /// [`SegmentInspection::tail_scanned`] so the SST stats stay honest.
+    async fn inspect_segment_via_direct(
         &self,
         direct: &LogDirect,
         segment: &LogSegment,
         key: &Bytes,
         window: Range<Sequence>,
-    ) -> Result<u64> {
+    ) -> Result<SegmentWalk> {
         let byte_range = LogEntryKey::scan_range(segment, key, window.clone());
         let result = direct.count_in_range(&byte_range).await?;
         // LogDb is append-only, so only puts contribute. Tombstones or
         // merges in this byte range would indicate an unsupported op.
-        let mut total = result.counts.num_puts;
+        let sst_count = result.counts.num_puts;
 
-        let scan_lo = match result.covered_to {
-            Some(covered_key) => LogEntryKey::deserialize(&covered_key, segment.meta().start_seq)?
+        let scan_lo = match &result.covered_to {
+            Some(covered_key) => LogEntryKey::deserialize(covered_key, segment.meta().start_seq)?
                 .sequence
                 .saturating_add(1),
             None => window.start,
         };
-        if scan_lo < window.end {
-            total = total.saturating_add(
-                self.storage
-                    .count_entries(segment, key, scan_lo..window.end)
-                    .await?,
-            );
-        }
-        Ok(total)
+        let tail_scanned = if scan_lo < window.end {
+            self.storage
+                .count_entries(segment, key, scan_lo..window.end)
+                .await?
+        } else {
+            0
+        };
+
+        let stats = result.stats;
+        Ok(SegmentWalk {
+            inspection: SegmentInspection {
+                segment_id: segment.id(),
+                count: sst_count.saturating_add(tail_scanned),
+                tail_scanned,
+                reads: Some(SegmentReadStats {
+                    ssts_opened: stats.ssts_opened,
+                    ssts_contributing: stats.ssts_contributing,
+                    blocks_read: stats.blocks_read,
+                }),
+            },
+            l0_ssts: stats.l0_ssts,
+            sorted_runs: stats.sorted_runs,
+        })
     }
 
     /// Lists distinct keys within a segment range.
@@ -606,10 +747,14 @@ impl LogRead for LogDbReader {
         Ok(view.scan_with_options(key, seq_range, &options))
     }
 
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
+    async fn inspect(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> Result<Inspection> {
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
-        view.count(key, seq_range).await
+        view.inspect(key, seq_range).await
     }
 
     async fn list_keys(
