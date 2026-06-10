@@ -2430,8 +2430,13 @@ mod tests {
 
         let path = "/test/inspect_read_amp";
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        // Install the routing extractor so this matches production: writes
+        // land in per-segment trees, not the default tree. Without it the
+        // count walk would still pass via the default tree and never exercise
+        // the segment path.
         let db = Arc::new(
             DbBuilder::new(path, object_store.clone())
+                .with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
                 .build()
                 .await
                 .unwrap(),
@@ -2584,8 +2589,11 @@ mod tests {
 
         let path = "/test/slate_with_direct";
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        // Route writes into per-segment trees as production does; the count
+        // walk must find data in segments, not the (empty) default tree.
         let db = Arc::new(
             DbBuilder::new(path, object_store.clone())
+                .with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
                 .build()
                 .await
                 .unwrap(),

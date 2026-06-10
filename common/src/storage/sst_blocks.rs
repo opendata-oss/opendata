@@ -53,10 +53,11 @@
 //! append-only model where physical ops equal logical records. If an
 //! update or delete API is added to LogDb, revisit.
 
+use std::collections::VecDeque;
 use std::ops::Bound;
 
 use bytes::Bytes;
-use slatedb::manifest::{SsTableView, VersionedManifest};
+use slatedb::manifest::{SortedRun, SsTableView, VersionedManifest};
 use slatedb::{RowEntry, SstReader, SstStats, ValueDeletable};
 
 use crate::{BytesRange, StorageError, StorageResult};
@@ -84,18 +85,22 @@ impl BlockOpCounts {
 /// LSM traversal statistics for a single [`count_in_range`] walk.
 ///
 /// Captures how much of the tree the walk had to touch to produce the
-/// count — the raw material for read-amplification analysis. `l0_ssts`
-/// and `sorted_runs` describe the manifest's shape (global to the DB, not
-/// scoped to `query`); the remaining fields are scoped to the query range.
+/// count — the raw material for read-amplification analysis. `l0_ssts` and
+/// `sorted_runs` are summed over the trees the walk visited: the
+/// unsegmented default tree plus every configured segment whose prefix
+/// interval overlaps `query` (see [`count_in_range`]). For a query confined
+/// to one segment's prefix — the LogDb case — they describe that one
+/// segment's shape. The remaining fields are scoped to the query range.
 ///
-/// L0 SSTs are not range-partitioned, so the walk opens *every* L0 SST
-/// regardless of overlap — `ssts_opened` reflects that, which is why a
-/// large L0 directly inflates read amplification.
+/// L0 SSTs are not range-partitioned within a tree, so the walk opens
+/// *every* L0 SST of a visited tree regardless of overlap — `ssts_opened`
+/// reflects that, which is why a large L0 directly inflates read
+/// amplification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalkStats {
-    /// L0 SSTs present in the manifest (tree shape; not query-scoped).
+    /// L0 SSTs across the trees walked (tree shape; not query-scoped).
     pub l0_ssts: u32,
-    /// Sorted runs present in the manifest (tree shape; not query-scoped).
+    /// Sorted runs across the trees walked (tree shape; not query-scoped).
     pub sorted_runs: u32,
     /// SST views opened during the walk: every L0 SST plus each sorted
     /// run's views covering `query`. Opening reads the SST's index and
@@ -136,27 +141,100 @@ pub struct CountResult {
 /// Counts every physical write operation in the manifest whose key falls
 /// in `query`, and returns a witness of how far up the walk observed data.
 ///
-/// Covers L0 SSTs and the views returned by each compacted sorted run's
-/// `tables_covering_range(query)`. SSTs without a stats block (predating
-/// RFC 0020) are skipped with a tracing warning, so the result undercounts
-/// in that case.
+/// SlateDB stores data in two places: the unsegmented *default* tree
+/// ([`VersionedManifest::l0`] / [`compacted`](VersionedManifest::compacted))
+/// and, when a `PrefixExtractor` is configured, one independent LSM tree per
+/// *segment* ([`VersionedManifest::segments`]) — each owning the key
+/// interval `[prefix, prefix++)`. With an extractor every write routes to a
+/// segment and the default tree is empty by construction, so a walk that
+/// only consulted the default tree would miss all the data. This walks the
+/// default tree and every segment whose interval overlaps `query`; for a
+/// query confined to one routing prefix (the LogDb case) that is exactly one
+/// segment.
+///
+/// Within each tree it covers L0 SSTs and the views returned by each
+/// compacted sorted run's `tables_covering_range(query)`. SSTs without a
+/// stats block (predating RFC 0020) are skipped with a tracing warning, so
+/// the result undercounts in that case.
 pub async fn count_in_range(
     manifest: &VersionedManifest,
     sst_reader: &SstReader,
     query: &BytesRange,
 ) -> StorageResult<CountResult> {
     let mut result = CountResult::default();
-    result.stats.l0_ssts = manifest.l0().len() as u32;
-    result.stats.sorted_runs = manifest.compacted().len() as u32;
-    for view in manifest.l0() {
-        count_view(sst_reader, view, query, &mut result).await?;
-    }
-    for run in manifest.compacted() {
-        for view in run.tables_covering_range::<BytesRange>(query.clone()) {
-            count_view(sst_reader, view, query, &mut result).await?;
+
+    // The unsegmented default tree. Empty when an extractor is configured,
+    // but walking it keeps the no-extractor case correct.
+    walk_tree(
+        sst_reader,
+        manifest.l0(),
+        manifest.compacted(),
+        query,
+        &mut result,
+    )
+    .await?;
+
+    // Each configured segment owns a disjoint prefix interval; walk only
+    // those the query touches. This is where the data lives once a segment
+    // extractor routes writes away from the default tree.
+    for segment in manifest.segments() {
+        if ranges_overlap(query, &prefix_range(segment.prefix())) {
+            walk_tree(
+                sst_reader,
+                segment.l0(),
+                segment.compacted(),
+                query,
+                &mut result,
+            )
+            .await?;
         }
     }
     Ok(result)
+}
+
+/// Walks one LSM tree (a default tree or a single segment's tree): every L0
+/// SST plus the covering views of each sorted run. Accumulates counts,
+/// `covered_to`, and traversal stats into `result`.
+async fn walk_tree(
+    sst_reader: &SstReader,
+    l0: &VecDeque<SsTableView>,
+    compacted: &[SortedRun],
+    query: &BytesRange,
+    result: &mut CountResult,
+) -> StorageResult<()> {
+    result.stats.l0_ssts += l0.len() as u32;
+    result.stats.sorted_runs += compacted.len() as u32;
+    for view in l0 {
+        count_view(sst_reader, view, query, result).await?;
+    }
+    for run in compacted {
+        for view in run.tables_covering_range::<BytesRange>(query.clone()) {
+            count_view(sst_reader, view, query, result).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The key interval a segment owns: `[prefix, prefix++)`, where `prefix++`
+/// is the smallest key strictly greater than every key beginning with
+/// `prefix` (increment the last non-`0xFF` byte, dropping trailing `0xFF`s).
+/// An all-`0xFF` or empty prefix has no upper bound.
+fn prefix_range(prefix: &[u8]) -> BytesRange {
+    let start = Bound::Included(Bytes::copy_from_slice(prefix));
+    let mut end = prefix.to_vec();
+    loop {
+        match end.last().copied() {
+            None => return BytesRange::new(start, Bound::Unbounded),
+            Some(0xFF) => {
+                end.pop();
+            }
+            Some(b) => {
+                let last = end.len() - 1;
+                end[last] = b + 1;
+                return BytesRange::new(start, Bound::Excluded(Bytes::from(end)));
+            }
+        }
+    }
 }
 
 async fn count_view(
@@ -668,6 +746,99 @@ mod tests {
             result.stats.blocks_read >= 1,
             "boundary slice must read at least one data block, got {}",
             result.stats.blocks_read
+        );
+    }
+
+    /// Routes writes into per-segment trees by a fixed-length key prefix,
+    /// mirroring how LogDb's `LogSegmentExtractor` partitions the keyspace.
+    #[derive(Debug)]
+    struct FixedPrefixExtractor(usize);
+
+    impl slatedb::PrefixExtractor for FixedPrefixExtractor {
+        fn name(&self) -> &str {
+            "test/fixed-prefix"
+        }
+
+        fn prefix_len(&self, target: &slatedb::PrefixTarget) -> Option<usize> {
+            let len = match target {
+                slatedb::PrefixTarget::Point(b) => b.as_ref().len(),
+                slatedb::PrefixTarget::Prefix(b) => b.as_ref().len(),
+            };
+            (len >= self.0).then_some(self.0)
+        }
+    }
+
+    /// Builds a DB whose writes are routed into per-segment trees by their
+    /// first `prefix_len` bytes, then flushed to L0.
+    async fn build_segmented_db(
+        entries: &[(&[u8], &[u8])],
+        prefix_len: usize,
+    ) -> (Arc<Db>, Arc<InMemory>) {
+        let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+        let db = DbBuilder::new(PATH, object_store.clone())
+            .with_sst_block_size(SstBlockSize::Block1Kib)
+            .with_segment_extractor(Arc::new(FixedPrefixExtractor(prefix_len)))
+            .build()
+            .await
+            .unwrap();
+        for (k, v) in entries {
+            db.put_with_options(*k, *v, &PutOptions::default(), &WriteOptions::default())
+                .await
+                .unwrap();
+        }
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        (Arc::new(db), object_store)
+    }
+
+    #[tokio::test]
+    async fn walks_per_segment_trees_when_extractor_configured() {
+        // Regression: with a segment extractor, writes route into per-segment
+        // trees and the default tree is empty. A walk that consulted only the
+        // default tree (manifest.l0()/compacted()) would count zero — this is
+        // the production LogDb layout, since LogDb always installs an
+        // extractor.
+        let entries: &[(&[u8], &[u8])] = &[
+            (b"aa-1", b"v"),
+            (b"aa-2", b"v"),
+            (b"aa-3", b"v"),
+            (b"bb-1", b"v"),
+        ];
+        let (db, object_store) = build_segmented_db(entries, 2).await;
+        let manifest = db.manifest();
+
+        // Precondition: data lives in segments, not the default tree.
+        assert!(
+            manifest.l0().is_empty() && manifest.compacted().is_empty(),
+            "default tree must be empty under a segment extractor"
+        );
+        assert_eq!(manifest.segments().len(), 2, "one segment per prefix");
+
+        // A query confined to the `aa` prefix must find exactly its three
+        // rows and walk only that segment's tree (not the `bb` segment).
+        let result = count_in_range(
+            &manifest,
+            &sst_reader(object_store),
+            &mk_range(b"aa", b"ab"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.counts.num_puts, 3, "the three aa-* rows");
+        assert_eq!(result.covered_to.as_deref(), Some(b"aa-3" as &[u8]));
+        assert!(
+            result.stats.ssts_opened >= 1,
+            "must open the aa segment's SST"
+        );
+        assert_eq!(
+            result.stats.ssts_contributing, 1,
+            "only the aa segment holds in-range rows"
+        );
+        assert!(
+            result.stats.l0_ssts >= 1,
+            "tree shape must reflect the walked segment, not the empty default tree"
         );
     }
 
