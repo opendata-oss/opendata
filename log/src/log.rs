@@ -29,7 +29,7 @@ use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
 use crate::model::{AppendOutput, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
-use crate::reader::{LogIterator, LogRead, LogReadView};
+use crate::reader::{Inspection, LogIterator, LogRead, LogReadView};
 use crate::segment::SegmentCache;
 use crate::serde::SEQ_BLOCK_KEY;
 use crate::view_tracker::{ViewEntry, ViewTracker};
@@ -499,11 +499,15 @@ impl LogRead for LogDb {
         Ok(view.scan_with_options(key, seq_range, &options))
     }
 
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
+    async fn inspect(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> Result<Inspection> {
         self.sync_reads().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
-        view.count(key, seq_range).await
+        view.inspect(key, seq_range).await
     }
 
     async fn list_keys(
@@ -2410,6 +2414,147 @@ mod tests {
         let reader = LogDbReader::new_with_direct(storage, direct).await.unwrap();
         assert_eq!(reader.count(Bytes::from("k"), ..).await.unwrap(), 10);
         assert_eq!(reader.count(Bytes::from("k"), 2..7).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn slate_inspect_reports_read_amplification() {
+        // Slatedb-backed inspect surfaces the LSM traversal the count walk
+        // performed: manifest shape plus per-segment SSTs opened/contributing.
+        // Built with its own Db handle so we can force a memtable->L0 flush;
+        // a plain `log.flush()` only flushes the WAL, leaving the data in the
+        // memtable where the manifest walk would never see it.
+        use common::storage::slate::SlateDbStorage;
+        use slatedb::config::{DbReaderOptions, FlushOptions, FlushType};
+        use slatedb::object_store::memory::InMemory;
+        use slatedb::{DbBuilder, DbReader, SstReader};
+
+        let path = "/test/inspect_read_amp";
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            DbBuilder::new(path, object_store.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn common::Storage> = Arc::new(SlateDbStorage::new(db.clone()));
+
+        let reader = DbReader::builder(path, object_store.clone())
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_millis(5),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let sst_reader = SstReader::new(path, object_store, None, None);
+        let direct = Arc::new(crate::direct::LogDirect::from_components(
+            Arc::new(reader),
+            sst_reader,
+        ));
+
+        let log = LogDb::new_with_direct(storage, direct).await.unwrap();
+        log.try_append(
+            (0..10u8)
+                .map(|i| Record {
+                    key: Bytes::from("k"),
+                    value: Bytes::from(vec![i]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        log.flush().await.unwrap();
+        // Push the memtable into an L0 SST so the manifest walk has data.
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // The DbReader's manifest snapshot polls at 5ms; loop until it has
+        // picked up the flushed SST so the read-amp assertions don't race
+        // the poll. `count` is already correct meanwhile via the tail scan.
+        // The data may land in L0 or be compacted into a sorted run by the
+        // writer's compaction scheduler; either way it becomes visible in the
+        // manifest as a persisted SST. Wait for that.
+        let persisted = |i: &Inspection| i.l0_ssts >= 1 || i.sorted_runs >= 1;
+        let mut inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
+        for _ in 0..200 {
+            if persisted(&inspection) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
+        }
+
+        assert_eq!(inspection.total, 10);
+        assert!(
+            persisted(&inspection),
+            "flushed data should be visible as an L0 SST or sorted run (l0={}, sr={})",
+            inspection.l0_ssts,
+            inspection.sorted_runs
+        );
+        assert_eq!(
+            inspection.segments.len(),
+            1,
+            "default segmentation keeps everything in segment 0"
+        );
+        let seg = &inspection.segments[0];
+        assert_eq!(seg.count, 10);
+        let reads = seg
+            .reads
+            .expect("slatedb-backed read should report SST traversal stats");
+        assert!(reads.ssts_opened >= 1, "at least the flushed SST is opened");
+        assert!(
+            reads.ssts_contributing >= 1,
+            "the SST holding k's rows must contribute"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_no_sst_stats_without_direct() {
+        // In-memory backend has no LogDirect, so count falls back to a scan
+        // and per-segment read stats are unavailable (reads = None).
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let log = LogDb::from_storage(
+            storage,
+            None,
+            SegmentConfig::default(),
+            RetentionConfig::default(),
+            ReadVisibility::Memory,
+            Arc::new(SystemClock),
+            None,
+        )
+        .await
+        .unwrap();
+        log.try_append(
+            (0..4u8)
+                .map(|i| Record {
+                    key: Bytes::from("k"),
+                    value: Bytes::from(vec![i]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        log.flush().await.unwrap();
+
+        let inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
+        assert_eq!(inspection.total, 4);
+        assert_eq!(inspection.l0_ssts, 0, "no manifest walk on the scan path");
+        assert_eq!(inspection.sorted_runs, 0);
+        assert_eq!(inspection.segments.len(), 1);
+        let seg = &inspection.segments[0];
+        assert_eq!(seg.count, 4);
+        assert!(
+            seg.reads.is_none(),
+            "scan fallback has no SST-level detail to report"
+        );
     }
 
     /// Helper: creates a SlateDB-backed storage using an in-memory object store.

@@ -74,7 +74,9 @@ pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendOutput, LogEntry, Record, Segment, SegmentId, Sequence};
 
-pub use reader::{LogDbReader, LogIterator, LogRead};
+pub use reader::{
+    Inspection, LogDbReader, LogIterator, LogRead, SegmentInspection, SegmentReadStats,
+};
 pub use tree::{LevelSummary, SegmentTree, TreeSummary};
 
 // Re-export proto types for use by clients

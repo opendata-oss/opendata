@@ -81,6 +81,40 @@ impl BlockOpCounts {
     }
 }
 
+/// LSM traversal statistics for a single [`count_in_range`] walk.
+///
+/// Captures how much of the tree the walk had to touch to produce the
+/// count — the raw material for read-amplification analysis. `l0_ssts`
+/// and `sorted_runs` describe the manifest's shape (global to the DB, not
+/// scoped to `query`); the remaining fields are scoped to the query range.
+///
+/// L0 SSTs are not range-partitioned, so the walk opens *every* L0 SST
+/// regardless of overlap — `ssts_opened` reflects that, which is why a
+/// large L0 directly inflates read amplification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkStats {
+    /// L0 SSTs present in the manifest (tree shape; not query-scoped).
+    pub l0_ssts: u32,
+    /// Sorted runs present in the manifest (tree shape; not query-scoped).
+    pub sorted_runs: u32,
+    /// SST views opened during the walk: every L0 SST plus each sorted
+    /// run's views covering `query`. Opening reads the SST's index and
+    /// stats footer, so this counts even when no block overlaps.
+    pub ssts_opened: u32,
+    /// Opened SSTs that contributed at least one in-query row. The key's
+    /// records in `query` were physically spread across this many SSTs.
+    pub ssts_contributing: u32,
+    /// Data blocks read (`read_block`) during the walk. The cheap
+    /// stats/last-entry paths do not count here.
+    pub blocks_read: u32,
+}
+
+impl WalkStats {
+    fn note_block_read(&mut self) {
+        self.blocks_read += 1;
+    }
+}
+
 /// Result of a [`count_in_range`] walk: aggregate counts plus a witness
 /// of the highest key actually observed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -95,6 +129,8 @@ pub struct CountResult {
     /// Callers that need exact counts including not-yet-persisted writes
     /// can combine this with a scan over `(covered_to, range.end)`.
     pub covered_to: Option<Bytes>,
+    /// LSM traversal statistics for this walk; see [`WalkStats`].
+    pub stats: WalkStats,
 }
 
 /// Counts every physical write operation in the manifest whose key falls
@@ -110,6 +146,8 @@ pub async fn count_in_range(
     query: &BytesRange,
 ) -> StorageResult<CountResult> {
     let mut result = CountResult::default();
+    result.stats.l0_ssts = manifest.l0().len() as u32;
+    result.stats.sorted_runs = manifest.compacted().len() as u32;
     for view in manifest.l0() {
         count_view(sst_reader, view, query, &mut result).await?;
     }
@@ -131,6 +169,9 @@ async fn count_view(
         .open_with_handle(view.sst.clone())
         .map_err(StorageError::from_storage)?;
     let sst_id = sst_file.id();
+    // Opening already fetched the index and stats footer, so this SST is
+    // "touched" even if no block ends up overlapping the query.
+    result.stats.ssts_opened += 1;
 
     let Some(stats) = sst_file.stats().await.map_err(StorageError::from_storage)? else {
         tracing::warn!(?sst_id, "SST has no stats block; skipping");
@@ -171,6 +212,7 @@ async fn count_view(
             break;
         }
 
+        result.stats.note_block_read();
         let rows = sst_file
             .read_block(i)
             .await
@@ -190,6 +232,7 @@ async fn count_view(
         // No SST contents in query.
         return Ok(());
     };
+    result.stats.ssts_contributing += 1;
 
     // Forward pass for blocks below the witness. Cheap stats path when
     // contained; read for boundary blocks (needed to filter rows by query).
@@ -200,6 +243,7 @@ async fn count_view(
                 .counts
                 .add(block_counts_from_stats(&stats, i, sst_id));
         } else {
+            result.stats.note_block_read();
             let rows = sst_file
                 .read_block(i)
                 .await
@@ -521,6 +565,110 @@ mod tests {
         assert_eq!(result.counts.num_puts, 10);
         // covered_to comes from the SST with the highest last_entry — `k\x09`.
         assert_eq!(result.covered_to.as_deref(), Some(&b"k\x09"[..]));
+    }
+
+    /// Flushes `batches` separately so each becomes its own L0 SST, then
+    /// returns the DB + object store. Keys are taken verbatim from each
+    /// batch so callers control which SST a key lands in.
+    async fn build_db_with_l0_batches(batches: &[&[(&[u8], &[u8])]]) -> (Arc<Db>, Arc<InMemory>) {
+        let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+        let db = DbBuilder::new(PATH, object_store.clone())
+            .with_sst_block_size(SstBlockSize::Block1Kib)
+            .build()
+            .await
+            .unwrap();
+        for batch in batches {
+            for (k, v) in *batch {
+                db.put_with_options(*k, *v, &PutOptions::default(), &WriteOptions::default())
+                    .await
+                    .unwrap();
+            }
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        }
+        (Arc::new(db), object_store)
+    }
+
+    #[tokio::test]
+    async fn walk_stats_report_manifest_shape() {
+        let a: &[(&[u8], &[u8])] = &[(b"k000", b"v0"), (b"k001", b"v1")];
+        let b: &[(&[u8], &[u8])] = &[(b"k100", b"v2"), (b"k101", b"v3")];
+        let (db, object_store) = build_db_with_l0_batches(&[a, b]).await;
+
+        let result = count_in_range(
+            &db.manifest(),
+            &sst_reader(object_store),
+            &BytesRange::unbounded(),
+        )
+        .await
+        .unwrap();
+
+        // Two flushes, no compaction → two L0 SSTs, zero sorted runs.
+        assert_eq!(result.stats.l0_ssts, 2);
+        assert_eq!(result.stats.sorted_runs, 0);
+        // Unbounded query reaches both SSTs and both contribute.
+        assert_eq!(result.stats.ssts_opened, 2);
+        assert_eq!(result.stats.ssts_contributing, 2);
+        // Each SST hits the free-witness shortcut (its last block is
+        // contained), and every other block is contained → stats path. So
+        // an unbounded full-SST count touches no data blocks.
+        assert_eq!(result.stats.blocks_read, 0);
+    }
+
+    #[tokio::test]
+    async fn walk_stats_opens_every_l0_even_when_query_misses() {
+        // L0 is not range-partitioned: a query matching only the second SST
+        // must still open the first to know it has nothing in range.
+        let a: &[(&[u8], &[u8])] = &[(b"k000", b"v0"), (b"k001", b"v1")];
+        let b: &[(&[u8], &[u8])] = &[(b"k100", b"v2"), (b"k101", b"v3")];
+        let (db, object_store) = build_db_with_l0_batches(&[a, b]).await;
+
+        let result = count_in_range(
+            &db.manifest(),
+            &sst_reader(object_store),
+            &mk_range(b"k100", b"k200"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.counts.num_puts, 2, "only the k1xx batch matches");
+        assert_eq!(result.stats.ssts_opened, 2, "both L0 SSTs are opened");
+        assert_eq!(
+            result.stats.ssts_contributing, 1,
+            "only the second SST holds in-range rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_stats_count_block_reads_on_boundary_slice() {
+        // A subrange that slices interior blocks forces real block reads to
+        // filter rows precisely (the cheap stats path can't be used).
+        let entries = many_entries(250);
+        let entries_ref: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let (db, object_store) = build_db_with_entries(&entries_ref).await;
+
+        let result = count_in_range(
+            &db.manifest(),
+            &sst_reader(object_store),
+            &mk_range(b"k100", b"k150"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.counts.num_puts, 50);
+        assert_eq!(result.stats.ssts_opened, 1);
+        assert_eq!(result.stats.ssts_contributing, 1);
+        assert!(
+            result.stats.blocks_read >= 1,
+            "boundary slice must read at least one data block, got {}",
+            result.stats.blocks_read
+        );
     }
 
     #[tokio::test]
