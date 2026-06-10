@@ -18,6 +18,7 @@
 //! log-inspect --data-dir ./.data tree
 //! log-inspect --data-dir ./.data tree --segment 1
 //! log-inspect --data-dir ./.data count orders
+//! log-inspect --data-dir ./.data inspect orders
 //! log-inspect --data-dir ./.data scan orders --limit 20
 //! log-inspect --config reader.yaml scan orders --from 100 --to 200 --hex
 //! ```
@@ -29,7 +30,7 @@ use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use common::StorageConfig;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
-use log::{LogDbReader, LogRead, ReaderConfig, SegmentTree, TreeSummary};
+use log::{Inspection, LogDbReader, LogRead, ReaderConfig, SegmentTree, TreeSummary};
 
 /// Inspect an OpenData log through a read-only [`LogDbReader`].
 #[derive(Debug, Parser)]
@@ -125,6 +126,24 @@ enum Command {
         #[arg(long)]
         to: Option<u64>,
     },
+    /// Inspect how a key's records are distributed across segments, with
+    /// per-segment read-amplification stats.
+    ///
+    /// Reports the total record count plus, per covering segment, how many
+    /// records live there and the LSM traversal the count walk incurred
+    /// (SSTs opened, SSTs that contributed rows, data blocks read). Read
+    /// stats are only available on a persistent slatedb backend; an
+    /// in-memory log shows `-`.
+    Inspect {
+        /// The key whose entries to inspect.
+        key: String,
+        /// Lowest sequence number to include.
+        #[arg(long)]
+        from: Option<u64>,
+        /// Exclusive upper bound on sequence number.
+        #[arg(long)]
+        to: Option<u64>,
+    },
     /// Summarize how data is distributed across the SlateDB LSM tree.
     ///
     /// With no flags, prints the manifest header and a per-segment
@@ -189,6 +208,7 @@ async fn run(reader: &LogDbReader, command: Command) -> Result<()> {
         } => keys(reader, segment_start, segment_end).await,
         Command::Tree { segment } => tree(reader, segment).await,
         Command::Count { key, from, to } => count(reader, key, from, to).await,
+        Command::Inspect { key, from, to } => inspect(reader, key, from, to).await,
         Command::Scan {
             key,
             from,
@@ -388,6 +408,57 @@ async fn count(
         .context("counting entries")?;
     println!("{total}");
     Ok(())
+}
+
+async fn inspect(
+    reader: &LogDbReader,
+    key: String,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> Result<()> {
+    let inspection = reader
+        .inspect(Bytes::from(key), seq_range(from, to))
+        .await
+        .context("inspecting key")?;
+    print_inspection(&inspection);
+    Ok(())
+}
+
+/// Renders an [`Inspection`]: total count, manifest shape, and the
+/// per-segment distribution with read-amplification stats.
+fn print_inspection(inspection: &Inspection) {
+    println!("total records: {}", inspection.total);
+    println!(
+        "manifest shape: {} L0 SST(s), {} sorted run(s)",
+        inspection.l0_ssts, inspection.sorted_runs,
+    );
+    println!();
+
+    if inspection.segments.is_empty() {
+        println!("(no covering segments)");
+        return;
+    }
+
+    println!(
+        "{:>8}  {:>10}  {:>10}  {:>10}  {:>12}  {:>11}",
+        "SEGMENT", "COUNT", "TAIL_SCAN", "SSTS_OPEN", "SSTS_CONTRIB", "BLOCKS_READ",
+    );
+    for seg in &inspection.segments {
+        // Read stats are absent on the scan-fallback path (no manifest walk).
+        let (opened, contrib, blocks) = match seg.reads {
+            Some(r) => (
+                r.ssts_opened.to_string(),
+                r.ssts_contributing.to_string(),
+                r.blocks_read.to_string(),
+            ),
+            None => ("-".to_string(), "-".to_string(), "-".to_string()),
+        };
+        println!(
+            "{:>8}  {:>10}  {:>10}  {:>10}  {:>12}  {:>11}",
+            seg.segment_id, seg.count, seg.tail_scanned, opened, contrib, blocks,
+        );
+    }
+    println!("\n{} covering segment(s)", inspection.segments.len());
 }
 
 async fn scan(
