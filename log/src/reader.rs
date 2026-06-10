@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{ReaderConfig, ScanOptions, SegmentConfig};
+use crate::config::{ReaderConfig, ScanOptions, ScanPath, SegmentConfig};
 use crate::direct::LogDirect;
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
@@ -276,9 +276,15 @@ impl LogReadView {
         &self,
         key: Bytes,
         seq_range: Range<Sequence>,
-        _options: &ScanOptions,
+        options: &ScanOptions,
     ) -> LogIterator {
-        LogIterator::open(Arc::clone(&self.storage), &self.segments, key, seq_range)
+        LogIterator::open(
+            Arc::clone(&self.storage),
+            &self.segments,
+            key,
+            seq_range,
+            options.scan_path,
+        )
     }
 
     /// Counts entries for `key` in `seq_range`, exact.
@@ -642,6 +648,7 @@ pub struct LogIterator {
     segments: Vec<LogSegment>,
     key: Bytes,
     seq_range: Range<Sequence>,
+    scan_path: ScanPath,
     current_segment_idx: usize,
     current_iter: Option<SegmentIterator>,
 }
@@ -653,6 +660,7 @@ impl LogIterator {
         segment_cache: &SegmentCache,
         key: Bytes,
         seq_range: Range<Sequence>,
+        scan_path: ScanPath,
     ) -> Self {
         let segments = segment_cache.find_covering(&seq_range);
         Self {
@@ -660,6 +668,7 @@ impl LogIterator {
             segments,
             key,
             seq_range,
+            scan_path,
             current_segment_idx: 0,
             current_iter: None,
         }
@@ -678,6 +687,7 @@ impl LogIterator {
             segments,
             key,
             seq_range,
+            scan_path: ScanPath::default(),
             current_segment_idx: 0,
             current_iter: None,
         }
@@ -714,7 +724,7 @@ impl LogIterator {
         let segment = &self.segments[self.current_segment_idx];
         let iter = self
             .storage
-            .scan_entries(segment, &self.key, self.seq_range.clone())
+            .scan_entries(segment, &self.key, self.seq_range.clone(), self.scan_path)
             .await?;
         self.current_iter = Some(iter);
         Ok(true)

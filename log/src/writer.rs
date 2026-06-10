@@ -846,7 +846,7 @@ mod tests {
 
         let key = Bytes::from("mykey");
         let mut iter = storage
-            .scan_entries(&segments[0], &key, 0..u64::MAX)
+            .scan_entries(&segments[0], &key, 0..u64::MAX, crate::config::ScanPath::default())
             .await
             .unwrap();
         let e0 = iter.next().await.unwrap().unwrap();

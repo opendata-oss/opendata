@@ -289,9 +289,33 @@ impl Default for LogCompactionOptions {
 /// Additional options may be added in future versions.
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
+    /// Which storage access path serves the scan; see [`ScanPath`].
+    pub scan_path: ScanPath,
     // Reserved for future options such as:
     // - read_level: control consistency vs performance tradeoff
     // - cache_policy: control block cache behavior
+}
+
+/// How a scan reads a key's entries from the storage backend.
+///
+/// Both paths return the same entries; they differ in which pruning the
+/// backend can apply, so this is a performance knob. It exists to let the
+/// scan benchmark compare the two paths over identical data; once the
+/// better path is established this knob is expected to go away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScanPath {
+    /// Issue a prefix scan over the `(segment, key)` prefix and enforce the
+    /// sequence range client-side. Backends with prefix-aware bloom filters
+    /// (slatedb's `BloomFilterPolicy` with `LogKeyPrefixExtractor`) skip
+    /// SSTs that contain no entries for the key, but the scan reads from the
+    /// key's first entry in the segment regardless of the requested start
+    /// sequence.
+    #[default]
+    Prefix,
+    /// Issue a range scan bounded to the requested sequence range. The
+    /// backend prunes SSTs and blocks by key-range metadata and starts at
+    /// the requested start sequence, but bloom filters are not consulted.
+    Range,
 }
 
 /// Configuration for opening a [`LogDbReader`](crate::LogDbReader).

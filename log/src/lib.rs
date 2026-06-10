@@ -67,7 +67,7 @@ mod writer;
 
 pub use config::{
     Config, LogCompactionOptions, ReadVisibility, ReaderConfig, RetentionConfig, ScanOptions,
-    SegmentConfig,
+    ScanPath, SegmentConfig,
 };
 pub use error::{AppendError, AppendResult, Error, Result};
 pub use listing::{LogKey, LogKeyIterator};

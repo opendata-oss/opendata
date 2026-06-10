@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use std::collections::BTreeSet;
 use std::ops::Range;
 
+use crate::config::ScanPath;
 use crate::error::{Error, Result};
 use crate::model::{LogEntry, SegmentId};
 use crate::segment::LogSegment;
@@ -72,20 +73,35 @@ pub(crate) trait LogStorageRead: StorageRead {
     ///
     /// Returns an iterator that yields `LogEntry` values in sequence order.
     ///
-    /// Issues a prefix scan over the `(segment, key)` prefix rather than a
-    /// bounded range so that backends with prefix-aware bloom filters
-    /// (slatedb's `BloomFilterPolicy` with `LogKeyPrefixExtractor`) can skip
-    /// SSTs that contain no entries for this `(segment, key)`. The seq range
-    /// is enforced client-side by [`SegmentIterator`], which early-exits
-    /// once `sequence >= seq_range.end`.
+    /// `path` selects the storage access pattern (see [`ScanPath`]):
+    ///
+    /// - [`ScanPath::Prefix`] issues a prefix scan over the `(segment, key)`
+    ///   prefix so that backends with prefix-aware bloom filters (slatedb's
+    ///   `BloomFilterPolicy` with `LogKeyPrefixExtractor`) can skip SSTs that
+    ///   contain no entries for this `(segment, key)`. The seq range is
+    ///   enforced client-side by [`SegmentIterator`], which skips entries
+    ///   below `seq_range.start` and early-exits once
+    ///   `sequence >= seq_range.end`.
+    /// - [`ScanPath::Range`] issues a scan bounded to the encoded seq range,
+    ///   letting the backend prune by key-range metadata and start at
+    ///   `seq_range.start`, but without consulting bloom filters.
     async fn scan_entries(
         &self,
         segment: &LogSegment,
         key: &Bytes,
         seq_range: Range<u64>,
+        path: ScanPath,
     ) -> Result<SegmentIterator> {
-        let prefix = LogEntryKey::scan_prefix(segment, key);
-        let inner = self.scan_prefix_iter(prefix).await?;
+        let inner = match path {
+            ScanPath::Prefix => {
+                let prefix = LogEntryKey::scan_prefix(segment, key);
+                self.scan_prefix_iter(prefix).await?
+            }
+            ScanPath::Range => {
+                let byte_range = LogEntryKey::scan_range(segment, key, seq_range.clone());
+                self.scan_iter(byte_range).await?
+            }
+        };
         Ok(SegmentIterator::new(
             inner,
             seq_range,
@@ -301,7 +317,7 @@ mod tests {
 
         // when
         let mut iter = storage
-            .scan_entries(&segment, &key, 0..u64::MAX)
+            .scan_entries(&segment, &key, 0..u64::MAX, ScanPath::default())
             .await
             .unwrap();
 
@@ -333,7 +349,7 @@ mod tests {
         }
 
         // when - scan only sequences 3..7
-        let mut iter = storage.scan_entries(&segment, &key, 3..7).await.unwrap();
+        let mut iter = storage.scan_entries(&segment, &key, 3..7, ScanPath::default()).await.unwrap();
 
         // then
         let mut entries = Vec::new();
@@ -353,7 +369,7 @@ mod tests {
 
         // when
         let mut iter = storage
-            .scan_entries(&segment, &Bytes::from("unknown"), 0..u64::MAX)
+            .scan_entries(&segment, &Bytes::from("unknown"), 0..u64::MAX, ScanPath::default())
             .await
             .unwrap();
 
