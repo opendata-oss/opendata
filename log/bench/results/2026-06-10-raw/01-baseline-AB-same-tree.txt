@@ -1,0 +1,171 @@
+Running benchmark: scan
+    post-prefill verify: key 0 returned 21 of 21 expected entries
+    pre-close verify: key 0 returned 21 of 21 expected entries
+  [benchmark=scan, commit=fc6ef8bee8c68b2cf6335bda58fe279d1574c244, branch=logdb-scan-bench, entries_per_key=20, flush_every=20000, num_keys=20000, scan_lag=5, scans=200, seal_interval_ms=0, settle_secs=0, value_size=256]
+    prefill_secs            0.56
+    prefill_gets            97
+    scans_completed         200
+    entries_read            1.00K
+    scans_per_sec           640.72
+    range_latency_us_mean   2.43K
+    range_latency_us_p50    2.38K
+    range_latency_us_p90    2.60K
+    range_latency_us_p99    3.49K
+    range_latency_us_max    4.49K
+    range_gets_mean         99.36
+    range_gets_p50          98
+    range_gets_p90          99
+    range_gets_p99          122
+    range_gets_max          166
+    prefix_latency_us_mean  691.34
+    prefix_latency_us_p50   536.58
+    prefix_latency_us_p90   683.88
+    prefix_latency_us_p99   1.01K
+    prefix_latency_us_max   14.08K
+    prefix_gets_mean        20.23
+    prefix_gets_p50         19
+    prefix_gets_p90         24
+    prefix_gets_p99         38
+    prefix_gets_max         139
+    post-prefill verify: key 0 returned 21 of 21 expected entries
+    pre-close verify: key 0 returned 21 of 21 expected entries
+  [benchmark=scan, commit=fc6ef8bee8c68b2cf6335bda58fe279d1574c244, branch=logdb-scan-bench, entries_per_key=20, flush_every=20000, num_keys=20000, scan_lag=18446744073709551615, scans=200, seal_interval_ms=0, settle_secs=0, value_size=256]
+    prefill_secs            0.56
+    prefill_gets            94
+    scans_completed         200
+    entries_read            4.06K
+    scans_per_sec           651.48
+    range_latency_us_mean   2.43K
+    range_latency_us_p50    2.42K
+    range_latency_us_p90    2.62K
+    range_latency_us_p99    2.88K
+    range_latency_us_max    4.19K
+    range_gets_mean         99.03
+    range_gets_p50          98
+    range_gets_p90          99
+    range_gets_p99          122
+    range_gets_max          167
+    prefix_latency_us_mean  634.85
+    prefix_latency_us_p50   578.21
+    prefix_latency_us_p90   730.62
+    prefix_latency_us_p99   1.01K
+    prefix_latency_us_max   5.19K
+    prefix_gets_mean        20.53
+    prefix_gets_p50         19
+    prefix_gets_p90         24
+    prefix_gets_p99         40
+    prefix_gets_max         133
+    post-prefill verify: key 0 returned 1044 of 1044 expected entries
+    pre-close verify: key 0 returned 1044 of 1044 expected entries
+  [benchmark=scan, commit=fc6ef8bee8c68b2cf6335bda58fe279d1574c244, branch=logdb-scan-bench, entries_per_key=1000, flush_every=20000, num_keys=2000, scan_lag=5, scans=200, seal_interval_ms=0, settle_secs=0, value_size=256]
+    prefill_secs            2.34
+    prefill_gets            137
+    scans_completed         200
+    entries_read            1.00K
+    scans_per_sec           265.94
+    range_latency_us_mean   3.42K
+    range_latency_us_p50    2.80K
+    range_latency_us_p90    3.87K
+    range_latency_us_p99    11.96K
+    range_latency_us_max    16.47K
+    range_gets_mean         155.22
+    range_gets_p50          152
+    range_gets_p90          162
+    range_gets_p99          177
+    range_gets_max          298
+    prefix_latency_us_mean  4.09K
+    prefix_latency_us_p50   3.72K
+    prefix_latency_us_p90   4.81K
+    prefix_latency_us_p99   9.92K
+    prefix_latency_us_max   10.14K
+    prefix_gets_mean        141.87
+    prefix_gets_p50         139
+    prefix_gets_p90         146
+    prefix_gets_p99         170
+    prefix_gets_max         317
+    post-prefill verify: key 0 returned 1044 of 1044 expected entries
+    pre-close verify: key 0 returned 1044 of 1044 expected entries
+  [benchmark=scan, commit=fc6ef8bee8c68b2cf6335bda58fe279d1574c244, branch=logdb-scan-bench, entries_per_key=1000, flush_every=20000, num_keys=2000, scan_lag=18446744073709551615, scans=200, seal_interval_ms=0, settle_secs=0, value_size=256]
+    prefill_secs            2.34
+    prefill_gets            141
+    scans_completed         200
+    entries_read            200.18K
+    scans_per_sec           229.79
+    range_latency_us_mean   4.42K
+    range_latency_us_p50    3.94K
+    range_latency_us_p90    5.10K
+    range_latency_us_p99    9.50K
+    range_latency_us_max    16.87K
+    range_gets_mean         155.87
+    range_gets_p50          152
+    range_gets_p90          165
+    range_gets_p99          185
+    range_gets_max          311
+    prefix_latency_us_mean  4.28K
+    prefix_latency_us_p50   3.82K
+    prefix_latency_us_p90   5.24K
+    prefix_latency_us_p99   9.80K
+    prefix_latency_us_max   10.32K
+    prefix_gets_mean        141.50
+    prefix_gets_p50         138
+    prefix_gets_p90         145
+    prefix_gets_p99         166
+    prefix_gets_max         327
+=====DEEP SETTLED=====
+Running benchmark: scan
+    post-prefill verify: key 0 returned 1044 of 1044 expected entries
+    pre-close verify: key 0 returned 1044 of 1044 expected entries
+  [benchmark=scan, commit=fc6ef8bee8c68b2cf6335bda58fe279d1574c244, branch=logdb-scan-bench, entries_per_key=1000, flush_every=20000, num_keys=2000, scan_lag=5, scans=200, seal_interval_ms=500, settle_secs=45, value_size=256]
+    prefill_secs            47.20
+    prefill_gets            4.30K
+    scans_completed         200
+    entries_read            1.00K
+    scans_per_sec           2.22K
+    range_latency_us_mean   405.02
+    range_latency_us_p50    398.75
+    range_latency_us_p90    459.67
+    range_latency_us_p99    816.96
+    range_latency_us_max    1.27K
+    range_gets_mean         7.91
+    range_gets_p50          8
+    range_gets_p90          8
+    range_gets_p99          11
+    range_gets_max          17
+    prefix_latency_us_mean  491.05
+    prefix_latency_us_p50   488
+    prefix_latency_us_p90   597.25
+    prefix_latency_us_p99   691.71
+    prefix_latency_us_max   728.12
+    prefix_gets_mean        7.08
+    prefix_gets_p50         7
+    prefix_gets_p90         8
+    prefix_gets_p99         11
+    prefix_gets_max         18
+    post-prefill verify: key 0 returned 1044 of 1044 expected entries
+    pre-close verify: key 0 returned 1044 of 1044 expected entries
+  [benchmark=scan, commit=fc6ef8bee8c68b2cf6335bda58fe279d1574c244, branch=logdb-scan-bench, entries_per_key=1000, flush_every=20000, num_keys=2000, scan_lag=18446744073709551615, scans=200, seal_interval_ms=500, settle_secs=45, value_size=256]
+    prefill_secs            47.25
+    prefill_gets            4.32K
+    scans_completed         200
+    entries_read            200.18K
+    scans_per_sec           292.83
+    range_latency_us_mean   3.42K
+    range_latency_us_p50    3.31K
+    range_latency_us_p90    3.54K
+    range_latency_us_p99    3.75K
+    range_latency_us_max    14.12K
+    range_gets_mean         12.04
+    range_gets_p50          12
+    range_gets_p90          12
+    range_gets_p99          24
+    range_gets_max          37
+    prefix_latency_us_mean  3.40K
+    prefix_latency_us_p50   3.40K
+    prefix_latency_us_p90   3.56K
+    prefix_latency_us_p99   3.77K
+    prefix_latency_us_max   4.13K
+    prefix_gets_mean        11.42
+    prefix_gets_p50         11
+    prefix_gets_p90         12
+    prefix_gets_p99         19
+    prefix_gets_max         26
