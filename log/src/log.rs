@@ -754,10 +754,15 @@ fn spawn_subscriber(
                         last_segment_id: view.last_segment_id,
                         last_deleted_segment_id: view.last_deleted_segment_id,
                     });
-                    watermarks.update_written(view.epoch);
-
                     if !advance_rv_on_durable {
                         // Memory mode: read view sees writes immediately.
+                        // Advance the read view *before* publishing the
+                        // written epoch. `sync_reads` wakes on the written
+                        // epoch, so publishing it first would let a reader
+                        // acquire the read view and scan before this snapshot
+                        // and segment-cache refresh land — surfacing zero
+                        // records for a write it was told is visible. Mirrors
+                        // the durable path's view-then-watermark ordering.
                         advance_read_view_to(
                             &read_view,
                             &mut known_segment_id,
@@ -768,6 +773,7 @@ fn spawn_subscriber(
                         )
                         .await;
                     }
+                    watermarks.update_written(view.epoch);
 
                     // Try drain in case durability already covers this seqnum
                     // (e.g. InMemoryStorage default, or SlateDB already flushed).
@@ -2288,6 +2294,41 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(log.count(Bytes::from("k"), ..).await.unwrap(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_mode_scan_sees_each_write_after_sync_reads() {
+        // Regression for the Memory-mode read-visibility race. The read-view
+        // subscriber must advance the read view *before* publishing the
+        // written epoch: a scan waits on that epoch via `sync_reads`, so
+        // publishing it first lets the scan wake and read the view before the
+        // snapshot/segment refresh lands — returning fewer records than were
+        // appended, for writes it was told are visible.
+        //
+        // Runs multi-threaded so the subscriber and scanning tasks genuinely
+        // race, and loops so the (small) window gets many chances to surface.
+        let log = LogDb::open(test_config()).await.unwrap();
+        let key = Bytes::from("k");
+        for i in 0..1000u64 {
+            log.try_append(vec![Record {
+                key: key.clone(),
+                value: Bytes::from(vec![0u8]),
+            }])
+            .await
+            .unwrap();
+
+            let mut iter = log.scan(key.clone(), ..).await.unwrap();
+            let mut seen = 0u64;
+            while iter.next().await.unwrap().is_some() {
+                seen += 1;
+            }
+            assert_eq!(
+                seen,
+                i + 1,
+                "scan missed a write the appender was told is visible (after append #{i})"
+            );
+        }
+        log.close().await.unwrap();
     }
 
     #[tokio::test]
