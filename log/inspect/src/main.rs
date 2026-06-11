@@ -126,14 +126,14 @@ enum Command {
         #[arg(long)]
         to: Option<u64>,
     },
-    /// Inspect how a key's records are distributed across segments, with
-    /// per-segment read-amplification stats.
+    /// Inspect how a key's records are distributed across segments and, within
+    /// each segment, across the L0 and sorted-run tiers of its LSM tree.
     ///
-    /// Reports the total record count plus, per covering segment, how many
-    /// records live there and the LSM traversal the count walk incurred
-    /// (SSTs opened, SSTs that contributed rows, data blocks read). Read
-    /// stats are only available on a persistent slatedb backend; an
-    /// in-memory log shows `-`.
+    /// Reports the total count plus, per covering segment, the records found in
+    /// each tier and how localized they are: SSTs holding data vs total SSTs
+    /// consulted, and the number of data blocks those records span. Tier stats
+    /// are only available on a persistent slatedb backend; an in-memory log
+    /// shows `-` (its count comes from a scan, not an SST walk).
     Inspect {
         /// The key whose entries to inspect.
         key: String,
@@ -427,10 +427,17 @@ async fn inspect(
 /// Renders an [`Inspection`]: total count, manifest shape, and the
 /// per-segment distribution with read-amplification stats.
 fn print_inspection(inspection: &Inspection) {
+    // Aggregate persisted-SST distribution across all covering segments. The
+    // remainder of `total` (not in any persisted SST) was tail-scanned from
+    // the memtable / lagging snapshot.
+    let agg = &inspection.reads;
+    let persisted = agg.l0.records + agg.sorted_runs.records;
     println!("total records: {}", inspection.total);
     println!(
-        "manifest shape: {} L0 SST(s), {} sorted run(s)",
-        inspection.l0_ssts, inspection.sorted_runs,
+        "persisted: {persisted} (L0 {}, sorted runs {}),  tail-scanned: {}",
+        agg.l0.records,
+        agg.sorted_runs.records,
+        inspection.total.saturating_sub(persisted),
     );
     println!();
 
@@ -439,26 +446,49 @@ fn print_inspection(inspection: &Inspection) {
         return;
     }
 
+    // Per-segment tier distribution. SSTs are shown as with_data/total; BLKS
+    // is the number of data blocks the in-range records span (locality).
     println!(
-        "{:>8}  {:>10}  {:>10}  {:>10}  {:>12}  {:>11}",
-        "SEGMENT", "COUNT", "TAIL_SCAN", "SSTS_OPEN", "SSTS_CONTRIB", "BLOCKS_READ",
+        "{:>7}  {:>7}  {:>6}   {:>9}  {:>7}  {:>6}   {:>7}  {:>9}  {:>7}  {:>6}",
+        "SEGMENT",
+        "COUNT",
+        "TAIL",
+        "L0_SSTS",
+        "L0_BLKS",
+        "L0_REC",
+        "SR_RUNS",
+        "SR_SSTS",
+        "SR_BLKS",
+        "SR_REC",
     );
     for seg in &inspection.segments {
-        // Read stats are absent on the scan-fallback path (no manifest walk).
-        let (opened, contrib, blocks) = match seg.reads {
-            Some(r) => (
-                r.ssts_opened.to_string(),
-                r.ssts_contributing.to_string(),
-                r.blocks_read.to_string(),
+        match &seg.reads {
+            // SST-walk path: split the segment's records across the tiers.
+            Some(r) => println!(
+                "{:>7}  {:>7}  {:>6}   {:>9}  {:>7}  {:>6}   {:>7}  {:>9}  {:>7}  {:>6}",
+                seg.segment_id,
+                seg.count,
+                seg.tail_scanned,
+                format!("{}/{}", r.l0.ssts_with_data, r.l0.ssts_total),
+                r.l0.blocks_with_data,
+                r.l0.records,
+                r.sorted_runs.runs,
+                format!(
+                    "{}/{}",
+                    r.sorted_runs.ssts_with_data, r.sorted_runs.ssts_total
+                ),
+                r.sorted_runs.blocks_with_data,
+                r.sorted_runs.records,
             ),
-            None => ("-".to_string(), "-".to_string(), "-".to_string()),
-        };
-        println!(
-            "{:>8}  {:>10}  {:>10}  {:>10}  {:>12}  {:>11}",
-            seg.segment_id, seg.count, seg.tail_scanned, opened, contrib, blocks,
-        );
+            // Scan-fallback path (in-memory backend): no per-tier detail.
+            None => println!(
+                "{:>7}  {:>7}  {:>6}   {:>9}  {:>7}  {:>6}   {:>7}  {:>9}  {:>7}  {:>6}",
+                seg.segment_id, seg.count, seg.tail_scanned, "-", "-", "-", "-", "-", "-", "-",
+            ),
+        }
     }
     println!("\n{} covering segment(s)", inspection.segments.len());
+    println!("(SSTS = with_data/total; BLKS = data blocks the in-range records span)");
 }
 
 async fn scan(
