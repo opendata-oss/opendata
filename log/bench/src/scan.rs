@@ -68,6 +68,7 @@ fn make_params(
 struct PathStats {
     latencies_us: Vec<f64>,
     gets: Vec<f64>,
+    get_bytes: Vec<f64>,
     entries_read: usize,
     completed: usize,
 }
@@ -333,6 +334,7 @@ impl Benchmark for ScanBenchmark {
             let expected = seqs.len() - start_pos;
 
             let gets_before = common::object_store_gets();
+            let bytes_before = common::object_store_get_bytes();
             let scan_start = Instant::now();
             let mut iter = db
                 .scan_with_options(
@@ -349,6 +351,7 @@ impl Benchmark for ScanBenchmark {
             }
             let elapsed = scan_start.elapsed();
             let gets = common::object_store_gets() - gets_before;
+            let get_bytes = common::object_store_get_bytes() - bytes_before;
 
             if n != expected {
                 let returned_set: std::collections::HashSet<u64> =
@@ -396,6 +399,7 @@ impl Benchmark for ScanBenchmark {
             };
             stats.latencies_us.push(latency_us);
             stats.gets.push(gets as f64);
+            stats.get_bytes.push(get_bytes as f64);
             stats.entries_read += n;
             stats.completed += 1;
         }
@@ -413,8 +417,10 @@ impl Benchmark for ScanBenchmark {
             .add("scans_per_sec", completed as f64 / elapsed_secs);
         summary = add_percentiles(summary, "range_latency_us", &mut range_stats.latencies_us);
         summary = add_percentiles(summary, "range_gets", &mut range_stats.gets);
+        summary = add_percentiles(summary, "range_get_bytes", &mut range_stats.get_bytes);
         summary = add_percentiles(summary, "prefix_latency_us", &mut prefix_stats.latencies_us);
         summary = add_percentiles(summary, "prefix_gets", &mut prefix_stats.gets);
+        summary = add_percentiles(summary, "prefix_get_bytes", &mut prefix_stats.get_bytes);
         bench.summarize(summary).await?;
 
         db.close().await?;
