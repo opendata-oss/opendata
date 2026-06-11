@@ -368,6 +368,7 @@ pub(crate) unsafe fn build_config(
         },
         retention: Default::default(),
         compaction: Default::default(),
+        sst_block_size: None,
     })
 }
 
