@@ -18,5 +18,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .expect("no manifest found");
     println!("{:#?}", manifest);
+
+    // Compaction history with statuses — which specs ran, which are stuck.
+    match admin.read_compactions(None).await {
+        Ok(compactions) => println!("COMPACTIONS: {:#?}", compactions),
+        Err(e) => println!("COMPACTIONS unavailable: {e}"),
+    }
     Ok(())
 }
