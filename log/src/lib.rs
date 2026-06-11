@@ -74,6 +74,7 @@ pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendOutput, LogEntry, Record, Segment, SegmentId, Sequence};
 
 pub use reader::{LogDbReader, LogIterator, LogRead};
+pub use slatedb::SstBlockSize;
 
 // Re-export proto types for use by clients
 #[cfg(feature = "http-server")]

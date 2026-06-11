@@ -17,6 +17,7 @@ use common::clock::{Clock, SystemClock};
 use common::coordinator::{Durability, EpochWatcher, EpochWatermarks};
 use common::storage::config::StorageConfig;
 use common::{CompactorBuilder, StorageBuilder, create_object_store};
+use slatedb::SstBlockSize;
 use slatedb::compactor::CompactionSchedulerSupplier;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
@@ -533,6 +534,7 @@ impl LogRead for LogDb {
 pub struct LogDbBuilder {
     config: crate::config::Config,
     clock: Option<Arc<dyn Clock>>,
+    sst_block_size: Option<SstBlockSize>,
 }
 
 impl LogDbBuilder {
@@ -541,7 +543,22 @@ impl LogDbBuilder {
         Self {
             config,
             clock: None,
+            sst_block_size: None,
         }
+    }
+
+    /// Overrides the SlateDB SST block size. This is a `DbBuilder`-time setting
+    /// (not part of SlateDB `Settings`), so it can only be set here.
+    ///
+    /// When set, this takes precedence over [`Config::sst_block_size`]; when left
+    /// `None` (the default), [`build`](Self::build) falls back to the config value.
+    /// A no-op for the in-memory backend. A resolved value of `None` leaves
+    /// SlateDB's own default of 4 KiB.
+    ///
+    /// [`Config::sst_block_size`]: crate::Config::sst_block_size
+    pub fn with_sst_block_size(mut self, size: Option<SstBlockSize>) -> Self {
+        self.sst_block_size = size;
+        self
     }
 
     /// Overrides the wall-clock source. Test-only — production callers always
@@ -592,6 +609,13 @@ impl LogDbBuilder {
             })
         } else {
             sb
+        };
+        // SST block size is a DbBuilder-time setting (not part of SlateDB Settings);
+        // apply it here when requested. The builder override wins; otherwise fall
+        // back to the config value. No-op for the in-memory backend.
+        let sb = match self.sst_block_size.or(self.config.sst_block_size) {
+            Some(size) => sb.map_slatedb(move |db| db.with_sst_block_size(size)),
+            None => sb,
         };
         let storage = sb
             .build()
