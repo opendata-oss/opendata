@@ -7,10 +7,12 @@
 //! handles in the process (the RFC's GETs/poll cost signal). Overhead is one
 //! relaxed atomic add per GET; non-GET operations are pure delegation.
 //!
-//! Each GET-family method is overridden and delegated to the inner store, so the
-//! inner store's optimized request behavior (e.g. S3 ranged/coalesced reads) is
-//! preserved — counting does not change the request pattern. HEAD requests are
-//! not counted as GETs.
+//! In object_store 0.13 the whole GET family (`get`, `get_range`, `head`)
+//! funnels through `get_opts`, so counting there plus `get_ranges` covers
+//! every read. The inner store's optimized request behavior is preserved —
+//! the provided wrapper methods only build options and call the funnel
+//! methods, which delegate to the inner store. HEAD requests are not counted
+//! as GETs.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 
@@ -61,17 +63,12 @@ impl std::fmt::Display for CountingObjectStore {
 
 #[async_trait]
 impl ObjectStore for CountingObjectStore {
-    // --- GET family: delegate to inner (preserving its behavior) and count. ---
-
-    async fn get(&self, location: &Path) -> OsResult<GetResult> {
-        let result = self.inner.get(location).await?;
-        record_get(result.range.end.saturating_sub(result.range.start));
-        Ok(result)
-    }
+    // --- GET family: `get`/`get_range`/`head` are provided wrappers that
+    // funnel through `get_opts`; counting here covers them all. ---
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
-        // A HEAD request rides through `get_opts` with `head = true`; don't count
-        // it as a GET.
+        // A HEAD request rides through `get_opts` with `head = true`; don't
+        // count it as a GET.
         let is_head = options.head;
         let result = self.inner.get_opts(location, options).await?;
         if !is_head {
@@ -80,24 +77,14 @@ impl ObjectStore for CountingObjectStore {
         Ok(result)
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OsResult<Bytes> {
-        let bytes = self.inner.get_range(location, range).await?;
-        record_get(bytes.len() as u64);
-        Ok(bytes)
-    }
-
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
         let results = self.inner.get_ranges(location, ranges).await?;
-        // One GET per requested range (inner may coalesce on the wire, but each
-        // range is a logical fetch).
+        // One GET per requested range (inner may coalesce on the wire, but
+        // each range is a logical fetch).
         GETS.fetch_add(ranges.len() as u64, Ordering::Relaxed);
         let total: usize = results.iter().map(|b| b.len()).sum();
         GET_BYTES.fetch_add(total as u64, Ordering::Relaxed);
         Ok(results)
-    }
-
-    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
-        self.inner.head(location).await
     }
 
     // --- Everything else: pure delegation. ---
@@ -119,8 +106,11 @@ impl ObjectStore for CountingObjectStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn delete(&self, location: &Path) -> OsResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OsResult<Path>>,
+    ) -> BoxStream<'static, OsResult<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
@@ -131,11 +121,7 @@ impl ObjectStore for CountingObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OsResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }

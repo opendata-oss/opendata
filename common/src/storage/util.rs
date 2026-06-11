@@ -4,7 +4,7 @@
 //! such as deleting data from object stores after benchmarks or tests.
 
 use futures::StreamExt;
-use slatedb::object_store::{ObjectStore, path::Path};
+use slatedb::object_store::{ObjectStore, ObjectStoreExt as _, path::Path};
 
 use super::config::{SlateDbStorageConfig, StorageConfig};
 use super::factory::create_object_store;

@@ -77,3 +77,11 @@ tikv-jemallocator = "0.6"
 [profile.release]
 debug = true
 strip = "none"
+
+# Local slatedb override for the prefix-filter-on-range-scans experiment
+# (variant C of slatedb#1778). Points at the range-scan-prefix-filter branch
+# of the sibling checkout. Remove before publishing anything.
+[patch.crates-io]
+slatedb = { path = "../slatedb/slatedb" }
+slatedb-common = { path = "../slatedb/slatedb-common" }
+slatedb-txn-obj = { path = "../slatedb/slatedb-txn-obj" }
