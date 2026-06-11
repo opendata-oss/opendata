@@ -658,7 +658,7 @@ impl FtsIndexDelta {
                     .entry(key.clone())
                     .or_default()
                     .push(PostingEntry {
-                        doc_id: vector_id.id(),
+                        id: vector_id,
                         freq: freq_u32,
                         norm,
                     });

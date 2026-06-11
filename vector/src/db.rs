@@ -209,7 +209,10 @@ impl VectorDb {
         builder: StorageBuilder,
     ) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = builder
+        // Route each vector segment (Default/ANN/FTS) into its own SlateDB
+        // segment so the FTS segment can be compacted independently (RFC-0006).
+        // No-op for the in-memory backend.
+        let storage = crate::storage::segment_extractor::builder_with_vector_segments(builder)
             .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
             .build()
             .await
@@ -482,7 +485,7 @@ impl VectorDb {
         snapshot: &dyn StorageRead,
     ) -> Result<HashMap<String, VectorId>> {
         // Create prefix for all IdDictionary records
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
         crate::serde::RecordType::IdDictionary.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
