@@ -186,10 +186,11 @@ pub trait LogRead {
     /// Returns the exact number of entries in the specified range. Useful
     /// for computing lag (how far behind a consumer is) or progress metrics.
     ///
-    /// This is a thin wrapper over [`inspect`](LogRead::inspect), returning
-    /// only [`Inspection::total`]. The two do identical work; use `inspect`
-    /// when you also want the per-segment distribution and read-amplification
-    /// breakdown.
+    /// Provided for every `LogRead` implementor: it runs the same LSM walk as
+    /// [`inspect`](LogRead::inspect) and returns only [`Inspection::total`].
+    /// Reach for `inspect` directly when you also want the per-segment record
+    /// distribution. Implementors may override this if they can count more
+    /// cheaply, but the default is correct for all of them.
     ///
     /// # Arguments
     ///
@@ -204,13 +205,14 @@ pub trait LogRead {
     }
 
     /// Inspects entries for a key within a sequence number range, returning
-    /// the record count plus a breakdown of how the query flowed through the
+    /// the record count plus a breakdown of how that data is laid out in the
     /// LSM tree.
     ///
     /// Like [`count`](LogRead::count) but also reports, per covering segment,
-    /// the record distribution and the read amplification the underlying
-    /// SST walk incurred (SSTs opened, SSTs that contributed rows, data
-    /// blocks read), along with the manifest's tree shape. See [`Inspection`].
+    /// how the key's records are distributed across the L0 and sorted-run
+    /// tiers (record counts, SSTs holding data, blocks spanned). See
+    /// [`Inspection`]. Useful for understanding read amplification and tuning
+    /// segmentation/compaction.
     ///
     /// # Arguments
     ///
@@ -383,11 +385,11 @@ impl LogReadView {
     }
 
     /// Inspects entries for `key` in `seq_range`: exact count plus the
-    /// per-segment read-amplification breakdown.
+    /// per-segment record-distribution breakdown.
     ///
     /// Fans out across overlapping segments — clipped to each segment's
     /// window. When [`LogDirect`] is available, walks persisted SSTs via
-    /// `count_in_range` (capturing traversal stats) for the bulk count and
+    /// `count_in_range` (capturing per-tier stats) for the bulk count and
     /// scans `(covered_to, seg_hi)` to pick up anything still in the
     /// memtable. Otherwise falls back to a plain scan tally with no
     /// SST-level detail.

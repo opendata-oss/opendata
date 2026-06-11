@@ -2458,12 +2458,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slate_inspect_reports_read_amplification() {
-        // Slatedb-backed inspect surfaces the LSM traversal the count walk
-        // performed: manifest shape plus per-segment SSTs opened/contributing.
-        // Built with its own Db handle so we can force a memtable->L0 flush;
-        // a plain `log.flush()` only flushes the WAL, leaving the data in the
-        // memtable where the manifest walk would never see it.
+    async fn slate_inspect_reports_record_distribution() {
+        // Slatedb-backed inspect reports how a segment's records are spread
+        // across the L0 and sorted-run tiers. Built with its own Db handle so
+        // we can force a memtable->L0 flush; a plain `log.flush()` only
+        // flushes the WAL, leaving the data in the memtable where the SST
+        // walk would never see it.
         use common::storage::slate::SlateDbStorage;
         use slatedb::config::{DbReaderOptions, FlushOptions, FlushType};
         use slatedb::object_store::memory::InMemory;

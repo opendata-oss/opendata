@@ -120,13 +120,19 @@ pub struct SortedRunStats {
 
 /// LSM data-distribution statistics for a single [`count_in_range`] walk.
 ///
-/// Characterizes the *shape of the data* the query touched — how the key's
-/// records are split between the L0 tier and the sorted-run tier — rather
-/// than the cost of the count that produced it. Both tiers are summed over
-/// the trees the walk visited: the unsegmented default tree plus every
-/// configured segment whose prefix interval overlaps `query` (see
-/// [`count_in_range`]). For a query confined to one segment's prefix — the
-/// LogDb case — they describe that one segment's tree.
+/// A *tier* here is one of the two kinds of level a SlateDB tree holds: the
+/// **L0 tier** — the freshly-flushed SSTs, which are not range-partitioned
+/// and may overlap each other in key space — and the **sorted-run tier** —
+/// the compacted sorted runs, each a range-partitioned, non-overlapping run
+/// of SSTs. A read consults both.
+///
+/// These stats characterize the *shape of the data* the query touched — how
+/// the key's records are split between those two tiers — rather than the
+/// cost of the count that produced it. Both tiers are summed over the trees
+/// the walk visited: the unsegmented default tree plus every configured
+/// segment whose prefix interval overlaps `query` (see [`count_in_range`]).
+/// For a query confined to one segment's prefix — the LogDb case — they
+/// describe that one segment's tree.
 ///
 /// `l0.records + sorted_runs.records` is the count contributed by persisted
 /// SSTs; writes not yet flushed are accounted separately by the caller.
@@ -138,8 +144,9 @@ pub struct WalkStats {
     pub sorted_runs: SortedRunStats,
 }
 
-/// Private per-tier accumulator the walk threads through `count_view`. The
-/// public [`L0Stats`] / [`SortedRunStats`] are assembled from these.
+/// Private accumulator for one tier (L0 or sorted-run — see [`WalkStats`])
+/// that the walk threads through `count_view`. The public [`L0Stats`] /
+/// [`SortedRunStats`] are assembled from these.
 #[derive(Default)]
 struct TierWalk {
     ssts_total: u32,
@@ -173,7 +180,7 @@ pub struct CountResult {
     /// Callers that need exact counts including not-yet-persisted writes
     /// can combine this with a scan over `(covered_to, range.end)`.
     pub covered_to: Option<Bytes>,
-    /// LSM traversal statistics for this walk; see [`WalkStats`].
+    /// Per-tier record distribution for this walk; see [`WalkStats`].
     pub stats: WalkStats,
 }
 
