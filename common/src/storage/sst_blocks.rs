@@ -82,41 +82,80 @@ impl BlockOpCounts {
     }
 }
 
-/// LSM traversal statistics for a single [`count_in_range`] walk.
-///
-/// Captures how much of the tree the walk had to touch to produce the
-/// count — the raw material for read-amplification analysis. `l0_ssts` and
-/// `sorted_runs` are summed over the trees the walk visited: the
-/// unsegmented default tree plus every configured segment whose prefix
-/// interval overlaps `query` (see [`count_in_range`]). For a query confined
-/// to one segment's prefix — the LogDb case — they describe that one
-/// segment's shape. The remaining fields are scoped to the query range.
-///
-/// L0 SSTs are not range-partitioned within a tree, so the walk opens
-/// *every* L0 SST of a visited tree regardless of overlap — `ssts_opened`
-/// reflects that, which is why a large L0 directly inflates read
-/// amplification.
+/// Distribution of a key's in-query records across the **L0 tier** of the
+/// walked tree(s). L0 SSTs are not range-partitioned, so a read must consult
+/// every L0 SST — `ssts_total` therefore counts all of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WalkStats {
-    /// L0 SSTs across the trees walked (tree shape; not query-scoped).
-    pub l0_ssts: u32,
-    /// Sorted runs across the trees walked (tree shape; not query-scoped).
-    pub sorted_runs: u32,
-    /// SST views opened during the walk: every L0 SST plus each sorted
-    /// run's views covering `query`. Opening reads the SST's index and
-    /// stats footer, so this counts even when no block overlaps.
-    pub ssts_opened: u32,
-    /// Opened SSTs that contributed at least one in-query row. The key's
-    /// records in `query` were physically spread across this many SSTs.
-    pub ssts_contributing: u32,
-    /// Data blocks read (`read_block`) during the walk. The cheap
-    /// stats/last-entry paths do not count here.
-    pub blocks_read: u32,
+pub struct L0Stats {
+    /// L0 SSTs in the tier — all of them, since L0 isn't range-partitioned.
+    pub ssts_total: u32,
+    /// Of those, how many actually held an in-query record for the key
+    /// (data locality: fewer ⇒ better-localized).
+    pub ssts_with_data: u32,
+    /// Across the SSTs that held data, how many data blocks the in-query
+    /// records span — block-level locality. Divided by `ssts_with_data` it
+    /// gives the average blocks-per-SST a read must touch.
+    pub blocks_with_data: u32,
+    /// In-query records (physical puts) found in L0.
+    pub records: u64,
 }
 
-impl WalkStats {
-    fn note_block_read(&mut self) {
-        self.blocks_read += 1;
+/// Distribution of a key's in-query records across the **sorted-run tier**.
+/// Sorted runs are range-partitioned, so only the SST views covering the
+/// query are checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SortedRunStats {
+    /// Sorted runs overlapping the query (a read merges across these).
+    pub runs: u32,
+    /// SST views across those runs that cover the query.
+    pub ssts_total: u32,
+    /// Of those, how many actually held an in-query record for the key.
+    pub ssts_with_data: u32,
+    /// Across the SSTs that held data, how many data blocks the in-query
+    /// records span — block-level locality.
+    pub blocks_with_data: u32,
+    /// In-query records (physical puts) found in the sorted runs.
+    pub records: u64,
+}
+
+/// LSM data-distribution statistics for a single [`count_in_range`] walk.
+///
+/// Characterizes the *shape of the data* the query touched — how the key's
+/// records are split between the L0 tier and the sorted-run tier — rather
+/// than the cost of the count that produced it. Both tiers are summed over
+/// the trees the walk visited: the unsegmented default tree plus every
+/// configured segment whose prefix interval overlaps `query` (see
+/// [`count_in_range`]). For a query confined to one segment's prefix — the
+/// LogDb case — they describe that one segment's tree.
+///
+/// `l0.records + sorted_runs.records` is the count contributed by persisted
+/// SSTs; writes not yet flushed are accounted separately by the caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkStats {
+    /// The L0 tier's contribution; see [`L0Stats`].
+    pub l0: L0Stats,
+    /// The sorted-run tier's contribution; see [`SortedRunStats`].
+    pub sorted_runs: SortedRunStats,
+}
+
+/// Private per-tier accumulator the walk threads through `count_view`. The
+/// public [`L0Stats`] / [`SortedRunStats`] are assembled from these.
+#[derive(Default)]
+struct TierWalk {
+    ssts_total: u32,
+    ssts_with_data: u32,
+    blocks_with_data: u32,
+    records: u64,
+}
+
+impl TierWalk {
+    /// Records one block's in-query contribution: its records, and — when it
+    /// holds at least one in-query row — that it's a data-spanning block.
+    fn add_block(&mut self, counts: BlockOpCounts) {
+        self.records += counts.num_puts;
+        if counts.num_rows() > 0 {
+            self.blocks_with_data += 1;
+        }
     }
 }
 
@@ -194,7 +233,7 @@ pub async fn count_in_range(
 
 /// Walks one LSM tree (a default tree or a single segment's tree): every L0
 /// SST plus the covering views of each sorted run. Accumulates counts,
-/// `covered_to`, and traversal stats into `result`.
+/// `covered_to`, and per-tier data-distribution stats into `result`.
 async fn walk_tree(
     sst_reader: &SstReader,
     l0: &VecDeque<SsTableView>,
@@ -202,16 +241,33 @@ async fn walk_tree(
     query: &BytesRange,
     result: &mut CountResult,
 ) -> StorageResult<()> {
-    result.stats.l0_ssts += l0.len() as u32;
-    result.stats.sorted_runs += compacted.len() as u32;
+    // L0: not range-partitioned, so every SST is checked.
+    let mut l0_walk = TierWalk::default();
     for view in l0 {
-        count_view(sst_reader, view, query, result).await?;
+        count_view(sst_reader, view, query, result, &mut l0_walk).await?;
     }
+    result.stats.l0.ssts_total += l0_walk.ssts_total;
+    result.stats.l0.ssts_with_data += l0_walk.ssts_with_data;
+    result.stats.l0.blocks_with_data += l0_walk.blocks_with_data;
+    result.stats.l0.records += l0_walk.records;
+
+    // Sorted runs: range-partitioned, so only the views covering the query
+    // are checked. A run counts as overlapping if it yields any such view.
+    let mut sr_walk = TierWalk::default();
     for run in compacted {
+        let mut overlaps = false;
         for view in run.tables_covering_range::<BytesRange>(query.clone()) {
-            count_view(sst_reader, view, query, result).await?;
+            overlaps = true;
+            count_view(sst_reader, view, query, result, &mut sr_walk).await?;
+        }
+        if overlaps {
+            result.stats.sorted_runs.runs += 1;
         }
     }
+    result.stats.sorted_runs.ssts_total += sr_walk.ssts_total;
+    result.stats.sorted_runs.ssts_with_data += sr_walk.ssts_with_data;
+    result.stats.sorted_runs.blocks_with_data += sr_walk.blocks_with_data;
+    result.stats.sorted_runs.records += sr_walk.records;
     Ok(())
 }
 
@@ -242,14 +298,15 @@ async fn count_view(
     view: &SsTableView,
     query: &BytesRange,
     result: &mut CountResult,
+    tier: &mut TierWalk,
 ) -> StorageResult<()> {
     let sst_file = sst_reader
         .open_with_handle(view.sst.clone())
         .map_err(StorageError::from_storage)?;
     let sst_id = sst_file.id();
-    // Opening already fetched the index and stats footer, so this SST is
-    // "touched" even if no block ends up overlapping the query.
-    result.stats.ssts_opened += 1;
+    // This SST belongs to the tier (its index/stats footer were read) even
+    // if no block ends up overlapping the query.
+    tier.ssts_total += 1;
 
     let Some(stats) = sst_file.stats().await.map_err(StorageError::from_storage)? else {
         tracing::warn!(?sst_id, "SST has no stats block; skipping");
@@ -282,15 +339,14 @@ async fn count_view(
             && contained
             && let Some(last) = last_entry.as_ref()
         {
-            result
-                .counts
-                .add(block_counts_from_stats(&stats, i, sst_id));
+            let block_counts = block_counts_from_stats(&stats, i, sst_id);
+            result.counts.add(block_counts);
+            tier.add_block(block_counts);
             bump_covered_to(&mut result.covered_to, last.clone());
             witness_pos = Some(pos);
             break;
         }
 
-        result.stats.note_block_read();
         let rows = sst_file
             .read_block(i)
             .await
@@ -298,6 +354,7 @@ async fn count_view(
         let (block_counts, block_max) = count_rows_in_range_with_max(&rows, query);
         if let Some(max) = block_max {
             result.counts.add(block_counts);
+            tier.add_block(block_counts);
             bump_covered_to(&mut result.covered_to, max);
             witness_pos = Some(pos);
             break;
@@ -310,25 +367,23 @@ async fn count_view(
         // No SST contents in query.
         return Ok(());
     };
-    result.stats.ssts_contributing += 1;
+    tier.ssts_with_data += 1;
 
     // Forward pass for blocks below the witness. Cheap stats path when
     // contained; read for boundary blocks (needed to filter rows by query).
     for &i in &overlapping[..witness_pos] {
         let key_range = block_key_range(&index, i, last_entry.as_ref());
-        if range_contains(query, &key_range) {
-            result
-                .counts
-                .add(block_counts_from_stats(&stats, i, sst_id));
+        let block_counts = if range_contains(query, &key_range) {
+            block_counts_from_stats(&stats, i, sst_id)
         } else {
-            result.stats.note_block_read();
             let rows = sst_file
                 .read_block(i)
                 .await
                 .map_err(StorageError::from_storage)?;
-            let (block_counts, _) = count_rows_in_range_with_max(&rows, query);
-            result.counts.add(block_counts);
-        }
+            count_rows_in_range_with_max(&rows, query).0
+        };
+        result.counts.add(block_counts);
+        tier.add_block(block_counts);
     }
 
     Ok(())
@@ -684,22 +739,22 @@ mod tests {
         .await
         .unwrap();
 
-        // Two flushes, no compaction → two L0 SSTs, zero sorted runs.
-        assert_eq!(result.stats.l0_ssts, 2);
-        assert_eq!(result.stats.sorted_runs, 0);
-        // Unbounded query reaches both SSTs and both contribute.
-        assert_eq!(result.stats.ssts_opened, 2);
-        assert_eq!(result.stats.ssts_contributing, 2);
-        // Each SST hits the free-witness shortcut (its last block is
-        // contained), and every other block is contained → stats path. So
-        // an unbounded full-SST count touches no data blocks.
-        assert_eq!(result.stats.blocks_read, 0);
+        // Two flushes, no compaction → all data in two L0 SSTs, no runs.
+        assert_eq!(result.stats.l0.ssts_total, 2);
+        assert_eq!(result.stats.l0.ssts_with_data, 2, "both SSTs contribute");
+        assert_eq!(
+            result.stats.l0.blocks_with_data, 2,
+            "two small SSTs, one block of data each"
+        );
+        assert_eq!(result.stats.l0.records, 4, "two records per batch");
+        assert_eq!(result.stats.sorted_runs, SortedRunStats::default());
     }
 
     #[tokio::test]
-    async fn walk_stats_opens_every_l0_even_when_query_misses() {
+    async fn walk_stats_check_every_l0_but_attribute_data_to_one() {
         // L0 is not range-partitioned: a query matching only the second SST
-        // must still open the first to know it has nothing in range.
+        // must still check the first to know it has nothing in range — but
+        // only the second holds data.
         let a: &[(&[u8], &[u8])] = &[(b"k000", b"v0"), (b"k001", b"v1")];
         let b: &[(&[u8], &[u8])] = &[(b"k100", b"v2"), (b"k101", b"v3")];
         let (db, object_store) = build_db_with_l0_batches(&[a, b]).await;
@@ -713,17 +768,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.counts.num_puts, 2, "only the k1xx batch matches");
-        assert_eq!(result.stats.ssts_opened, 2, "both L0 SSTs are opened");
+        assert_eq!(result.stats.l0.ssts_total, 2, "both L0 SSTs are present");
         assert_eq!(
-            result.stats.ssts_contributing, 1,
+            result.stats.l0.ssts_with_data, 1,
             "only the second SST holds in-range rows"
         );
+        assert_eq!(result.stats.l0.records, 2);
     }
 
     #[tokio::test]
-    async fn walk_stats_count_block_reads_on_boundary_slice() {
-        // A subrange that slices interior blocks forces real block reads to
-        // filter rows precisely (the cheap stats path can't be used).
+    async fn walk_stats_attribute_records_on_boundary_slice() {
+        // A subrange that slices interior blocks still attributes the exact
+        // record count to the (single) L0 SST it lives in.
         let entries = many_entries(250);
         let entries_ref: Vec<(&[u8], &[u8])> = entries
             .iter()
@@ -740,13 +796,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.counts.num_puts, 50);
-        assert_eq!(result.stats.ssts_opened, 1);
-        assert_eq!(result.stats.ssts_contributing, 1);
+        assert_eq!(result.stats.l0.ssts_total, 1);
+        assert_eq!(result.stats.l0.ssts_with_data, 1);
+        // 50 records of ~30 bytes over 1 KiB blocks span multiple blocks.
         assert!(
-            result.stats.blocks_read >= 1,
-            "boundary slice must read at least one data block, got {}",
-            result.stats.blocks_read
+            result.stats.l0.blocks_with_data >= 2,
+            "a 50-record slice should span several blocks, got {}",
+            result.stats.l0.blocks_with_data
         );
+        assert_eq!(result.stats.l0.records, 50);
+        assert_eq!(result.stats.sorted_runs, SortedRunStats::default());
     }
 
     /// Routes writes into per-segment trees by a fixed-length key prefix,
@@ -828,18 +887,15 @@ mod tests {
         .unwrap();
         assert_eq!(result.counts.num_puts, 3, "the three aa-* rows");
         assert_eq!(result.covered_to.as_deref(), Some(b"aa-3" as &[u8]));
+        // The data and its stats come from the walked segment's tree, not
+        // the empty default tree.
         assert!(
-            result.stats.ssts_opened >= 1,
-            "must open the aa segment's SST"
+            result.stats.l0.ssts_total >= 1,
+            "must check the aa segment's L0 SST"
         );
-        assert_eq!(
-            result.stats.ssts_contributing, 1,
-            "only the aa segment holds in-range rows"
-        );
-        assert!(
-            result.stats.l0_ssts >= 1,
-            "tree shape must reflect the walked segment, not the empty default tree"
-        );
+        assert_eq!(result.stats.l0.ssts_with_data, 1);
+        assert_eq!(result.stats.l0.blocks_with_data, 1, "three rows, one block");
+        assert_eq!(result.stats.l0.records, 3);
     }
 
     #[tokio::test]

@@ -814,7 +814,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::reader::LogDbReader;
+    use crate::reader::{LogDbReader, SegmentReadStats};
 
     fn test_config() -> Config {
         Config {
@@ -2482,10 +2482,13 @@ mod tests {
         // The data may land in L0 or be compacted into a sorted run by the
         // writer's compaction scheduler; either way it becomes visible in the
         // manifest as a persisted SST. Wait for that.
-        let persisted = |i: &Inspection| i.l0_ssts >= 1 || i.sorted_runs >= 1;
+        // Records land in L0 or get compacted into a sorted run by the
+        // writer's scheduler; either way they become visible as persisted
+        // SST records. Wait for that.
         let mut inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
         for _ in 0..200 {
-            if persisted(&inspection) {
+            let r = &inspection.reads;
+            if r.l0.records + r.sorted_runs.records >= 10 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2493,12 +2496,6 @@ mod tests {
         }
 
         assert_eq!(inspection.total, 10);
-        assert!(
-            persisted(&inspection),
-            "flushed data should be visible as an L0 SST or sorted run (l0={}, sr={})",
-            inspection.l0_ssts,
-            inspection.sorted_runs
-        );
         assert_eq!(
             inspection.segments.len(),
             1,
@@ -2508,12 +2505,23 @@ mod tests {
         assert_eq!(seg.count, 10);
         let reads = seg
             .reads
-            .expect("slatedb-backed read should report SST traversal stats");
-        assert!(reads.ssts_opened >= 1, "at least the flushed SST is opened");
-        assert!(
-            reads.ssts_contributing >= 1,
-            "the SST holding k's rows must contribute"
+            .expect("slatedb-backed read should report tier distribution");
+        // All 10 records are persisted in this one segment's tree, split
+        // across the L0 and sorted-run tiers.
+        assert_eq!(
+            reads.l0.records + reads.sorted_runs.records,
+            10,
+            "every record is attributed to a tier (l0={}, sr={})",
+            reads.l0.records,
+            reads.sorted_runs.records
         );
+        let tier_ssts = reads.l0.ssts_with_data + reads.sorted_runs.ssts_with_data;
+        assert!(
+            tier_ssts >= 1,
+            "the records must live in at least one tier's SST"
+        );
+        // The top-level aggregate mirrors the single segment.
+        assert_eq!(inspection.reads, reads);
     }
 
     #[tokio::test]
@@ -2551,8 +2559,11 @@ mod tests {
 
         let inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
         assert_eq!(inspection.total, 4);
-        assert_eq!(inspection.l0_ssts, 0, "no manifest walk on the scan path");
-        assert_eq!(inspection.sorted_runs, 0);
+        assert_eq!(
+            inspection.reads,
+            SegmentReadStats::default(),
+            "no SST walk on the scan path, so the aggregate is empty"
+        );
         assert_eq!(inspection.segments.len(), 1);
         let seg = &inspection.segments[0];
         assert_eq!(seg.count, 4);
