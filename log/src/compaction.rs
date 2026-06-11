@@ -321,7 +321,12 @@ fn build_active_l0_spec(
     next_sr: &mut u32,
     max_l0: usize,
 ) -> Option<CompactionSpec> {
-    let sources: Vec<SourceId> = segment.l0_sources().take(max_l0).collect();
+    // `l0()` is newest-first, so the oldest L0s sit at the tail. Skip the
+    // newest ones and relieve the oldest `max_l0`. Taking from the front
+    // would keep recompacting the most recent L0s and starve the oldest,
+    // which eventually fall out of the live set.
+    let skip = segment.l0_ids.len().saturating_sub(max_l0);
+    let sources: Vec<SourceId> = segment.l0_sources().skip(skip).collect();
     if sources.is_empty() {
         return None;
     }
@@ -552,6 +557,49 @@ mod tests {
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].sources().len(), opts.max_l0_per_compaction);
+    }
+
+    #[test]
+    fn propose_l0_relieves_oldest_l0s_not_newest() {
+        // `l0()` is newest-first (slatedb push_front on flush), so l0_ids[0] is
+        // the newest SST and the tail is the oldest. The relief spec must
+        // compact the OLDEST `max_l0`; taking from the front keeps recompacting
+        // recent L0s and starves the oldest until they fall out of the live set.
+        let opts = default_options();
+        let max = opts.max_l0_per_compaction;
+        let total = max + 3;
+
+        // Ascending ids, reversed to mirror slatedb's newest-first `l0()` order.
+        let mut l0_ids: Vec<Ulid> = (0..total as u128).map(Ulid::from).collect();
+        l0_ids.reverse(); // index 0 = newest (largest id)
+        let oldest: Vec<Ulid> = l0_ids[l0_ids.len() - max..].to_vec();
+        let newest = l0_ids[0];
+
+        let segment = SegmentSnapshot {
+            prefix: prefix_for(3),
+            l0_ids,
+            sr_ids: vec![],
+        };
+
+        let mut next_sr = 0;
+        let spec = build_active_l0_spec(&segment, &mut next_sr, max).unwrap();
+
+        let got: Vec<Ulid> = spec
+            .sources()
+            .iter()
+            .map(|s| match s {
+                SourceId::SstView(id) => *id,
+                other => panic!("expected SstView, got {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(got.len(), max);
+        let mut got_sorted = got.clone();
+        got_sorted.sort();
+        let mut want_sorted = oldest;
+        want_sorted.sort();
+        assert_eq!(got_sorted, want_sorted, "must select the oldest L0s");
+        assert!(!got.contains(&newest), "newest L0 must not be compacted");
     }
 
     #[test]
