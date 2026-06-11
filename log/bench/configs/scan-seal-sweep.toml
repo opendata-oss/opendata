@@ -1,0 +1,62 @@
+# Seal-interval sweep: how does the prefix path's read-from-segment-start
+# penalty scale with per-segment history depth? Deep histories (2k keys x
+# 1000 entries, ~2.4s prefill), cursor at lag=5, seal_tail so the
+# data-bearing tail segment seals and consolidates before measurement.
+# Larger seal intervals -> fewer, deeper segments -> denser per-key slices
+# in the cursor's segment. Range+inferred-filters starts at the cursor;
+# scan_prefix reads the segment's slice from entry 0.
+#
+#   cargo run --release -p log-bench -- -b scan -c log/bench/configs/scan-seal-sweep.toml -d 120
+
+[data.storage]
+type = "SlateDb"
+path = "bench-data"
+settings_path = "log/bench/configs/slatedb-small-sst.toml"
+
+[data.storage.object_store]
+type = "Local"
+path = "/tmp/opendata-scan-bench"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "5"
+seal_interval_ms = "500"
+seal_tail = "true"
+settle_secs = "45"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "5"
+seal_interval_ms = "1000"
+seal_tail = "true"
+settle_secs = "45"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "5"
+seal_interval_ms = "2000"
+seal_tail = "true"
+settle_secs = "45"
+
+[[params.scan]]
+num_keys = "2000"
+entries_per_key = "1000"
+value_size = "256"
+flush_every = "20000"
+scans = "200"
+scan_lag = "5"
+seal_interval_ms = "4000"
+seal_tail = "true"
+settle_secs = "45"

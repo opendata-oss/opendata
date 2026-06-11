@@ -150,6 +150,10 @@ impl Benchmark for ScanBenchmark {
             Some(v) => v.parse()?,
             None => 0,
         };
+        let seal_tail: bool = match bench.spec().params().get("seal_tail") {
+            Some(v) => v.parse()?,
+            None => false,
+        };
         let total_records = num_keys * entries_per_key;
         anyhow::ensure!(scans <= num_keys, "scans must be <= num_keys");
 
@@ -240,6 +244,31 @@ impl Benchmark for ScanBenchmark {
             }
         }
         db.flush().await?;
+        // Sealing fires on the write path when `seal_interval` has elapsed,
+        // so once prefill stops the tail segment stays active forever — and
+        // active segments never consolidate (L0 relief only). `seal_tail`
+        // writes one sentinel record after the interval elapses, rolling the
+        // segment so the data-bearing tail seals and consolidates during the
+        // settle window. This is what puts the measured cursors inside a
+        // sealed, dense segment instead of the active segment's run pile.
+        // The sentinel key sorts outside the benchmark keyspace and is never
+        // scanned.
+        if seal_tail {
+            anyhow::ensure!(
+                seal_interval_ms > 0,
+                "seal_tail requires seal_interval_ms > 0"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(seal_interval_ms + 600)).await;
+            append_retrying(
+                &db,
+                vec![log::Record {
+                    key: Bytes::from_static(b"~~seal-sentinel"),
+                    value: Bytes::from_static(b"~"),
+                }],
+            )
+            .await?;
+            db.flush().await?;
+        }
         // Compaction runs inside the writer; an aggressive prefill outpaces
         // it and leaves the tree as a pile of small sorted runs. A settle
         // window lets the compactor consolidate before we measure, so the
