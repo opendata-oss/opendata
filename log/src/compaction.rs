@@ -316,12 +316,22 @@ fn is_single_sr_steady(segment: &SegmentSnapshot) -> bool {
 }
 
 /// Builds an L0-relief compaction spec for an active segment.
+///
+/// Takes the **oldest** `max_l0` L0s. The manifest's L0 list is newest-first,
+/// and slatedb's writer/compactor manifest merge treats every L0 at or older
+/// than the spec's first source (the compaction watermark) as already
+/// compacted. The chosen set must therefore be a contiguous oldest-suffix of
+/// the list — selecting newer L0s while older uncompacted ones remain would
+/// move the watermark past them and the merge would silently drop their data.
+/// The newest-first order within the slice is also load-bearing: slatedb
+/// reads the watermark from the spec's first source.
 fn build_active_l0_spec(
     segment: &SegmentSnapshot,
     next_sr: &mut u32,
     max_l0: usize,
 ) -> Option<CompactionSpec> {
-    let sources: Vec<SourceId> = segment.l0_sources().take(max_l0).collect();
+    let skip = segment.l0_ids.len().saturating_sub(max_l0);
+    let sources: Vec<SourceId> = segment.l0_sources().skip(skip).collect();
     if sources.is_empty() {
         return None;
     }
@@ -552,6 +562,32 @@ mod tests {
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].sources().len(), opts.max_l0_per_compaction);
+    }
+
+    #[test]
+    fn propose_l0_relief_takes_oldest_l0s_in_newest_first_order() {
+        // The manifest's L0 list is newest-first, and slatedb's manifest
+        // merge prunes every L0 at or older than the spec's FIRST source
+        // (the compaction watermark). Relief over a capped subset must
+        // therefore select the contiguous OLDEST suffix of the list —
+        // taking newer L0s while older uncompacted ones remain would move
+        // the watermark past them and silently destroy their data.
+        let segments = vec![snapshot(3, 12, &[])];
+        let opts = default_options();
+        let specs = propose_compactions(
+            &segments,
+            bounds(1, 3),
+            &ActiveCompactionsView::default(),
+            &opts,
+        );
+
+        assert_eq!(specs.len(), 1);
+        let expected: Vec<SourceId> = segments[0].l0_ids[12 - opts.max_l0_per_compaction..]
+            .iter()
+            .copied()
+            .map(SourceId::SstView)
+            .collect();
+        assert_eq!(specs[0].sources(), expected.as_slice());
     }
 
     #[test]
