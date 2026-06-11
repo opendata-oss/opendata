@@ -131,7 +131,7 @@ pub(crate) async fn handle_get_vector<T: VectorDbRead + Send + Sync + 'static>(
         None => {
             let body = serde_json::json!({
                 "status": "error",
-                "message": format!("Document '{}' not found", id)
+                "message": format!("Vector '{}' not found", id)
             });
             Err((StatusCode::NOT_FOUND, ApiResponse::Json(axum::Json(body))))
         }
