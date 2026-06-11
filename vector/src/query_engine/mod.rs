@@ -9,9 +9,8 @@ use crate::error::{Error, Result};
 use crate::math::bm25 as bm25_math;
 use crate::math::distance;
 use crate::metric_names::{QUERY_SEARCH_DURATION_SECONDS, QUERY_VECTORS_SCORED_TOTAL};
-use crate::model::{
-    Bm25Query, FieldSelection, Filter, Query, ScoreBy, SearchOptions, SearchResult,
-};
+use crate::model::{Bm25Query, FieldSelection, Query, ScoreBy, SearchOptions, SearchResult};
+use crate::query_engine::filter::PreparedFilter;
 use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::field_stats::FieldStatsValue;
 use crate::serde::key::{FieldStatsKey, TermPostingsKey, TermStatsKey};
@@ -26,7 +25,6 @@ use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centro
 use crate::write::indexer::tree::posting_list::{Posting, PostingList};
 use crate::{Attribute, Vector};
 use common::storage::StorageRead;
-use roaring::RoaringTreemap;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
@@ -166,8 +164,10 @@ impl QueryEngine {
         }
 
         // Apply metadata filter
-        if let Some(filter) = &query.filter {
-            Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
+        let prepared_filter =
+            PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
+        for list in sorted_lists.iter_mut() {
+            list.retain(|candidate| prepared_filter.matches(candidate.internal_id.id()));
         }
 
         let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
@@ -249,8 +249,10 @@ impl QueryEngine {
         }
 
         // 6. Apply metadata filter (if provided)
-        if let Some(filter) = &query.filter {
-            Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
+        let prepared_filter =
+            PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
+        for list in sorted_lists.iter_mut() {
+            list.retain(|candidate| prepared_filter.matches(candidate.internal_id.id()));
         }
 
         // 7. K-way merge and resolve top-k forward index lookups
@@ -307,19 +309,11 @@ impl QueryEngine {
             }
         }
 
-        // Filter window: re-evaluate the filter bitmap over a chunk of doc
-        // ids at a time so we never materialise the full corpus universe.
-        // `low` is inclusive; as the loop walks lower we recompute the window
-        // containing the current doc id in one step (no sliding).
-        let mut filter_window: Option<FilterWindow> = match &query.filter {
-            None => None,
-            Some(filter) => {
-                let top = head_heap.peek().expect("streams non-empty").doc_id;
-                let (low, high) = window_for(top);
-                let bitmap = self.recompute_filter_window(filter, low, high).await?;
-                Some(FilterWindow { low, high, bitmap })
-            }
-        };
+        // Prepared metadata filter. `matches` answers per-doc membership
+        // without materialising the full corpus universe, so the BM25 loop can
+        // check each candidate as it is scored.
+        let prepared_filter =
+            PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
 
         // Min-heap (via `WorstFirst` ordering) tracking the K worst candidates
         // accepted so far. `peek()` is the candidate to evict.
@@ -356,24 +350,9 @@ impl QueryEngine {
                 }
             }
 
-            // Refresh the chunked filter window if we've walked past it.
-            // The windows are aligned to multiples of `FILTER_WINDOW_SIZE`,
-            // so the window containing `doc_id` is reachable in one step.
-            if let Some(filter) = query.filter.as_ref()
-                && let Some(window) = filter_window.as_mut()
-                && doc_id < window.low
-            {
-                let (low, high) = window_for(doc_id);
-                window.bitmap = self.recompute_filter_window(filter, low, high).await?;
-                window.low = low;
-                window.high = high;
-            }
-
             // Apply the metadata filter BEFORE scoring so excluded docs
             // don't pay the BM25 cost.
-            if let Some(window) = filter_window.as_ref()
-                && !window.bitmap.contains(doc_id)
-            {
+            if !prepared_filter.matches(doc_id) {
                 continue;
             }
 
@@ -468,25 +447,6 @@ impl QueryEngine {
             streams.push(PostingStream::new(entries, bm25_math::idf(n_docs, n_t)));
         }
         Ok(streams)
-    }
-
-    /// Evaluate the query filter for a single `[low, high]` doc-id window.
-    ///
-    /// The universe used for `Filter::Neq` complement is the full inclusive
-    /// `[low, high]` range — `RoaringTreemap::insert_range` materialises this
-    /// in O(window_size / 2^16) bitmap containers, which is much cheaper than
-    /// scanning every posting stream just to collect doc ids. Doc ids outside
-    /// the streams never reach the membership check, so widening the
-    /// universe is safe.
-    async fn recompute_filter_window(
-        &self,
-        filter: &Filter,
-        low: u64,
-        high: u64,
-    ) -> Result<RoaringTreemap> {
-        let mut universe = RoaringTreemap::new();
-        universe.insert_range(low..=high);
-        Self::evaluate_filter(filter, &universe, self.storage.as_ref()).await
     }
 
     async fn load_field_stats(&self, field: &str) -> Result<FieldStatsValue> {
@@ -718,91 +678,6 @@ impl QueryEngine {
             }
         }
     }
-
-    /// Apply a metadata filter to scored candidate lists.
-    ///
-    /// Collects all candidate IDs into a bitmap, evaluates the filter against
-    /// the inverted index, then retains only candidates that pass the filter.
-    async fn apply_filter(
-        sorted_lists: &mut [Vec<ScoredCandidate>],
-        filter: &Filter,
-        storage: &dyn StorageRead,
-    ) -> Result<()> {
-        // Collect all candidate internal IDs
-        let mut candidates = RoaringTreemap::new();
-        for list in sorted_lists.iter() {
-            for candidate in list {
-                candidates.insert(candidate.internal_id.id());
-            }
-        }
-
-        // Evaluate filter to get allowed IDs
-        let allowed = Self::evaluate_filter(filter, &candidates, storage).await?;
-
-        // Filter each list
-        for list in sorted_lists.iter_mut() {
-            list.retain(|c| allowed.contains(c.internal_id.id()));
-        }
-
-        Ok(())
-    }
-
-    /// Recursively evaluate a filter against the metadata inverted index.
-    ///
-    /// Returns a bitmap of vector IDs that match the filter.
-    /// For Neq, the `candidates` bitmap is used as the universe for complement.
-    fn evaluate_filter<'a>(
-        filter: &'a Filter,
-        candidates: &'a RoaringTreemap,
-        storage: &'a dyn StorageRead,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringTreemap>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            match filter {
-                Filter::Eq(field, value) => {
-                    let field_value: crate::serde::FieldValue = value.clone().into();
-                    let bitmap = storage.get_metadata_index(field, field_value).await?;
-                    Ok(bitmap.effective_vector_ids())
-                }
-                Filter::Neq(field, value) => {
-                    let field_value: crate::serde::FieldValue = value.clone().into();
-                    let bitmap = storage.get_metadata_index(field, field_value).await?;
-                    let mut result = candidates.clone();
-                    result -= &bitmap.effective_vector_ids();
-                    Ok(result)
-                }
-                Filter::In(field, values) => {
-                    let mut result = RoaringTreemap::new();
-                    for value in values {
-                        let field_value: crate::serde::FieldValue = value.clone().into();
-                        let bitmap = storage.get_metadata_index(field, field_value).await?;
-                        result |= &bitmap.effective_vector_ids();
-                    }
-                    Ok(result)
-                }
-                Filter::And(filters) => {
-                    if filters.is_empty() {
-                        return Ok(candidates.clone());
-                    }
-                    let mut result =
-                        Self::evaluate_filter(&filters[0], candidates, storage).await?;
-                    for f in &filters[1..] {
-                        let sub = Self::evaluate_filter(f, candidates, storage).await?;
-                        result &= &sub;
-                    }
-                    Ok(result)
-                }
-                Filter::Or(filters) => {
-                    let mut result = RoaringTreemap::new();
-                    for f in filters {
-                        let sub = Self::evaluate_filter(f, candidates, storage).await?;
-                        result |= &sub;
-                    }
-                    Ok(result)
-                }
-            }
-        })
-    }
 }
 
 struct ScoredCandidate {
@@ -889,30 +764,6 @@ impl PartialOrd for StreamHead {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
-}
-
-/// Width of the doc-id window used to materialise the metadata-filter
-/// allow-list. Tuned so the universe roughly matches a SlateDB scan unit.
-const FILTER_WINDOW_SIZE: u64 = 10_000;
-
-/// Cached filter allow-list for an inclusive `[low, high]` doc-id window.
-struct FilterWindow {
-    /// Inclusive lower bound (zero when the window covers down to id 0).
-    low: u64,
-    /// Inclusive upper bound — the highest `doc_id` covered by `bitmap`.
-    high: u64,
-    /// Allow-list emitted by `evaluate_filter` for the doc ids in
-    /// `[low, high]`.
-    bitmap: RoaringTreemap,
-}
-
-/// Returns the `[low, high]` filter window containing `doc_id`. Windows are
-/// aligned to multiples of [`FILTER_WINDOW_SIZE`], so the loop can jump to
-/// the window covering any current doc id in one step.
-fn window_for(doc_id: u64) -> (u64, u64) {
-    let low = doc_id - (doc_id % FILTER_WINDOW_SIZE);
-    let high = low.saturating_add(FILTER_WINDOW_SIZE - 1);
-    (low, high)
 }
 
 /// Top-K candidate ordered so `BinaryHeap::peek()` returns the worst
