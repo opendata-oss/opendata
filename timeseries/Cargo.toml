@@ -65,7 +65,7 @@ blake3 = "1.8.2"
 metrics.workspace = true
 metrics-exporter-prometheus = { workspace = true, optional = true }
 mime_guess = "2"
-promql-parser = "0.8"
+promql-parser = "0.9"
 regex = "1.0"
 ryu = "1"
 regex-syntax = "0.8"
