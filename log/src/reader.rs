@@ -229,6 +229,11 @@ pub(crate) struct LogReadView {
     pub(crate) storage: Arc<dyn StorageRead>,
     pub(crate) direct: Option<Arc<LogDirect>>,
     pub(crate) segments: SegmentCache,
+    /// Exclusive global sequence this snapshot is known-complete through:
+    /// every record with `seq < frontier` is observable here. Advanced
+    /// atomically with the snapshot so a scan can report how far it observed
+    /// (see `LogIterator::next_sequence` and RFC 0007).
+    pub(crate) frontier: Sequence,
 }
 
 impl LogReadView {
@@ -237,17 +242,23 @@ impl LogReadView {
         storage: Arc<dyn StorageRead>,
         direct: Option<Arc<LogDirect>>,
         segments: SegmentCache,
+        frontier: Sequence,
     ) -> Self {
         Self {
             storage,
             direct,
             segments,
+            frontier,
         }
     }
 
-    /// Replaces the underlying storage snapshot with a new one.
-    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<dyn StorageRead>) {
+    /// Replaces the underlying storage snapshot and the frontier it observes.
+    ///
+    /// The two move together so an observer can never see the frontier run
+    /// ahead of the snapshot the scan actually reads.
+    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<dyn StorageRead>, frontier: Sequence) {
         self.storage = snapshot;
+        self.frontier = frontier;
     }
 
     /// Reloads segments from the current storage snapshot.
@@ -278,7 +289,13 @@ impl LogReadView {
         seq_range: Range<Sequence>,
         _options: &ScanOptions,
     ) -> LogIterator {
-        LogIterator::open(Arc::clone(&self.storage), &self.segments, key, seq_range)
+        LogIterator::open(
+            Arc::clone(&self.storage),
+            &self.segments,
+            key,
+            seq_range,
+            self.frontier,
+        )
     }
 
     /// Counts entries for `key` in `seq_range`, exact.
@@ -496,7 +513,10 @@ impl LogDbReader {
             .map_err(|e| Error::Storage(e.to_string()))?
             .map(Arc::new);
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments)));
+        // Phase 1: standalone readers carry no frontier yet (set from segment
+        // metadata in Phase 2), so `next_sequence` reflects only per-key
+        // coverage. This is sound — it just forgoes the cross-key lift.
+        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments, 0)));
 
         let (shutdown_tx, refresh_task) =
             Self::spawn_refresh_task(Arc::clone(&read_view), config.refresh_interval);
@@ -566,7 +586,10 @@ impl LogDbReader {
         direct: Option<Arc<LogDirect>>,
     ) -> Result<Self> {
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments)));
+        // Phase 1: standalone readers carry no frontier yet (set from segment
+        // metadata in Phase 2), so `next_sequence` reflects only per-key
+        // coverage. This is sound — it just forgoes the cross-key lift.
+        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments, 0)));
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             read_view,
@@ -643,6 +666,14 @@ pub struct LogIterator {
     seq_range: Range<Sequence>,
     current_segment_idx: usize,
     current_iter: Option<SegmentIterator>,
+    /// Exclusive global sequence the underlying snapshot observed, captured at
+    /// open. Used to lift `next_sequence` once the scan drains.
+    frontier: Sequence,
+    /// Highest sequence yielded so far, if any.
+    last_yielded: Option<Sequence>,
+    /// Set once `next()` has returned `None` — i.e. the scan reached the end of
+    /// its range within the snapshot rather than being abandoned early.
+    drained: bool,
 }
 
 impl LogIterator {
@@ -652,6 +683,7 @@ impl LogIterator {
         segment_cache: &SegmentCache,
         key: Bytes,
         seq_range: Range<Sequence>,
+        frontier: Sequence,
     ) -> Self {
         let segments = segment_cache.find_covering(&seq_range);
         Self {
@@ -661,16 +693,33 @@ impl LogIterator {
             seq_range,
             current_segment_idx: 0,
             current_iter: None,
+            frontier,
+            last_yielded: None,
+            drained: false,
         }
     }
 
-    /// Creates a new iterator over the given segments.
+    /// Creates a new iterator over the given segments, with no frontier
+    /// information (`next_sequence` reflects only what was consumed).
     #[cfg(test)]
     pub(crate) fn new(
         storage: Arc<dyn StorageRead>,
         segments: Vec<LogSegment>,
         key: Bytes,
         seq_range: Range<Sequence>,
+    ) -> Self {
+        Self::new_with_frontier(storage, segments, key, seq_range, 0)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit observed frontier, so tests
+    /// can exercise the drained-scan lift in [`next_sequence`](Self::next_sequence).
+    #[cfg(test)]
+    pub(crate) fn new_with_frontier(
+        storage: Arc<dyn StorageRead>,
+        segments: Vec<LogSegment>,
+        key: Bytes,
+        seq_range: Range<Sequence>,
+        frontier: Sequence,
     ) -> Self {
         Self {
             storage,
@@ -679,6 +728,9 @@ impl LogIterator {
             seq_range,
             current_segment_idx: 0,
             current_iter: None,
+            frontier,
+            last_yielded: None,
+            drained: false,
         }
     }
 
@@ -688,6 +740,7 @@ impl LogIterator {
             // If we have a current iterator, try to get the next entry
             if let Some(iter) = &mut self.current_iter {
                 if let Some(entry) = iter.next().await? {
+                    self.last_yielded = Some(entry.sequence);
                     return Ok(Some(entry));
                 }
                 // Current segment exhausted, move to next
@@ -697,8 +750,36 @@ impl LogIterator {
 
             // No current iterator, try to advance to next segment
             if !self.advance_segment().await? {
+                self.drained = true;
                 return Ok(None);
             }
+        }
+    }
+
+    /// Exclusive upper bound on the global sequence this scan observed — the
+    /// next sequence a reader should fetch to resume losslessly. See RFC 0007.
+    ///
+    /// `next_sequence() == N` means: under this scan's read visibility, the scan
+    /// observed `key` completely through `seq < N`, so `scan(key, N..)` omits
+    /// nothing this scan would have returned.
+    ///
+    /// - While iterating, or if abandoned before the end: `last_yielded + 1`
+    ///   (or the scan's `start` if nothing was yielded) — the scan only covered
+    ///   as far as it consumed.
+    /// - After `next()` returns `None`: lifted to the observed frontier, clamped
+    ///   to the requested range end. The frontier advances even for keys with no
+    ///   records, because it reflects the whole snapshot rather than this key.
+    pub fn next_sequence(&self) -> Sequence {
+        let consumed = self
+            .last_yielded
+            .map(|seq| seq.saturating_add(1))
+            .unwrap_or(self.seq_range.start);
+        if self.drained {
+            // Coverage is `[start, min(frontier, end))`: the scan only looks
+            // within its range, and only sees what the snapshot holds.
+            consumed.max(self.frontier.min(self.seq_range.end))
+        } else {
+            consumed
         }
     }
 
@@ -748,6 +829,111 @@ mod tests {
         );
 
         assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[storage_test]
+    async fn next_sequence_empty_drained_scan_returns_frontier(storage: Arc<dyn Storage>) {
+        let mut iter = LogIterator::new_with_frontier(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![],
+            Bytes::from("key"),
+            0..u64::MAX,
+            100,
+        );
+        assert!(iter.next().await.unwrap().is_none());
+        assert_eq!(
+            iter.next_sequence(),
+            100,
+            "an empty scan that drained lifts to the observed frontier"
+        );
+    }
+
+    #[storage_test]
+    async fn next_sequence_clamps_frontier_to_range_end(storage: Arc<dyn Storage>) {
+        // Frontier sits beyond the requested end: a bounded scan only covered
+        // its own window, so it resumes at the end, not the larger frontier.
+        let mut iter = LogIterator::new_with_frontier(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![],
+            Bytes::from("key"),
+            5..100,
+            1000,
+        );
+        assert!(iter.next().await.unwrap().is_none());
+        assert_eq!(iter.next_sequence(), 100);
+    }
+
+    #[storage_test]
+    async fn next_sequence_uses_frontier_below_range_end(storage: Arc<dyn Storage>) {
+        // Snapshot only observed through 50, even though the range extends to
+        // 100: resume at 50, since [50, 100) was never observed.
+        let mut iter = LogIterator::new_with_frontier(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![],
+            Bytes::from("key"),
+            5..100,
+            50,
+        );
+        assert!(iter.next().await.unwrap().is_none());
+        assert_eq!(iter.next_sequence(), 50);
+    }
+
+    #[storage_test]
+    async fn next_sequence_before_first_read_returns_start(storage: Arc<dyn Storage>) {
+        // Nothing consumed and not drained → resume at the scan's start, never
+        // the frontier (we have not yet observed anything).
+        let iter = LogIterator::new_with_frontier(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![],
+            Bytes::from("key"),
+            5..u64::MAX,
+            100,
+        );
+        assert_eq!(iter.next_sequence(), 5);
+    }
+
+    #[storage_test]
+    async fn next_sequence_reflects_consumed_before_drain(storage: Arc<dyn Storage>) {
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        for i in 0..3 {
+            storage
+                .write_entry(&segment, &entry(b"key", i, b"v"))
+                .await
+                .unwrap();
+        }
+        let mut iter = LogIterator::new_with_frontier(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![segment],
+            Bytes::from("key"),
+            0..u64::MAX,
+            100,
+        );
+        // One record consumed, still not drained → last yielded + 1, never the
+        // frontier (there may be more records we haven't read).
+        assert_eq!(iter.next().await.unwrap().unwrap().sequence, 0);
+        assert_eq!(iter.next_sequence(), 1);
+    }
+
+    #[storage_test]
+    async fn next_sequence_lifts_past_last_record_once_drained(storage: Arc<dyn Storage>) {
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        for i in 0..3 {
+            storage
+                .write_entry(&segment, &entry(b"key", i, b"v"))
+                .await
+                .unwrap();
+        }
+        let mut iter = LogIterator::new_with_frontier(
+            storage.clone() as Arc<dyn StorageRead>,
+            vec![segment],
+            Bytes::from("key"),
+            0..u64::MAX,
+            100,
+        );
+        while iter.next().await.unwrap().is_some() {}
+        // Last record was seq 2, but the snapshot was observed through 100, so
+        // a follower resumes at 100 and skips the empty [3, 100) gap.
+        assert_eq!(iter.next_sequence(), 100);
     }
 
     #[storage_test]
