@@ -107,14 +107,18 @@ The contract is one value; only the frontier source differs:
     below which everything is in sealed, fully-durable segments. Available at
     open from metadata, advances only at seal boundaries.
   - an **SST bound** — the maximum global sequence decoded from the key bounds
-    (`SsTableInfo.last_entry`) of the SSTs in the manifest, both L0 and compacted
-    (`DbReader::manifest().l0()` / `.compacted()`). Any record's sequence in an SST
-    exceeds every sequence in older SSTs, so this advances the frontier at *flush*
-    granularity — finer than the seal floor, read on refresh (the reader's
-    `LogDirect` polls the manifest at `refresh_interval`), off the scan path, and
-    independent of which keys are queried. A bound key may be a non-`LogEntry`
-    record or sit outside the active segment, so the decode checks the record type
-    and segment and skips it when it cannot decode a `LogEntry` sequence.
+    (`SsTableInfo.last_entry`) of the durable SSTs (L0 and compacted), read via
+    `StorageRead::sst_key_bounds()` **on the scan reader itself**. Any record's
+    sequence in an SST exceeds every sequence in older SSTs, so this advances the
+    frontier at *flush* granularity — finer than the seal floor, off the scan path,
+    and independent of which keys are queried. Because the bounds come from the
+    same reader — hence the same monotonic snapshot — that the scans use, the
+    frontier can never outrun what a scan observes. (Sourcing it from a *separate*
+    `DbReader` would not: that reader can poll a newer manifest and lift the
+    frontier past records the scan reader has yet to see.) A bound key may be a
+    non-`LogEntry` record or sit outside the active segment, so the decode checks
+    the record type and segment and skips it when it cannot decode a `LogEntry`
+    sequence.
 
 This split matches reality: the writer knows its tip; a standalone reader estimates
 it from durable metadata — sealed boundaries and the SST key bounds. The estimate

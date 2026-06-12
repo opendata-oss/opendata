@@ -301,19 +301,18 @@ impl LogReadView {
         self.frontier = self.segments.sealed_frontier().max(l0);
     }
 
-    /// The frontier implied by the newest L0's key bound: one past the sequence
-    /// of the bound record, when it decodes as a `LogEntry` in the active segment.
+    /// The frontier implied by the durable SST key bounds: one past the highest
+    /// bound sequence that decodes as a `LogEntry` in the active segment.
     ///
-    /// Any record's sequence in the newest L0 exceeds every sequence in prior
-    /// L0s, so this advances the frontier at flush granularity. `deserialize`
-    /// validates the `LogEntry` tag (listings, metadata, and other types error
-    /// out), and the `segment_id` check confirms the bound sits in the active
-    /// segment, so its `start_seq` is the correct base for the decode.
+    /// The bounds come from `self.storage` — the same reader (and snapshot) the
+    /// scans use — so the frontier can never outrun what a scan observes.
+    /// `deserialize` validates the `LogEntry` tag (listings, metadata, and other
+    /// types error out), and the `segment_id` check confirms the bound sits in
+    /// the active segment, so its `start_seq` is the correct decode base.
     fn l0_bound_frontier(&self) -> Option<Sequence> {
-        let direct = self.direct.as_deref()?;
         let latest = self.segments.latest()?;
-        direct
-            .sst_last_entries()
+        self.storage
+            .sst_key_bounds()
             .iter()
             .filter_map(|bound| decode_l0_bound(bound.as_ref(), &latest))
             .max()
@@ -545,7 +544,7 @@ impl LogDbReader {
         )
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
-        let direct = LogDirect::maybe_from_storage_config(&config.storage, config.refresh_interval)
+        let direct = LogDirect::maybe_from_storage_config(&config.storage)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?
             .map(Arc::new);

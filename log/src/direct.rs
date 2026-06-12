@@ -11,7 +11,6 @@
 //! count falls back to a plain scan.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::storage::config::{ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use common::storage::factory::create_object_store;
@@ -39,14 +38,10 @@ impl LogDirect {
     pub(crate) async fn from_config(
         config: &SlateDbStorageConfig,
         block_cache: Option<Arc<dyn DbCache>>,
-        manifest_poll_interval: Duration,
     ) -> StorageResult<Self> {
         let object_store = create_object_store(&config.object_store)?;
         let mut builder = DbReader::builder(config.path.clone(), object_store.clone())
-            .with_options(DbReaderOptions {
-                manifest_poll_interval,
-                ..DbReaderOptions::default()
-            });
+            .with_options(DbReaderOptions::default());
         if let Some(cache) = block_cache.clone() {
             builder = builder.with_db_cache(cache);
         }
@@ -69,14 +64,11 @@ impl LogDirect {
     /// the writer's storage in that case.
     pub(crate) async fn maybe_from_storage_config(
         config: &StorageConfig,
-        manifest_poll_interval: Duration,
     ) -> StorageResult<Option<Self>> {
         match config {
             StorageConfig::SlateDb(slate) => match slate.object_store {
                 ObjectStoreConfig::InMemory => Ok(None),
-                _ => Ok(Some(
-                    Self::from_config(slate, None, manifest_poll_interval).await?,
-                )),
+                _ => Ok(Some(Self::from_config(slate, None).await?)),
             },
             StorageConfig::InMemory => Ok(None),
         }
@@ -98,28 +90,5 @@ impl LogDirect {
         range: &BytesRange,
     ) -> StorageResult<sst_blocks::CountResult> {
         sst_blocks::count_in_range(&self.reader.manifest(), &self.sst_reader, range).await
-    }
-
-    /// Returns the `last_entry` key of every SST in the current manifest
-    /// snapshot — both L0 and the compacted sorted runs.
-    ///
-    /// Any SST's bound record carries a real, present sequence, so a standalone
-    /// reader decodes the maximum to advance its frontier (RFC 0007). Including
-    /// the compacted runs keeps this working when recent data has been compacted
-    /// out of L0. Reads only the manifest the `DbReader` already polls — no SST
-    /// access.
-    pub(crate) fn sst_last_entries(&self) -> Vec<bytes::Bytes> {
-        let manifest = self.reader.manifest();
-        manifest
-            .l0()
-            .iter()
-            .chain(
-                manifest
-                    .compacted()
-                    .iter()
-                    .flat_map(|run| run.sst_views.iter()),
-            )
-            .filter_map(|view| view.sst.info.last_entry.clone())
-            .collect()
     }
 }
