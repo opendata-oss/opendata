@@ -85,8 +85,10 @@
 //!   tolerates document-frequency drift — see the RFC).
 //! - Rewritten blocks re-pack to the fixed 256-entry block size baked into
 //!   the posting encoder (the configurable `target_posting_block_size` from
-//!   the RFC is not yet wired); verbatim-copied blocks keep their existing
-//!   alignment.
+//!   the RFC is not yet wired). Re-packing coalesces survivors only within a
+//!   run of consecutive touched blocks — a verbatim-copied clean pair between
+//!   two runs is a hard boundary, since ids must stay ascending across pairs —
+//!   so each rewritten run ends with one block below the target size.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,7 +107,7 @@ use crate::serde::key::{
     TERM_POSTINGS_DISCRIMINATOR, TERM_STATS_DISCRIMINATOR, VectorFieldStatsKey,
 };
 use crate::serde::term_postings::{
-    DecodedPostingsBlock, PostingEntry, TermPostingsView, TermPostingsEncoder,
+    DecodedPostingsBlock, PostingEntry, TermPostingsEncoder, TermPostingsView,
 };
 use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_bitmap::VectorBitmap;
@@ -222,9 +224,11 @@ impl VectorCompactionFilter {
     /// range holds no deleted id is copied into the rewritten value
     /// **verbatim** — no decode, no re-encode, impacts preserved — so a
     /// sparse delete set only pays for the blocks it actually touches.
-    /// Touched blocks are decoded, pruned, and re-encoded as fresh
-    /// `(Skip, Postings)` pairs with recomputed impacts. (Untouched blocks
-    /// keep their existing alignment; only rewritten blocks re-pack.)
+    /// Touched blocks are decoded and pruned; the survivors of each run of
+    /// consecutive touched blocks are re-encoded together as fresh
+    /// `(Skip, Postings)` pairs with recomputed impacts, re-packed into full
+    /// blocks. (Runs cannot coalesce across a clean block: its verbatim pair
+    /// sits between them in id order.)
     fn handle_postings(
         &mut self,
         entry: &RowEntry,
@@ -250,33 +254,41 @@ impl VectorCompactionFilter {
 
         // `out` is created lazily at the first touched block; while it is
         // `None` every block so far was clean and the original value can be
-        // kept as-is.
+        // kept as-is. Survivors accumulate across each *run* of consecutive
+        // touched blocks and are re-encoded together when the run ends, so
+        // they re-pack into full blocks instead of one undersized pair per
+        // touched block (which would fragment a little further on every
+        // delete/compaction cycle).
         let mut out: Option<BytesMut> = None;
         let mut removed: i64 = 0;
         let mut scratch = DecodedPostingsBlock::default();
+        let mut run_survivors: Vec<PostingEntry> = Vec::new();
         for idx in 0..view.blocks().len() {
             let meta = &view.blocks()[idx];
             if !self.deletions.contains_in_range(meta.min_id, meta.max_id) {
                 if let Some(out) = &mut out {
+                    // A clean pair ends the current dirty run: its verbatim
+                    // bytes follow the run's survivors in id order, so the
+                    // run must be encoded before the pair is copied.
+                    flush_survivor_run(out, &mut run_survivors);
                     out.extend_from_slice(view.pair_bytes(idx));
                 }
                 continue;
             }
             view.decode_block_into(idx, &mut scratch)
                 .map_err(filter_err)?;
-            let mut survivors: Vec<PostingEntry> = Vec::with_capacity(scratch.ids.len());
             for i in 0..scratch.ids.len() {
                 if self.deletions.contains(scratch.ids[i]) {
                     removed += 1;
                 } else {
-                    survivors.push(PostingEntry {
+                    run_survivors.push(PostingEntry {
                         id: VectorId::from_raw(scratch.ids[i]),
                         freq: scratch.freqs[i],
                         norm: scratch.norms[i],
                     });
                 }
             }
-            let out = out.get_or_insert_with(|| {
+            out.get_or_insert_with(|| {
                 // First touched block: start the rewrite with every earlier
                 // (clean) pair. Copy pair by pair rather than slicing the raw
                 // prefix so degenerate zero-count pairs (tolerated by parse
@@ -289,11 +301,9 @@ impl VectorCompactionFilter {
                 }
                 buf
             });
-            if !survivors.is_empty() {
-                out.extend_from_slice(
-                    &TermPostingsEncoder::from_postings(survivors).encode_to_bytes(),
-                );
-            }
+        }
+        if let Some(out) = &mut out {
+            flush_survivor_run(out, &mut run_survivors);
         }
 
         if removed == 0 {
@@ -541,6 +551,21 @@ impl CompactionFilter for NoOpCompactionFilter {
     async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
         Ok(())
     }
+}
+
+/// Re-encodes the survivors of one run of consecutive touched blocks as
+/// fresh `(Skip, Postings)` pairs appended to `out`, leaving `survivors`
+/// empty. Encoding the run as a whole re-packs the survivors into full
+/// blocks ([`TermPostingsEncoder::from_postings`] chunks them at the target
+/// block size); encoding per touched block instead would emit one undersized
+/// pair each, fragmenting the list further on every delete/compaction cycle.
+fn flush_survivor_run(out: &mut BytesMut, survivors: &mut Vec<PostingEntry>) {
+    if survivors.is_empty() {
+        return;
+    }
+    out.extend_from_slice(
+        &TermPostingsEncoder::from_postings(std::mem::take(survivors)).encode_to_bytes(),
+    );
 }
 
 /// Strips the trailing discriminator byte from an `FtsTerm` key so a
@@ -1114,5 +1139,46 @@ mod tests {
             }
             assert!(ids.windows(2).all(|w| w[0] < w[1]));
         }
+    }
+
+    /// Survivors of *consecutive* touched blocks must re-pack into full
+    /// 256-entry blocks (one combined encode per dirty run), not one
+    /// undersized pair per touched block — per-block encoding would shrink
+    /// the blocks a little further on every delete/compaction cycle.
+    #[tokio::test]
+    async fn should_repack_consecutive_dirty_blocks_into_full_blocks() {
+        // given - three full blocks (0..768); deletions hit blocks 0 and 1,
+        // so they form one dirty run with 510 survivors; block 2 stays clean
+        let mut filter = VectorCompactionFilter::new(None);
+        filter.filter(&sentinel_entry()).await.unwrap();
+        filter.filter(&deletions_entry(&[10, 300])).await.unwrap();
+
+        let postings: Vec<_> = (0..768)
+            .map(|i| posting(i, (i % 7) as u32 + 1, 1))
+            .collect();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
+        let view = TermPostingsView::parse(encoded.clone()).unwrap();
+        assert_eq!(view.blocks().len(), 3);
+
+        // when
+        let entry = merge_entry(TermPostingsKey::new("body", "fox").encode(), encoded);
+        let decision = filter.filter(&entry).await.unwrap();
+        let rewritten = TermPostingsView::parse(modified_bytes(&decision)).unwrap();
+
+        // then - the run re-packed as [256, 254], not [255, 255]; the clean
+        // pair follows verbatim
+        let counts: Vec<u32> = rewritten.blocks().iter().map(|b| b.count).collect();
+        assert_eq!(counts, vec![256, 254, 256]);
+        assert_eq!(rewritten.pair_bytes(2), view.pair_bytes(2));
+
+        // and - exactly the deleted ids are gone; order stays ascending
+        let ids: Vec<u64> = rewritten
+            .iter_entries()
+            .map(|e| e.map(|e| e.id.id()))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 766);
+        assert!(!ids.contains(&10) && !ids.contains(&300));
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
     }
 }

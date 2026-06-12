@@ -1054,7 +1054,7 @@ mod tests {
     /// between copied and rewritten pairs cleanly.
     #[test]
     fn term_scorer_traverses_filter_rewritten_layout() {
-        use crate::serde::term_postings::{PostingEntry, TermPostingsView, TermPostingsEncoder};
+        use crate::serde::term_postings::{PostingEntry, TermPostingsEncoder, TermPostingsView};
         use bytes::BytesMut;
 
         let posting = |id: u64| PostingEntry {
@@ -1076,7 +1076,8 @@ mod tests {
             .filter(|&id| id != 300 && id != 400)
             .map(posting)
             .collect();
-        rewritten.extend_from_slice(&TermPostingsEncoder::from_postings(survivors).encode_to_bytes());
+        rewritten
+            .extend_from_slice(&TermPostingsEncoder::from_postings(survivors).encode_to_bytes());
         rewritten.extend_from_slice(view.pair_bytes(2));
         rewritten.extend_from_slice(view.pair_bytes(3));
 
