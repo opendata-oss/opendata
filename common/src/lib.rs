@@ -15,7 +15,7 @@ pub use storage::config::{
 };
 pub use storage::factory::{
     CompactorBuilder, DbBuilder, StorageBuilder, StorageReaderRuntime, StorageSemantics,
-    create_object_store, create_storage_read,
+    create_object_store, create_storage_read, new_slatedb_compactor_builder,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::sst_blocks::{BlockOpCounts, CountResult, count_in_range};
