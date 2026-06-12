@@ -1,0 +1,274 @@
+# RFC 0007: Efficient Tail Scans
+
+**Status**: Draft
+
+**Authors**:
+- Jason Gustafson <12502538+hachikuji@users.noreply.github.com>
+
+## Summary
+
+This RFC keeps tail scans cheap as the log grows, so that following the end of
+the log costs roughly `O(data since the last poll)` rather than `O(backlog)`. It
+combines two cooperating mechanisms:
+
+1. A **resume watermark** — `LogIterator::next_sequence()` reports the exclusive
+   global sequence a scan observed, so a follower resumes past the range it has
+   already seen instead of re-scanning from its original start. Activity on any
+   key advances the watermark for all keys.
+2. **Sequence-aware SST filtering** — per-SST filter metadata lets a scan with an
+   advanced cursor skip entire tables, so a higher watermark actually prunes I/O.
+   Two filter policies cover the tree: a global-sequence-range policy that prunes
+   by sequence (table-level on recent data, per-key once compacted) and a prefix
+   bloom that prunes by key.
+
+The watermark decides *how far* a follower can skip ahead; the filtering makes a
+skipped-ahead cursor *cheap*. Neither is sufficient alone.
+
+## Motivation
+
+Benchmarking found idle tail polling is expensive: a follower querying
+`scan(key, N..)` pays a full range scan every poll even when the key has no new
+data, and that cost grows with the log as the empty `[N, tip)` range widens.
+
+The scan already knows more than it returns. If `scan(key, N..)` observes the log
+through global sequence `M` and finds nothing past `N`, then `key` provably has no
+records in `[N, M)` — durable, because the log is append-only (no backfill below
+the tip). Surfacing `M` lets the caller resume at `M`.
+
+But advancing the cursor only helps if a higher cursor reads less. The key layout
+sorts `segment_id` high and `relative_seq` low, so a per-key scan prunes whole
+**segments** (a different `segment_id` is a disjoint key range) but, *within* a
+segment, every SST spanning the key is probed regardless of the cursor — sequence
+has no pruning power over SST selection. So the watermark must be paired with SST
+filtering that can prune on sequence (Part 2).
+
+## Goals
+
+- Expose, per scan, the exclusive global sequence through which the scan observed
+  the log, as a lossless resume cursor.
+- Let activity on hot keys advance the resume point for idle keys (one watermark,
+  shared via prefix-consistent visibility).
+- Prune SSTs a scan cannot need — by key membership and by sequence range — so an
+  advanced cursor reduces I/O rather than just narrowing the logical range.
+- Keep the resume contract mechanism-independent, so frontier sources and filters
+  can improve without changing callers.
+
+## Non-Goals
+
+- Erasing work for a key that has genuinely advanced. The watermark narrows scan
+  width and the filters drop whole tables; together they shrink — but do not
+  eliminate — the cost of catching a key up.
+- Server-side per-key cursor storage. Cursors are carried by the caller; the
+  server holds at most a single shared watermark.
+- Event-driven wakeup instead of polling. The watermark can later double as a
+  wakeup source, but that is out of scope here.
+
+## Design — Part 1: the resume watermark
+
+### The value
+
+```rust
+impl LogIterator {
+    /// Exclusive upper bound on the global sequence this scan observed —
+    /// the next sequence a reader should fetch to resume losslessly.
+    ///
+    /// `next_sequence() == N` means: under this scan's read visibility, the
+    /// scan observed `key` completely through `seq < N`. Resuming
+    /// `scan(key, next_sequence()..)` omits nothing this scan would return.
+    pub fn next_sequence(&self) -> Sequence;
+}
+```
+
+Exclusive, matching `LogDb::durable_sequence` and `WrittenView.next_sequence`.
+Resume is `cursor = cursor.max(it.next_sequence())` — no off-by-one.
+
+### Always a sound resume cursor
+
+- **While iterating, or stopped early by a `ScanOptions` limit:**
+  `last_yielded_seq + 1` (or the scan's `start` if nothing was yielded). The scan
+  only covered as far as it consumed, so it cannot claim the frontier.
+- **After `next()` returns `None` (full drain):** lifted to the global frontier
+  this scan observed — which advances even for keys with no records, because the
+  frontier is fed by activity on other keys.
+
+The value is never larger than what the scan actually covered for `key`, so
+advancing to it can never skip a record, drained or not.
+
+### Frontier source by reader type
+
+The contract is one value; only the frontier source differs:
+
+- **In-process reader:** the frontier is exact and free — it is the read-view
+  frontier the subscriber already maintains (`durable_sequence` in Remote mode,
+  the written epoch in Memory mode). Lift `next_sequence` to it at drain.
+- **Standalone reader:** has no writer watermark, so it estimates the frontier
+  as the maximum of two sound lower bounds:
+  - a **seal floor** — the start of the active segment (`SegmentCache::sealed_frontier`),
+    below which everything is in sealed, fully-durable segments. Available at
+    open from metadata, advances only at seal boundaries.
+  - a **witnessed watermark** — `observed`, one past the highest sequence any
+    scan on the read view has read (`fetch_max` on yield). A scan of one key
+    lifts it for all keys, so it advances *within* the active segment between
+    seals.
+
+This split matches reality: the writer knows its tip; a standalone reader can only
+estimate it — from sealed boundaries plus what its scans actually read. (A tighter,
+filter-derived source is described under Future work.)
+
+### Why the cross-key lift is sound
+
+A scan of one key may advance an idle key's resume point because the log's
+visibility is **prefix-consistent**: a record at `M` being visible implies every
+`seq < M` is visible in the same snapshot. LogDb expresses durability as a single
+monotonic scalar (`storage.subscribe_durable` → `ViewTracker::advance` →
+`next_sequence`), and advances the read view *before* publishing the watermark
+(`log.rs` `try_advance_durable`; the Memory-mode ordering is the 0006/0005-era
+read-visibility fix), so an observer of the watermark never outruns the snapshot.
+
+For the standalone reader this reduces to SlateDB's manifest being a consistent
+point-in-time snapshot under a single sequence-ordered writer — a SlateDB
+invariant, named here as a dependency rather than proven in this crate.
+
+The witnessed watermark adds one requirement: a scan must read the snapshot and
+`observed` together (under the read lock at open). The reader's snapshot only
+moves forward, so anything in `observed` was witnessed in a snapshot no newer
+than the current one; by prefix-consistency the current snapshot is therefore
+complete through `observed`, and an empty idle scan genuinely has nothing below
+it. `scan_with_options` already runs under that lock, so the ordering is free.
+
+## Design — Part 2: sequence-aware SST filtering
+
+Per Motivation, advancing the cursor prunes only whole segments; within a segment,
+sequence is the lowest-order key term and cannot select SSTs. SST-level filtering
+supplies the missing pruning.
+
+### Mechanism
+
+SlateDB's pluggable `FilterPolicy` provides the two hooks we need: a
+`FilterBuilder::add_entry(&RowEntry)` that accumulates per-SST metadata as the SST
+is written (and rebuilt on compaction output), and `Filter::might_match(&FilterQuery)`
+that consults it at read time. A query carries a caller-supplied `FilterContext`
+(an inline 64-byte payload, enough for a pair of `u64`s), so a scan can parametrize
+the filter with its cursor. A policy is identified by `name()`, stored per-SST, so
+a reader only applies a filter it can decode.
+
+We register **two policies**, complementary by LSM level:
+
+- **Global-sequence-range policy.** Every SST stores a table-level min/max global
+  sequence (~16 bytes); a scan passes its cursor `N` as context and the filter
+  returns *no match* when `max < N`. This is exact in **L0**, where single-writer,
+  time-ordered flushes have disjoint, monotonic ranges — a caught-up cursor skips
+  all but the newest L0(s).
+
+  A single range is coarse on **compacted** SSTs: key-range compaction merges many
+  keys across a wide window, so the overall `max` stays high even when the scanned
+  key's records are all old. To recover precision, the builder additionally stores
+  a per-key map `{key-hash → [min, max]}`, but only when it fits a byte budget `B`
+  — otherwise it is omitted (all-or-nothing). The budget is exceeded exactly when
+  an SST has many keys (an L0), where the table range already suffices, so the
+  enrichment is dropped only where it is not needed. Keys are stored as hashes,
+  keeping the map compact for arbitrary key sizes; a collision unions two ranges,
+  costing selectivity but never soundness. (Lookup is specified under
+  Serialization.)
+
+  The encoding is chosen per-SST at build time and rebuilt on compaction, so as a
+  table's resident-key count falls under `B` it flips from table-level to per-key
+  automatically — precision improves monotonically with compaction, under a hard
+  per-SST size ceiling. Per-key ranges remain SST-wide: a sparse, long-lived key
+  spanning the whole table is not narrowed (block-level ranges would be a secondary
+  index, out of scope), and if a budget-bound SST ever warrants partial coverage,
+  the principled choice is to keep the lowest-`max` (most skippable) keys.
+
+  The builder records *global* sequence (`segment_start + relative_seq`), which the
+  key alone does not carry; the policy resolves `segment_id → start_seq` to compute
+  it.
+
+- **Prefix bloom policy.** The builder hashes the key prefix of each entry; at
+  read time the filter rules out any SST that cannot contain the scanned key.
+  This is strongest at the **compacted levels**: as data sorts, each SST covers a
+  narrower key range, so fewer distinct logs per SST and a higher skip rate. It is
+  weak in L0, where each flush spans many keys.
+
+### Composition
+
+The policies layer rather than split by level: the prefix bloom drops SSTs that
+cannot contain the key, then the sequence policy drops survivors whose data for
+the key is all below the cursor — and the watermark from Part 1 keeps that cursor
+high. Together they collapse a tail follower's per-poll cost to the newest L0(s)
+plus the one compacted SST that both contains its key and holds a record at or
+past the cursor, independent of how large the log or active segment has grown.
+
+### Sequence-filter serialization
+
+The policy owns its filter blob; SlateDB stores it tagged with the policy `name()`
+and returns it to `decode` on read, so this layout is private to the policy.
+Sequences use the project's `var_u64` varint (`common::serde::varint`); fixed
+64-bit values use big-endian `u64`, matching existing record encodings.
+
+```
+blob := version  : u8
+        flags    : u8                    # bit 0: per-key map present
+        table_min       : var_u64
+        table_max_delta : var_u64        # table_max = table_min + delta
+        if flags.per_key:
+            count : var_u64
+            entry × count, sorted by hash (binary-searched at query):
+                hash      : u64          # 64-bit key hash, same family as the
+                                         #   prefix bloom; collisions union ranges
+                min       : var_u64
+                max_delta : var_u64
+```
+
+Each range is stored as `min + (max − min)` so the varints stay small — the delta
+is bounded by the records the SST holds, not the absolute sequence.
+
+The cursor reaches the filter through `FilterContext::Inline`: bytes `0..8` hold
+`N` as a big-endian `u64`, the remainder reserved (zero). `decode` parses the blob
+into `{ table: (min, max), per_key: Option<[(hash, min, max)]> }`. The resume
+predicate uses only `max` (`might_match` reads `N`, looks up `hash(K)` in `per_key`
+when present — binary search, absent → `table.max` — else `table.max`, and returns
+`max ≥ N`); `min` is carried for a future bounded-scan upper-bound prune and is
+otherwise unused.
+
+Compatibility: an incompatible format change bumps the policy `name`, so a reader
+that cannot match the policy skips the filter entirely — no pruning, still sound.
+The `version` byte covers compatible evolution; an unknown `version` is likewise
+treated as match-everything.
+
+### Evaluation path
+
+SlateDB evaluates SST filters on `get` and `scan_prefix`, but **not** on plain
+range `scan`. A per-key scan is naturally a prefix scan — all sequences for a key
+share the prefix `…|segment_id|record_type|key`, with `seq` as the suffix — so it
+runs as `scan_prefix` over that prefix, with the cursor `N` supplied as filter
+context. This requires an upstream SlateDB change to let `scan_prefix` accept a
+**sub-range**, so the scan can begin at `N` within the key's prefix instead of
+re-reading the key's whole history while still evaluating the filters.
+
+## Wire surface
+
+The scan response gains one field, `next_sequence`; `follow=true` feeds it back as
+the next poll's start. There is no existing global-sequence field on the read API
+or wire today, so this is purely additive.
+
+## Future work: filter-derived frontier advancement
+
+The global-sequence-range policy's per-SST `max` is, in aggregate, exactly the
+durable tip a standalone reader otherwise lacks: the maximum `max` across the SSTs
+in the reader's snapshot is the highest durable global sequence present, and by
+prefix-consistency the reader is complete through it. The newest L0's `max` is
+that tip. Sourcing the frontier from it would supersede both the seal floor and
+the witnessed watermark in Part 1 — it is tighter (it includes the active
+segment's flushed data) and, unlike the witnessed watermark, independent of which
+keys are queried — while changing only how `LogReadView.frontier` is computed, not
+the `next_sequence` contract.
+
+This is blocked on SlateDB: the `FilterPolicy` exposes `might_match` (a per-query
+predicate during a scan) but no accessor to *read* a stored filter value off an
+SST. Advancing the frontier wants to harvest the newest SST's `max` on refresh,
+off the scan path — there is no API for that today. SlateDB's own surfaces don't
+substitute: `WriteHandle::seqnum` and the manifest live in SlateDB's internal
+seqnum space, not LogDb's global sequence, and the manifest's per-SST max *key* is
+useless for max sequence under the key-major layout. Until SlateDB can surface
+custom per-SST filter metadata to a reader, the standalone reader uses the seal
+floor plus witnessed watermark.
