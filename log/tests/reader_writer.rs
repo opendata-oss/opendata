@@ -374,6 +374,97 @@ async fn reader_idle_key_resumes_at_sealed_frontier() {
 }
 
 #[tokio::test]
+async fn reader_idle_key_resumes_at_witnessed_sequence() {
+    // Within a single, never-sealed segment the seal floor stays at 0. A
+    // standalone reader that scans a hot key witnesses its sequences and lifts
+    // the frontier for all keys, so an idle key resumes past the active-segment
+    // records with no seal involved (RFC 0007 cross-key witnessed lift).
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let storage = local_storage_config(&temp_dir);
+
+    let writer = LogDb::open(Config {
+        storage: storage.clone(),
+        segmentation: SegmentConfig {
+            seal_interval: None,
+        },
+        ..Default::default()
+    })
+    .await
+    .expect("Failed to open writer");
+
+    writer
+        .try_append(vec![
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v1"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v2"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v3"),
+            },
+        ])
+        .await
+        .expect("Failed to append");
+    writer.flush().await.expect("Failed to flush");
+
+    let reader = LogDbReader::open(ReaderConfig {
+        storage,
+        refresh_interval: Duration::from_millis(20),
+    })
+    .await
+    .expect("Failed to open reader");
+
+    // Wait until the reader can see the hot records.
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+        || async {
+            reader
+                .count(Bytes::from("hot"), ..)
+                .await
+                .map(|n| n == 4)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    // Single unsealed segment: before witnessing, the idle key only has the
+    // seal floor (0).
+    let mut cold = reader
+        .scan(Bytes::from("cold"), ..)
+        .await
+        .expect("Failed to scan idle key");
+    assert!(cold.next().await.expect("Failed to scan").is_none());
+    assert_eq!(cold.next_sequence(), 0);
+
+    // Scan the hot key to witness its sequences (0..4).
+    let mut hot = reader
+        .scan(Bytes::from("hot"), ..)
+        .await
+        .expect("Failed to scan hot key");
+    while hot.next().await.expect("Failed to scan").is_some() {}
+
+    // The idle key now resumes at the witnessed frontier, despite no seal.
+    let mut cold = reader
+        .scan(Bytes::from("cold"), ..)
+        .await
+        .expect("Failed to rescan idle key");
+    assert!(cold.next().await.expect("Failed to scan").is_none());
+    assert_eq!(cold.next_sequence(), 4);
+
+    reader.close().await;
+    writer.close().await.expect("Failed to close writer");
+}
+
+#[tokio::test]
 async fn flush_guarantees_durability_across_reopen() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let storage = local_storage_config(&temp_dir);

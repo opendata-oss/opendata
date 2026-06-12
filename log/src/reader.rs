@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -229,11 +230,18 @@ pub(crate) struct LogReadView {
     pub(crate) storage: Arc<dyn StorageRead>,
     pub(crate) direct: Option<Arc<LogDirect>>,
     pub(crate) segments: SegmentCache,
-    /// Exclusive global sequence this snapshot is known-complete through:
-    /// every record with `seq < frontier` is observable here. Advanced
-    /// atomically with the snapshot so a scan can report how far it observed
-    /// (see `LogIterator::next_sequence` and RFC 0007).
+    /// Exclusive global sequence floor this snapshot is known-complete through:
+    /// every record with `seq < frontier` is observable here. The writer sets
+    /// this from its sequence watermark; a standalone reader sets it from sealed
+    /// segment boundaries. Advanced atomically with the snapshot (see RFC 0007).
     pub(crate) frontier: Sequence,
+    /// Exclusive global sequence witnessed by scans: one past the highest
+    /// sequence any scan has read. A scan of one key lifts this for all keys,
+    /// advancing the frontier *within* the active segment between seals (the
+    /// cross-key lift; see RFC 0007). Sound because visibility is
+    /// prefix-consistent and the snapshot only moves forward, so anything
+    /// witnessed in a past snapshot is complete in the current one.
+    pub(crate) observed: Arc<AtomicU64>,
 }
 
 impl LogReadView {
@@ -249,7 +257,15 @@ impl LogReadView {
             direct,
             segments,
             frontier,
+            observed: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The effective frontier for a new scan: the maximum of the floor and the
+    /// witnessed watermark. Read together with the snapshot under the caller's
+    /// read lock, so it never names a sequence past what this snapshot covers.
+    fn scan_frontier(&self) -> Sequence {
+        self.frontier.max(self.observed.load(Ordering::Relaxed))
     }
 
     /// Replaces the underlying storage snapshot and the frontier it observes.
@@ -305,7 +321,8 @@ impl LogReadView {
             &self.segments,
             key,
             seq_range,
-            self.frontier,
+            self.scan_frontier(),
+            Arc::clone(&self.observed),
         )
     }
 
@@ -686,6 +703,9 @@ pub struct LogIterator {
     /// Exclusive global sequence the underlying snapshot observed, captured at
     /// open. Used to lift `next_sequence` once the scan drains.
     frontier: Sequence,
+    /// Shared witnessed watermark for the read view. Bumped to one past each
+    /// sequence this scan reads, so later scans of other keys benefit.
+    observed: Arc<AtomicU64>,
     /// Highest sequence yielded so far, if any.
     last_yielded: Option<Sequence>,
     /// Set once `next()` has returned `None` — i.e. the scan reached the end of
@@ -701,6 +721,7 @@ impl LogIterator {
         key: Bytes,
         seq_range: Range<Sequence>,
         frontier: Sequence,
+        observed: Arc<AtomicU64>,
     ) -> Self {
         let segments = segment_cache.find_covering(&seq_range);
         Self {
@@ -711,6 +732,7 @@ impl LogIterator {
             current_segment_idx: 0,
             current_iter: None,
             frontier,
+            observed,
             last_yielded: None,
             drained: false,
         }
@@ -730,6 +752,8 @@ impl LogIterator {
 
     /// Like [`new`](Self::new) but with an explicit observed frontier, so tests
     /// can exercise the drained-scan lift in [`next_sequence`](Self::next_sequence).
+    /// Uses a private witnessed watermark — to test the shared lift, scan
+    /// through a [`LogReadView`].
     #[cfg(test)]
     pub(crate) fn new_with_frontier(
         storage: Arc<dyn StorageRead>,
@@ -746,6 +770,7 @@ impl LogIterator {
             current_segment_idx: 0,
             current_iter: None,
             frontier,
+            observed: Arc::new(AtomicU64::new(0)),
             last_yielded: None,
             drained: false,
         }
@@ -758,6 +783,10 @@ impl LogIterator {
             if let Some(iter) = &mut self.current_iter {
                 if let Some(entry) = iter.next().await? {
                     self.last_yielded = Some(entry.sequence);
+                    // Lift the read view's witnessed watermark so later scans of
+                    // other keys resume past this point (RFC 0007 cross-key lift).
+                    self.observed
+                        .fetch_max(entry.sequence.saturating_add(1), Ordering::Relaxed);
                     return Ok(Some(entry));
                 }
                 // Current segment exhausted, move to next
@@ -951,6 +980,42 @@ mod tests {
         // Last record was seq 2, but the snapshot was observed through 100, so
         // a follower resumes at 100 and skips the empty [3, 100) gap.
         assert_eq!(iter.next_sequence(), 100);
+    }
+
+    #[storage_test]
+    async fn observed_lift_advances_idle_key_within_active_segment(storage: Arc<dyn Storage>) {
+        // No sealed segments, so the frontier floor is 0. A scan of a hot key
+        // witnesses its sequences and lifts the read view's shared watermark,
+        // so a later scan of an idle key resumes past them — the cross-key lift
+        // operating inside the active segment, with no seal involved.
+        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
+        for i in 0..4 {
+            storage
+                .write_entry(&segment, &entry(b"hot", i, b"v"))
+                .await
+                .unwrap();
+        }
+        let mut segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        segments.insert(segment);
+
+        let view = LogReadView::new(storage.clone() as Arc<dyn StorageRead>, None, segments, 0);
+        let opts = ScanOptions::default();
+
+        // Idle key before any witnessing: only the floor (0) is available.
+        let mut cold = view.scan_with_options(Bytes::from("cold"), 0..u64::MAX, &opts);
+        assert!(cold.next().await.unwrap().is_none());
+        assert_eq!(cold.next_sequence(), 0);
+
+        // Drain the hot key, witnessing seq 0..4.
+        let mut hot = view.scan_with_options(Bytes::from("hot"), 0..u64::MAX, &opts);
+        while hot.next().await.unwrap().is_some() {}
+
+        // The idle key now resumes past the witnessed records, despite no seal.
+        let mut cold = view.scan_with_options(Bytes::from("cold"), 0..u64::MAX, &opts);
+        assert!(cold.next().await.unwrap().is_none());
+        assert_eq!(cold.next_sequence(), 4);
     }
 
     #[storage_test]
