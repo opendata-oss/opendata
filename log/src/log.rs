@@ -323,7 +323,9 @@ impl LogDb {
     ///
     /// Cheap — a read-lock load, no storage I/O — so the scan handler can skip
     /// work entirely while a follower's cursor is `>= observed_sequence()`.
-    /// Internal: external callers resume off `LogIterator::next_sequence`.
+    /// Internal: external callers resume off `LogIterator::next_sequence`, so
+    /// this exists only for the HTTP scan handler's idle-poll short-circuit.
+    #[cfg(feature = "http-server")]
     pub(crate) async fn observed_sequence(&self) -> Sequence {
         self.read_view.read().await.frontier
     }

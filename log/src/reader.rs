@@ -282,6 +282,17 @@ impl LogReadView {
         self.segments.drop_through(through_id);
     }
 
+    /// Sets the frontier from sealed segment boundaries.
+    ///
+    /// The standalone reader's frontier source: it has no writer watermark, so
+    /// it derives a sound (if coarse) frontier from the segments it has loaded.
+    /// Only the reader paths call this — the writer sets a tighter frontier from
+    /// its sequence watermark in `advance_read_view_to`, and must not be
+    /// clobbered by the coarser segment-derived value. See RFC 0007.
+    pub(crate) fn refresh_frontier_from_segments(&mut self) {
+        self.frontier = self.segments.sealed_frontier();
+    }
+
     /// Scans entries for a key within a sequence number range with custom options.
     pub(crate) fn scan_with_options(
         &self,
@@ -513,10 +524,12 @@ impl LogDbReader {
             .map_err(|e| Error::Storage(e.to_string()))?
             .map(Arc::new);
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        // Phase 1: standalone readers carry no frontier yet (set from segment
-        // metadata in Phase 2), so `next_sequence` reflects only per-key
-        // coverage. This is sound — it just forgoes the cross-key lift.
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments, 0)));
+        // Standalone readers have no writer watermark, so seed the frontier
+        // from sealed segment boundaries (RFC 0007).
+        let frontier = segments.sealed_frontier();
+        let read_view = Arc::new(RwLock::new(LogReadView::new(
+            storage, direct, segments, frontier,
+        )));
 
         let (shutdown_tx, refresh_task) =
             Self::spawn_refresh_task(Arc::clone(&read_view), config.refresh_interval);
@@ -551,6 +564,8 @@ impl LogDbReader {
                         if let Err(e) = view.segments.refresh(storage.as_ref(), None).await {
                             tracing::warn!("Failed to refresh segment cache: {}", e);
                         }
+                        // Advance the frontier as newly-sealed segments appear.
+                        view.refresh_frontier_from_segments();
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -586,10 +601,12 @@ impl LogDbReader {
         direct: Option<Arc<LogDirect>>,
     ) -> Result<Self> {
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        // Phase 1: standalone readers carry no frontier yet (set from segment
-        // metadata in Phase 2), so `next_sequence` reflects only per-key
-        // coverage. This is sound — it just forgoes the cross-key lift.
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments, 0)));
+        // Standalone readers have no writer watermark, so seed the frontier
+        // from sealed segment boundaries (RFC 0007).
+        let frontier = segments.sealed_frontier();
+        let read_view = Arc::new(RwLock::new(LogReadView::new(
+            storage, direct, segments, frontier,
+        )));
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             read_view,
