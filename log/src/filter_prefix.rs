@@ -539,6 +539,7 @@ mod tests {
                 }),
                 settings_path: None,
                 block_cache: None,
+                meta_cache: None,
             })
         }
 
