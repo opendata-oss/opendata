@@ -3,19 +3,23 @@
 //! A term's posting list is a sequence of typed blocks written one after
 //! another to the end of the value buffer. Each `Postings` block holds up to
 //! [`TARGET_POSTINGS_PER_BLOCK`] `(id, freq, norm)` triples in strictly
-//! descending `id` order. Each `Postings` block is preceded by a `Skip`
-//! block that summarises the postings block's last id and serialized byte
-//! length, so a future query path can iterate without parsing the full
-//! payload. Multiple `(Skip, Postings)` pairs may appear in a single value;
-//! they too are stored in descending id order (each pair's ids are strictly
-//! lower than all ids in the preceding pair).
+//! ascending `id` order. Each `Postings` block is preceded by a `Skip`
+//! block that summarises the postings block's last (highest) id, impacts,
+//! and serialized byte length, so readers can index and skip blocks without
+//! decoding their payloads. Multiple `(Skip, Postings)` pairs may appear in
+//! a single value, also in ascending id order (each pair's ids are strictly
+//! higher than all ids in the preceding pair).
 //!
 //! Each skip block carries the `impacts` of its postings block: the dominating
 //! `(freq, norm)` pairs of the contained documents (RFC-0006). The query path
 //! uses them to compute a tight upper bound on the BM25 contribution of any
-//! document in the block without decoding the block (BlockMaxScore). Values
-//! written before impacts landed decode with an empty impact list, which
-//! readers must treat as "unknown" (fall back to the term's global bound).
+//! document in the block without decoding the block (BlockMaxScore).
+//!
+//! The canonical decoded representation is columnar: [`PostingListView`]
+//! parses block headers into a directory and decodes payloads on demand into
+//! ascending parallel arrays ([`DecodedPostingsBlock`]). Row-oriented readers
+//! use [`PostingListView::iter_entries`]; [`TermPostingsValue`] is the
+//! encode-side builder only.
 //!
 //! ## Value Layout (little-endian unless noted)
 //!
@@ -28,28 +32,27 @@
 //! Postings (type = 0x00) payload
 //! ┌──────────────────────────────────────────────────────────────────┐
 //! │  count:        u32   (1..=256 entries actually used)             │
-//! │  base_id:      u64   (highest id in block)                       │
-//! │  ids_encoding: u8   (0 = bitpacked gaps, 1 = u64 varint gaps)    │
+//! │  base_id:      u64   (lowest id in block, == ids[0])             │
+//! │  ids_encoding: u8   (0 = bitpacked gaps, 1 = varint gaps)       │
 //! │  -- if ids_encoding == 0:                                        │
 //! │     ids_bits:    u8                                              │
-//! │     ids_packed:  ids_bits * 32 bytes (BitPacker8x of 256 gaps)   │
+//! │     ids_packed:  ids_bits * 32 bytes (BitPacker8x of 256 gaps)  │
 //! │  -- if ids_encoding == 1:                                        │
-//! │     ids_varint:  count u64 LEB128 unsigned varints               │
+//! │     ids_varint:  count - 1 u64 LEB128 unsigned varints           │
 //! │  freqs_bits:   u8                                                │
 //! │  freqs_packed: freqs_bits * 32 bytes (BitPacker8x of 256 freqs)  │
 //! │  norms:        count bytes                                       │
 //! └──────────────────────────────────────────────────────────────────┘
 //!
-//! `ids_*` carries gaps between consecutive ids in descending order:
-//! `gap[0] = 0` (the delta from the first id to itself) and
-//! `gap[i] = ids[i-1] - ids[i]` for `i > 0`. The encoder builds the
-//! gap array first, then picks bitpacked when every gap fits in `u32` and
-//! falls back to per-gap LEB128 unsigned varints (`ids_encoding = 1`)
-//! otherwise.
+//! `ids_*` carries the ascending gaps `ids[i] - ids[i-1]` for `i >= 1`
+//! (`base_id` itself is stored explicitly). When every gap fits in `u32`
+//! they are stored as a plain bitpacked 256-element [`BitPacker8x`] block
+//! (tail padded with zeros so it never widens `ids_bits`); otherwise each
+//! gap is written as an unsigned LEB128 `u64` varint (`ids_encoding = 1`).
 //!
 //! Skip (type = 0x01) payload
 //! ┌──────────────────────────────────────────────────────────────────┐
-//! │  last_id:        u64                                              │
+//! │  last_id:        u64   (highest id in block, == ids[count - 1])   │
 //! │  impacts_count:  u16                                              │
 //! │  impacts:        impacts_count * { freq: u32, norm: u8 }          │
 //! │  length:         u64   (byte length of associated Postings block) │
@@ -62,14 +65,9 @@
 //! produces a single `(Skip, Postings)` pair containing only the newly
 //! inserted ids. Vector ids are monotonically allocated, so a newer batch's
 //! ids are strictly higher than any previous batch's ids and the merge
-//! operator can simply concatenate newer operands' bytes before the existing
-//! value's bytes — preserving the global descending-id ordering.
-//!
-//! TODO(rfc-0006 milestone 1+): once the FTS compaction filter lands, it
-//! will rewrite postings into uniform 256-entry `Postings` blocks (each
-//! preceded by a refreshed `Skip`) and prune any stale ids removed via the
-//! deletions bitmap. The variable-size last block today is a Milestone 0
-//! artifact of merge-by-concat with batches of arbitrary size.
+//! operator can simply concatenate operands' bytes after the existing
+//! value's bytes, in delivery (oldest-to-newest) order — preserving the
+//! global ascending-id ordering.
 
 use super::EncodingError;
 use crate::serde::vector_id::VectorId;
@@ -85,11 +83,14 @@ pub(crate) const TARGET_POSTINGS_PER_BLOCK: usize = BLOCK_LEN;
 const BLOCK_TYPE_POSTINGS: u8 = 0x00;
 const BLOCK_TYPE_SKIP: u8 = 0x01;
 
-/// id `gaps` packed via [`BitPacker8x`]. Used when every gap fits in `u32`.
+/// Ascending id gaps packed via [`BitPacker8x`]. Used when every gap fits
+/// in `u32`. (The strictly-sorted delta codec was measured ~50x slower to
+/// decode than plain unpacking plus a scalar prefix sum, for a one-bit-per-id
+/// saving — so gaps are packed plain.)
 const IDS_ENCODING_BITPACKED: u8 = 0;
 
-/// id `gaps` written one-by-one as unsigned LEB128 `u64` varints. Used
-/// when at least one gap exceeds [`u32::MAX`].
+/// Ascending id gaps written one-by-one as unsigned LEB128 `u64` varints.
+/// Used when at least one gap exceeds `u32::MAX`.
 const IDS_ENCODING_VARINT: u8 = 1;
 
 /// A single posting entry within a `Postings` block.
@@ -143,23 +144,24 @@ fn compute_dominating_impacts(entries: &[PostingEntry]) -> Vec<Impact> {
     impacts
 }
 
-/// A `Postings` block: a run of `PostingEntry` in descending `id` order.
+/// A `Postings` block: a run of `PostingEntry` in ascending `id` order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PostingsBlock {
-    /// Entries, sorted by descending `id`.
+    /// Entries, sorted by ascending `id`.
     pub(crate) entries: Vec<PostingEntry>,
 }
 
 impl PostingsBlock {
-    pub(crate) fn from_descending(entries: Vec<PostingEntry>) -> Self {
+    pub(crate) fn from_ascending(entries: Vec<PostingEntry>) -> Self {
         debug_assert!(
-            entries.windows(2).all(|w| w[0].id > w[1].id),
-            "PostingsBlock entries must be strictly descending"
+            entries.windows(2).all(|w| w[0].id < w[1].id),
+            "PostingsBlock entries must be strictly ascending"
         );
         debug_assert!(entries.len() <= BLOCK_LEN);
         Self { entries }
     }
 
+    /// Id of the last (highest) entry in the block.
     pub(crate) fn last_id(&self) -> VectorId {
         self.entries
             .last()
@@ -179,40 +181,34 @@ impl PostingsBlock {
         let base_id = self.entries[0].id.id();
         buf.put_u64_le(base_id);
 
-        // Build the gap array first so we can choose the id encoding
-        // based on the max gap. `gap[0]` is always 0 (the first id is
-        // its own delta); subsequent gaps are positive because the block is
-        // strictly descending.
-        let mut gaps = Vec::with_capacity(count);
-        gaps.push(0u64);
+        let bitpacker = BitPacker8x::new();
+
+        // Gaps between consecutive ids for entries 1.. (the first entry is
+        // base_id itself, so only `count - 1` gaps are real).
         let mut max_gap = 0u64;
         for window in self.entries.windows(2) {
-            let g = window[0].id.id() - window[1].id.id();
-            max_gap = max_gap.max(g);
-            gaps.push(g);
+            max_gap = max_gap.max(window[1].id.id() - window[0].id.id());
         }
-
-        let bitpacker = BitPacker8x::new();
 
         if max_gap <= u32::MAX as u64 {
             buf.put_u8(IDS_ENCODING_BITPACKED);
-            // Pad the tail with zeros — zero is `<= max_gap`, so this never
-            // widens num_bits beyond what the real data requires.
-            let mut ids = [0u32; BLOCK_LEN];
-            for (i, &g) in gaps.iter().enumerate() {
-                ids[i] = g as u32;
+            // Pad the tail with zeros — zero is `<= max_gap`, so padding
+            // never widens ids_bits beyond what the real data requires.
+            let mut gaps = [0u32; BLOCK_LEN];
+            for (i, window) in self.entries.windows(2).enumerate() {
+                gaps[i] = (window[1].id.id() - window[0].id.id()) as u32;
             }
-            let ids_bits = bitpacker.num_bits(&ids);
+            let ids_bits = bitpacker.num_bits(&gaps);
             buf.put_u8(ids_bits);
             let ids_bytes = ids_bits as usize * (BLOCK_LEN / 8);
             let mut packed = vec![0u8; ids_bytes];
-            let written = bitpacker.compress(&ids, &mut packed, ids_bits);
+            let written = bitpacker.compress(&gaps, &mut packed, ids_bits);
             debug_assert_eq!(written, ids_bytes);
             buf.extend_from_slice(&packed);
         } else {
             buf.put_u8(IDS_ENCODING_VARINT);
-            for &g in &gaps {
-                write_u64_varint(buf, g);
+            for window in self.entries.windows(2) {
+                write_u64_varint(buf, window[1].id.id() - window[0].id.id());
             }
         }
 
@@ -235,28 +231,11 @@ impl PostingsBlock {
             buf.put_u8(entry.norm);
         }
     }
-
-    fn decode_payload(buf: &[u8]) -> Result<Self, EncodingError> {
-        let mut ids = [0u64; BLOCK_LEN];
-        let mut freqs = [0u32; BLOCK_LEN];
-        let (count, norms) = decode_postings_raw(buf, &mut ids, &mut freqs)?;
-        let mut entries = Vec::with_capacity(count);
-        for i in 0..count {
-            entries.push(PostingEntry {
-                id: VectorId::from_raw(ids[i]),
-                freq: freqs[i],
-                norm: norms[i],
-            });
-        }
-        Ok(Self { entries })
-    }
 }
 
 /// Decode a `Postings` block payload into caller-provided stack arrays in
-/// stored (descending id) order. Returns the entry count and the borrowed
-/// norms slice. Shared by the eager [`PostingsBlock`] decode and the lazy
-/// [`PostingListView`] block decode; allocation-free so both hot paths can
-/// reuse buffers.
+/// ascending id order. Returns the entry count and the borrowed norms
+/// slice. Allocation-free so the hot decode path can reuse buffers.
 fn decode_postings_raw<'a>(
     buf: &'a [u8],
     ids: &mut [u64; BLOCK_LEN],
@@ -303,8 +282,9 @@ fn decode_postings_raw<'a>(
     let ids_encoding = cursor[0];
     cursor = &cursor[1..];
 
-    // Decode gaps into `ids` (as the gap values), then reconstruct the
-    // descending ids in place below. `gap[0]` is 0 so ids[0] == base_id.
+    // The first id is base_id itself; the remaining `count - 1` come from
+    // the encoded section.
+    ids[0] = base_id;
     match ids_encoding {
         IDS_ENCODING_BITPACKED => {
             if cursor.is_empty() {
@@ -314,6 +294,13 @@ fn decode_postings_raw<'a>(
             }
             let ids_bits = cursor[0];
             cursor = &cursor[1..];
+            // BitPacker8x asserts (panics) on widths above 32; corrupt data
+            // must surface as a recoverable error instead.
+            if ids_bits > 32 {
+                return Err(EncodingError {
+                    message: format!("postings ids_bits {} exceeds 32", ids_bits),
+                });
+            }
             let ids_bytes = ids_bits as usize * (BLOCK_LEN / 8);
             if cursor.len() < ids_bytes {
                 return Err(EncodingError {
@@ -328,15 +315,25 @@ fn decode_postings_raw<'a>(
             let consumed = bitpacker.decompress(&cursor[..ids_bytes], &mut gaps, ids_bits);
             debug_assert_eq!(consumed, ids_bytes);
             cursor = &cursor[ids_bytes..];
-            for i in 0..count {
-                ids[i] = gaps[i] as u64;
+            let mut current = base_id;
+            for i in 1..count {
+                current = current
+                    .checked_add(gaps[i - 1] as u64)
+                    .ok_or_else(|| EncodingError {
+                        message: format!("gap {} overflows running id {}", gaps[i - 1], current),
+                    })?;
+                ids[i] = current;
             }
         }
         IDS_ENCODING_VARINT => {
-            for slot in ids.iter_mut().take(count) {
+            let mut current = base_id;
+            for slot in ids.iter_mut().take(count).skip(1) {
                 let (g, used) = read_u64_varint(cursor)?;
                 cursor = &cursor[used..];
-                *slot = g;
+                current = current.checked_add(g).ok_or_else(|| EncodingError {
+                    message: format!("gap {} overflows running id {}", g, current),
+                })?;
+                *slot = current;
             }
         }
         other => {
@@ -344,17 +341,6 @@ fn decode_postings_raw<'a>(
                 message: format!("unknown postings ids_encoding: 0x{:02x}", other),
             });
         }
-    }
-
-    let mut current = base_id;
-    for (i, slot) in ids.iter_mut().enumerate().take(count) {
-        let g = *slot;
-        if i > 0 {
-            current = current.checked_sub(g).ok_or_else(|| EncodingError {
-                message: format!("gap {} underflows running id {}", g, current),
-            })?;
-        }
-        *slot = current;
     }
 
     // freqs
@@ -365,6 +351,11 @@ fn decode_postings_raw<'a>(
     }
     let freqs_bits = cursor[0];
     cursor = &cursor[1..];
+    if freqs_bits > 32 {
+        return Err(EncodingError {
+            message: format!("postings freqs_bits {} exceeds 32", freqs_bits),
+        });
+    }
     let freqs_bytes = freqs_bits as usize * (BLOCK_LEN / 8);
     if cursor.len() < freqs_bytes {
         return Err(EncodingError {
@@ -429,8 +420,8 @@ fn read_u64_varint(buf: &[u8]) -> Result<(u64, usize), EncodingError> {
 /// A `Skip` block summarising the immediately following `Postings` block.
 ///
 /// `impacts` holds the dominating `(freq, norm)` pairs of the postings block
-/// (see [`Impact`]). Values written before impacts landed (RFC-0006 M0-M2)
-/// decode with an empty list, which readers treat as "unknown".
+/// (see [`Impact`]). An empty list is valid on the wire and means "unknown" —
+/// readers must fall back to the term's global score bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkipBlock {
     pub(crate) last_id: VectorId,
@@ -449,63 +440,21 @@ impl SkipBlock {
         }
         buf.put_u64_le(self.length);
     }
-
-    fn decode_payload(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < 8 + 2 + 8 {
-            return Err(EncodingError {
-                message: format!(
-                    "skip block payload too short: need {} bytes, have {}",
-                    8 + 2 + 8,
-                    buf.len()
-                ),
-            });
-        }
-        let last_id = VectorId::from_raw(u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]));
-        let impacts_count = u16::from_le_bytes([buf[8], buf[9]]);
-        let mut cursor = &buf[10..];
-        let mut impacts = Vec::with_capacity(impacts_count as usize);
-        for _ in 0..impacts_count {
-            if cursor.len() < 5 {
-                return Err(EncodingError {
-                    message: "skip block payload truncated within impacts".to_string(),
-                });
-            }
-            impacts.push(Impact {
-                freq: u32::from_le_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]),
-                norm: cursor[4],
-            });
-            cursor = &cursor[5..];
-        }
-        if cursor.len() < 8 {
-            return Err(EncodingError {
-                message: "skip block payload too short for length".to_string(),
-            });
-        }
-        let length = u64::from_le_bytes([
-            cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6], cursor[7],
-        ]);
-        Ok(Self {
-            last_id,
-            impacts,
-            length,
-        })
-    }
 }
 
-/// Decoded block within a `TermPostingsValue`.
+/// Block within a `TermPostingsValue` builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TermPostingsBlock {
     Skip(SkipBlock),
     Postings(PostingsBlock),
 }
 
-/// Decoded view of a term's posting list.
+/// Encode-side builder for a term's posting list. The decoded/canonical
+/// representation is [`PostingListView`].
 ///
-/// Blocks appear in descending `id` order: each `Skip` is immediately
+/// Blocks appear in ascending `id` order: each `Skip` is immediately
 /// followed by the `Postings` block it describes, and successive pairs cover
-/// strictly lower id ranges.
+/// strictly higher id ranges.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TermPostingsValue {
     pub(crate) blocks: Vec<TermPostingsBlock>,
@@ -514,20 +463,20 @@ pub(crate) struct TermPostingsValue {
 impl TermPostingsValue {
     /// Build a value from a flat list of postings in arbitrary order.
     ///
-    /// Postings are sorted descending and chunked into
+    /// Postings are sorted ascending and chunked into
     /// [`TARGET_POSTINGS_PER_BLOCK`]-sized `Postings` blocks; each block is
     /// preceded by its `Skip` summary.
     pub(crate) fn from_postings(mut postings: Vec<PostingEntry>) -> Self {
         if postings.is_empty() {
             return Self::default();
         }
-        postings.sort_unstable_by_key(|p| std::cmp::Reverse(p.id));
+        postings.sort_unstable_by_key(|p| p.id);
         // De-dup defensively; a single id should appear at most once per term per batch.
         postings.dedup_by_key(|e| e.id);
 
         let mut blocks = Vec::new();
         for chunk in postings.chunks(TARGET_POSTINGS_PER_BLOCK) {
-            let postings_block = PostingsBlock::from_descending(chunk.to_vec());
+            let postings_block = PostingsBlock::from_ascending(chunk.to_vec());
             let mut payload = BytesMut::new();
             postings_block.encode_payload(&mut payload);
             let skip = SkipBlock {
@@ -541,59 +490,12 @@ impl TermPostingsValue {
         Self { blocks }
     }
 
-    /// Iterate all decoded posting entries in descending `id` order across blocks.
-    pub(crate) fn iter_entries(&self) -> impl Iterator<Item = &PostingEntry> {
-        self.blocks.iter().flat_map(|block| match block {
-            TermPostingsBlock::Postings(p) => p.entries.iter(),
-            TermPostingsBlock::Skip(_) => [].iter(),
-        })
-    }
-
     pub(crate) fn encode_to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
         for block in &self.blocks {
             encode_block(block, &mut buf);
         }
         buf.freeze()
-    }
-
-    pub(crate) fn decode_from_bytes(buf: &[u8]) -> Result<Self, EncodingError> {
-        let mut cursor = buf;
-        let mut blocks = Vec::new();
-        while !cursor.is_empty() {
-            if cursor.len() < 5 {
-                return Err(EncodingError {
-                    message: "term postings value truncated at block header".to_string(),
-                });
-            }
-            let block_type = cursor[0];
-            let len = u32::from_le_bytes([cursor[1], cursor[2], cursor[3], cursor[4]]) as usize;
-            cursor = &cursor[5..];
-            if cursor.len() < len {
-                return Err(EncodingError {
-                    message: format!(
-                        "term postings value truncated within block: need {}, have {}",
-                        len,
-                        cursor.len()
-                    ),
-                });
-            }
-            let payload = &cursor[..len];
-            cursor = &cursor[len..];
-            let block = match block_type {
-                BLOCK_TYPE_SKIP => TermPostingsBlock::Skip(SkipBlock::decode_payload(payload)?),
-                BLOCK_TYPE_POSTINGS => {
-                    TermPostingsBlock::Postings(PostingsBlock::decode_payload(payload)?)
-                }
-                other => {
-                    return Err(EncodingError {
-                        message: format!("unknown term postings block type: 0x{:02x}", other),
-                    });
-                }
-            };
-            blocks.push(block);
-        }
-        Ok(Self { blocks })
     }
 }
 
@@ -618,24 +520,27 @@ fn encode_block(block: &TermPostingsBlock, buf: &mut BytesMut) {
 /// `TermPostings` value, recorded by [`PostingListView::parse`].
 #[derive(Debug, Clone)]
 pub(crate) struct PostingBlockMeta {
-    /// Lowest doc id in the block (the skip block's `last_id`).
+    /// Lowest doc id in the block (the postings payload's `base_id`).
     pub(crate) min_id: u64,
-    /// Highest doc id in the block (the postings payload's `base_id`).
+    /// Highest doc id in the block (the skip block's `last_id`).
     pub(crate) max_id: u64,
     /// Number of postings in the block.
     pub(crate) count: u32,
     /// Range of this block's impacts within the view's impact arena.
     impacts_start: u32,
     impacts_len: u16,
+    /// Byte offset of the pair's skip-block header within the raw value;
+    /// with `payload_start + payload_len` this delimits the whole
+    /// `(Skip, Postings)` pair for verbatim copying.
+    pair_start: usize,
     /// Byte range of the postings payload within the raw value.
     payload_start: usize,
     payload_len: usize,
 }
 
-/// A `Postings` block decoded into parallel arrays in **ascending** doc id
-/// order — the iteration order of the BlockMaxScore query path. (Blocks are
-/// stored descending; [`PostingListView::decode_block_into`] reverses on
-/// decode.)
+/// A `Postings` block decoded into parallel arrays in ascending doc id
+/// order — the storage order, and the iteration order of the BlockMaxScore
+/// query path.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecodedPostingsBlock {
     pub(crate) ids: Vec<u64>,
@@ -651,8 +556,8 @@ pub(crate) struct DecodedPostingsBlock {
 /// blocks on demand. This is what lets BlockMaxScore skip whole blocks
 /// without paying their decode cost.
 ///
-/// `blocks` is ordered by **ascending** doc id range (the reverse of storage
-/// order): `blocks[0]` holds the lowest ids. Ranges of distinct blocks never
+/// `blocks` is ordered by ascending doc id range (the storage order):
+/// `blocks[0]` holds the lowest ids. Ranges of distinct blocks never
 /// overlap (merge operands partition the id space). All blocks' impacts live
 /// in one arena (`impacts`) rather than per-block `Vec`s so a query on a
 /// common term with thousands of blocks doesn't pay one allocation per block.
@@ -670,8 +575,9 @@ impl PostingListView {
         let mut blocks = Vec::new();
         let mut impacts: Vec<Impact> = Vec::new();
         let mut offset = 0usize;
-        // (min_id, impacts range) decoded from the pending skip block.
-        let mut pending_skip: Option<(u64, u32, u16)> = None;
+        // (max_id, impacts range, pair start) decoded from the pending skip
+        // block.
+        let mut pending_skip: Option<(u64, u32, u16, usize)> = None;
         while offset < raw.len() {
             if raw.len() - offset < 5 {
                 return Err(EncodingError {
@@ -715,7 +621,7 @@ impl PostingListView {
                             ),
                         });
                     }
-                    let min_id = u64::from_le_bytes([
+                    let max_id = u64::from_le_bytes([
                         payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
                         payload[6], payload[7],
                     ]);
@@ -733,10 +639,17 @@ impl PostingListView {
                             norm: chunk[4],
                         });
                     }
-                    pending_skip = Some((min_id, impacts_start, impacts_count as u16));
+                    pending_skip = Some((
+                        max_id,
+                        impacts_start,
+                        impacts_count as u16,
+                        payload_start - 5,
+                    ));
                 }
                 BLOCK_TYPE_POSTINGS => {
-                    let Some((min_id, impacts_start, impacts_len)) = pending_skip.take() else {
+                    let Some((max_id, impacts_start, impacts_len, pair_start)) =
+                        pending_skip.take()
+                    else {
                         return Err(EncodingError {
                             message: "postings block without preceding skip block".to_string(),
                         });
@@ -760,7 +673,7 @@ impl PostingListView {
                             message: "postings block payload too short for base id".to_string(),
                         });
                     }
-                    let max_id = u64::from_le_bytes([
+                    let min_id = u64::from_le_bytes([
                         payload[4],
                         payload[5],
                         payload[6],
@@ -770,12 +683,35 @@ impl PostingListView {
                         payload[10],
                         payload[11],
                     ]);
+                    // The directory invariants every consumer relies on
+                    // (block ranges are well-formed, ascending, and
+                    // disjoint) come from persisted bytes, so check them
+                    // here rather than trusting the writer.
+                    if min_id > max_id {
+                        return Err(EncodingError {
+                            message: format!(
+                                "postings block base_id {} exceeds skip block last_id {}",
+                                min_id, max_id
+                            ),
+                        });
+                    }
+                    if let Some(prev) = blocks.last().map(|b: &PostingBlockMeta| b.max_id)
+                        && min_id <= prev
+                    {
+                        return Err(EncodingError {
+                            message: format!(
+                                "postings block base_id {} does not ascend past previous block's last id {}",
+                                min_id, prev
+                            ),
+                        });
+                    }
                     blocks.push(PostingBlockMeta {
                         min_id,
                         max_id,
                         count,
                         impacts_start,
                         impacts_len,
+                        pair_start,
                         payload_start,
                         payload_len: len,
                     });
@@ -792,9 +728,6 @@ impl PostingListView {
                 message: "trailing skip block without postings block".to_string(),
             });
         }
-        // Storage order is descending; flip so blocks[0] holds the lowest ids.
-        // Arena ranges are positional and unaffected by directory order.
-        blocks.reverse();
         Ok(Self {
             raw,
             blocks,
@@ -807,9 +740,8 @@ impl PostingListView {
         &self.blocks
     }
 
-    /// Impacts of block `idx`. Empty when the block was written before
-    /// impacts landed — callers must treat that as "unknown" and fall back to
-    /// the term's global score bound.
+    /// Impacts of block `idx`. May be empty ("unknown") — callers must fall
+    /// back to the term's global score bound.
     pub(crate) fn impacts(&self, idx: usize) -> &[Impact] {
         let meta = &self.blocks[idx];
         &self.impacts[meta.impacts_start as usize..][..meta.impacts_len as usize]
@@ -829,11 +761,11 @@ impl PostingListView {
         let mut freqs = [0u32; BLOCK_LEN];
         let (count, norms) = decode_postings_raw(payload, &mut ids, &mut freqs)?;
         out.ids.clear();
-        out.ids.extend(ids[..count].iter().rev());
+        out.ids.extend_from_slice(&ids[..count]);
         out.freqs.clear();
-        out.freqs.extend(freqs[..count].iter().rev());
+        out.freqs.extend_from_slice(&freqs[..count]);
         out.norms.clear();
-        out.norms.extend(norms.iter().rev());
+        out.norms.extend_from_slice(norms);
         Ok(())
     }
 
@@ -844,15 +776,86 @@ impl PostingListView {
         self.decode_block_into(idx, &mut out)?;
         Ok(out)
     }
+
+    /// The raw bytes of block `idx`'s whole `(Skip, Postings)` pair —
+    /// headers included — for copying into a rewritten value verbatim.
+    pub(crate) fn pair_bytes(&self, idx: usize) -> &[u8] {
+        &self.raw[self.pair_range(idx)]
+    }
+
+    /// Byte range of block `idx`'s whole `(Skip, Postings)` pair within the
+    /// raw value.
+    pub(crate) fn pair_range(&self, idx: usize) -> std::ops::Range<usize> {
+        let meta = &self.blocks[idx];
+        meta.pair_start..meta.payload_start + meta.payload_len
+    }
+
+    /// Iterate every posting in ascending doc id order, decoding blocks
+    /// lazily into a reused buffer (memory stays O(one block)). The
+    /// row-oriented adapter over the columnar representation: yields an
+    /// `Err` once and ends if a block payload fails to decode.
+    pub(crate) fn iter_entries(&self) -> PostingEntriesIter<'_> {
+        PostingEntriesIter {
+            view: self,
+            block_idx: 0,
+            decoded: DecodedPostingsBlock::default(),
+            pos: 0,
+            failed: false,
+        }
+    }
+}
+
+/// Lazily-decoding row iterator over a [`PostingListView`]; see
+/// [`PostingListView::iter_entries`].
+pub(crate) struct PostingEntriesIter<'a> {
+    view: &'a PostingListView,
+    /// Index of the next block to decode.
+    block_idx: usize,
+    /// Decoded arrays for the block currently being yielded.
+    decoded: DecodedPostingsBlock,
+    /// Cursor within `decoded`.
+    pos: usize,
+    failed: bool,
+}
+
+impl Iterator for PostingEntriesIter<'_> {
+    type Item = Result<PostingEntry, EncodingError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        while self.pos >= self.decoded.ids.len() {
+            if self.block_idx >= self.view.blocks().len() {
+                return None;
+            }
+            if let Err(err) = self
+                .view
+                .decode_block_into(self.block_idx, &mut self.decoded)
+            {
+                self.failed = true;
+                return Some(Err(err));
+            }
+            self.block_idx += 1;
+            self.pos = 0;
+        }
+        let i = self.pos;
+        self.pos += 1;
+        Some(Ok(PostingEntry {
+            id: VectorId::from_raw(self.decoded.ids[i]),
+            freq: self.decoded.freqs[i],
+            norm: self.decoded.norms[i],
+        }))
+    }
 }
 
 /// Merge multiple `TermPostings` values via byte concatenation.
 ///
 /// SlateDB delivers operands oldest-to-newest. Newer batches insert strictly
-/// higher vector ids (ids are monotonically allocated and Milestone 0 is
-/// insert-only), so reversing the operand list and prepending it to the
-/// existing value preserves the global descending-id invariant. No parsing
-/// or re-encoding required.
+/// higher vector ids (ids are monotonically allocated; deletes never reuse
+/// ids), so appending operands after the existing value, in delivery order,
+/// preserves the global ascending-id invariant. No parsing or re-encoding
+/// required.
 pub(crate) fn merge_batch_term_postings(existing: Option<Bytes>, operands: &[Bytes]) -> Bytes {
     if operands.is_empty() {
         return existing.unwrap_or_default();
@@ -863,11 +866,11 @@ pub(crate) fn merge_batch_term_postings(existing: Option<Bytes>, operands: &[Byt
     let total: usize = existing.as_ref().map(|b| b.len()).unwrap_or(0)
         + operands.iter().map(|b| b.len()).sum::<usize>();
     let mut out = BytesMut::with_capacity(total);
-    for operand in operands.iter().rev() {
-        out.extend_from_slice(operand);
-    }
     if let Some(ex) = existing {
         out.extend_from_slice(&ex);
+    }
+    for operand in operands {
+        out.extend_from_slice(operand);
     }
     out.freeze()
 }
@@ -884,11 +887,21 @@ mod tests {
         }
     }
 
-    /// Corrupt bytes at the given payload offsets within the first
+    /// Decode every posting through the view's row iterator.
+    fn all_entries(encoded: Bytes) -> Vec<PostingEntry> {
+        PostingListView::parse(encoded)
+            .unwrap()
+            .iter_entries()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Corrupt bytes at the given payload offsets within the `nth`
     /// postings-block payload of an encoded value.
-    fn corrupt_postings_payload(encoded: &Bytes, edits: &[(usize, u8)]) -> Bytes {
+    fn corrupt_nth_postings_payload(encoded: &Bytes, nth: usize, edits: &[(usize, u8)]) -> Bytes {
         let mut bytes = encoded.to_vec();
         let mut offset = 0usize;
+        let mut seen = 0usize;
         loop {
             let tag = bytes[offset];
             let len = u32::from_le_bytes([
@@ -899,13 +912,21 @@ mod tests {
             ]) as usize;
             let payload_start = offset + 5;
             if tag == BLOCK_TYPE_POSTINGS {
-                for &(off, val) in edits {
-                    bytes[payload_start + off] = val;
+                if seen == nth {
+                    for &(off, val) in edits {
+                        bytes[payload_start + off] = val;
+                    }
+                    return Bytes::from(bytes);
                 }
-                return Bytes::from(bytes);
+                seen += 1;
             }
             offset = payload_start + len;
         }
+    }
+
+    /// Corrupt bytes within the first postings-block payload.
+    fn corrupt_postings_payload(encoded: &Bytes, edits: &[(usize, u8)]) -> Bytes {
+        corrupt_nth_postings_payload(encoded, 0, edits)
     }
 
     /// parse() only validates framing; a payload corrupted past the header
@@ -924,6 +945,10 @@ mod tests {
             "{}",
             err.message
         );
+        // The row iterator surfaces the same error once, then ends.
+        let items: Vec<_> = view.iter_entries().collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_err());
 
         // count is payload bytes 0..4; 300 (0x012C) > BLOCK_LEN (256).
         let bad_count = corrupt_postings_payload(&encoded, &[(0, 0x2C), (1, 0x01)]);
@@ -932,8 +957,8 @@ mod tests {
         assert!(err.message.contains("exceeds BLOCK_LEN"), "{}", err.message);
     }
 
-    /// A degenerate count==0 postings block is tolerated by the eager decoder
-    /// and must be skipped (not turned into an error) by the lazy view.
+    /// A degenerate count==0 postings block must be skipped by the view,
+    /// not turned into an error.
     #[test]
     fn view_should_skip_zero_count_blocks() {
         // given - a valid pair followed by an empty (skip, postings) pair
@@ -954,14 +979,12 @@ mod tests {
         buf.put_u32_le(0);
         let encoded = buf.freeze();
 
-        // when - both decoders read the value
-        let eager = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
+        // when
         let view = PostingListView::parse(encoded).unwrap();
 
         // then - the view skips the empty pair and indexes only the real one
         assert_eq!(view.blocks().len(), 1);
         assert_eq!(view.decode_block(0).unwrap().ids, vec![3, 7]);
-        assert_eq!(eager.iter_entries().count(), 2);
     }
 
     #[test]
@@ -971,10 +994,10 @@ mod tests {
 
         // when
         let encoded = value.encode_to_bytes();
-        let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
+        let view = PostingListView::parse(encoded).unwrap();
 
         // then
-        assert_eq!(decoded, value);
+        assert!(view.blocks().is_empty());
     }
 
     #[test]
@@ -986,19 +1009,15 @@ mod tests {
             entry(8, 2, 30),
         ]);
 
-        // when
-        let encoded = value.encode_to_bytes();
-        let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
-
-        // then - two blocks: Skip + Postings
-        assert_eq!(decoded.blocks.len(), 2);
-        assert!(matches!(decoded.blocks[0], TermPostingsBlock::Skip(_)));
-        assert!(matches!(decoded.blocks[1], TermPostingsBlock::Postings(_)));
-        // Entries descending by id with original freq/norm preserved.
-        let entries: Vec<_> = decoded.iter_entries().copied().collect();
+        // then - one (Skip, Postings) pair in the builder
+        assert_eq!(value.blocks.len(), 2);
+        assert!(matches!(value.blocks[0], TermPostingsBlock::Skip(_)));
+        assert!(matches!(value.blocks[1], TermPostingsBlock::Postings(_)));
+        // Entries ascending by id with original freq/norm preserved.
+        let entries = all_entries(value.encode_to_bytes());
         assert_eq!(
             entries,
-            vec![entry(8, 2, 30), entry(5, 1, 10), entry(2, 3, 20),]
+            vec![entry(2, 3, 20), entry(5, 1, 10), entry(8, 2, 30)]
         );
     }
 
@@ -1012,16 +1031,14 @@ mod tests {
         let value = TermPostingsValue::from_postings(postings);
 
         // when
-        let encoded = value.encode_to_bytes();
-        let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
+        let entries = all_entries(value.encode_to_bytes());
 
         // then - 3 pairs of (Skip, Postings)
-        assert_eq!(decoded.blocks.len(), 6);
-        let entries: Vec<_> = decoded.iter_entries().copied().collect();
+        assert_eq!(value.blocks.len(), 6);
         assert_eq!(entries.len(), n);
-        // Strictly descending
+        // Strictly ascending
         for w in entries.windows(2) {
-            assert!(w[0].id > w[1].id);
+            assert!(w[0].id < w[1].id);
         }
     }
 
@@ -1047,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn should_merge_concatenating_newer_blocks_first() {
+    fn should_merge_appending_newer_blocks_after_older() {
         // given - older operand has lower ids, newer operand has higher ids
         let older = TermPostingsValue::from_postings(vec![entry(1, 1, 1), entry(2, 1, 1)])
             .encode_to_bytes();
@@ -1056,11 +1073,10 @@ mod tests {
 
         // when - operands ordered oldest -> newest
         let merged = merge_batch_term_postings(None, &[older, newer]);
-        let decoded = TermPostingsValue::decode_from_bytes(&merged).unwrap();
 
-        // then - ids are globally descending
-        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.id.id()).collect();
-        assert_eq!(ids, vec![11, 10, 2, 1]);
+        // then - ids are globally ascending
+        let ids: Vec<u64> = all_entries(merged).iter().map(|e| e.id.id()).collect();
+        assert_eq!(ids, vec![1, 2, 10, 11]);
     }
 
     #[test]
@@ -1071,11 +1087,10 @@ mod tests {
 
         // when
         let merged = merge_batch_term_postings(Some(existing), &[op]);
-        let decoded = TermPostingsValue::decode_from_bytes(&merged).unwrap();
 
-        // then - ids globally descending
-        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.id.id()).collect();
-        assert_eq!(ids, vec![5, 1]);
+        // then - ids globally ascending
+        let ids: Vec<u64> = all_entries(merged).iter().map(|e| e.id.id()).collect();
+        assert_eq!(ids, vec![1, 5]);
     }
 
     #[test]
@@ -1084,8 +1099,8 @@ mod tests {
         let older = TermPostingsValue::from_postings(vec![entry(1, 1, 1)]).encode_to_bytes();
         let newer = TermPostingsValue::from_postings(vec![entry(10, 1, 1)]).encode_to_bytes();
         let mut expected = Vec::with_capacity(older.len() + newer.len());
-        expected.extend_from_slice(&newer); // newer first
-        expected.extend_from_slice(&older);
+        expected.extend_from_slice(&older); // delivery order: oldest first
+        expected.extend_from_slice(&newer);
 
         // when
         let merged = merge_batch_term_postings(None, &[older, newer]);
@@ -1113,8 +1128,9 @@ mod tests {
             })
             .unwrap();
 
-        // then - last_id is the lowest id in the following postings block; length matches
-        assert_eq!(skip.last_id.id(), 10);
+        // then - last_id is the highest id in the following postings block;
+        // length matches
+        assert_eq!(skip.last_id.id(), 30);
         let postings_payload_len = {
             let postings = value
                 .blocks
@@ -1132,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn should_use_bitpacked_id_encoding_when_gaps_fit_in_u32() {
+    fn should_use_bitpacked_id_encoding_when_range_fits_u32() {
         // given
         let value = TermPostingsValue::from_postings(vec![
             entry(100, 1, 1),
@@ -1152,17 +1168,18 @@ mod tests {
         // then
         assert_eq!(ids_encoding, IDS_ENCODING_BITPACKED);
 
-        // and - encode/decode round-trips identical entries
-        let encoded = value.encode_to_bytes();
-        let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
-        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.id.id()).collect();
-        assert_eq!(ids, vec![100, 50, 1]);
+        // and - encode/decode round-trips identical ids, ascending
+        let ids: Vec<u64> = all_entries(value.encode_to_bytes())
+            .iter()
+            .map(|e| e.id.id())
+            .collect();
+        assert_eq!(ids, vec![1, 50, 100]);
     }
 
     #[test]
-    fn should_switch_to_varint_id_encoding_when_gap_exceeds_u32() {
-        // given - gap between two consecutive entries exceeds u32::MAX
-        let huge = (u32::MAX as u64) + 2; // gap will be 1 too big for u32
+    fn should_switch_to_varint_id_encoding_when_range_exceeds_u32() {
+        // given - the block's id range exceeds what bitpacked offsets hold
+        let huge = (u32::MAX as u64) + 2;
         let value = TermPostingsValue::from_postings(vec![entry(huge, 1, 5), entry(0, 2, 7)]);
 
         // when - inspect ids_encoding byte
@@ -1177,10 +1194,61 @@ mod tests {
         assert_eq!(ids_encoding, IDS_ENCODING_VARINT);
 
         // and - encode/decode preserves the original entries (huge id and all)
-        let encoded = value.encode_to_bytes();
-        let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
-        let entries: Vec<_> = decoded.iter_entries().copied().collect();
-        assert_eq!(entries, vec![entry(huge, 1, 5), entry(0, 2, 7)]);
+        let entries = all_entries(value.encode_to_bytes());
+        assert_eq!(entries, vec![entry(0, 2, 7), entry(huge, 1, 5)]);
+    }
+
+    /// The bitpacked condition is per-gap: the block's total id range can
+    /// exceed `u32::MAX` as long as every individual gap fits (the prefix
+    /// sum accumulates in u64).
+    #[test]
+    fn should_stay_bitpacked_when_gaps_fit_but_range_does_not() {
+        let step = 3_000_000_000u64; // < u32::MAX, but two steps exceed it
+        let value = TermPostingsValue::from_postings(vec![
+            entry(0, 1, 1),
+            entry(step, 1, 1),
+            entry(2 * step, 1, 1),
+        ]);
+
+        let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
+            panic!("expected postings block")
+        };
+        let mut payload = BytesMut::new();
+        p.encode_payload(&mut payload);
+        assert_eq!(payload[12], IDS_ENCODING_BITPACKED);
+
+        let ids: Vec<u64> = all_entries(value.encode_to_bytes())
+            .iter()
+            .map(|e| e.id.id())
+            .collect();
+        assert_eq!(ids, vec![0, step, 2 * step]);
+    }
+
+    /// Single-entry blocks exercise the all-padding path of the
+    /// strictly-sorted codec.
+    #[test]
+    fn should_roundtrip_single_entry_block() {
+        let value = TermPostingsValue::from_postings(vec![entry(12345, 7, 3)]);
+        let entries = all_entries(value.encode_to_bytes());
+        assert_eq!(entries, vec![entry(12345, 7, 3)]);
+    }
+
+    /// Dense consecutive ids pack to one-bit gaps.
+    #[test]
+    fn consecutive_ids_pack_to_one_bit() {
+        let postings: Vec<_> = (1000..1256u64).map(|i| entry(i, 1, 1)).collect();
+        let value = TermPostingsValue::from_postings(postings.clone());
+
+        let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
+            panic!("expected postings block")
+        };
+        let mut payload = BytesMut::new();
+        p.encode_payload(&mut payload);
+        // count(4) + base_id(8) + encoding(1), then ids_bits.
+        assert_eq!(payload[12], IDS_ENCODING_BITPACKED);
+        assert_eq!(payload[13], 1, "gaps of 1 need 1 bit");
+
+        assert_eq!(all_entries(value.encode_to_bytes()), postings);
     }
 
     #[test]
@@ -1277,16 +1345,12 @@ mod tests {
         ]);
 
         // when
-        let encoded = value.encode_to_bytes();
-        let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
+        let view = PostingListView::parse(value.encode_to_bytes()).unwrap();
 
         // then - skip block impacts survive the round trip
-        let TermPostingsBlock::Skip(skip) = &decoded.blocks[0] else {
-            panic!("expected skip block");
-        };
         assert_eq!(
-            skip.impacts,
-            vec![
+            view.impacts(0),
+            &[
                 Impact { freq: 1, norm: 2 },
                 Impact { freq: 3, norm: 7 },
                 Impact { freq: 5, norm: 9 }
@@ -1294,26 +1358,33 @@ mod tests {
         );
     }
 
+    /// A pair whose skip block carries no impacts parses with an empty
+    /// impact list (the "unknown — use the global bound" signal).
     #[test]
-    fn should_decode_legacy_skip_block_without_impacts() {
-        // given - a skip payload hand-encoded the way M0 wrote it (impacts_count = 0)
-        let mut buf = BytesMut::new();
-        buf.put_u8(BLOCK_TYPE_SKIP);
-        buf.put_u32_le(8 + 2 + 8);
-        buf.put_u64_le(42); // last_id
-        buf.put_u16_le(0); // impacts_count
-        buf.put_u64_le(99); // length
+    fn should_parse_skip_block_without_impacts() {
+        // given - a hand-built pair with impacts stripped from the skip
+        let postings = PostingsBlock::from_ascending(vec![entry(7, 1, 1), entry(42, 2, 2)]);
+        let mut payload = BytesMut::new();
+        postings.encode_payload(&mut payload);
+        let value = TermPostingsValue {
+            blocks: vec![
+                TermPostingsBlock::Skip(SkipBlock {
+                    last_id: postings.last_id(),
+                    impacts: Vec::new(),
+                    length: payload.len() as u64,
+                }),
+                TermPostingsBlock::Postings(postings),
+            ],
+        };
 
         // when
-        let decoded = TermPostingsValue::decode_from_bytes(&buf).unwrap();
+        let view = PostingListView::parse(value.encode_to_bytes()).unwrap();
 
-        // then - decodes with an empty impact list
-        let TermPostingsBlock::Skip(skip) = &decoded.blocks[0] else {
-            panic!("expected skip block");
-        };
-        assert_eq!(skip.last_id.id(), 42);
-        assert_eq!(skip.length, 99);
-        assert!(skip.impacts.is_empty());
+        // then
+        assert_eq!(view.blocks().len(), 1);
+        assert_eq!(view.blocks()[0].min_id, 7);
+        assert_eq!(view.blocks()[0].max_id, 42);
+        assert!(view.impacts(0).is_empty());
     }
 
     #[test]
@@ -1325,16 +1396,10 @@ mod tests {
         let value = TermPostingsValue::from_postings(postings.clone());
 
         // when
-        let encoded = value.encode_to_bytes();
-        let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
+        let entries = all_entries(value.encode_to_bytes());
 
-        // then
-        let entries: Vec<_> = decoded.iter_entries().copied().collect();
-        assert_eq!(entries.len(), postings.len());
-        // Original postings sorted descending should match decoded order.
-        let mut expected = postings;
-        expected.sort_unstable_by_key(|e| std::cmp::Reverse(e.id));
-        assert_eq!(entries, expected);
+        // then - decoded order is the ascending input order
+        assert_eq!(entries, postings);
     }
 
     #[test]
@@ -1417,5 +1482,169 @@ mod tests {
     fn view_of_empty_value_has_no_blocks() {
         let view = PostingListView::parse(Bytes::new()).unwrap();
         assert!(view.blocks().is_empty());
+    }
+
+    /// `iter_entries` walks every block lazily and yields the ascending row
+    /// stream the compaction filter and exhaustive scorer consume.
+    #[test]
+    fn iter_entries_yields_all_postings_ascending() {
+        let n = TARGET_POSTINGS_PER_BLOCK + 17;
+        let postings: Vec<_> = (0..n as u64)
+            .map(|i| entry(i * 3, (i % 9) as u32 + 1, (i % 50) as u8 + 1))
+            .collect();
+        let encoded = TermPostingsValue::from_postings(postings.clone()).encode_to_bytes();
+
+        let entries = all_entries(encoded);
+
+        assert_eq!(entries, postings);
+    }
+
+    /// The pair byte ranges recorded by parse() tile the raw value exactly,
+    /// so verbatim pair copies reconstruct it byte-for-byte.
+    #[test]
+    fn pair_bytes_tile_the_encoded_value() {
+        let n = TARGET_POSTINGS_PER_BLOCK * 2 + 9;
+        let postings: Vec<_> = (0..n as u64).map(|i| entry(i, 1, 1)).collect();
+        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+
+        let view = PostingListView::parse(encoded.clone()).unwrap();
+        let mut rebuilt = BytesMut::new();
+        for idx in 0..view.blocks().len() {
+            rebuilt.extend_from_slice(view.pair_bytes(idx));
+        }
+
+        assert_eq!(rebuilt.freeze(), encoded);
+    }
+
+    /// Corrupt bit-width bytes must error, not panic inside the bitpacker
+    /// (its `num_bits <= 32` assert is active in release builds, and a panic
+    /// here would crash-loop the compactor on the same corrupt SST).
+    #[test]
+    fn corrupt_bit_widths_decode_to_error_not_panic() {
+        // A full block with wide freqs gives the corrupted ids_bytes claim
+        // room to pass the payload-length check.
+        let postings: Vec<_> = (0..BLOCK_LEN as u64)
+            .map(|i| entry(1000 + i, u32::MAX, 1))
+            .collect();
+        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+
+        // ids_bits is at payload offset 13 (count:4 + base_id:8 + encoding:1).
+        let bad_ids_bits = corrupt_postings_payload(&encoded, &[(13, 33)]);
+        let view = PostingListView::parse(bad_ids_bits).expect("framing is intact");
+        let err = view.decode_block(0).unwrap_err();
+        assert!(err.message.contains("ids_bits"), "{}", err.message);
+
+        // freqs_bits sits after the packed ids section, whose width depends
+        // on the encoded ids_bits — read it back rather than hardcoding.
+        let ids_bits = {
+            // Skip block first: its header is 5 bytes + payload.
+            let skip_len =
+                u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]) as usize;
+            let payload_start = 5 + skip_len + 5;
+            encoded[payload_start + 13] as usize
+        };
+        let freqs_bits_offset = 14 + ids_bits * (BLOCK_LEN / 8);
+        let bad_freqs_bits = corrupt_postings_payload(&encoded, &[(freqs_bits_offset, 40)]);
+        let view = PostingListView::parse(bad_freqs_bits).expect("framing is intact");
+        let err = view.decode_block(0).unwrap_err();
+        assert!(err.message.contains("freqs_bits"), "{}", err.message);
+    }
+
+    /// Inconsistent directory metadata (inverted or non-ascending pairs) is
+    /// rejected at parse time rather than trusted by consumers — the
+    /// compaction filter's verbatim-copy probe would otherwise silently
+    /// resurrect deleted postings.
+    #[test]
+    fn parse_rejects_inconsistent_pair_metadata() {
+        // Inverted: corrupt the skip's last_id below the postings base_id.
+        let encoded = TermPostingsValue::from_postings(vec![
+            entry(10, 1, 1),
+            entry(42, 1, 1),
+            entry(100, 1, 1),
+        ])
+        .encode_to_bytes();
+        let mut bytes = encoded.to_vec();
+        // Skip block payload starts at offset 5; last_id is its first 8 bytes.
+        bytes[5..13].copy_from_slice(&5u64.to_le_bytes());
+        let err = PostingListView::parse(Bytes::from(bytes)).unwrap_err();
+        assert!(
+            err.message.contains("exceeds skip block"),
+            "{}",
+            err.message
+        );
+
+        // Non-ascending: two pairs whose ranges do not ascend.
+        let pair_a = TermPostingsValue::from_postings(vec![entry(50, 1, 1)]).encode_to_bytes();
+        let pair_b = TermPostingsValue::from_postings(vec![entry(20, 1, 1)]).encode_to_bytes();
+        let mut merged = BytesMut::new();
+        merged.extend_from_slice(&pair_a);
+        merged.extend_from_slice(&pair_b);
+        let err = PostingListView::parse(merged.freeze()).unwrap_err();
+        assert!(err.message.contains("does not ascend"), "{}", err.message);
+    }
+
+    /// Both sides of the codec-selection seam: the boundary is the largest
+    /// single gap, `u32::MAX`.
+    #[test]
+    fn codec_selection_boundary() {
+        let ids_encoding = |value: &TermPostingsValue| {
+            let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
+                panic!("expected postings block")
+            };
+            let mut payload = BytesMut::new();
+            p.encode_payload(&mut payload);
+            payload[12]
+        };
+
+        // gap == u32::MAX: bitpacked, round-trips.
+        let at =
+            TermPostingsValue::from_postings(vec![entry(0, 1, 1), entry(u32::MAX as u64, 1, 1)]);
+        assert_eq!(ids_encoding(&at), IDS_ENCODING_BITPACKED);
+        let ids: Vec<u64> = all_entries(at.encode_to_bytes())
+            .iter()
+            .map(|e| e.id.id())
+            .collect();
+        assert_eq!(ids, vec![0, u32::MAX as u64]);
+
+        // gap == u32::MAX + 1: varint, round-trips.
+        let past = TermPostingsValue::from_postings(vec![
+            entry(0, 1, 1),
+            entry(u32::MAX as u64 + 1, 1, 1),
+        ]);
+        assert_eq!(ids_encoding(&past), IDS_ENCODING_VARINT);
+        let ids: Vec<u64> = all_entries(past.encode_to_bytes())
+            .iter()
+            .map(|e| e.id.id())
+            .collect();
+        assert_eq!(ids, vec![0, u32::MAX as u64 + 1]);
+
+        // Full block with one boundary gap: zero padding never widens bits.
+        let mut postings: Vec<_> = (0..(BLOCK_LEN as u64 - 1))
+            .map(|i| entry(i, 1, 1))
+            .collect();
+        postings.push(entry(BLOCK_LEN as u64 - 2 + u32::MAX as u64, 1, 1));
+        let full = TermPostingsValue::from_postings(postings.clone());
+        assert_eq!(ids_encoding(&full), IDS_ENCODING_BITPACKED);
+        assert_eq!(all_entries(full.encode_to_bytes()), postings);
+    }
+
+    /// Mid-stream corruption: the iterator yields every entry of the good
+    /// blocks, then exactly one Err, then ends.
+    #[test]
+    fn iter_entries_yields_good_blocks_then_one_error() {
+        let n = TARGET_POSTINGS_PER_BLOCK + 5;
+        let postings: Vec<_> = (0..n as u64).map(|i| entry(i, 1, 1)).collect();
+        let encoded = TermPostingsValue::from_postings(postings.clone()).encode_to_bytes();
+        // Corrupt the SECOND postings payload's ids_encoding byte.
+        let corrupted = corrupt_nth_postings_payload(&encoded, 1, &[(12, 0xEE)]);
+
+        let view = PostingListView::parse(corrupted).expect("framing is intact");
+        let mut iter = view.iter_entries();
+        for expected in postings.iter().take(TARGET_POSTINGS_PER_BLOCK) {
+            assert_eq!(iter.next().unwrap().unwrap(), *expected);
+        }
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
     }
 }

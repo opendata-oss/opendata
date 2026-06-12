@@ -21,7 +21,7 @@ use crate::query_engine::filter::PreparedFilter;
 use crate::query_engine::operator::Operator;
 use crate::query_engine::types::ScoredVectorId;
 use crate::serde::key::TermPostingsKey;
-use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
+use crate::serde::term_postings::{PostingEntry, PostingListView};
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::VectorId;
 
@@ -69,24 +69,23 @@ impl BM25Operator {
             if n_t == 0 {
                 return Ok::<Option<TermScorer>, crate::error::Error>(None);
             }
-            let postings = self.load_term_postings(field, term).await?;
-            // Block iteration order is already descending by doc id.
-            let entries: Vec<PostingEntry> = postings.iter_entries().copied().collect();
+            let key = TermPostingsKey::new(field, term).encode();
+            let Some(record) = self.storage.get(key).await? else {
+                return Ok(None);
+            };
+            let view = PostingListView::parse(record.value)?;
+            // Postings are stored ascending; this scorer's union heap
+            // consumes entries highest-id first, so collect and flip.
+            let mut entries: Vec<PostingEntry> =
+                view.iter_entries().collect::<std::result::Result<_, _>>()?;
             if entries.is_empty() {
                 return Ok(None);
             }
+            entries.reverse();
             Ok(Some(TermScorer::new(entries, bm25::idf(n_docs, n_t))))
         });
         let scorers: Vec<Option<TermScorer>> = futures::future::try_join_all(loads).await?;
         Ok(scorers.into_iter().flatten().collect())
-    }
-
-    async fn load_term_postings(&self, field: &str, term: &str) -> Result<TermPostingsValue> {
-        let key = TermPostingsKey::new(field, term).encode();
-        match self.storage.get(key).await? {
-            Some(record) => Ok(TermPostingsValue::decode_from_bytes(&record.value)?),
-            None => Ok(TermPostingsValue::default()),
-        }
     }
 }
 
@@ -179,8 +178,9 @@ impl Operator<Vec<ScoredVectorId<BM25Score>>> for BM25Operator {
 
 /// A term's postings paired with the term's precomputed IDF.
 ///
-/// Yields entries in descending `doc_id` order — the same order the underlying
-/// `TermPostingsValue` blocks are stored in (RFC-0006).
+/// Yields entries in descending `doc_id` order — reversed by the loader from
+/// the ascending storage order of the posting list (RFC-0006), because the
+/// union heap consumes per-scorer streams highest-id first.
 struct TermScorer {
     /// All entries in descending `doc_id` order.
     entries: Vec<PostingEntry>,

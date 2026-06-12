@@ -460,7 +460,7 @@ reflect deletes after compacting the relevant postings.
 │  Postings                                                      │
 │  ┌──────────────────────────────────────────────────────────┐  │
 |  |  count:           u32 (entries actually used, <= 256)    |  |
-|  |  base_id:         u64 (highest doc id in the block)      |  |
+|  |  base_id:         u64 (lowest doc id in the block)       |  |
 |  |  docs_encoding:   u8  (0 = bitpacked gaps, 1 = varint)   |  |
 |  |  docs:            Bitpacked | Varint                     |  |
 |  |  freqs:           Bitpacked                              |  |
@@ -477,35 +477,37 @@ reflect deletes after compacting the relevant postings.
 
 ** Structure **
 
-The postings stores a sequence of postings for the term in order of descending vector id 
-(highest first), alongside block-level scoring stats and skip data for efficient traversal.
+The postings stores a sequence of postings for the term in order of ascending vector id 
+(lowest first), alongside block-level scoring stats and skip data for efficient traversal.
 Each postings value is a sequence of typed blocks with the type discriminated using a 
 discriminator field (`type`). The type is either `Postings` or `Skip`. Blocks appear in 
-reverse-document ID order. So each `Posting` block holds ids strictly lower than the preceding 
+document ID order, so each `Posting` block holds ids strictly higher than the preceding 
 `Posting` block. We'll target 256 postings per block.
 
 `Postings` stores:
 - `count`: Number of entries actually populated in the block (1..=256). Recorded explicitly
   because the encoded `docs` and `freqs` sections are always sized for a full 256-element
   bitpacked block.
-- `base_id`: The highest doc id in the block (i.e. `doc_ids[0]`). The remaining doc ids are
-  reconstructed by subtracting successive gaps from `base_id`.
-- `docs_encoding`: Discriminator for the layout of `docs`. The encoder first materialises the
-  gap array `gap[0] = 0`, `gap[i] = doc_ids[i-1] - doc_ids[i]` and chooses the encoding from
-  the maximum gap:
-  - `0x00`: gaps fit in `u32`. Stored as a bitpacked 256-element block via the bitpacking
-    crate (https://github.com/quickwit-oss/bitpacking) using `BitPacker8x`. A `num_bits` byte
-    is followed by `num_bits * 32` packed bytes; the tail (entries beyond `count`) is padded
-    with zero so it never widens `num_bits`.
-  - `0x01`: at least one gap exceeds `u32::MAX`. Each gap is written as an unsigned LEB128
-    `u64` varint, in order, for `count` entries total.
+- `base_id`: The lowest doc id in the block (i.e. `doc_ids[0]`). The remaining doc ids are
+  reconstructed by adding the encoded offsets/gaps to `base_id`.
+- `docs_encoding`: Discriminator for the layout of `docs`, chosen from the block's largest
+  gap:
+  - `0x00`: every gap fits in `u32`. The ascending gaps `doc_ids[i] - doc_ids[i-1]` for
+    `i >= 1` are stored as a plain bitpacked 256-element block via the bitpacking crate
+    (https://github.com/quickwit-oss/bitpacking) using `BitPacker8x`. A `num_bits` byte is
+    followed by `num_bits * 32` packed bytes; the tail (entries beyond `count`) is padded
+    with zeros so it never widens `num_bits`. (Plain gap packing is chosen over the crate's
+    strictly-sorted delta codec, whose decode measured ~50x slower for a one-bit-per-id
+    saving.)
+  - `0x01`: at least one gap exceeds `u32::MAX`. The ascending gaps are written as unsigned
+    LEB128 `u64` varints, in order, for `count - 1` entries total.
 - `freqs`: Per-document term frequencies, bitpacked as `u32` using the same `BitPacker8x`
   block layout (tail padded with zero).
 - `norms`: The size norm of each document, stored as a `count`-byte array.
 
 `Skips` stores skip data that can be used to efficiently find postings for a document in the list.
 It also contains max score stats for the skipped range.
-- `last_id`: The id of the last document in the range (subsequent block).
+- `last_id`: The id of the last (highest) document in the range (subsequent block).
 - `impacts`: An array of (freq, norm) pairs where freq is the frequency of the term in a doc and
   norm is the size norm of the associated document. These represent the set of dominating size
   norms where either the freq is larger or the norm is lower than another vector in the range.
@@ -518,7 +520,9 @@ For the initial version of this feature we will only encode a skip for every blo
 iterations, we will additionally encode skips for longer ranges to support more efficient 
 traversal of the posting list.
 
-The postings are written as a SlateDB `Merge`. Merges are simple buffer concatenations.
+The postings are written as a SlateDB `Merge`. Merges are simple buffer concatenations in
+operand delivery (oldest-to-newest) order: ids are allocated monotonically, so appending
+newer operands preserves the global ascending order.
 
 ### Term Statistics 
 
@@ -636,7 +640,7 @@ For each write, the Indexer:
    specifies the vector ID, the frequency, and the document's length norm. It can collect these 
    into simple `Vec<(VectorId, u32, u8)>`, and then when flushing pack these into a `Merge` 
    whose value contains the encoded posting blocks. The posting will store the documents in 
-   descending ID order.
+   ascending ID order.
 2. Update `TermStatsValue` for every term in each of its `Text` attribute.
 3. Put the `VectorFieldStatsValue` with lengths for each `Text` attribute.
 4. Update the `FieldStatsValue` for every `Text` attribute.

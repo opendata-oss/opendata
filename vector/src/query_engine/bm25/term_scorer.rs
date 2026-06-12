@@ -191,7 +191,7 @@ impl TermScorer {
         }
         let impacts = self.view.impacts(idx);
         let score = if impacts.is_empty() {
-            // Written before impacts landed: fall back to the global bound.
+            // Empty impacts means unknown: fall back to the global bound.
             ctx.global_bound(self.idf)
         } else {
             impacts
