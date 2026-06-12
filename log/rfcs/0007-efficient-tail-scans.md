@@ -106,35 +106,38 @@ The contract is one value; only the frontier source differs:
   - a **seal floor** — the start of the active segment (`SegmentCache::sealed_frontier`),
     below which everything is in sealed, fully-durable segments. Available at
     open from metadata, advances only at seal boundaries.
-  - a **witnessed watermark** — `observed`, one past the highest sequence any
-    scan on the read view has read (`fetch_max` on yield). A scan of one key
-    lifts it for all keys, so it advances *within* the active segment between
-    seals.
+  - an **SST bound** — the maximum global sequence decoded from the key bounds
+    (`SsTableInfo.last_entry`) of the SSTs in the manifest, both L0 and compacted
+    (`DbReader::manifest().l0()` / `.compacted()`). Any record's sequence in an SST
+    exceeds every sequence in older SSTs, so this advances the frontier at *flush*
+    granularity — finer than the seal floor, read on refresh (the reader's
+    `LogDirect` polls the manifest at `refresh_interval`), off the scan path, and
+    independent of which keys are queried. A bound key may be a non-`LogEntry`
+    record or sit outside the active segment, so the decode checks the record type
+    and segment and skips it when it cannot decode a `LogEntry` sequence.
 
-This split matches reality: the writer knows its tip; a standalone reader can only
-estimate it — from sealed boundaries plus what its scans actually read. (A tighter,
-filter-derived source is described under Future work.)
+This split matches reality: the writer knows its tip; a standalone reader estimates
+it from durable metadata — sealed boundaries and the SST key bounds. The estimate
+reflects only data flushed to SSTs: records still in the write-ahead log are not
+counted, so it lags the true tip by the WAL contents (sound — a lower bound). A
+tighter, filter-derived source (Future work) narrows the per-SST part of the gap.
 
-### Why the cross-key lift is sound
+### Why the frontier is sound
 
-A scan of one key may advance an idle key's resume point because the log's
-visibility is **prefix-consistent**: a record at `M` being visible implies every
-`seq < M` is visible in the same snapshot. LogDb expresses durability as a single
-monotonic scalar (`storage.subscribe_durable` → `ViewTracker::advance` →
-`next_sequence`), and advances the read view *before* publishing the watermark
-(`log.rs` `try_advance_durable`; the Memory-mode ordering is the 0006/0005-era
-read-visibility fix), so an observer of the watermark never outruns the snapshot.
+Both frontier sources rest on the log's visibility being **prefix-consistent**: a
+record at `M` being visible implies every `seq < M` is visible in the same snapshot.
+For the in-process reader, LogDb expresses durability as a single monotonic scalar
+(`storage.subscribe_durable` → `ViewTracker::advance` → `next_sequence`) and advances
+the read view *before* publishing the watermark (`log.rs` `try_advance_durable`; the
+Memory-mode ordering is the 0006/0005-era read-visibility fix), so an observer of the
+frontier never outruns the snapshot.
 
 For the standalone reader this reduces to SlateDB's manifest being a consistent
-point-in-time snapshot under a single sequence-ordered writer — a SlateDB
-invariant, named here as a dependency rather than proven in this crate.
-
-The witnessed watermark adds one requirement: a scan must read the snapshot and
-`observed` together (under the read lock at open). The reader's snapshot only
-moves forward, so anything in `observed` was witnessed in a snapshot no newer
-than the current one; by prefix-consistency the current snapshot is therefore
-complete through `observed`, and an empty idle scan genuinely has nothing below
-it. `scan_with_options` already runs under that lock, so the ordering is free.
+point-in-time snapshot under a single sequence-ordered writer — a SlateDB invariant,
+named here as a dependency rather than proven in this crate. The SST bound is then
+sound by the same property: a bound is the sequence of a record in some SST, so
+everything below it is flushed and present in that snapshot. The maximum over the
+decodable SST bounds is therefore itself a valid completeness frontier.
 
 ## Design — Part 2: sequence-aware SST filtering
 
@@ -251,24 +254,23 @@ The scan response gains one field, `next_sequence`; `follow=true` feeds it back 
 the next poll's start. There is no existing global-sequence field on the read API
 or wire today, so this is purely additive.
 
-## Future work: filter-derived frontier advancement
+## Future work: a tighter frontier from the filter
 
-The global-sequence-range policy's per-SST `max` is, in aggregate, exactly the
-durable tip a standalone reader otherwise lacks: the maximum `max` across the SSTs
-in the reader's snapshot is the highest durable global sequence present, and by
-prefix-consistency the reader is complete through it. The newest L0's `max` is
-that tip. Sourcing the frontier from it would supersede both the seal floor and
-the witnessed watermark in Part 1 — it is tighter (it includes the active
-segment's flushed data) and, unlike the witnessed watermark, independent of which
-keys are queried — while changing only how `LogReadView.frontier` is computed, not
-the `next_sequence` contract.
+The standalone reader's SST bound is the sequence of the bound *key*, not the SST's
+maximum sequence, so within the newest SST it can fall short of the true tip — a
+caught-up follower may re-scan that SST once before finding it empty. The
+global-sequence-range policy's per-SST `max` is that maximum, so sourcing the
+frontier from it instead would close that part of the gap (the newest SST's `max` is
+its exact tip), eliminating the redundant scan — while changing only how
+`LogReadView.frontier` is computed, not the `next_sequence` contract.
 
-This is blocked on SlateDB: the `FilterPolicy` exposes `might_match` (a per-query
-predicate during a scan) but no accessor to *read* a stored filter value off an
-SST. Advancing the frontier wants to harvest the newest SST's `max` on refresh,
-off the scan path — there is no API for that today. SlateDB's own surfaces don't
-substitute: `WriteHandle::seqnum` and the manifest live in SlateDB's internal
-seqnum space, not LogDb's global sequence, and the manifest's per-SST max *key* is
-useless for max sequence under the key-major layout. Until SlateDB can surface
-custom per-SST filter metadata to a reader, the standalone reader uses the seal
-floor plus witnessed watermark.
+This is a tightening, not an unblock: the flush-granular frontier above already works
+today with no upstream change. The tighter version needs a way to *read* a stored
+filter value off an SST, off the scan path — `FilterPolicy` today exposes only
+`might_match` (a per-query predicate during a scan). The cleanest fit is a public
+filter-read on the existing `FilterPolicy` framework (expose the policy's payload, or
+the decoded filter plus a downcast), paired with the `DbStatus` manifest subscription
+to harvest the newest SST's `max` on refresh. SlateDB's own surfaces don't substitute:
+`WriteHandle::seqnum` and the manifest live in SlateDB's internal seqnum space, not
+LogDb's global sequence, and the manifest's per-SST max *key* is useless for max
+sequence under the key-major layout.

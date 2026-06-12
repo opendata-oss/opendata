@@ -614,10 +614,15 @@ impl LogDbBuilder {
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let direct = crate::direct::LogDirect::maybe_from_storage_config(&self.config.storage)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .map(Arc::new);
+        // The writer reads its own data; count tops up from the memtable, so a
+        // lazily-polled manifest is fine here.
+        let direct = crate::direct::LogDirect::maybe_from_storage_config(
+            &self.config.storage,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .map(Arc::new);
 
         let clock: Arc<dyn Clock> = self.clock.unwrap_or_else(|| Arc::new(SystemClock));
 

@@ -7,7 +7,6 @@
 use std::collections::BTreeSet;
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -232,16 +231,18 @@ pub(crate) struct LogReadView {
     pub(crate) segments: SegmentCache,
     /// Exclusive global sequence floor this snapshot is known-complete through:
     /// every record with `seq < frontier` is observable here. The writer sets
-    /// this from its sequence watermark; a standalone reader sets it from sealed
-    /// segment boundaries. Advanced atomically with the snapshot (see RFC 0007).
+    /// this from its sequence watermark; a standalone reader from sealed segment
+    /// boundaries and the newest L0's sequence (see RFC 0007).
     pub(crate) frontier: Sequence,
-    /// Exclusive global sequence witnessed by scans: one past the highest
-    /// sequence any scan has read. A scan of one key lifts this for all keys,
-    /// advancing the frontier *within* the active segment between seals (the
-    /// cross-key lift; see RFC 0007). Sound because visibility is
-    /// prefix-consistent and the snapshot only moves forward, so anything
-    /// witnessed in a past snapshot is complete in the current one.
-    pub(crate) observed: Arc<AtomicU64>,
+}
+
+/// Decodes an L0 key bound into the frontier it implies: one past the bound
+/// record's sequence, when it is a `LogEntry` in the active segment. Returns
+/// `None` for non-`LogEntry` bounds (other record types fail to deserialize) or
+/// bounds outside the active segment, where its `start_seq` is the wrong base.
+fn decode_l0_bound(bound: &[u8], latest: &LogSegment) -> Option<Sequence> {
+    let key = LogEntryKey::deserialize(bound, latest.meta().start_seq).ok()?;
+    (key.segment_id == latest.id()).then_some(key.sequence.saturating_add(1))
 }
 
 impl LogReadView {
@@ -257,15 +258,7 @@ impl LogReadView {
             direct,
             segments,
             frontier,
-            observed: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    /// The effective frontier for a new scan: the maximum of the floor and the
-    /// witnessed watermark. Read together with the snapshot under the caller's
-    /// read lock, so it never names a sequence past what this snapshot covers.
-    fn scan_frontier(&self) -> Sequence {
-        self.frontier.max(self.observed.load(Ordering::Relaxed))
     }
 
     /// Replaces the underlying storage snapshot and the frontier it observes.
@@ -298,15 +291,32 @@ impl LogReadView {
         self.segments.drop_through(through_id);
     }
 
-    /// Sets the frontier from sealed segment boundaries.
+    /// Recomputes the standalone reader's frontier from durable metadata: the
+    /// maximum of the sealed-segment floor and the newest L0's sequence. Off the
+    /// scan path and key-independent. Only the reader paths call this — the writer
+    /// sets a tighter frontier from its sequence watermark in
+    /// `advance_read_view_to`, which this must not clobber. See RFC 0007.
+    pub(crate) fn refresh_frontier(&mut self) {
+        let l0 = self.l0_bound_frontier().unwrap_or(0);
+        self.frontier = self.segments.sealed_frontier().max(l0);
+    }
+
+    /// The frontier implied by the newest L0's key bound: one past the sequence
+    /// of the bound record, when it decodes as a `LogEntry` in the active segment.
     ///
-    /// The standalone reader's frontier source: it has no writer watermark, so
-    /// it derives a sound (if coarse) frontier from the segments it has loaded.
-    /// Only the reader paths call this — the writer sets a tighter frontier from
-    /// its sequence watermark in `advance_read_view_to`, and must not be
-    /// clobbered by the coarser segment-derived value. See RFC 0007.
-    pub(crate) fn refresh_frontier_from_segments(&mut self) {
-        self.frontier = self.segments.sealed_frontier();
+    /// Any record's sequence in the newest L0 exceeds every sequence in prior
+    /// L0s, so this advances the frontier at flush granularity. `deserialize`
+    /// validates the `LogEntry` tag (listings, metadata, and other types error
+    /// out), and the `segment_id` check confirms the bound sits in the active
+    /// segment, so its `start_seq` is the correct base for the decode.
+    fn l0_bound_frontier(&self) -> Option<Sequence> {
+        let direct = self.direct.as_deref()?;
+        let latest = self.segments.latest()?;
+        direct
+            .sst_last_entries()
+            .iter()
+            .filter_map(|bound| decode_l0_bound(bound.as_ref(), &latest))
+            .max()
     }
 
     /// Scans entries for a key within a sequence number range with custom options.
@@ -321,8 +331,7 @@ impl LogReadView {
             &self.segments,
             key,
             seq_range,
-            self.scan_frontier(),
-            Arc::clone(&self.observed),
+            self.frontier,
         )
     }
 
@@ -536,7 +545,7 @@ impl LogDbReader {
         )
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
-        let direct = LogDirect::maybe_from_storage_config(&config.storage)
+        let direct = LogDirect::maybe_from_storage_config(&config.storage, config.refresh_interval)
             .await
             .map_err(|e| Error::Storage(e.to_string()))?
             .map(Arc::new);
@@ -581,8 +590,8 @@ impl LogDbReader {
                         if let Err(e) = view.segments.refresh(storage.as_ref(), None).await {
                             tracing::warn!("Failed to refresh segment cache: {}", e);
                         }
-                        // Advance the frontier as newly-sealed segments appear.
-                        view.refresh_frontier_from_segments();
+                        // Advance the frontier as new L0s and sealed segments appear.
+                        view.refresh_frontier();
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -703,9 +712,6 @@ pub struct LogIterator {
     /// Exclusive global sequence the underlying snapshot observed, captured at
     /// open. Used to lift `next_sequence` once the scan drains.
     frontier: Sequence,
-    /// Shared witnessed watermark for the read view. Bumped to one past each
-    /// sequence this scan reads, so later scans of other keys benefit.
-    observed: Arc<AtomicU64>,
     /// Highest sequence yielded so far, if any.
     last_yielded: Option<Sequence>,
     /// Set once `next()` has returned `None` — i.e. the scan reached the end of
@@ -721,7 +727,6 @@ impl LogIterator {
         key: Bytes,
         seq_range: Range<Sequence>,
         frontier: Sequence,
-        observed: Arc<AtomicU64>,
     ) -> Self {
         let segments = segment_cache.find_covering(&seq_range);
         Self {
@@ -732,7 +737,6 @@ impl LogIterator {
             current_segment_idx: 0,
             current_iter: None,
             frontier,
-            observed,
             last_yielded: None,
             drained: false,
         }
@@ -750,10 +754,8 @@ impl LogIterator {
         Self::new_with_frontier(storage, segments, key, seq_range, 0)
     }
 
-    /// Like [`new`](Self::new) but with an explicit observed frontier, so tests
-    /// can exercise the drained-scan lift in [`next_sequence`](Self::next_sequence).
-    /// Uses a private witnessed watermark — to test the shared lift, scan
-    /// through a [`LogReadView`].
+    /// Like [`new`](Self::new) but with an explicit frontier, so tests can
+    /// exercise the drained-scan lift in [`next_sequence`](Self::next_sequence).
     #[cfg(test)]
     pub(crate) fn new_with_frontier(
         storage: Arc<dyn StorageRead>,
@@ -770,7 +772,6 @@ impl LogIterator {
             current_segment_idx: 0,
             current_iter: None,
             frontier,
-            observed: Arc::new(AtomicU64::new(0)),
             last_yielded: None,
             drained: false,
         }
@@ -783,10 +784,6 @@ impl LogIterator {
             if let Some(iter) = &mut self.current_iter {
                 if let Some(entry) = iter.next().await? {
                     self.last_yielded = Some(entry.sequence);
-                    // Lift the read view's witnessed watermark so later scans of
-                    // other keys resume past this point (RFC 0007 cross-key lift).
-                    self.observed
-                        .fetch_max(entry.sequence.saturating_add(1), Ordering::Relaxed);
                     return Ok(Some(entry));
                 }
                 // Current segment exhausted, move to next
@@ -982,40 +979,31 @@ mod tests {
         assert_eq!(iter.next_sequence(), 100);
     }
 
-    #[storage_test]
-    async fn observed_lift_advances_idle_key_within_active_segment(storage: Arc<dyn Storage>) {
-        // No sealed segments, so the frontier floor is 0. A scan of a hot key
-        // witnesses its sequences and lifts the read view's shared watermark,
-        // so a later scan of an idle key resumes past them — the cross-key lift
-        // operating inside the active segment, with no seal involved.
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 1000));
-        for i in 0..4 {
-            storage
-                .write_entry(&segment, &entry(b"hot", i, b"v"))
-                .await
-                .unwrap();
-        }
-        let mut segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
-            .await
-            .unwrap();
-        segments.insert(segment);
+    #[test]
+    fn decode_l0_bound_yields_one_past_logentry_bound() {
+        // A LogEntry bound at global seq 103 in the active segment (start 100)
+        // implies completeness through 103, so the frontier is 104.
+        let latest = LogSegment::new(1, SegmentMeta::new(100, 0));
+        let bound = LogEntryKey::new(1, Bytes::from("z"), 103).serialize(100);
+        assert_eq!(decode_l0_bound(bound.as_ref(), &latest), Some(104));
+    }
 
-        let view = LogReadView::new(storage.clone() as Arc<dyn StorageRead>, None, segments, 0);
-        let opts = ScanOptions::default();
+    #[test]
+    fn decode_l0_bound_rejects_other_segment() {
+        // The bound lives in a different segment, so the active segment's
+        // start_seq is the wrong decode base — reject rather than miscompute.
+        let latest = LogSegment::new(1, SegmentMeta::new(100, 0));
+        let bound = LogEntryKey::new(2, Bytes::from("z"), 5000).serialize(5000);
+        assert_eq!(decode_l0_bound(bound.as_ref(), &latest), None);
+    }
 
-        // Idle key before any witnessing: only the floor (0) is available.
-        let mut cold = view.scan_with_options(Bytes::from("cold"), 0..u64::MAX, &opts);
-        assert!(cold.next().await.unwrap().is_none());
-        assert_eq!(cold.next_sequence(), 0);
-
-        // Drain the hot key, witnessing seq 0..4.
-        let mut hot = view.scan_with_options(Bytes::from("hot"), 0..u64::MAX, &opts);
-        while hot.next().await.unwrap().is_some() {}
-
-        // The idle key now resumes past the witnessed records, despite no seal.
-        let mut cold = view.scan_with_options(Bytes::from("cold"), 0..u64::MAX, &opts);
-        assert!(cold.next().await.unwrap().is_none());
-        assert_eq!(cold.next_sequence(), 4);
+    #[test]
+    fn decode_l0_bound_rejects_non_logentry() {
+        // A non-`LogEntry` bound key (here a SegmentMeta key) fails the tag
+        // check in deserialize and is rejected.
+        let latest = LogSegment::new(1, SegmentMeta::new(100, 0));
+        let bound = crate::serde::SegmentMetaKey::new(7).serialize();
+        assert_eq!(decode_l0_bound(bound.as_ref(), &latest), None);
     }
 
     #[storage_test]
