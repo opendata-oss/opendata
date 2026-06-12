@@ -8,6 +8,7 @@ use std::time::Duration;
 use common::StorageConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{DurationMilliSeconds, serde_as};
+use slatedb::SstBlockSize;
 
 use crate::error::Error;
 
@@ -70,6 +71,17 @@ pub struct Config {
     /// Compaction policy; see [`LogCompactionOptions`] and RFC 0005.
     #[serde(default)]
     pub compaction: LogCompactionOptions,
+
+    /// SlateDB SST block size.
+    ///
+    /// A no-op for the in-memory backend. `None` (the default) leaves SlateDB's
+    /// own default of 4 KiB ([`SstBlockSize::Block4Kib`]).
+    ///
+    /// This is applied at `DbBuilder` time;
+    /// [`LogDbBuilder::with_sst_block_size`](crate::LogDbBuilder::with_sst_block_size)
+    /// overrides it when set.
+    #[serde(default)]
+    pub sst_block_size: Option<SstBlockSize>,
 }
 
 impl Config {
@@ -542,6 +554,30 @@ mod tests {
         // then
         assert_eq!(cfg.retention, Some(Duration::from_secs(3600)));
         assert_eq!(cfg.check_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn should_default_sst_block_size_to_none() {
+        // given
+        let json = r#"{"storage": {"type": "InMemory"}}"#;
+
+        // when
+        let cfg: Config = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.sst_block_size, None);
+    }
+
+    #[test]
+    fn should_deserialize_sst_block_size() {
+        // given
+        let json = r#"{"storage": {"type": "InMemory"}, "sst_block_size": "Block16Kib"}"#;
+
+        // when
+        let cfg: Config = serde_json::from_str(json).unwrap();
+
+        // then
+        assert_eq!(cfg.sst_block_size, Some(SstBlockSize::Block16Kib));
     }
 
     #[test]

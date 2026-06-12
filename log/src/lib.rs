@@ -77,6 +77,7 @@ pub use common::{L0Stats, SortedRunStats};
 pub use reader::{
     Inspection, LogDbReader, LogIterator, LogRead, SegmentInspection, SegmentReadStats,
 };
+pub use slatedb::SstBlockSize;
 
 // Re-export proto types for use by clients
 #[cfg(feature = "http-server")]
