@@ -316,6 +316,21 @@ impl LogDb {
         self.durable_sequence_rx.clone()
     }
 
+    /// Returns the exclusive global sequence the read view currently observes:
+    /// every record with `seq < observed_sequence()` is visible to scans, and
+    /// nothing at or beyond it is. This is the frontier
+    /// [`LogIterator::next_sequence`](crate::LogIterator::next_sequence) lifts
+    /// to on a drained scan (see RFC 0007).
+    ///
+    /// Cheap — a read-lock load, no storage I/O — so the scan handler can skip
+    /// work entirely while a follower's cursor is `>= observed_sequence()`.
+    /// Internal: external callers resume off `LogIterator::next_sequence`, so
+    /// this exists only for the HTTP scan handler's idle-poll short-circuit.
+    #[cfg(feature = "http-server")]
+    pub(crate) async fn observed_sequence(&self) -> Sequence {
+        self.read_view.read().await.frontier
+    }
+
     /// Waits for read-side visibility to reach the current requirement.
     async fn sync_reads(&self) -> Result<()> {
         let (target, durability) = match self.read_visibility {
@@ -460,6 +475,7 @@ impl LogDb {
             snapshot as Arc<dyn common::StorageRead>,
             direct,
             segment_cache,
+            initial_next_sequence,
         )));
 
         let (epoch_watcher, durable_sequence_rx, read_subscriber_task) = spawn_subscriber(
@@ -657,11 +673,12 @@ async fn advance_read_view_to(
     known_segment_id: &mut Option<SegmentId>,
     known_deleted_segment_id: &mut Option<SegmentId>,
     snapshot: Arc<dyn common::storage::StorageSnapshot>,
+    frontier: Sequence,
     new_segment_id: Option<SegmentId>,
     new_deleted_segment_id: Option<SegmentId>,
 ) {
     let mut rv = read_view.write().await;
-    rv.update_snapshot(snapshot as Arc<dyn common::StorageRead>);
+    rv.update_snapshot(snapshot as Arc<dyn common::StorageRead>, frontier);
 
     if new_segment_id != *known_segment_id {
         match rv.refresh_segments(*known_segment_id).await {
@@ -708,6 +725,7 @@ async fn try_advance_durable(
                 known_segment_id,
                 known_deleted_segment_id,
                 advanced.snapshot,
+                advanced.next_sequence,
                 advanced.last_segment_id,
                 advanced.last_deleted_segment_id,
             )
@@ -792,6 +810,7 @@ fn spawn_subscriber(
                             &mut known_segment_id,
                             &mut known_deleted_segment_id,
                             view.snapshot,
+                            view.next_sequence,
                             view.last_segment_id,
                             view.last_deleted_segment_id,
                         )
@@ -2867,6 +2886,78 @@ mod tests {
         // should contribute (covered_to from count_in_range is below the
         // range start, so scan_lo gets pulled to seg_lo).
         assert_eq!(log.count(Bytes::from("k"), 7..).await.unwrap(), 3);
+    }
+
+    // ---- next_sequence (resumable scan) tests ----
+
+    #[tokio::test]
+    async fn next_sequence_lifts_idle_key_to_global_frontier() {
+        // Writes land only on a hot key. A drained scan of an idle key should
+        // still resume at the global frontier — the whole point of the
+        // cross-key lift — rather than at 0.
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v1"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v2"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // `scan` runs `sync_reads`, so the read view (and its frontier) reflects
+        // the appends above before the iterator is built.
+        let mut iter = log.scan(Bytes::from("cold"), ..).await.unwrap();
+        assert!(
+            iter.next().await.unwrap().is_none(),
+            "the cold key has no records"
+        );
+        assert_eq!(
+            iter.next_sequence(),
+            3,
+            "idle-key scan resumes at the frontier set by the hot key's writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_sequence_resumes_past_consumed_tail() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        let mut iter = log.scan(Bytes::from("k"), ..).await.unwrap();
+        let mut last = None;
+        while let Some(e) = iter.next().await.unwrap() {
+            last = Some(e.sequence);
+        }
+        assert_eq!(last, Some(1));
+        // Drained: resume one past the last record, at the frontier.
+        let resume = iter.next_sequence();
+        assert_eq!(resume, 2);
+
+        // Resuming from there sees nothing new and reports the same frontier —
+        // the idle-poll steady state.
+        let mut iter2 = log.scan(Bytes::from("k"), resume..).await.unwrap();
+        assert!(iter2.next().await.unwrap().is_none());
+        assert_eq!(iter2.next_sequence(), 2);
     }
 
     // ---- durable_sequence tests ----

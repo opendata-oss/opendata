@@ -252,6 +252,19 @@ pub trait StorageRead: Any + Send + Sync {
         Ok(records)
     }
 
+    /// Returns the key bound (`last_entry`) of every durable SST in the current
+    /// snapshot — both L0 and the compacted runs.
+    ///
+    /// Used to derive resumable-scan frontiers without scanning data (see
+    /// RFC 0007 in the log crate): the maximum decodable sequence among these
+    /// bounds is a lower bound on the durable tip. Returns empty for stores
+    /// without an LSM manifest. Reads only the manifest snapshot this handle
+    /// already holds, so a frontier derived from it shares the snapshot scans
+    /// observe.
+    fn sst_key_bounds(&self) -> Vec<Bytes> {
+        Vec::new()
+    }
+
     /// Closes the storage, releasing any resources.
     ///
     /// This method should be called before dropping the storage to ensure

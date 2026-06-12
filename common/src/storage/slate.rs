@@ -393,6 +393,24 @@ impl SlateDbStorageReader {
 
 #[async_trait]
 impl StorageRead for SlateDbStorageReader {
+    /// Walks the current manifest snapshot — L0 plus the compacted sorted runs —
+    /// collecting each SST's `last_entry` bound. Same `DbReader` the scans use,
+    /// so the frontier and scans share one monotonic snapshot.
+    fn sst_key_bounds(&self) -> Vec<Bytes> {
+        let manifest = self.reader.manifest();
+        manifest
+            .l0()
+            .iter()
+            .chain(
+                manifest
+                    .compacted()
+                    .iter()
+                    .flat_map(|run| run.sst_views.iter()),
+            )
+            .filter_map(|view| view.sst.info.last_entry.clone())
+            .collect()
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get(&self, key: Bytes) -> StorageResult<Option<Record>> {
         let value = self
