@@ -77,25 +77,23 @@ pub async fn handle_scan(
 ) -> Result<ApiResponse, ApiError> {
     let format = ResponseFormat::from_headers(&headers);
     let key = params.key();
-    let range = params.seq_range();
+    let mut range = params.seq_range();
     let limit = params.limit.unwrap_or(32);
 
-    let entries = scan_entries(&state, key.clone(), range.clone(), limit).await?;
+    let (entries, mut next_sequence) =
+        scan_entries(&state, key.clone(), range.clone(), limit).await?;
 
-    // If we have entries or follow is disabled, return immediately
+    // If we have entries or follow is disabled, return immediately.
     if !entries.is_empty() || !params.follow.unwrap_or(false) {
-        let values: Vec<Value> = entries
-            .iter()
-            .map(|e| Value {
-                sequence: e.sequence,
-                value: e.value.clone(),
-            })
-            .collect();
-        let response = ScanResponse::success(key, values);
-        return Ok(to_api_response(response, format));
+        return Ok(to_api_response(
+            scan_response(key, &entries, next_sequence),
+            format,
+        ));
     }
 
-    // Long-poll: wait for new entries
+    // Empty and following: advance the cursor past the observed-empty range so
+    // each poll only scans newly-arrived data, then long-poll for it.
+    range.start = next_sequence;
     let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(30000));
     let deadline = Instant::now() + timeout;
     let poll_interval = Duration::from_millis(100);
@@ -103,33 +101,58 @@ pub async fn handle_scan(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let response = ScanResponse::success(key, vec![]);
-            return Ok(to_api_response(response, format));
+            return Ok(to_api_response(
+                scan_response(key, &[], next_sequence),
+                format,
+            ));
         }
         tokio::time::sleep(poll_interval.min(remaining)).await;
 
-        let entries = scan_entries(&state, key.clone(), range.clone(), limit).await?;
-        if !entries.is_empty() {
-            let values: Vec<Value> = entries
-                .iter()
-                .map(|e| Value {
-                    sequence: e.sequence,
-                    value: e.value.clone(),
-                })
-                .collect();
-            let response = ScanResponse::success(key, values);
-            return Ok(to_api_response(response, format));
+        // Short-circuit: if nothing has been observed past our cursor, there is
+        // no work to do — skip the scan entirely (no read view lock contention,
+        // no segment lookup, no storage range read).
+        let observed = state.log.observed_sequence().await;
+        if range.start >= observed {
+            next_sequence = next_sequence.max(observed);
+            continue;
         }
+
+        let (entries, ns) = scan_entries(&state, key.clone(), range.clone(), limit).await?;
+        next_sequence = ns;
+        if !entries.is_empty() {
+            return Ok(to_api_response(
+                scan_response(key, &entries, next_sequence),
+                format,
+            ));
+        }
+        range.start = ns;
     }
 }
 
+/// Builds a successful scan response from borrowed entries.
+fn scan_response(key: Bytes, entries: &[crate::LogEntry], next_sequence: u64) -> ScanResponse {
+    let values: Vec<Value> = entries
+        .iter()
+        .map(|e| Value {
+            sequence: e.sequence,
+            value: e.value.clone(),
+        })
+        .collect();
+    ScanResponse::success(key, values, next_sequence)
+}
+
 /// Helper function to scan entries from the log.
+///
+/// Returns the entries read plus the iterator's `next_sequence` — the exclusive
+/// global sequence to resume from (see RFC 0007). When the scan drains without
+/// hitting `limit`, this is lifted to the observed frontier so callers skip the
+/// empty tail; when truncated by `limit`, it is one past the last entry.
 async fn scan_entries(
     state: &AppState,
     key: Bytes,
     range: std::ops::Range<u64>,
     limit: usize,
-) -> Result<Vec<crate::LogEntry>, ApiError> {
+) -> Result<(Vec<crate::LogEntry>, u64), ApiError> {
     let mut iter = state.log.scan(key, range).await?;
     let mut entries = Vec::new();
     while let Some(entry) = iter.next().await.map_err(ApiError::from)? {
@@ -138,6 +161,7 @@ async fn scan_entries(
             break;
         }
     }
+    let next_sequence = iter.next_sequence();
 
     let bytes_scanned: usize = entries
         .iter()
@@ -151,7 +175,7 @@ async fn scan_entries(
         .metrics
         .log_bytes_scanned_total
         .inc_by(bytes_scanned as u64);
-    Ok(entries)
+    Ok((entries, next_sequence))
 }
 
 /// Handle GET /api/v1/log/keys
