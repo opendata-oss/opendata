@@ -4,8 +4,15 @@
 //! frequencies for `TextAttributeSummary`) and the query path (when expanding
 //! a BM25 query string into terms) tokenize identically.
 
-use icu_segmenter::WordSegmenter;
 use icu_segmenter::options::WordBreakInvariantOptions;
+use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed};
+
+thread_local! {
+    /// Constructing a `WordSegmenter` sets up segmentation models and is too
+    /// expensive to do per call on the write path; cache one per thread.
+    static SEGMENTER: WordSegmenterBorrowed<'static> =
+        WordSegmenter::new_auto(WordBreakInvariantOptions::default());
+}
 
 /// Tokenize a UTF-8 string into Unicode-aware, lowercase word terms.
 ///
@@ -21,24 +28,25 @@ pub(crate) fn tokenize(input: &str) -> Vec<String> {
     if input.is_empty() {
         return Vec::new();
     }
-    let segmenter = WordSegmenter::new_auto(WordBreakInvariantOptions::default());
-    let mut tokens = Vec::new();
-    let mut iter = segmenter.segment_str(input).iter_with_word_type();
-    // The first emitted boundary is the start of input (always 0); we only
-    // care about segments lying _between_ consecutive boundaries.
-    let Some((mut prev, _)) = iter.next() else {
-        return Vec::new();
-    };
-    for (boundary, word_type) in iter {
-        if word_type.is_word_like() {
-            let segment = &input[prev..boundary];
-            if !segment.is_empty() {
-                tokens.push(segment.to_lowercase());
+    SEGMENTER.with(|segmenter| {
+        let mut tokens = Vec::new();
+        let mut iter = segmenter.segment_str(input).iter_with_word_type();
+        // The first emitted boundary is the start of input (always 0); we only
+        // care about segments lying _between_ consecutive boundaries.
+        let Some((mut prev, _)) = iter.next() else {
+            return Vec::new();
+        };
+        for (boundary, word_type) in iter {
+            if word_type.is_word_like() {
+                let segment = &input[prev..boundary];
+                if !segment.is_empty() {
+                    tokens.push(segment.to_lowercase());
+                }
             }
+            prev = boundary;
         }
-        prev = boundary;
-    }
-    tokens
+        tokens
+    })
 }
 
 #[cfg(test)]
