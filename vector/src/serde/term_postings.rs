@@ -15,10 +15,10 @@
 //! uses them to compute a tight upper bound on the BM25 contribution of any
 //! document in the block without decoding the block (BlockMaxScore).
 //!
-//! The canonical decoded representation is columnar: [`PostingListView`]
+//! The canonical decoded representation is columnar: [`TermPostingsView`]
 //! parses block headers into a directory and decodes payloads on demand into
 //! ascending parallel arrays ([`DecodedPostingsBlock`]). Row-oriented readers
-//! use [`PostingListView::iter_entries`]; [`TermPostingsValue`] is the
+//! use [`TermPostingsView::iter_entries`]; [`TermPostingsEncoder`] is the
 //! encode-side builder only.
 //!
 //! ## Value Layout (little-endian unless noted)
@@ -84,16 +84,18 @@ const BLOCK_TYPE_POSTINGS: u8 = 0x00;
 const BLOCK_TYPE_SKIP: u8 = 0x01;
 
 /// Ascending id gaps packed via [`BitPacker8x`]. Used when every gap fits
-/// in `u32`. (The strictly-sorted delta codec was measured ~50x slower to
-/// decode than plain unpacking plus a scalar prefix sum, for a one-bit-per-id
-/// saving — so gaps are packed plain.)
+/// in `u32`. This format encodes deltas between consecutive ids. One alternative
+/// is to encode deltas between each id and the first id in the block. These are
+/// strictly sorted and could use [`BitPacker8x#compress_strictly_sorted`]. This
+/// was measured to be much slower (1.9us vs 36ns per block)
 const IDS_ENCODING_BITPACKED: u8 = 0;
 
 /// Ascending id gaps written one-by-one as unsigned LEB128 `u64` varints.
 /// Used when at least one gap exceeds `u32::MAX`.
 const IDS_ENCODING_VARINT: u8 = 1;
 
-/// A single posting entry within a `Postings` block.
+/// A single posting entry within a `Postings` block. Used for construction
+/// and row-oriented/aos iteration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PostingEntry {
     pub(crate) id: VectorId,
@@ -107,7 +109,7 @@ pub(crate) struct PostingEntry {
 /// Impacts have a partial order: a pair with higher `freq` *and* lower `norm`
 /// than another is guaranteed to score at least as high under BM25 (the score
 /// is non-decreasing in frequency and non-increasing in document length). A
-/// skip block stores the *dominating* pairs — those not dominated by any other
+/// skip block stores the *dominating* pairs — those not lower than any other
 /// pair in the block — so the max score over the block is the max score over
 /// its impacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +128,7 @@ fn compute_dominating_impacts(entries: &[PostingEntry]) -> Vec<Impact> {
     let mut max_freq_by_norm = [0u32; 256];
     for entry in entries {
         let slot = &mut max_freq_by_norm[entry.norm as usize];
+        // this assumes entry.freq is non-zero, so entry.freq.max(1) _should_ be a no-op
         *slot = (*slot).max(entry.freq.max(1));
     }
     // Sweep norms ascending; a pair survives only when its freq strictly
@@ -166,7 +169,13 @@ impl PostingsBlock {
         self.entries
             .last()
             .map(|e| e.id)
-            .unwrap_or(VectorId::data_vector_id(0))
+            .expect("invalid empty posting block")
+    }
+
+    fn encoded_len(&self) -> usize {
+        let mut payload = BytesMut::new();
+        self.encode_payload(&mut payload);
+        payload.len()
     }
 
     /// Encode just the payload (no type tag or length prefix).
@@ -236,7 +245,7 @@ impl PostingsBlock {
 /// Decode a `Postings` block payload into caller-provided stack arrays in
 /// ascending id order. Returns the entry count and the borrowed norms
 /// slice. Allocation-free so the hot decode path can reuse buffers.
-fn decode_postings_raw<'a>(
+fn decode_postings_block_raw<'a>(
     buf: &'a [u8],
     ids: &mut [u64; BLOCK_LEN],
     freqs: &mut [u32; BLOCK_LEN],
@@ -450,17 +459,17 @@ pub(crate) enum TermPostingsBlock {
 }
 
 /// Encode-side builder for a term's posting list. The decoded/canonical
-/// representation is [`PostingListView`].
+/// representation is [`TermPostingsView`].
 ///
 /// Blocks appear in ascending `id` order: each `Skip` is immediately
 /// followed by the `Postings` block it describes, and successive pairs cover
 /// strictly higher id ranges.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct TermPostingsValue {
+pub(crate) struct TermPostingsEncoder {
     pub(crate) blocks: Vec<TermPostingsBlock>,
 }
 
-impl TermPostingsValue {
+impl TermPostingsEncoder {
     /// Build a value from a flat list of postings in arbitrary order.
     ///
     /// Postings are sorted ascending and chunked into
@@ -477,12 +486,10 @@ impl TermPostingsValue {
         let mut blocks = Vec::new();
         for chunk in postings.chunks(TARGET_POSTINGS_PER_BLOCK) {
             let postings_block = PostingsBlock::from_ascending(chunk.to_vec());
-            let mut payload = BytesMut::new();
-            postings_block.encode_payload(&mut payload);
             let skip = SkipBlock {
                 last_id: postings_block.last_id(),
                 impacts: compute_dominating_impacts(&postings_block.entries),
-                length: payload.len() as u64,
+                length: postings_block.encoded_len() as u64,
             };
             blocks.push(TermPostingsBlock::Skip(skip));
             blocks.push(TermPostingsBlock::Postings(postings_block));
@@ -493,31 +500,31 @@ impl TermPostingsValue {
     pub(crate) fn encode_to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
         for block in &self.blocks {
-            encode_block(block, &mut buf);
+            Self::encode_block(block, &mut buf);
         }
         buf.freeze()
     }
-}
 
-fn encode_block(block: &TermPostingsBlock, buf: &mut BytesMut) {
-    let mut payload = BytesMut::new();
-    let (tag, payload_buf) = match block {
-        TermPostingsBlock::Skip(s) => {
-            s.encode_payload(&mut payload);
-            (BLOCK_TYPE_SKIP, &payload)
-        }
-        TermPostingsBlock::Postings(p) => {
-            p.encode_payload(&mut payload);
-            (BLOCK_TYPE_POSTINGS, &payload)
-        }
-    };
-    buf.put_u8(tag);
-    buf.put_u32_le(payload_buf.len() as u32);
-    buf.extend_from_slice(payload_buf);
+    fn encode_block(block: &TermPostingsBlock, buf: &mut BytesMut) {
+        let mut payload = BytesMut::new();
+        let (tag, payload_buf) = match block {
+            TermPostingsBlock::Skip(s) => {
+                s.encode_payload(&mut payload);
+                (BLOCK_TYPE_SKIP, &payload)
+            }
+            TermPostingsBlock::Postings(p) => {
+                p.encode_payload(&mut payload);
+                (BLOCK_TYPE_POSTINGS, &payload)
+            }
+        };
+        buf.put_u8(tag);
+        buf.put_u32_le(payload_buf.len() as u32);
+        buf.extend_from_slice(payload_buf);
+    }
 }
 
 /// Directory entry for one `(Skip, Postings)` pair within an encoded
-/// `TermPostings` value, recorded by [`PostingListView::parse`].
+/// `TermPostings` value, recorded by [`TermPostingsView::parse`].
 #[derive(Debug, Clone)]
 pub(crate) struct PostingBlockMeta {
     /// Lowest doc id in the block (the postings payload's `base_id`).
@@ -529,7 +536,7 @@ pub(crate) struct PostingBlockMeta {
     /// Range of this block's impacts within the view's impact arena.
     impacts_start: u32,
     impacts_len: u16,
-    /// Byte offset of the pair's skip-block header within the raw value;
+    /// Byte offset of the skip+postings pair's skip-block header within the raw value;
     /// with `payload_start + payload_len` this delimits the whole
     /// `(Skip, Postings)` pair for verbatim copying.
     pair_start: usize,
@@ -548,7 +555,7 @@ pub(crate) struct DecodedPostingsBlock {
     pub(crate) norms: Vec<u8>,
 }
 
-/// A lazily-decoded view over an encoded `TermPostings` value.
+/// A lazily-decoded view over an encoded term postings value.
 ///
 /// [`parse`](Self::parse) scans only the block headers and skip payloads —
 /// it never touches the bitpacked postings payloads — and records where each
@@ -562,15 +569,14 @@ pub(crate) struct DecodedPostingsBlock {
 /// in one arena (`impacts`) rather than per-block `Vec`s so a query on a
 /// common term with thousands of blocks doesn't pay one allocation per block.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PostingListView {
+pub(crate) struct TermPostingsView {
     raw: Bytes,
     blocks: Vec<PostingBlockMeta>,
     impacts: Vec<Impact>,
 }
 
-impl PostingListView {
-    /// Scan the value's block headers into a directory. Cost is proportional
-    /// to the number of blocks, not the number of postings.
+impl TermPostingsView {
+    /// Scan the value's block headers into a directory.
     pub(crate) fn parse(raw: Bytes) -> Result<Self, EncodingError> {
         let mut blocks = Vec::new();
         let mut impacts: Vec<Impact> = Vec::new();
@@ -759,7 +765,7 @@ impl PostingListView {
         let payload = &self.raw[meta.payload_start..meta.payload_start + meta.payload_len];
         let mut ids = [0u64; BLOCK_LEN];
         let mut freqs = [0u32; BLOCK_LEN];
-        let (count, norms) = decode_postings_raw(payload, &mut ids, &mut freqs)?;
+        let (count, norms) = decode_postings_block_raw(payload, &mut ids, &mut freqs)?;
         out.ids.clear();
         out.ids.extend_from_slice(&ids[..count]);
         out.freqs.clear();
@@ -805,10 +811,10 @@ impl PostingListView {
     }
 }
 
-/// Lazily-decoding row iterator over a [`PostingListView`]; see
-/// [`PostingListView::iter_entries`].
+/// Row-oriented iterator over a [`TermPostingsView`] that returns `PostingEntry`s; see
+/// [`TermPostingsView::iter_entries`].
 pub(crate) struct PostingEntriesIter<'a> {
-    view: &'a PostingListView,
+    view: &'a TermPostingsView,
     /// Index of the next block to decode.
     block_idx: usize,
     /// Decoded arrays for the block currently being yielded.
@@ -889,7 +895,7 @@ mod tests {
 
     /// Decode every posting through the view's row iterator.
     fn all_entries(encoded: Bytes) -> Vec<PostingEntry> {
-        PostingListView::parse(encoded)
+        TermPostingsView::parse(encoded)
             .unwrap()
             .iter_entries()
             .collect::<Result<_, _>>()
@@ -934,11 +940,11 @@ mod tests {
     #[test]
     fn corrupt_payload_decodes_to_error_not_panic() {
         let postings = vec![entry(8, 2, 30), entry(2, 3, 20), entry(5, 1, 10)];
-        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
 
         // ids_encoding byte is at payload offset 12 (count:4 + base_id:8).
         let bad_encoding = corrupt_postings_payload(&encoded, &[(12, 0xEE)]);
-        let view = PostingListView::parse(bad_encoding).expect("framing is intact");
+        let view = TermPostingsView::parse(bad_encoding).expect("framing is intact");
         let err = view.decode_block(0).unwrap_err();
         assert!(
             err.message.contains("unknown postings ids_encoding"),
@@ -952,7 +958,7 @@ mod tests {
 
         // count is payload bytes 0..4; 300 (0x012C) > BLOCK_LEN (256).
         let bad_count = corrupt_postings_payload(&encoded, &[(0, 0x2C), (1, 0x01)]);
-        let view = PostingListView::parse(bad_count).expect("framing is intact");
+        let view = TermPostingsView::parse(bad_count).expect("framing is intact");
         let err = view.decode_block(0).unwrap_err();
         assert!(err.message.contains("exceeds BLOCK_LEN"), "{}", err.message);
     }
@@ -963,7 +969,7 @@ mod tests {
     fn view_should_skip_zero_count_blocks() {
         // given - a valid pair followed by an empty (skip, postings) pair
         let mut buf = BytesMut::new();
-        let real = TermPostingsValue::from_postings(vec![entry(7, 1, 1), entry(3, 2, 2)]);
+        let real = TermPostingsEncoder::from_postings(vec![entry(7, 1, 1), entry(3, 2, 2)]);
         buf.extend_from_slice(&real.encode_to_bytes());
         // skip block for the empty pair
         let mut skip_payload = BytesMut::new();
@@ -980,7 +986,7 @@ mod tests {
         let encoded = buf.freeze();
 
         // when
-        let view = PostingListView::parse(encoded).unwrap();
+        let view = TermPostingsView::parse(encoded).unwrap();
 
         // then - the view skips the empty pair and indexes only the real one
         assert_eq!(view.blocks().len(), 1);
@@ -990,11 +996,11 @@ mod tests {
     #[test]
     fn should_roundtrip_empty_value() {
         // given
-        let value = TermPostingsValue::default();
+        let value = TermPostingsEncoder::default();
 
         // when
         let encoded = value.encode_to_bytes();
-        let view = PostingListView::parse(encoded).unwrap();
+        let view = TermPostingsView::parse(encoded).unwrap();
 
         // then
         assert!(view.blocks().is_empty());
@@ -1003,7 +1009,7 @@ mod tests {
     #[test]
     fn should_roundtrip_single_block() {
         // given
-        let value = TermPostingsValue::from_postings(vec![
+        let value = TermPostingsEncoder::from_postings(vec![
             entry(5, 1, 10),
             entry(2, 3, 20),
             entry(8, 2, 30),
@@ -1028,7 +1034,7 @@ mod tests {
         let postings: Vec<_> = (0..n as u64)
             .map(|i| entry(i, (i % 7) as u32 + 1, ((i % 11) as u8) + 1))
             .collect();
-        let value = TermPostingsValue::from_postings(postings);
+        let value = TermPostingsEncoder::from_postings(postings);
 
         // when
         let entries = all_entries(value.encode_to_bytes());
@@ -1047,7 +1053,7 @@ mod tests {
         // given - enough postings for 2 blocks
         let n = TARGET_POSTINGS_PER_BLOCK + 5;
         let postings: Vec<_> = (0..n as u64).map(|i| entry(i, 1, 1)).collect();
-        let value = TermPostingsValue::from_postings(postings);
+        let value = TermPostingsEncoder::from_postings(postings);
 
         // when
         let kinds: Vec<&str> = value
@@ -1066,9 +1072,9 @@ mod tests {
     #[test]
     fn should_merge_appending_newer_blocks_after_older() {
         // given - older operand has lower ids, newer operand has higher ids
-        let older = TermPostingsValue::from_postings(vec![entry(1, 1, 1), entry(2, 1, 1)])
+        let older = TermPostingsEncoder::from_postings(vec![entry(1, 1, 1), entry(2, 1, 1)])
             .encode_to_bytes();
-        let newer = TermPostingsValue::from_postings(vec![entry(10, 1, 1), entry(11, 1, 1)])
+        let newer = TermPostingsEncoder::from_postings(vec![entry(10, 1, 1), entry(11, 1, 1)])
             .encode_to_bytes();
 
         // when - operands ordered oldest -> newest
@@ -1082,8 +1088,8 @@ mod tests {
     #[test]
     fn should_merge_with_existing_value() {
         // given
-        let existing = TermPostingsValue::from_postings(vec![entry(1, 1, 1)]).encode_to_bytes();
-        let op = TermPostingsValue::from_postings(vec![entry(5, 1, 1)]).encode_to_bytes();
+        let existing = TermPostingsEncoder::from_postings(vec![entry(1, 1, 1)]).encode_to_bytes();
+        let op = TermPostingsEncoder::from_postings(vec![entry(5, 1, 1)]).encode_to_bytes();
 
         // when
         let merged = merge_batch_term_postings(Some(existing), &[op]);
@@ -1096,8 +1102,8 @@ mod tests {
     #[test]
     fn merge_is_pure_byte_concatenation() {
         // given - the encoded forms of two operands
-        let older = TermPostingsValue::from_postings(vec![entry(1, 1, 1)]).encode_to_bytes();
-        let newer = TermPostingsValue::from_postings(vec![entry(10, 1, 1)]).encode_to_bytes();
+        let older = TermPostingsEncoder::from_postings(vec![entry(1, 1, 1)]).encode_to_bytes();
+        let newer = TermPostingsEncoder::from_postings(vec![entry(10, 1, 1)]).encode_to_bytes();
         let mut expected = Vec::with_capacity(older.len() + newer.len());
         expected.extend_from_slice(&older); // delivery order: oldest first
         expected.extend_from_slice(&newer);
@@ -1112,7 +1118,7 @@ mod tests {
     #[test]
     fn should_preserve_skip_last_id_and_length() {
         // given
-        let value = TermPostingsValue::from_postings(vec![
+        let value = TermPostingsEncoder::from_postings(vec![
             entry(10, 1, 1),
             entry(20, 1, 1),
             entry(30, 1, 1),
@@ -1150,7 +1156,7 @@ mod tests {
     #[test]
     fn should_use_bitpacked_id_encoding_when_range_fits_u32() {
         // given
-        let value = TermPostingsValue::from_postings(vec![
+        let value = TermPostingsEncoder::from_postings(vec![
             entry(100, 1, 1),
             entry(50, 1, 1),
             entry(1, 1, 1),
@@ -1180,7 +1186,7 @@ mod tests {
     fn should_switch_to_varint_id_encoding_when_range_exceeds_u32() {
         // given - the block's id range exceeds what bitpacked offsets hold
         let huge = (u32::MAX as u64) + 2;
-        let value = TermPostingsValue::from_postings(vec![entry(huge, 1, 5), entry(0, 2, 7)]);
+        let value = TermPostingsEncoder::from_postings(vec![entry(huge, 1, 5), entry(0, 2, 7)]);
 
         // when - inspect ids_encoding byte
         let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
@@ -1204,7 +1210,7 @@ mod tests {
     #[test]
     fn should_stay_bitpacked_when_gaps_fit_but_range_does_not() {
         let step = 3_000_000_000u64; // < u32::MAX, but two steps exceed it
-        let value = TermPostingsValue::from_postings(vec![
+        let value = TermPostingsEncoder::from_postings(vec![
             entry(0, 1, 1),
             entry(step, 1, 1),
             entry(2 * step, 1, 1),
@@ -1228,7 +1234,7 @@ mod tests {
     /// strictly-sorted codec.
     #[test]
     fn should_roundtrip_single_entry_block() {
-        let value = TermPostingsValue::from_postings(vec![entry(12345, 7, 3)]);
+        let value = TermPostingsEncoder::from_postings(vec![entry(12345, 7, 3)]);
         let entries = all_entries(value.encode_to_bytes());
         assert_eq!(entries, vec![entry(12345, 7, 3)]);
     }
@@ -1237,7 +1243,7 @@ mod tests {
     #[test]
     fn consecutive_ids_pack_to_one_bit() {
         let postings: Vec<_> = (1000..1256u64).map(|i| entry(i, 1, 1)).collect();
-        let value = TermPostingsValue::from_postings(postings.clone());
+        let value = TermPostingsEncoder::from_postings(postings.clone());
 
         let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
             panic!("expected postings block")
@@ -1338,14 +1344,14 @@ mod tests {
     #[test]
     fn should_roundtrip_skip_impacts() {
         // given
-        let value = TermPostingsValue::from_postings(vec![
+        let value = TermPostingsEncoder::from_postings(vec![
             entry(10, 3, 7),
             entry(20, 1, 2),
             entry(30, 5, 9),
         ]);
 
         // when
-        let view = PostingListView::parse(value.encode_to_bytes()).unwrap();
+        let view = TermPostingsView::parse(value.encode_to_bytes()).unwrap();
 
         // then - skip block impacts survive the round trip
         assert_eq!(
@@ -1366,7 +1372,7 @@ mod tests {
         let postings = PostingsBlock::from_ascending(vec![entry(7, 1, 1), entry(42, 2, 2)]);
         let mut payload = BytesMut::new();
         postings.encode_payload(&mut payload);
-        let value = TermPostingsValue {
+        let value = TermPostingsEncoder {
             blocks: vec![
                 TermPostingsBlock::Skip(SkipBlock {
                     last_id: postings.last_id(),
@@ -1378,7 +1384,7 @@ mod tests {
         };
 
         // when
-        let view = PostingListView::parse(value.encode_to_bytes()).unwrap();
+        let view = TermPostingsView::parse(value.encode_to_bytes()).unwrap();
 
         // then
         assert_eq!(view.blocks().len(), 1);
@@ -1393,7 +1399,7 @@ mod tests {
         let postings: Vec<_> = (0..TARGET_POSTINGS_PER_BLOCK as u64)
             .map(|i| entry(i, (i as u32 % 5) + 1, ((i % 200) as u8) + 1))
             .collect();
-        let value = TermPostingsValue::from_postings(postings.clone());
+        let value = TermPostingsEncoder::from_postings(postings.clone());
 
         // when
         let entries = all_entries(value.encode_to_bytes());
@@ -1409,10 +1415,10 @@ mod tests {
         let postings: Vec<_> = (0..n as u64)
             .map(|i| entry(i, (i % 7) as u32 + 1, ((i % 11) as u8) + 1))
             .collect();
-        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
 
         // when
-        let view = PostingListView::parse(encoded).unwrap();
+        let view = TermPostingsView::parse(encoded).unwrap();
 
         // then - three blocks, ascending and non-overlapping, counts sum to n
         assert_eq!(view.blocks().len(), 3);
@@ -1433,10 +1439,10 @@ mod tests {
     fn view_decode_block_should_return_ascending_arrays() {
         // given
         let postings = vec![entry(8, 2, 30), entry(2, 3, 20), entry(5, 1, 10)];
-        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
 
         // when
-        let view = PostingListView::parse(encoded).unwrap();
+        let view = TermPostingsView::parse(encoded).unwrap();
         let decoded = view.decode_block(0).unwrap();
 
         // then
@@ -1448,18 +1454,18 @@ mod tests {
     #[test]
     fn view_should_parse_merged_operands() {
         // given - two merge operands (older = lower ids)
-        let older = TermPostingsValue::from_postings(
+        let older = TermPostingsEncoder::from_postings(
             (0..300u64).map(|i| entry(i, 1, 1)).collect::<Vec<_>>(),
         )
         .encode_to_bytes();
-        let newer = TermPostingsValue::from_postings(
+        let newer = TermPostingsEncoder::from_postings(
             (1000..1100u64).map(|i| entry(i, 2, 2)).collect::<Vec<_>>(),
         )
         .encode_to_bytes();
         let merged = merge_batch_term_postings(None, &[older, newer]);
 
         // when
-        let view = PostingListView::parse(merged).unwrap();
+        let view = TermPostingsView::parse(merged).unwrap();
 
         // then - blocks ascending across operand boundaries
         let mut prev_max = None;
@@ -1480,7 +1486,7 @@ mod tests {
 
     #[test]
     fn view_of_empty_value_has_no_blocks() {
-        let view = PostingListView::parse(Bytes::new()).unwrap();
+        let view = TermPostingsView::parse(Bytes::new()).unwrap();
         assert!(view.blocks().is_empty());
     }
 
@@ -1492,7 +1498,7 @@ mod tests {
         let postings: Vec<_> = (0..n as u64)
             .map(|i| entry(i * 3, (i % 9) as u32 + 1, (i % 50) as u8 + 1))
             .collect();
-        let encoded = TermPostingsValue::from_postings(postings.clone()).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings.clone()).encode_to_bytes();
 
         let entries = all_entries(encoded);
 
@@ -1505,9 +1511,9 @@ mod tests {
     fn pair_bytes_tile_the_encoded_value() {
         let n = TARGET_POSTINGS_PER_BLOCK * 2 + 9;
         let postings: Vec<_> = (0..n as u64).map(|i| entry(i, 1, 1)).collect();
-        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
 
-        let view = PostingListView::parse(encoded.clone()).unwrap();
+        let view = TermPostingsView::parse(encoded.clone()).unwrap();
         let mut rebuilt = BytesMut::new();
         for idx in 0..view.blocks().len() {
             rebuilt.extend_from_slice(view.pair_bytes(idx));
@@ -1526,11 +1532,11 @@ mod tests {
         let postings: Vec<_> = (0..BLOCK_LEN as u64)
             .map(|i| entry(1000 + i, u32::MAX, 1))
             .collect();
-        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
 
         // ids_bits is at payload offset 13 (count:4 + base_id:8 + encoding:1).
         let bad_ids_bits = corrupt_postings_payload(&encoded, &[(13, 33)]);
-        let view = PostingListView::parse(bad_ids_bits).expect("framing is intact");
+        let view = TermPostingsView::parse(bad_ids_bits).expect("framing is intact");
         let err = view.decode_block(0).unwrap_err();
         assert!(err.message.contains("ids_bits"), "{}", err.message);
 
@@ -1545,7 +1551,7 @@ mod tests {
         };
         let freqs_bits_offset = 14 + ids_bits * (BLOCK_LEN / 8);
         let bad_freqs_bits = corrupt_postings_payload(&encoded, &[(freqs_bits_offset, 40)]);
-        let view = PostingListView::parse(bad_freqs_bits).expect("framing is intact");
+        let view = TermPostingsView::parse(bad_freqs_bits).expect("framing is intact");
         let err = view.decode_block(0).unwrap_err();
         assert!(err.message.contains("freqs_bits"), "{}", err.message);
     }
@@ -1557,7 +1563,7 @@ mod tests {
     #[test]
     fn parse_rejects_inconsistent_pair_metadata() {
         // Inverted: corrupt the skip's last_id below the postings base_id.
-        let encoded = TermPostingsValue::from_postings(vec![
+        let encoded = TermPostingsEncoder::from_postings(vec![
             entry(10, 1, 1),
             entry(42, 1, 1),
             entry(100, 1, 1),
@@ -1566,7 +1572,7 @@ mod tests {
         let mut bytes = encoded.to_vec();
         // Skip block payload starts at offset 5; last_id is its first 8 bytes.
         bytes[5..13].copy_from_slice(&5u64.to_le_bytes());
-        let err = PostingListView::parse(Bytes::from(bytes)).unwrap_err();
+        let err = TermPostingsView::parse(Bytes::from(bytes)).unwrap_err();
         assert!(
             err.message.contains("exceeds skip block"),
             "{}",
@@ -1574,12 +1580,12 @@ mod tests {
         );
 
         // Non-ascending: two pairs whose ranges do not ascend.
-        let pair_a = TermPostingsValue::from_postings(vec![entry(50, 1, 1)]).encode_to_bytes();
-        let pair_b = TermPostingsValue::from_postings(vec![entry(20, 1, 1)]).encode_to_bytes();
+        let pair_a = TermPostingsEncoder::from_postings(vec![entry(50, 1, 1)]).encode_to_bytes();
+        let pair_b = TermPostingsEncoder::from_postings(vec![entry(20, 1, 1)]).encode_to_bytes();
         let mut merged = BytesMut::new();
         merged.extend_from_slice(&pair_a);
         merged.extend_from_slice(&pair_b);
-        let err = PostingListView::parse(merged.freeze()).unwrap_err();
+        let err = TermPostingsView::parse(merged.freeze()).unwrap_err();
         assert!(err.message.contains("does not ascend"), "{}", err.message);
     }
 
@@ -1587,7 +1593,7 @@ mod tests {
     /// single gap, `u32::MAX`.
     #[test]
     fn codec_selection_boundary() {
-        let ids_encoding = |value: &TermPostingsValue| {
+        let ids_encoding = |value: &TermPostingsEncoder| {
             let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
                 panic!("expected postings block")
             };
@@ -1598,7 +1604,7 @@ mod tests {
 
         // gap == u32::MAX: bitpacked, round-trips.
         let at =
-            TermPostingsValue::from_postings(vec![entry(0, 1, 1), entry(u32::MAX as u64, 1, 1)]);
+            TermPostingsEncoder::from_postings(vec![entry(0, 1, 1), entry(u32::MAX as u64, 1, 1)]);
         assert_eq!(ids_encoding(&at), IDS_ENCODING_BITPACKED);
         let ids: Vec<u64> = all_entries(at.encode_to_bytes())
             .iter()
@@ -1607,7 +1613,7 @@ mod tests {
         assert_eq!(ids, vec![0, u32::MAX as u64]);
 
         // gap == u32::MAX + 1: varint, round-trips.
-        let past = TermPostingsValue::from_postings(vec![
+        let past = TermPostingsEncoder::from_postings(vec![
             entry(0, 1, 1),
             entry(u32::MAX as u64 + 1, 1, 1),
         ]);
@@ -1623,7 +1629,7 @@ mod tests {
             .map(|i| entry(i, 1, 1))
             .collect();
         postings.push(entry(BLOCK_LEN as u64 - 2 + u32::MAX as u64, 1, 1));
-        let full = TermPostingsValue::from_postings(postings.clone());
+        let full = TermPostingsEncoder::from_postings(postings.clone());
         assert_eq!(ids_encoding(&full), IDS_ENCODING_BITPACKED);
         assert_eq!(all_entries(full.encode_to_bytes()), postings);
     }
@@ -1634,11 +1640,11 @@ mod tests {
     fn iter_entries_yields_good_blocks_then_one_error() {
         let n = TARGET_POSTINGS_PER_BLOCK + 5;
         let postings: Vec<_> = (0..n as u64).map(|i| entry(i, 1, 1)).collect();
-        let encoded = TermPostingsValue::from_postings(postings.clone()).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings.clone()).encode_to_bytes();
         // Corrupt the SECOND postings payload's ids_encoding byte.
         let corrupted = corrupt_nth_postings_payload(&encoded, 1, &[(12, 0xEE)]);
 
-        let view = PostingListView::parse(corrupted).expect("framing is intact");
+        let view = TermPostingsView::parse(corrupted).expect("framing is intact");
         let mut iter = view.iter_entries();
         for expected in postings.iter().take(TARGET_POSTINGS_PER_BLOCK) {
             assert_eq!(iter.next().unwrap().unwrap(), *expected);

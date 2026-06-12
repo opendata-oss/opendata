@@ -8,7 +8,7 @@
 use crate::error::Result;
 use crate::math::bm25::ScoreContext;
 use crate::query_engine::bm25::essential::{HitList, ScoreWindow};
-use crate::serde::term_postings::{DecodedPostingsBlock, PostingListView};
+use crate::serde::term_postings::{DecodedPostingsBlock, TermPostingsView};
 
 /// Sentinel: no documents at or beyond this id (data-vector ids use the low
 /// 56 bits only, so `u64::MAX` is unreachable).
@@ -16,7 +16,7 @@ pub(super) const NO_MORE_DOCS: u64 = u64::MAX;
 
 /// One query term's posting list, iterated lazily in ascending doc id order.
 pub(super) struct TermScorer {
-    view: PostingListView,
+    view: TermPostingsView,
     /// IDF for this term in the current corpus.
     idf: f32,
     /// Current doc id; [`NO_MORE_DOCS`] when exhausted.
@@ -35,7 +35,7 @@ pub(super) struct TermScorer {
 }
 
 impl TermScorer {
-    pub(super) fn new(view: PostingListView, idf: f32) -> Result<Self> {
+    pub(super) fn new(view: TermPostingsView, idf: f32) -> Result<Self> {
         let block_max_scores = vec![None; view.blocks().len()];
         let mut scorer = Self {
             view,

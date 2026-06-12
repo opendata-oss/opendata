@@ -32,7 +32,7 @@
 //!    reference is in this compaction and has been pruned, so the ids can never
 //!    resurface.
 //! 2. **Prunes term postings.** Each posting value is streamed block by
-//!    block ([`PostingListView`]): blocks whose id range holds no deleted id
+//!    block ([`TermPostingsView`]): blocks whose id range holds no deleted id
 //!    are copied verbatim, the rest are decoded, pruned, and re-encoded with
 //!    fresh impacts. The number of removed documents is recorded for the
 //!    sibling `TermStats` key.
@@ -105,7 +105,7 @@ use crate::serde::key::{
     TERM_POSTINGS_DISCRIMINATOR, TERM_STATS_DISCRIMINATOR, VectorFieldStatsKey,
 };
 use crate::serde::term_postings::{
-    DecodedPostingsBlock, PostingEntry, PostingListView, TermPostingsValue,
+    DecodedPostingsBlock, PostingEntry, TermPostingsView, TermPostingsEncoder,
 };
 use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_bitmap::VectorBitmap;
@@ -246,7 +246,7 @@ impl VectorCompactionFilter {
                 "unexpected empty postings val".into(),
             ));
         };
-        let view = PostingListView::parse(bytes.clone()).map_err(filter_err)?;
+        let view = TermPostingsView::parse(bytes.clone()).map_err(filter_err)?;
 
         // `out` is created lazily at the first touched block; while it is
         // `None` every block so far was clean and the original value can be
@@ -291,7 +291,7 @@ impl VectorCompactionFilter {
             });
             if !survivors.is_empty() {
                 out.extend_from_slice(
-                    &TermPostingsValue::from_postings(survivors).encode_to_bytes(),
+                    &TermPostingsEncoder::from_postings(survivors).encode_to_bytes(),
                 );
             }
         }
@@ -705,7 +705,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         filter.filter(&deletions_entry(&[1, 2])).await.unwrap();
 
-        let postings = TermPostingsValue::from_postings(vec![
+        let postings = TermPostingsEncoder::from_postings(vec![
             posting(1, 2, 10),
             posting(2, 1, 20),
             posting(3, 3, 30),
@@ -723,7 +723,7 @@ mod tests {
         let stats_decision = filter.filter(&stats_entry).await.unwrap();
 
         // then - only doc 3 survives in the postings
-        let pruned = PostingListView::parse(modified_bytes(&postings_decision)).unwrap();
+        let pruned = TermPostingsView::parse(modified_bytes(&postings_decision)).unwrap();
         let ids: Vec<u64> = pruned
             .iter_entries()
             .map(|e| e.map(|e| e.id.id()))
@@ -749,8 +749,8 @@ mod tests {
         let postings: Vec<_> = (0..768)
             .map(|i| posting(i, (i % 7) as u32 + 1, 1))
             .collect();
-        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
-        let view = PostingListView::parse(encoded.clone()).unwrap();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
+        let view = TermPostingsView::parse(encoded.clone()).unwrap();
         assert_eq!(view.blocks().len(), 3);
         let first_pair = view.pair_bytes(0).to_vec();
         let last_pair = view.pair_bytes(2).to_vec();
@@ -760,7 +760,7 @@ mod tests {
         let decision = filter.filter(&postings_entry).await.unwrap();
 
         // then - the clean pairs are byte-identical verbatim copies
-        let rewritten = PostingListView::parse(modified_bytes(&decision)).unwrap();
+        let rewritten = TermPostingsView::parse(modified_bytes(&decision)).unwrap();
         assert_eq!(rewritten.blocks().len(), 3);
         assert_eq!(rewritten.pair_bytes(0), first_pair.as_slice());
         assert_eq!(rewritten.pair_bytes(2), last_pair.as_slice());
@@ -784,7 +784,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         filter.filter(&deletions_entry(&[1, 2])).await.unwrap();
 
-        let postings = TermPostingsValue::from_postings(vec![posting(1, 1, 1), posting(2, 1, 1)])
+        let postings = TermPostingsEncoder::from_postings(vec![posting(1, 1, 1), posting(2, 1, 1)])
             .encode_to_bytes();
         let postings_entry = merge_entry(TermPostingsKey::new("body", "fox").encode(), postings);
         let stats_entry = merge_entry(
@@ -906,7 +906,7 @@ mod tests {
         // term postings -> CollectPostings
         let postings = merge_entry(
             TermPostingsKey::new("body", "fox").encode(),
-            TermPostingsValue::from_postings(vec![posting(5, 1, 1)]).encode_to_bytes(),
+            TermPostingsEncoder::from_postings(vec![posting(5, 1, 1)]).encode_to_bytes(),
         );
         filter.filter(&postings).await.unwrap();
         assert!(matches!(filter.phase, FilterPhase::CollectPostings(_)));
@@ -944,7 +944,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         let postings = merge_entry(
             TermPostingsKey::new("body", "fox").encode(),
-            TermPostingsValue::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
+            TermPostingsEncoder::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
         );
         filter.filter(&postings).await.unwrap();
 
@@ -967,7 +967,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         let postings = merge_entry(
             TermPostingsKey::new("body", "fox").encode(),
-            TermPostingsValue::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
+            TermPostingsEncoder::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
         );
         filter.filter(&postings).await.unwrap();
         let stats = merge_entry(
@@ -1001,7 +1001,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         filter.filter(&deletions_entry(&[3])).await.unwrap();
 
-        let encoded = TermPostingsValue::from_postings(vec![
+        let encoded = TermPostingsEncoder::from_postings(vec![
             posting(0, 1, 1),
             posting(2, 1, 1),
             posting(4, 1, 1),
@@ -1009,7 +1009,7 @@ mod tests {
         .encode_to_bytes();
         // sanity: the deletion intersects the block's range, so the decode
         // path (not the verbatim-copy probe) is exercised
-        let view = PostingListView::parse(encoded.clone()).unwrap();
+        let view = TermPostingsView::parse(encoded.clone()).unwrap();
         assert!(
             filter
                 .deletions
@@ -1048,7 +1048,7 @@ mod tests {
         buf.put_u32_le(4);
         buf.put_u32_le(0); // count == 0
         buf.extend_from_slice(
-            &TermPostingsValue::from_postings(vec![posting(3, 1, 1), posting(7, 1, 1)])
+            &TermPostingsEncoder::from_postings(vec![posting(3, 1, 1), posting(7, 1, 1)])
                 .encode_to_bytes(),
         );
 
@@ -1075,8 +1075,8 @@ mod tests {
             let postings: Vec<_> = (0..768)
                 .map(|i| posting(i, (i % 7) as u32 + 1, 1))
                 .collect();
-            let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
-            let view = PostingListView::parse(encoded.clone()).unwrap();
+            let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
+            let view = TermPostingsView::parse(encoded.clone()).unwrap();
             assert_eq!(view.blocks().len(), 3);
 
             let entry = merge_entry(
@@ -1084,7 +1084,7 @@ mod tests {
                 encoded.clone(),
             );
             let decision = filter.filter(&entry).await.unwrap();
-            let rewritten = PostingListView::parse(modified_bytes(&decision)).unwrap();
+            let rewritten = TermPostingsView::parse(modified_bytes(&decision)).unwrap();
 
             // Clean pairs are byte-identical; the dirty one is not.
             assert_eq!(rewritten.blocks().len(), 3, "dirty_idx {}", dirty_idx);

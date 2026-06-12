@@ -21,7 +21,7 @@ use crate::query_engine::filter::PreparedFilter;
 use crate::query_engine::operator::Operator;
 use crate::query_engine::types::ScoredVectorId;
 use crate::serde::key::TermPostingsKey;
-use crate::serde::term_postings::{PostingEntry, PostingListView};
+use crate::serde::term_postings::{PostingEntry, TermPostingsView};
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::VectorId;
 
@@ -73,7 +73,7 @@ impl BM25Operator {
             let Some(record) = self.storage.get(key).await? else {
                 return Ok(None);
             };
-            let view = PostingListView::parse(record.value)?;
+            let view = TermPostingsView::parse(record.value)?;
             // Postings are stored ascending; this scorer's union heap
             // consumes entries highest-id first, so collect and flip.
             let mut entries: Vec<PostingEntry> =
