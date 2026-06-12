@@ -58,7 +58,7 @@ use crate::query_engine::filter::PreparedFilter;
 use crate::query_engine::operator::Operator;
 use crate::query_engine::types::{Score, ScoredVectorId};
 use crate::serde::key::TermPostingsKey;
-use crate::serde::term_postings::PostingListView;
+use crate::serde::term_postings::TermPostingsView;
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::VectorId;
 
@@ -114,7 +114,7 @@ impl BlockMaxBM25Operator {
             let Some(record) = self.storage.get(key).await? else {
                 return Ok(None);
             };
-            let view = PostingListView::parse(record.value)?;
+            let view = TermPostingsView::parse(record.value)?;
             if view.blocks().is_empty() {
                 return Ok(None);
             }
@@ -836,7 +836,7 @@ mod tests {
     /// must surface as a recoverable error from the scorer, not a panic.
     #[test]
     fn corrupt_block_surfaces_as_error_not_panic() {
-        use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
+        use crate::serde::term_postings::{PostingEntry, TermPostingsEncoder};
         let postings = vec![
             PostingEntry {
                 id: VectorId::from_raw(8),
@@ -849,7 +849,7 @@ mod tests {
                 norm: 20,
             },
         ];
-        let encoded = TermPostingsValue::from_postings(postings).encode_to_bytes();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
         // Corrupt the ids_encoding byte (payload offset 12) of the first
         // postings block (tag 0x00); parse() never reads it.
         let mut bytes = encoded.to_vec();
@@ -869,7 +869,7 @@ mod tests {
             }
             offset = payload_start + len;
         }
-        let view = PostingListView::parse(bytes::Bytes::from(bytes))
+        let view = TermPostingsView::parse(bytes::Bytes::from(bytes))
             .expect("parse() accepts the corrupt payload");
         assert!(TermScorer::new(view, 1.0).is_err());
     }
@@ -1046,5 +1046,54 @@ mod tests {
             let sparse = run_block_max_sparse(&db, query, None, 10).await;
             assert_same_results(&sparse, &ex, &format!("sparse operands q=[{}]", query));
         }
+    }
+
+    /// Traversal over the mixed layout the compaction filter produces:
+    /// verbatim 256-entry pairs interleaved with a re-packed survivor pair
+    /// of odd count. Seeks and window planning must cross the boundary
+    /// between copied and rewritten pairs cleanly.
+    #[test]
+    fn term_scorer_traverses_filter_rewritten_layout() {
+        use crate::serde::term_postings::{PostingEntry, TermPostingsEncoder, TermPostingsView};
+        use bytes::BytesMut;
+
+        let posting = |id: u64| PostingEntry {
+            id: VectorId::from_raw(id),
+            freq: 1,
+            norm: 1,
+        };
+        // Original: 4 blocks [256, 256, 256, 32]; "delete" ids 300 and 400
+        // from the second block by emulating the filter's rewrite: copy the
+        // clean pairs verbatim and re-encode the survivors of block 1.
+        let original: Vec<_> = (0..800u64).map(posting).collect();
+        let encoded = TermPostingsEncoder::from_postings(original).encode_to_bytes();
+        let view = TermPostingsView::parse(encoded).unwrap();
+        assert_eq!(view.blocks().len(), 4);
+
+        let mut rewritten = BytesMut::new();
+        rewritten.extend_from_slice(view.pair_bytes(0));
+        let survivors: Vec<_> = (256..512u64)
+            .filter(|&id| id != 300 && id != 400)
+            .map(posting)
+            .collect();
+        rewritten
+            .extend_from_slice(&TermPostingsEncoder::from_postings(survivors).encode_to_bytes());
+        rewritten.extend_from_slice(view.pair_bytes(2));
+        rewritten.extend_from_slice(view.pair_bytes(3));
+
+        let mixed = TermPostingsView::parse(rewritten.freeze()).unwrap();
+        assert_eq!(mixed.blocks().len(), 4);
+        assert_eq!(mixed.blocks()[1].count, 254);
+
+        // Seeks across the verbatim/rewritten boundaries.
+        let mut scorer = TermScorer::new(mixed, 1.0).unwrap();
+        assert_eq!(scorer.seek(255).unwrap(), 255);
+        assert_eq!(scorer.seek(300).unwrap(), 301);
+        assert_eq!(scorer.seek(400).unwrap(), 401);
+        assert_eq!(scorer.seek(511).unwrap(), 511);
+        assert_eq!(scorer.seek(512).unwrap(), 512);
+        assert_eq!(scorer.seek(799).unwrap(), 799);
+        scorer.next().unwrap();
+        assert_eq!(scorer.doc(), NO_MORE_DOCS);
     }
 }
