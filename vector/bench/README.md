@@ -55,6 +55,25 @@ end cold reader phase
     cold_p99_latency_us  9.51K
 ```
 
+## Full-Text Search Benchmarks
+
+The `fts` benchmark supports two corpus modes:
+
+- `dataset = "synthetic"` (default): deterministic Zipf-distributed generated text.
+- `dataset = "msmarco-passage"`: MS MARCO passage-ranking `collection.tsv` with query text from `queries.dev.small.tsv`.
+
+For MS MARCO, download and extract the official archive under `vector/bench/data/msmarco/`:
+
+```bash
+curl -L -o /tmp/msmarco-passage.tar.gz \
+  https://msmarco.z22.web.core.windows.net/msmarcoranking/collectionandqueries.tar.gz
+mkdir -p vector/bench/data/msmarco
+tar xzf /tmp/msmarco-passage.tar.gz -C vector/bench/data/msmarco
+cargo run -p vector-bench --release -- --config vector/bench/fts-msmarco-passage.toml --benchmark fts
+```
+
+`num_docs` caps how many passages are ingested, so the same config can run quick subsets or the full 8.8M-passage corpus.
+
 ## Measurements 
 
 - **recall@10** — fraction of true top-10 neighbours returned (uses precomputed exact

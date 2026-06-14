@@ -1,18 +1,19 @@
-//! Deterministic synthetic corpus and query generation for the FTS
-//! benchmark.
+//! Corpus and query loading for the FTS benchmark.
 //!
-//! Everything here is derived from the spec's `seed` with a hand-rolled
-//! splitmix64 generator (no RNG dependency), so the same spec always
-//! produces the same corpus and queries:
-//!
-//! - **Terms** follow a Zipf distribution over `vocab_size` ranks with
-//!   exponent `zipf_s`; rank `r` renders as the token `t<r>`.
-//! - **Document lengths** are log-normal-ish: a standard normal is
-//!   approximated by summing 12 uniforms (Irwin–Hall) and the length is
-//!   `clamp(round(avg_doc_len * exp(0.5 * n)), 5, 2000)`.
-//! - **Queries** mix three strata of head/torso/tail term ranks.
+//! The benchmark supports the original deterministic synthetic corpus and
+//! MS MARCO passage-ranking files. Synthetic data is generated from the spec's
+//! seed. MS MARCO data is streamed from `collection.tsv`, so large corpora do
+//! not need to be materialized in memory before ingest.
 
-use crate::fts::FtsSpec;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::thread;
+
+use anyhow::Context;
+use tokio::sync::mpsc;
+
+use crate::fts::{FtsDataset, FtsSpec};
 
 /// Salt XOR'd into the seed for the query generator so queries don't reuse
 /// the corpus generator's random stream.
@@ -22,8 +23,11 @@ const QUERY_SEED_SALT: u64 = 0x9E3779B97F4A7C15;
 const MIN_DOC_LEN: usize = 5;
 const MAX_DOC_LEN: usize = 2000;
 
-/// A generated document: external id `d<i>`, a filler embedding, and the
-/// space-joined term body.
+const DEFAULT_MSMARCO_CORPUS_FILE: &str = "msmarco/collection.tsv";
+const DEFAULT_MSMARCO_QUERIES_FILE: &str = "msmarco/queries.dev.small.tsv";
+
+/// A generated or loaded document: external id, a filler embedding, and the
+/// text body.
 pub(crate) struct Doc {
     pub id: String,
     pub embedding: Vec<f32>,
@@ -102,10 +106,33 @@ impl ZipfTable {
 
 // -- Corpus generation ------------------------------------------------------------
 
-/// Streaming generator for the synthetic corpus. Documents are produced
-/// sequentially from a single random stream, so chunking does not affect
-/// the generated corpus — only how much is materialized at once.
-pub(crate) struct CorpusGenerator {
+/// Streaming generator for the configured corpus. Documents are produced
+/// sequentially, so chunking affects only how much is materialized at once.
+enum CorpusGenerator {
+    Synthetic(SyntheticCorpusGenerator),
+    MsMarco(MsMarcoCorpusGenerator),
+}
+
+impl CorpusGenerator {
+    pub fn new(spec: &FtsSpec) -> anyhow::Result<Self> {
+        match spec.dataset {
+            FtsDataset::Synthetic => Ok(Self::Synthetic(SyntheticCorpusGenerator::new(spec))),
+            FtsDataset::MsMarcoPassage => Ok(Self::MsMarco(MsMarcoCorpusGenerator::open(spec)?)),
+        }
+    }
+
+    /// Generate or load the next chunk of up to `max_docs` documents, or
+    /// `None` when the corpus is exhausted.
+    pub fn next_chunk(&mut self, max_docs: usize) -> anyhow::Result<Option<Vec<Doc>>> {
+        match self {
+            Self::Synthetic(generator) => Ok(generator.next_chunk(max_docs)),
+            Self::MsMarco(generator) => generator.next_chunk(max_docs),
+        }
+    }
+}
+
+/// Streaming generator for the synthetic corpus.
+struct SyntheticCorpusGenerator {
     rng: SplitMix64,
     zipf: ZipfTable,
     avg_doc_len: f64,
@@ -114,8 +141,8 @@ pub(crate) struct CorpusGenerator {
     next_doc: usize,
 }
 
-impl CorpusGenerator {
-    pub fn new(spec: &FtsSpec) -> Self {
+impl SyntheticCorpusGenerator {
+    fn new(spec: &FtsSpec) -> Self {
         Self {
             rng: SplitMix64::new(spec.seed),
             zipf: ZipfTable::new(spec.vocab_size, spec.zipf_s),
@@ -126,9 +153,7 @@ impl CorpusGenerator {
         }
     }
 
-    /// Generate the next chunk of up to `max_docs` documents, or `None`
-    /// when the corpus is exhausted.
-    pub fn next_chunk(&mut self, max_docs: usize) -> Option<Vec<Doc>> {
+    fn next_chunk(&mut self, max_docs: usize) -> Option<Vec<Doc>> {
         if self.next_doc >= self.num_docs {
             return None;
         }
@@ -170,6 +195,213 @@ impl CorpusGenerator {
         let len = (self.avg_doc_len * (0.5 * n).exp()).round();
         (len as usize).clamp(MIN_DOC_LEN, MAX_DOC_LEN)
     }
+}
+
+struct MsMarcoCorpusGenerator {
+    reader: BufReader<File>,
+    rng: SplitMix64,
+    dimensions: usize,
+    remaining: usize,
+    line_number: usize,
+}
+
+impl MsMarcoCorpusGenerator {
+    fn open(spec: &FtsSpec) -> anyhow::Result<Self> {
+        let corpus_path = resolve_data_path(
+            spec,
+            spec.corpus_file.as_deref(),
+            DEFAULT_MSMARCO_CORPUS_FILE,
+        );
+        let file = File::open(&corpus_path)
+            .with_context(|| format!("failed to open MS MARCO corpus {}", corpus_path.display()))?;
+        Ok(Self {
+            reader: BufReader::new(file),
+            rng: SplitMix64::new(spec.seed),
+            dimensions: spec.dimensions as usize,
+            remaining: spec.num_docs,
+            line_number: 0,
+        })
+    }
+
+    fn next_chunk(&mut self, max_docs: usize) -> anyhow::Result<Option<Vec<Doc>>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let count = max_docs.min(self.remaining);
+        let mut docs = Vec::with_capacity(count);
+        while docs.len() < count {
+            let Some(doc) = self.next_doc()? else {
+                break;
+            };
+            docs.push(doc);
+        }
+        if docs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(docs))
+        }
+    }
+
+    fn next_doc(&mut self) -> anyhow::Result<Option<Doc>> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = self.reader.read_line(&mut line)?;
+            if bytes == 0 {
+                return Ok(None);
+            }
+            self.line_number += 1;
+            let line = line.trim_end_matches(&['\r', '\n'][..]);
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, '\t');
+            let id = parts.next().unwrap_or_default();
+            let Some(body) = parts.next() else {
+                anyhow::bail!(
+                    "invalid MS MARCO collection row {}: expected '<pid>\t<passage>'",
+                    self.line_number
+                );
+            };
+            self.remaining -= 1;
+            let embedding: Vec<f32> = (0..self.dimensions).map(|_| self.rng.next_f32()).collect();
+            return Ok(Some(Doc {
+                id: id.to_string(),
+                embedding,
+                body: body.to_string(),
+            }));
+        }
+    }
+}
+
+/// Spawn a thread that streams corpus chunks through a bounded channel, so
+/// generation/file I/O overlaps with writes without materializing the whole
+/// corpus.
+pub(crate) fn spawn_doc_stream(
+    spec: FtsSpec,
+    chunk_size: usize,
+) -> (
+    mpsc::Receiver<anyhow::Result<Vec<Doc>>>,
+    thread::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::channel(1);
+    let handle = thread::spawn(move || {
+        let mut generator = match CorpusGenerator::new(&spec) {
+            Ok(generator) => generator,
+            Err(err) => {
+                let _ = tx.blocking_send(Err(err));
+                return;
+            }
+        };
+        loop {
+            match generator.next_chunk(chunk_size) {
+                Ok(Some(chunk)) => {
+                    if tx.blocking_send(Ok(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(err));
+                    return;
+                }
+            }
+        }
+    });
+    (rx, handle)
+}
+
+pub(crate) fn corpus_description(spec: &FtsSpec) -> String {
+    match spec.dataset {
+        FtsDataset::Synthetic => format!(
+            "synthetic docs (vocab={}, zipf_s={}, avg_len={}, dim={})",
+            spec.vocab_size, spec.zipf_s, spec.avg_doc_len, spec.dimensions
+        ),
+        FtsDataset::MsMarcoPassage => {
+            let corpus_path = resolve_data_path(
+                spec,
+                spec.corpus_file.as_deref(),
+                DEFAULT_MSMARCO_CORPUS_FILE,
+            );
+            format!(
+                "MS MARCO passage docs from {} (dim={})",
+                corpus_path.display(),
+                spec.dimensions
+            )
+        }
+    }
+}
+
+pub(crate) fn load_queries(spec: &FtsSpec) -> anyhow::Result<Vec<String>> {
+    match spec.dataset {
+        FtsDataset::Synthetic => Ok(generate_queries(
+            spec.seed,
+            spec.vocab_size,
+            spec.num_queries,
+        )),
+        FtsDataset::MsMarcoPassage => load_msmarco_queries(spec),
+    }
+}
+
+fn load_msmarco_queries(spec: &FtsSpec) -> anyhow::Result<Vec<String>> {
+    let path = resolve_data_path(
+        spec,
+        spec.queries_file.as_deref(),
+        DEFAULT_MSMARCO_QUERIES_FILE,
+    );
+    let file = File::open(&path)
+        .with_context(|| format!("failed to open MS MARCO queries {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut queries = Vec::with_capacity(spec.num_queries);
+    for (line_idx, line) in reader.lines().enumerate() {
+        if queries.len() == spec.num_queries {
+            break;
+        }
+        let line = line?;
+        let line = line.trim_end_matches(&['\r', '\n'][..]);
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, '\t');
+        let _qid = parts.next();
+        let Some(query) = parts.next() else {
+            anyhow::bail!(
+                "invalid MS MARCO query row {}: expected '<qid>\t<query>'",
+                line_idx + 1
+            );
+        };
+        if !query.trim().is_empty() {
+            queries.push(query.to_string());
+        }
+    }
+    if queries.is_empty() {
+        anyhow::bail!("MS MARCO query file {} produced no queries", path.display());
+    }
+    if queries.len() < spec.num_queries {
+        println!(
+            "  Query file {} has {} usable queries; requested {}",
+            path.display(),
+            queries.len(),
+            spec.num_queries
+        );
+    }
+    Ok(queries)
+}
+
+fn resolve_data_path(spec: &FtsSpec, configured: Option<&str>, default_relative: &str) -> PathBuf {
+    let path = PathBuf::from(configured.unwrap_or(default_relative));
+    if path.is_absolute() {
+        path
+    } else {
+        data_dir(spec).join(path)
+    }
+}
+
+fn data_dir(spec: &FtsSpec) -> PathBuf {
+    spec.data_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("data"))
 }
 
 // -- Query generation -------------------------------------------------------------
@@ -222,6 +454,7 @@ mod tests {
 
     fn test_spec() -> FtsSpec {
         FtsSpec {
+            dataset: FtsDataset::Synthetic,
             seed: 42,
             num_docs: 100,
             vocab_size: 20_000,
@@ -231,6 +464,9 @@ mod tests {
             num_queries: 50,
             limit: 10,
             block_cache_bytes: None,
+            data_dir: None,
+            corpus_file: None,
+            queries_file: None,
             scorers: Vec::new(),
             phases: Vec::new(),
         }
@@ -240,13 +476,17 @@ mod tests {
     fn corpus_should_be_deterministic_and_chunking_invariant() {
         let spec = test_spec();
         let mut all: Vec<Doc> = Vec::new();
-        let mut generator = CorpusGenerator::new(&spec);
-        while let Some(chunk) = generator.next_chunk(7) {
+        let mut generator = CorpusGenerator::new(&spec).unwrap();
+        while let Some(chunk) = generator.next_chunk(7).unwrap() {
             all.extend(chunk);
         }
         assert_eq!(all.len(), spec.num_docs);
 
-        let again = CorpusGenerator::new(&spec).next_chunk(1000).unwrap();
+        let again = CorpusGenerator::new(&spec)
+            .unwrap()
+            .next_chunk(1000)
+            .unwrap()
+            .unwrap();
         assert_eq!(again.len(), spec.num_docs);
         for (a, b) in all.iter().zip(again.iter()) {
             assert_eq!(a.id, b.id);
@@ -258,8 +498,8 @@ mod tests {
     #[test]
     fn doc_lengths_should_be_clamped() {
         let spec = test_spec();
-        let mut generator = CorpusGenerator::new(&spec);
-        for doc in generator.next_chunk(100).unwrap() {
+        let mut generator = CorpusGenerator::new(&spec).unwrap();
+        for doc in generator.next_chunk(100).unwrap().unwrap() {
             let len = doc.body.split(' ').count();
             assert!((MIN_DOC_LEN..=MAX_DOC_LEN).contains(&len));
         }
@@ -276,5 +516,43 @@ mod tests {
                 assert!(rank < 20_000);
             }
         }
+    }
+
+    #[test]
+    fn msmarco_should_load_queries_and_docs() {
+        // given
+        let root =
+            std::env::temp_dir().join(format!("opendata-msmarco-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("msmarco")).unwrap();
+        std::fs::write(
+            root.join("msmarco/collection.tsv"),
+            "10\tfirst passage text\n11\tsecond passage text\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("msmarco/queries.dev.small.tsv"),
+            "1\twhat is first\n2\twhat is second\n",
+        )
+        .unwrap();
+        let mut spec = test_spec();
+        spec.dataset = FtsDataset::MsMarcoPassage;
+        spec.data_dir = Some(root.to_string_lossy().to_string());
+        spec.num_docs = 2;
+        spec.num_queries = 2;
+
+        // when
+        let queries = load_queries(&spec).unwrap();
+        let mut generator = CorpusGenerator::new(&spec).unwrap();
+        let docs = generator.next_chunk(10).unwrap().unwrap();
+
+        // then
+        assert_eq!(queries, vec!["what is first", "what is second"]);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].id, "10");
+        assert_eq!(docs[0].body, "first passage text");
+        assert_eq!(docs[0].embedding.len(), spec.dimensions as usize);
+        assert_eq!(docs[1].id, "11");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,7 +1,7 @@
 //! Full-text-search (BM25) latency benchmark for the vector database.
 //!
-//! Ingests a deterministic synthetic corpus (Zipf-distributed vocabulary,
-//! log-normal-ish document lengths) and measures sequential BM25 query
+//! Ingests either a deterministic synthetic corpus (Zipf-distributed vocabulary,
+//! log-normal-ish document lengths) or an MS MARCO passage corpus, then measures sequential BM25 query
 //! latency for each configured scorer (`block_max`, `exhaustive`),
 //! cross-checking that the scorers return identical result lists.
 //!
@@ -31,6 +31,7 @@ const DEFAULT_AVG_DOC_LEN: f64 = 100.0;
 const DEFAULT_DIMENSIONS: u16 = 8;
 const DEFAULT_NUM_QUERIES: usize = 200;
 const DEFAULT_LIMIT: usize = 10;
+const DEFAULT_DATASET: FtsDataset = FtsDataset::Synthetic;
 
 /// Default phase list when the params don't specify otherwise.
 const DEFAULT_PHASES: &[Phase] = &[Phase::Ingest, Phase::Warm];
@@ -101,15 +102,36 @@ fn param_to_scorers(s: &str) -> Vec<Bm25Scorer> {
         .collect()
 }
 
+// -- Corpus datasets -----------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FtsDataset {
+    /// Deterministic Zipf-distributed synthetic corpus.
+    Synthetic,
+    /// MS MARCO passage ranking corpus (`collection.tsv`) and query TSV.
+    MsMarcoPassage,
+}
+
+fn parse_dataset(s: &str) -> FtsDataset {
+    match s {
+        "synthetic" => FtsDataset::Synthetic,
+        "msmarco" | "msmarco-passage" | "msmarco_passage" => FtsDataset::MsMarcoPassage,
+        _ => panic!("unknown fts dataset: {}", s),
+    }
+}
+
 // -- Spec ---------------------------------------------------------------------
 
 /// FTS benchmark spec, parsed from `[[params.fts]]`. All values are strings
 /// in the bencher config and fall back to the defaults above when unset.
 #[derive(Clone, Debug)]
 pub(crate) struct FtsSpec {
-    /// Seed for the deterministic corpus and query generators.
+    /// Corpus/query source for the FTS benchmark.
+    pub dataset: FtsDataset,
+    /// Seed for deterministic synthetic generation and filler embeddings.
     pub seed: u64,
-    /// Number of synthetic documents to ingest.
+    /// Number of documents to ingest. For file-backed datasets this caps the
+    /// document stream; set it to the corpus size to ingest the full dataset.
     pub num_docs: usize,
     /// Vocabulary size (term ranks `t0..t<vocab_size-1>`).
     pub vocab_size: usize,
@@ -128,6 +150,15 @@ pub(crate) struct FtsSpec {
     /// benchmark: `None` = phase default, negative = disabled, `n >= 0` =
     /// exactly `n` bytes.
     pub block_cache_bytes: Option<i64>,
+    /// Directory containing file-backed FTS datasets. Defaults to
+    /// `vector/bench/data`.
+    pub data_dir: Option<String>,
+    /// Corpus file path relative to `data_dir`, or absolute. Used by
+    /// `msmarco-passage`; defaults to `msmarco/collection.tsv`.
+    pub corpus_file: Option<String>,
+    /// Query file path relative to `data_dir`, or absolute. Used by
+    /// `msmarco-passage`; defaults to `msmarco/queries.dev.small.tsv`.
+    pub queries_file: Option<String>,
     /// Scorers to measure during the warm phase, in order.
     pub scorers: Vec<Bm25Scorer>,
     /// Phases to run, in order.
@@ -137,6 +168,10 @@ pub(crate) struct FtsSpec {
 impl From<Params> for FtsSpec {
     fn from(p: Params) -> Self {
         FtsSpec {
+            dataset: p
+                .get("dataset")
+                .map(parse_dataset)
+                .unwrap_or(DEFAULT_DATASET),
             seed: p.get_parse("seed").ok().unwrap_or(DEFAULT_SEED),
             num_docs: p.get_parse("num_docs").ok().unwrap_or(DEFAULT_NUM_DOCS),
             vocab_size: p.get_parse("vocab_size").ok().unwrap_or(DEFAULT_VOCAB_SIZE),
@@ -152,6 +187,9 @@ impl From<Params> for FtsSpec {
                 .unwrap_or(DEFAULT_NUM_QUERIES),
             limit: p.get_parse("limit").ok().unwrap_or(DEFAULT_LIMIT),
             block_cache_bytes: p.get_parse::<i64>("block_cache_bytes").ok(),
+            data_dir: p.get("data_dir").map(str::to_string),
+            corpus_file: p.get("corpus_file").map(str::to_string),
+            queries_file: p.get("queries_file").map(str::to_string),
             scorers: p
                 .get("scorers")
                 .map(param_to_scorers)
@@ -161,6 +199,13 @@ impl From<Params> for FtsSpec {
                 .map(param_to_phases)
                 .unwrap_or_else(|| DEFAULT_PHASES.to_vec()),
         }
+    }
+}
+
+fn dataset_summary_id(dataset: FtsDataset) -> f64 {
+    match dataset {
+        FtsDataset::Synthetic => 0.0,
+        FtsDataset::MsMarcoPassage => 1.0,
     }
 }
 
@@ -243,13 +288,14 @@ impl Benchmark for FtsBenchmark {
             ..Default::default()
         };
 
-        // Queries are derived from the seed alone, so WARM-only runs against
+        // Queries are derived from the spec alone, so WARM-only runs against
         // a previously ingested corpus issue the same queries.
-        let queries = corpus::generate_queries(spec.seed, spec.vocab_size, spec.num_queries);
-        println!("  Generated {} queries", queries.len());
+        let queries = corpus::load_queries(&spec)?;
+        println!("  Loaded {} queries", queries.len());
 
         // -- Dispatch each configured phase --------------------------------
         let mut summary = Summary::new()
+            .add("dataset_id", dataset_summary_id(spec.dataset))
             .add("num_docs", spec.num_docs as f64)
             .add("num_queries", spec.num_queries as f64)
             .add("limit", spec.limit as f64);

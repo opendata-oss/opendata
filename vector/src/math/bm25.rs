@@ -4,6 +4,13 @@
 //! the FTS query path. Kept in `math` alongside the vector distance functions
 //! so all scoring helpers live in one place.
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{
+    __m256i, _mm256_add_ps, _mm256_cvtepi32_ps, _mm256_div_ps, _mm256_i32gather_ps,
+    _mm256_loadu_si256, _mm256_mul_ps, _mm256_set1_ps, _mm256_setr_epi32, _mm256_storeu_ps,
+    _mm256_sub_ps,
+};
+
 use super::norm;
 
 /// Term-frequency saturation parameter (`k1`).
@@ -140,6 +147,38 @@ impl ScoreContext {
         hit_score(idf, freq, self.norm_cache[norm as usize])
     }
 
+    /// BM25 contributions for one term's posting run.
+    ///
+    /// Computes the same per-hit values as [`score_hit`](Self::score_hit),
+    /// but batches the independent `(freq, norm)` pairs so x86_64 hosts with
+    /// AVX2 can evaluate eight postings per vector instruction group. The
+    /// fallback is scalar and preserves the exact hit arithmetic.
+    pub(crate) fn score_hits(&self, idf: f32, freqs: &[u32], norms: &[u8], out: &mut [f32]) {
+        assert_eq!(freqs.len(), norms.len());
+        assert_eq!(freqs.len(), out.len());
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if freqs.len() >= 8 && std::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 support is checked at runtime. Slice length
+                // equality is asserted above, and the AVX2 helper handles
+                // chunks and tails within bounds.
+                unsafe {
+                    score_hits_avx2(&self.norm_cache, idf, freqs, norms, out);
+                }
+                return;
+            }
+        }
+
+        self.score_hits_scalar(idf, freqs, norms, out);
+    }
+
+    fn score_hits_scalar(&self, idf: f32, freqs: &[u32], norms: &[u8], out: &mut [f32]) {
+        for ((slot, &freq), &norm) in out.iter_mut().zip(freqs).zip(norms) {
+            *slot = self.score_hit(idf, freq, norm);
+        }
+    }
+
     /// Upper bound on any hit's contribution for a term, regardless of
     /// frequency or document length.
     ///
@@ -149,6 +188,61 @@ impl ScoreContext {
     #[inline]
     pub(crate) fn global_bound(&self, idf: f32) -> f32 {
         idf * (K1 + 1.0)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn score_hits_avx2(
+    norm_cache: &[f32; 256],
+    idf: f32,
+    freqs: &[u32],
+    norms: &[u8],
+    out: &mut [f32],
+) {
+    debug_assert_eq!(freqs.len(), norms.len());
+    debug_assert_eq!(freqs.len(), out.len());
+
+    let mut idx = 0usize;
+    let len = freqs.len();
+    let one = _mm256_set1_ps(1.0);
+    let w_scalar = idf * (K1 + 1.0);
+    let w = _mm256_set1_ps(w_scalar);
+
+    while idx + 8 <= len {
+        let freq_chunk = &freqs[idx..idx + 8];
+        if freq_chunk.iter().all(|&freq| freq <= i32::MAX as u32) {
+            // SAFETY: `idx + 8 <= len` guarantees the load and store cover
+            // eight initialized `u32` inputs and eight writable `f32` outputs.
+            let freq_i32 = unsafe { _mm256_loadu_si256(freqs.as_ptr().add(idx).cast::<__m256i>()) };
+            let freq = _mm256_cvtepi32_ps(freq_i32);
+            let norm_idx = _mm256_setr_epi32(
+                norms[idx] as i32,
+                norms[idx + 1] as i32,
+                norms[idx + 2] as i32,
+                norms[idx + 3] as i32,
+                norms[idx + 4] as i32,
+                norms[idx + 5] as i32,
+                norms[idx + 6] as i32,
+                norms[idx + 7] as i32,
+            );
+            // SAFETY: all gathered norm indices are bytes in 0..=255, and
+            // scale 4 addresses `f32` elements in `norm_cache`.
+            let inv = unsafe { _mm256_i32gather_ps(norm_cache.as_ptr(), norm_idx, 4) };
+            let denom = _mm256_add_ps(one, _mm256_mul_ps(freq, inv));
+            let score = _mm256_sub_ps(w, _mm256_div_ps(w, denom));
+            // SAFETY: `idx + 8 <= len` guarantees eight writable `f32`s.
+            unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(idx), score) };
+        } else {
+            for lane in idx..idx + 8 {
+                out[lane] = hit_score(idf, freqs[lane], norm_cache[norms[lane] as usize]);
+            }
+        }
+        idx += 8;
+    }
+
+    for lane in idx..len {
+        out[lane] = hit_score(idf, freqs[lane], norm_cache[norms[lane] as usize]);
     }
 }
 
@@ -249,6 +343,53 @@ mod tests {
             combined,
             single
         );
+    }
+
+    #[test]
+    fn score_hits_matches_scalar_score_hit() {
+        // given
+        let ctx = ScoreContext::new(37.0);
+        let idf = 1.7;
+        let freqs = vec![
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            u32::MAX,
+            17,
+            18,
+            19,
+        ];
+        let norms = vec![
+            0, 1, 3, 7, 15, 31, 63, 127, 255, 200, 150, 100, 50, 25, 12, 6, 4, 2, 1,
+        ];
+        let mut actual = vec![0.0; freqs.len()];
+
+        // when
+        ctx.score_hits(idf, &freqs, &norms, &mut actual);
+
+        // then
+        for i in 0..freqs.len() {
+            let expected = ctx.score_hit(idf, freqs[i], norms[i]);
+            assert_eq!(
+                actual[i].to_bits(),
+                expected.to_bits(),
+                "hit {i}: actual={} expected={}",
+                actual[i],
+                expected
+            );
+        }
     }
 
     #[test]
