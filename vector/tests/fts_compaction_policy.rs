@@ -87,6 +87,7 @@ fn make_config(dir: &std::path::Path, settings_path: &std::path::Path) -> Config
             }),
             settings_path: Some(settings_path.to_str().unwrap().to_string()),
             block_cache: None,
+            ..Default::default()
         }),
         dimensions: DIMS,
         distance_metric: DistanceMetric::L2,
