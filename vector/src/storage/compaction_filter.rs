@@ -31,10 +31,11 @@
 //!    compaction. The `Deletions` entries are dropped — every posting they
 //!    reference is in this compaction and has been pruned, so the ids can never
 //!    resurface.
-//! 2. **Prunes term postings.** Deleted ids are removed from each
-//!    [`TermPostingsValue`] and the survivors are re-packed into uniform blocks
-//!    via [`TermPostingsValue::from_postings`]. The number of removed documents
-//!    is recorded for the sibling `TermStats` key.
+//! 2. **Prunes term postings.** Each posting value is streamed block by
+//!    block ([`TermPostingsView`]): blocks whose id range holds no deleted id
+//!    are copied verbatim, the rest are decoded, pruned, and re-encoded with
+//!    fresh impacts. The number of removed documents is recorded for the
+//!    sibling `TermStats` key.
 //! 3. **Applies the term document-frequency delta** to the immediately
 //!    following [`TermStatsValue`] (the `TermStats` key for a `(field, term)`
 //!    sorts right after its `TermPostings` key — discriminator `0x01` > `0x00`).
@@ -61,7 +62,7 @@
 //! merged value. The design tolerates this because every FTS merge is structured
 //! so that pruning-then-merging equals merging-then-pruning:
 //!
-//! - **Postings** merge by byte concatenation in descending-id order. Each
+//! - **Postings** merge by byte concatenation in ascending-id order. Each
 //!   operand is a self-contained, independently decodable `TermPostingsValue`,
 //!   so pruning deleted ids from each operand in turn yields the same result as
 //!   pruning the concatenation. The document-frequency decrement is accumulated
@@ -82,15 +83,18 @@
 //!   written together, so this holds in practice; if a stats entry is somehow
 //!   absent the delta is dropped and the statistic is left slightly stale (BM25
 //!   tolerates document-frequency drift — see the RFC).
-//! - Block re-alignment uses the fixed 256-entry block size baked into the
-//!   posting encoder; the configurable `target_posting_block_size` from the RFC
-//!   is not yet wired.
+//! - Rewritten blocks re-pack to the fixed 256-entry block size baked into
+//!   the posting encoder (the configurable `target_posting_block_size` from
+//!   the RFC is not yet wired). Re-packing coalesces survivors only within a
+//!   run of consecutive touched blocks — a verbatim-copied clean pair between
+//!   two runs is a hard boundary, since ids must stay ascending across pairs —
+//!   so each rewritten run ends with one block below the target size.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use slatedb::{
     CompactionFilter, CompactionFilterDecision, CompactionFilterError, CompactionFilterSupplier,
     CompactionJobContext, RowEntry, ValueDeletable,
@@ -102,10 +106,13 @@ use crate::serde::key::{
     DELETIONS_DISCRIMINATOR, DELETIONS_SENTINEL_DISCRIMINATOR, FieldStatsKey,
     TERM_POSTINGS_DISCRIMINATOR, TERM_STATS_DISCRIMINATOR, VectorFieldStatsKey,
 };
-use crate::serde::term_postings::TermPostingsValue;
+use crate::serde::term_postings::{
+    DecodedPostingsBlock, PostingEntry, TermPostingsEncoder, TermPostingsView,
+};
 use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_field_stats::VectorFieldStatsValue;
+use crate::serde::vector_id::VectorId;
 use crate::serde::{EncodingError, RecordType, Segment, parse_record_tag};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -212,6 +219,16 @@ impl VectorCompactionFilter {
 
     /// Removes deleted ids from a term's postings and records the
     /// document-frequency decrement for the sibling `TermStats` key.
+    ///
+    /// Streams the value block by block: a block whose `[min_id, max_id]`
+    /// range holds no deleted id is copied into the rewritten value
+    /// **verbatim** — no decode, no re-encode, impacts preserved — so a
+    /// sparse delete set only pays for the blocks it actually touches.
+    /// Touched blocks are decoded and pruned; the survivors of each run of
+    /// consecutive touched blocks are re-encoded together as fresh
+    /// `(Skip, Postings)` pairs with recomputed impacts, re-packed into full
+    /// blocks. (Runs cannot coalesce across a clean block: its verbatim pair
+    /// sits between them in id order.)
     fn handle_postings(
         &mut self,
         entry: &RowEntry,
@@ -233,34 +250,82 @@ impl VectorCompactionFilter {
                 "unexpected empty postings val".into(),
             ));
         };
-        let value = TermPostingsValue::decode_from_bytes(&bytes).map_err(filter_err)?;
+        let view = TermPostingsView::parse(bytes.clone()).map_err(filter_err)?;
 
-        let mut retained = Vec::new();
+        // `out` is created lazily at the first touched block; while it is
+        // `None` every block so far was clean and the original value can be
+        // kept as-is. Survivors accumulate across each *run* of consecutive
+        // touched blocks and are re-encoded together when the run ends, so
+        // they re-pack into full blocks instead of one undersized pair per
+        // touched block (which would fragment a little further on every
+        // delete/compaction cycle).
+        let mut out: Option<BytesMut> = None;
         let mut removed: i64 = 0;
-        for posting in value.iter_entries() {
-            if self.deletions.contains(posting.id.id()) {
-                removed += 1;
-            } else {
-                retained.push(*posting);
+        let mut scratch = DecodedPostingsBlock::default();
+        let mut run_survivors: Vec<PostingEntry> = Vec::new();
+        for idx in 0..view.blocks().len() {
+            let meta = &view.blocks()[idx];
+            if !self.deletions.contains_in_range(meta.min_id, meta.max_id) {
+                if let Some(out) = &mut out {
+                    // A clean pair ends the current dirty run: its verbatim
+                    // bytes follow the run's survivors in id order, so the
+                    // run must be encoded before the pair is copied.
+                    flush_survivor_run(out, &mut run_survivors);
+                    out.extend_from_slice(view.pair_bytes(idx));
+                }
+                continue;
             }
+            view.decode_block_into(idx, &mut scratch)
+                .map_err(filter_err)?;
+            for i in 0..scratch.ids.len() {
+                if self.deletions.contains(scratch.ids[i]) {
+                    removed += 1;
+                } else {
+                    run_survivors.push(PostingEntry {
+                        id: VectorId::from_raw(scratch.ids[i]),
+                        freq: scratch.freqs[i],
+                        norm: scratch.norms[i],
+                    });
+                }
+            }
+            out.get_or_insert_with(|| {
+                // First touched block: start the rewrite with every earlier
+                // (clean) pair. Copy pair by pair rather than slicing the raw
+                // prefix so degenerate zero-count pairs (tolerated by parse
+                // but absent from the directory) are dropped uniformly —
+                // otherwise an all-deleted value with a leading dead pair
+                // would be kept alive by its dead bytes instead of dropped.
+                let mut buf = BytesMut::with_capacity(bytes.len());
+                for clean_idx in 0..idx {
+                    buf.extend_from_slice(view.pair_bytes(clean_idx));
+                }
+                buf
+            });
         }
+        if let Some(out) = &mut out {
+            flush_survivor_run(out, &mut run_survivors);
+        }
+
         if removed == 0 {
+            // Either no block's id range intersected the deletions bitmap, or
+            // the intersecting ids fell in gaps between this term's postings;
+            // the value is unchanged either way.
             return Ok(CompactionFilterDecision::Keep);
         }
+        let out = out.expect("a removed posting implies a touched block");
 
         *self
             .pending_term_deltas
             .entry(term_map_key(&entry.key))
             .or_insert(0) += removed;
 
-        if retained.is_empty() {
+        if out.is_empty() {
             // No documents left for this term in this run; drop the operand.
             // The sibling TermStats decrement is still applied when its key is
             // reached.
             return Ok(CompactionFilterDecision::Drop);
         }
-        let rewritten = TermPostingsValue::from_postings(retained).encode_to_bytes();
-        Ok(replace_value(&entry.value, rewritten))
+        Ok(replace_value(&entry.value, out.freeze()))
     }
 
     /// Applies the pending document-frequency decrement recorded by
@@ -488,6 +553,21 @@ impl CompactionFilter for NoOpCompactionFilter {
     }
 }
 
+/// Re-encodes the survivors of one run of consecutive touched blocks as
+/// fresh `(Skip, Postings)` pairs appended to `out`, leaving `survivors`
+/// empty. Encoding the run as a whole re-packs the survivors into full
+/// blocks ([`TermPostingsEncoder::from_postings`] chunks them at the target
+/// block size); encoding per touched block instead would emit one undersized
+/// pair each, fragmenting the list further on every delete/compaction cycle.
+fn flush_survivor_run(out: &mut BytesMut, survivors: &mut Vec<PostingEntry>) {
+    if survivors.is_empty() {
+        return;
+    }
+    out.extend_from_slice(
+        &TermPostingsEncoder::from_postings(std::mem::take(survivors)).encode_to_bytes(),
+    );
+}
+
 /// Strips the trailing discriminator byte from an `FtsTerm` key so a
 /// `TermPostings` key (`0x00`) and its sibling `TermStats` key (`0x01`) map to
 /// the same entry.
@@ -650,7 +730,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         filter.filter(&deletions_entry(&[1, 2])).await.unwrap();
 
-        let postings = TermPostingsValue::from_postings(vec![
+        let postings = TermPostingsEncoder::from_postings(vec![
             posting(1, 2, 10),
             posting(2, 1, 20),
             posting(3, 3, 30),
@@ -668,14 +748,58 @@ mod tests {
         let stats_decision = filter.filter(&stats_entry).await.unwrap();
 
         // then - only doc 3 survives in the postings
-        let pruned =
-            TermPostingsValue::decode_from_bytes(&modified_bytes(&postings_decision)).unwrap();
-        let ids: Vec<u64> = pruned.iter_entries().map(|e| e.id.id()).collect();
+        let pruned = TermPostingsView::parse(modified_bytes(&postings_decision)).unwrap();
+        let ids: Vec<u64> = pruned
+            .iter_entries()
+            .map(|e| e.map(|e| e.id.id()))
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(ids, vec![3]);
 
         // and the document frequency dropped by the 2 removed docs (3 -> 1)
         let stats = TermStatsValue::decode_from_bytes(&modified_bytes(&stats_decision)).unwrap();
         assert_eq!(stats.freq, 1);
+    }
+
+    /// Blocks whose id range holds no deleted id must be copied into the
+    /// rewritten value byte-for-byte — impacts, alignment, and all — with
+    /// only the touched block re-encoded.
+    #[tokio::test]
+    async fn should_copy_untouched_blocks_verbatim() {
+        // given - three full blocks (0..768); deletions hit only the middle
+        let mut filter = VectorCompactionFilter::new(None);
+        filter.filter(&sentinel_entry()).await.unwrap();
+        filter.filter(&deletions_entry(&[300, 400])).await.unwrap();
+
+        let postings: Vec<_> = (0..768)
+            .map(|i| posting(i, (i % 7) as u32 + 1, 1))
+            .collect();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
+        let view = TermPostingsView::parse(encoded.clone()).unwrap();
+        assert_eq!(view.blocks().len(), 3);
+        let first_pair = view.pair_bytes(0).to_vec();
+        let last_pair = view.pair_bytes(2).to_vec();
+
+        // when
+        let postings_entry = merge_entry(TermPostingsKey::new("body", "fox").encode(), encoded);
+        let decision = filter.filter(&postings_entry).await.unwrap();
+
+        // then - the clean pairs are byte-identical verbatim copies
+        let rewritten = TermPostingsView::parse(modified_bytes(&decision)).unwrap();
+        assert_eq!(rewritten.blocks().len(), 3);
+        assert_eq!(rewritten.pair_bytes(0), first_pair.as_slice());
+        assert_eq!(rewritten.pair_bytes(2), last_pair.as_slice());
+        assert_eq!(rewritten.impacts(0), view.impacts(0));
+
+        // and - the touched block lost exactly the deleted ids
+        let ids: Vec<u64> = rewritten
+            .iter_entries()
+            .map(|e| e.map(|e| e.id.id()))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 766);
+        assert!(!ids.contains(&300) && !ids.contains(&400));
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[tokio::test]
@@ -685,7 +809,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         filter.filter(&deletions_entry(&[1, 2])).await.unwrap();
 
-        let postings = TermPostingsValue::from_postings(vec![posting(1, 1, 1), posting(2, 1, 1)])
+        let postings = TermPostingsEncoder::from_postings(vec![posting(1, 1, 1), posting(2, 1, 1)])
             .encode_to_bytes();
         let postings_entry = merge_entry(TermPostingsKey::new("body", "fox").encode(), postings);
         let stats_entry = merge_entry(
@@ -807,7 +931,7 @@ mod tests {
         // term postings -> CollectPostings
         let postings = merge_entry(
             TermPostingsKey::new("body", "fox").encode(),
-            TermPostingsValue::from_postings(vec![posting(5, 1, 1)]).encode_to_bytes(),
+            TermPostingsEncoder::from_postings(vec![posting(5, 1, 1)]).encode_to_bytes(),
         );
         filter.filter(&postings).await.unwrap();
         assert!(matches!(filter.phase, FilterPhase::CollectPostings(_)));
@@ -845,7 +969,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         let postings = merge_entry(
             TermPostingsKey::new("body", "fox").encode(),
-            TermPostingsValue::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
+            TermPostingsEncoder::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
         );
         filter.filter(&postings).await.unwrap();
 
@@ -868,7 +992,7 @@ mod tests {
         filter.filter(&sentinel_entry()).await.unwrap();
         let postings = merge_entry(
             TermPostingsKey::new("body", "fox").encode(),
-            TermPostingsValue::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
+            TermPostingsEncoder::from_postings(vec![posting(1, 1, 1)]).encode_to_bytes(),
         );
         filter.filter(&postings).await.unwrap();
         let stats = merge_entry(
@@ -888,5 +1012,173 @@ mod tests {
         // unchanged, and the phase advances to CollectFieldStats
         assert_eq!(decision, CompactionFilterDecision::Keep);
         assert_eq!(filter.phase, FilterPhase::CollectFieldStats);
+    }
+
+    /// A deleted id can fall inside a block's `[min_id, max_id]` without
+    /// matching any of this term's postings (it matched other terms). The
+    /// block decodes, nothing is removed, and the value must be Kept with no
+    /// document-frequency decrement — not spuriously rewritten.
+    #[tokio::test]
+    async fn should_keep_postings_when_deleted_id_falls_in_gap_between_postings() {
+        // given - postings on even ids; deleted id 3 is inside the block's
+        // range but not one of this term's postings
+        let mut filter = VectorCompactionFilter::new(None);
+        filter.filter(&sentinel_entry()).await.unwrap();
+        filter.filter(&deletions_entry(&[3])).await.unwrap();
+
+        let encoded = TermPostingsEncoder::from_postings(vec![
+            posting(0, 1, 1),
+            posting(2, 1, 1),
+            posting(4, 1, 1),
+        ])
+        .encode_to_bytes();
+        // sanity: the deletion intersects the block's range, so the decode
+        // path (not the verbatim-copy probe) is exercised
+        let view = TermPostingsView::parse(encoded.clone()).unwrap();
+        assert!(
+            filter
+                .deletions
+                .contains_in_range(view.blocks()[0].min_id, view.blocks()[0].max_id)
+        );
+
+        // when
+        let entry = merge_entry(TermPostingsKey::new("body", "fox").encode(), encoded);
+        let decision = filter.filter(&entry).await.unwrap();
+
+        // then - Keep, and no pending document-frequency decrement
+        assert_eq!(decision, CompactionFilterDecision::Keep);
+        assert!(filter.pending_term_deltas.is_empty());
+    }
+
+    /// Degenerate zero-count pairs occupy bytes but are absent from the
+    /// directory; when every real posting is deleted, the rewrite must not
+    /// keep the value alive on dead bytes alone — it must Drop.
+    #[tokio::test]
+    async fn should_drop_value_with_leading_zero_count_pair_when_all_docs_deleted() {
+        use bytes::BufMut;
+        let mut filter = VectorCompactionFilter::new(None);
+        filter.filter(&sentinel_entry()).await.unwrap();
+        filter.filter(&deletions_entry(&[3, 7])).await.unwrap();
+
+        // value = zero-count pair ++ real pair {3, 7}
+        let mut buf = BytesMut::new();
+        let mut skip_payload = BytesMut::new();
+        skip_payload.put_u64_le(0); // last_id
+        skip_payload.put_u16_le(0); // impacts_count
+        skip_payload.put_u64_le(4); // length of the empty postings payload
+        buf.put_u8(0x01); // BLOCK_TYPE_SKIP
+        buf.put_u32_le(skip_payload.len() as u32);
+        buf.extend_from_slice(&skip_payload);
+        buf.put_u8(0x00); // BLOCK_TYPE_POSTINGS
+        buf.put_u32_le(4);
+        buf.put_u32_le(0); // count == 0
+        buf.extend_from_slice(
+            &TermPostingsEncoder::from_postings(vec![posting(3, 1, 1), posting(7, 1, 1)])
+                .encode_to_bytes(),
+        );
+
+        let entry = merge_entry(TermPostingsKey::new("body", "fox").encode(), buf.freeze());
+        let decision = filter.filter(&entry).await.unwrap();
+
+        assert_eq!(decision, CompactionFilterDecision::Drop);
+    }
+
+    /// The verbatim-copy prefix logic differs by dirty-block position; pin
+    /// first-dirty (empty prefix), middle-dirty, and last-dirty (whole-value
+    /// prefix, no trailing pairs).
+    #[tokio::test]
+    async fn should_copy_untouched_blocks_verbatim_at_every_position() {
+        for (deleted, dirty_idx) in [
+            (vec![10u64, 200], 0usize),
+            (vec![300, 400], 1),
+            (vec![600, 767], 2),
+        ] {
+            let mut filter = VectorCompactionFilter::new(None);
+            filter.filter(&sentinel_entry()).await.unwrap();
+            filter.filter(&deletions_entry(&deleted)).await.unwrap();
+
+            let postings: Vec<_> = (0..768)
+                .map(|i| posting(i, (i % 7) as u32 + 1, 1))
+                .collect();
+            let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
+            let view = TermPostingsView::parse(encoded.clone()).unwrap();
+            assert_eq!(view.blocks().len(), 3);
+
+            let entry = merge_entry(
+                TermPostingsKey::new("body", "fox").encode(),
+                encoded.clone(),
+            );
+            let decision = filter.filter(&entry).await.unwrap();
+            let rewritten = TermPostingsView::parse(modified_bytes(&decision)).unwrap();
+
+            // Clean pairs are byte-identical; the dirty one is not.
+            assert_eq!(rewritten.blocks().len(), 3, "dirty_idx {}", dirty_idx);
+            for idx in 0..3 {
+                if idx == dirty_idx {
+                    assert_ne!(rewritten.pair_bytes(idx), view.pair_bytes(idx));
+                } else {
+                    assert_eq!(
+                        rewritten.pair_bytes(idx),
+                        view.pair_bytes(idx),
+                        "clean pair {} (dirty_idx {})",
+                        idx,
+                        dirty_idx
+                    );
+                }
+            }
+
+            // Exactly the deleted ids are gone; order stays ascending.
+            let ids: Vec<u64> = rewritten
+                .iter_entries()
+                .map(|e| e.map(|e| e.id.id()))
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(ids.len(), 766);
+            for id in &deleted {
+                assert!(!ids.contains(id));
+            }
+            assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
+
+    /// Survivors of *consecutive* touched blocks must re-pack into full
+    /// 256-entry blocks (one combined encode per dirty run), not one
+    /// undersized pair per touched block — per-block encoding would shrink
+    /// the blocks a little further on every delete/compaction cycle.
+    #[tokio::test]
+    async fn should_repack_consecutive_dirty_blocks_into_full_blocks() {
+        // given - three full blocks (0..768); deletions hit blocks 0 and 1,
+        // so they form one dirty run with 510 survivors; block 2 stays clean
+        let mut filter = VectorCompactionFilter::new(None);
+        filter.filter(&sentinel_entry()).await.unwrap();
+        filter.filter(&deletions_entry(&[10, 300])).await.unwrap();
+
+        let postings: Vec<_> = (0..768)
+            .map(|i| posting(i, (i % 7) as u32 + 1, 1))
+            .collect();
+        let encoded = TermPostingsEncoder::from_postings(postings).encode_to_bytes();
+        let view = TermPostingsView::parse(encoded.clone()).unwrap();
+        assert_eq!(view.blocks().len(), 3);
+
+        // when
+        let entry = merge_entry(TermPostingsKey::new("body", "fox").encode(), encoded);
+        let decision = filter.filter(&entry).await.unwrap();
+        let rewritten = TermPostingsView::parse(modified_bytes(&decision)).unwrap();
+
+        // then - the run re-packed as [256, 254], not [255, 255]; the clean
+        // pair follows verbatim
+        let counts: Vec<u32> = rewritten.blocks().iter().map(|b| b.count).collect();
+        assert_eq!(counts, vec![256, 254, 256]);
+        assert_eq!(rewritten.pair_bytes(2), view.pair_bytes(2));
+
+        // and - exactly the deleted ids are gone; order stays ascending
+        let ids: Vec<u64> = rewritten
+            .iter_entries()
+            .map(|e| e.map(|e| e.id.id()))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 766);
+        assert!(!ids.contains(&10) && !ids.contains(&300));
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
     }
 }

@@ -13,7 +13,7 @@ use crate::serde::key::{
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
-use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
+use crate::serde::term_postings::{PostingEntry, TermPostingsEncoder};
 use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_data::{Field, VectorDataValue};
@@ -728,7 +728,7 @@ impl FtsIndexDelta {
         ));
 
         for ((field, term), entries) in term_postings {
-            let value = TermPostingsValue::from_postings(entries);
+            let value = TermPostingsEncoder::from_postings(entries);
             let key = TermPostingsKey::new(&field, &term).encode();
             output_ops.push(RecordOp::Merge(
                 Record::new(key, value.encode_to_bytes()).into(),
