@@ -120,11 +120,16 @@ The contract is one value; only the frontier source differs:
     the record type and segment and skips it when it cannot decode a `LogEntry`
     sequence.
 
-This split matches reality: the writer knows its tip; a standalone reader estimates
-it from durable metadata — sealed boundaries and the SST key bounds. The estimate
-reflects only data flushed to SSTs: records still in the write-ahead log are not
-counted, so it lags the true tip by the WAL contents (sound — a lower bound). A
-tighter, filter-derived source (Future work) narrows the per-SST part of the gap.
+This is a **conservative lower bound**, not the exact tip, on two counts: the
+bound is an SST's lexicographically-largest *key*, not its largest *sequence*
+(sequence is the lowest-order key term); and listing/metadata records sort after
+log entries, so an SST topped by one of those contributes nothing. Both make the
+frontier under-estimate — which is sound (a lower bound), at the cost of an
+occasional redundant scan. The split matches reality: the writer knows its tip; a
+standalone reader estimates it from durable metadata — sealed boundaries and SST
+key bounds — and the estimate also reflects only data already flushed to SSTs
+(records still in the WAL are not counted). A tighter, filter-derived source
+(Future work) closes the per-SST gap by carrying each SST's true max sequence.
 
 ### Why the frontier is sound
 

@@ -240,6 +240,16 @@ pub(crate) struct LogReadView {
 /// record's sequence, when it is a `LogEntry` in the active segment. Returns
 /// `None` for non-`LogEntry` bounds (other record types fail to deserialize) or
 /// bounds outside the active segment, where its `start_seq` is the wrong base.
+///
+/// This is a deliberately **conservative lower bound**, not the exact tip. The
+/// bound is the SST's lexicographically-largest *key*, not its largest
+/// *sequence* (sequence is the lowest-order key term), and listing/metadata
+/// records sort after log entries — so an SST whose top key is one of those
+/// yields `None` and contributes nothing, and even a `LogEntry` bound is only
+/// some record's sequence, not the SST's max. The result therefore
+/// under-estimates the durable tip, which is sound (the frontier is a lower
+/// bound). Explicit max-sequence filter metadata would make it exact — see
+/// RFC 0007's future-work section.
 fn decode_l0_bound(bound: &[u8], latest: &LogSegment) -> Option<Sequence> {
     let key = LogEntryKey::deserialize(bound, latest.meta().start_seq).ok()?;
     (key.segment_id == latest.id()).then_some(key.sequence.saturating_add(1))
