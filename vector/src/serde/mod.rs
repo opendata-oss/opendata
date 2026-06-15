@@ -25,12 +25,20 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub use common::serde::encoding::{
     EncodingError, decode_optional_utf8, decode_utf8, encode_optional_utf8, encode_utf8,
 };
-use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
 use common::serde::record_tag::RecordTag;
 
-/// Offset of the first subsystem-defined field after the 2-byte common prefix
-/// plus the 1-byte vector tag.
-pub const PREFIX_AND_TAG_LEN: usize = KEY_PREFIX_LEN + 1;
+/// Length of the fixed key prefix `[subsystem | segment | version | tag]` that
+/// precedes the subsystem-defined suffix of every vector key.
+///
+/// RFC-0006 inserts the 1-byte segment id between the subsystem and version
+/// bytes (see [`Segment`]), growing the prefix from 3 to 4 bytes.
+pub const PREFIX_AND_TAG_LEN: usize = 4;
+
+/// Byte offsets within the fixed key prefix `[subsystem | segment | version | tag]`.
+const SUBSYSTEM_OFFSET: usize = 0;
+const SEGMENT_OFFSET: usize = 1;
+const VERSION_OFFSET: usize = 2;
+const TAG_OFFSET: usize = 3;
 
 /// Key format version (currently 0x01)
 pub const KEY_VERSION: u8 = 0x01;
@@ -99,8 +107,8 @@ impl RecordType {
         }
     }
 
-    /// Decodes the record type from the tag byte that follows the 2-byte key
-    /// prefix in a vector key.
+    /// Decodes the record type from the tag byte that follows the
+    /// `[subsystem | segment | version]` prefix bytes in a vector key.
     pub fn from_tag_byte(byte: u8) -> Result<Self, EncodingError> {
         let tag = RecordTag::from_byte(byte)?;
         RecordType::from_id(tag.record_type())
@@ -111,13 +119,43 @@ impl RecordType {
         RecordTag::new(self.id(), 0)
     }
 
-    /// Writes the 3-byte vector record prefix `[subsystem, version, tag]`.
+    /// Returns the storage [`Segment`] this record type lives in (RFC-0006).
+    ///
+    /// The segment is encoded as the second byte of every vector key so the
+    /// SlateDB segment extractor can route each segment's records into a
+    /// dedicated SlateDB segment.
+    pub fn segment(&self) -> Segment {
+        match self {
+            RecordType::CollectionMeta
+            | RecordType::VectorIndexData
+            | RecordType::IdDictionary
+            | RecordType::VectorData
+            | RecordType::MetadataIndex
+            | RecordType::SeqBlock => Segment::Default,
+            RecordType::CentroidSeqBlock
+            | RecordType::PostingList
+            | RecordType::CentroidStats
+            | RecordType::Centroids
+            | RecordType::CentroidInfo => Segment::Ann,
+            RecordType::Deletions
+            | RecordType::FtsTerm
+            | RecordType::FtsVectorFieldStats
+            | RecordType::FtsFieldStats => Segment::Fts,
+        }
+    }
+
+    /// Writes the 4-byte vector record prefix `[subsystem | segment | version | tag]`.
+    ///
+    /// RFC-0006 places the 1-byte segment id between the subsystem and version
+    /// bytes so all record types within a segment share a common routing prefix.
     pub fn write_prefix(&self, buf: &mut BytesMut) {
-        KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
+        buf.put_u8(SUBSYSTEM);
+        buf.put_u8(self.segment().as_byte());
+        buf.put_u8(KEY_VERSION);
         buf.put_u8(self.tag().as_byte());
     }
 
-    /// Encodes the 3-byte vector record prefix into a fresh `Bytes`.
+    /// Encodes the 4-byte vector record prefix into a fresh `Bytes`.
     pub fn encode_prefix(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         self.write_prefix(&mut buf);
@@ -125,16 +163,85 @@ impl RecordType {
     }
 }
 
-/// Reads the tag byte that follows the 2-byte key prefix, validating that the
-/// preceding 2 bytes are the vector subsystem and current key version.
+/// Reads the record tag byte from a vector key, validating the subsystem,
+/// version, and segment bytes that precede it.
+///
+/// The key layout is `[subsystem | segment | version | tag | ...]` (RFC-0006).
+/// The segment id is redundant with the record type, but we validate that the
+/// two agree to catch mis-routed or corrupt keys early.
 pub fn parse_record_tag(buf: &[u8]) -> Result<RecordTag, EncodingError> {
-    KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
     if buf.len() < PREFIX_AND_TAG_LEN {
         return Err(EncodingError {
             message: "Buffer too short for record tag".to_string(),
         });
     }
-    Ok(RecordTag::from_byte(buf[KEY_PREFIX_LEN])?)
+    if buf[SUBSYSTEM_OFFSET] != SUBSYSTEM {
+        return Err(EncodingError {
+            message: format!(
+                "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
+                SUBSYSTEM, buf[SUBSYSTEM_OFFSET]
+            ),
+        });
+    }
+    if buf[VERSION_OFFSET] != KEY_VERSION {
+        return Err(EncodingError {
+            message: format!(
+                "invalid key version: expected 0x{:02x}, got 0x{:02x}",
+                KEY_VERSION, buf[VERSION_OFFSET]
+            ),
+        });
+    }
+    let tag = RecordTag::from_byte(buf[TAG_OFFSET])?;
+    let record_type = RecordType::from_id(tag.record_type())?;
+    let segment = Segment::from_byte(buf[SEGMENT_OFFSET])?;
+    if segment != record_type.segment() {
+        return Err(EncodingError {
+            message: format!(
+                "segment mismatch for {:?}: key has {:?}, expected {:?}",
+                record_type,
+                segment,
+                record_type.segment()
+            ),
+        });
+    }
+    Ok(tag)
+}
+
+/// Logical storage segment for a vector record (RFC-0006 segmentation).
+///
+/// The segment id is encoded as the second byte of every vector key
+/// (`[subsystem | segment | version | tag | ...]`). The SlateDB segment
+/// extractor routes each segment's records into its own SlateDB segment, which
+/// lets the FTS segment be compacted aggressively (to apply accumulated
+/// deletes) without rewriting the ANN or default-segment data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Segment {
+    /// Singletons, the forward index, and the metadata (inverted) index.
+    Default = 0x00,
+    /// ANN posting lists and the centroid tree.
+    Ann = 0x01,
+    /// Full-text-search postings, statistics, and the deletions bitmap.
+    Fts = 0x02,
+}
+
+impl Segment {
+    /// Returns the on-disk segment id byte.
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
+
+    /// Decodes a segment id byte.
+    pub fn from_byte(byte: u8) -> Result<Self, EncodingError> {
+        match byte {
+            0x00 => Ok(Segment::Default),
+            0x01 => Ok(Segment::Ann),
+            0x02 => Ok(Segment::Fts),
+            _ => Err(EncodingError {
+                message: format!("Invalid segment id: 0x{:02x}", byte),
+            }),
+        }
+    }
 }
 
 /// Trait for record keys that have a record type.
@@ -758,6 +865,64 @@ mod tests {
             RecordType::from_id(decoded.record_type()).unwrap(),
             RecordType::CollectionMeta
         );
+    }
+
+    #[test]
+    fn should_write_segment_byte_in_prefix() {
+        // given - record types in each of the three segments
+        let cases = [
+            (RecordType::CollectionMeta, Segment::Default),
+            (RecordType::PostingList, Segment::Ann),
+            (RecordType::CentroidInfo, Segment::Ann),
+            (RecordType::Deletions, Segment::Fts),
+            (RecordType::FtsTerm, Segment::Fts),
+            (RecordType::FtsFieldStats, Segment::Fts),
+        ];
+
+        for (record_type, expected_segment) in cases {
+            // when
+            let prefix = record_type.encode_prefix();
+
+            // then - layout is [subsystem | segment | version | tag]
+            assert_eq!(prefix.len(), PREFIX_AND_TAG_LEN);
+            assert_eq!(prefix[SUBSYSTEM_OFFSET], SUBSYSTEM);
+            assert_eq!(prefix[SEGMENT_OFFSET], expected_segment.as_byte());
+            assert_eq!(prefix[VERSION_OFFSET], KEY_VERSION);
+            assert_eq!(
+                RecordType::from_id(
+                    RecordTag::from_byte(prefix[TAG_OFFSET])
+                        .unwrap()
+                        .record_type()
+                )
+                .unwrap(),
+                record_type
+            );
+            // and the central tag parser accepts the well-formed prefix
+            assert!(parse_record_tag(&prefix).is_ok());
+        }
+    }
+
+    #[test]
+    fn should_reject_key_with_mismatched_segment() {
+        // given - a CollectionMeta prefix (Default segment) with the segment
+        // byte corrupted to the FTS segment
+        let mut prefix = RecordType::CollectionMeta.encode_prefix().to_vec();
+        prefix[SEGMENT_OFFSET] = Segment::Fts.as_byte();
+
+        // when
+        let result = parse_record_tag(&prefix);
+
+        // then
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("segment mismatch"));
+    }
+
+    #[test]
+    fn should_round_trip_segment_id_byte() {
+        for segment in [Segment::Default, Segment::Ann, Segment::Fts] {
+            assert_eq!(Segment::from_byte(segment.as_byte()).unwrap(), segment);
+        }
+        assert!(Segment::from_byte(0x99).is_err());
     }
 
     #[test]

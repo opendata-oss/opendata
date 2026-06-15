@@ -16,7 +16,7 @@ use std::ops::Bound::{Excluded, Included};
 
 /// CollectionMeta key - singleton record storing collection schema.
 ///
-/// Key layout: `[subsystem | version | tag]` (3 bytes)
+/// Key layout: `[subsystem | segment | version | tag]` (4 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionMetaKey;
 
@@ -26,7 +26,7 @@ impl RecordKey for CollectionMetaKey {
 
 impl CollectionMetaKey {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         buf.freeze()
     }
@@ -44,7 +44,7 @@ impl CollectionMetaKey {
 
 /// Centroids key - singleton record storing centroid tree metadata.
 ///
-/// Key layout: `[subsystem | version | tag]` (3 bytes)
+/// Key layout: `[subsystem | segment | version | tag]` (4 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidsKey;
 
@@ -58,7 +58,7 @@ impl CentroidsKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         buf.freeze()
     }
@@ -82,7 +82,7 @@ impl Default for CentroidsKey {
 
 /// Deletions key - singleton record storing the FTS deletions bitmap.
 ///
-/// Key layout: `[subsystem | version | tag]` (3 bytes)
+/// Key layout: `[subsystem | segment | version | tag]` (4 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionsKey;
 
@@ -96,7 +96,7 @@ impl DeletionsKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         buf.freeze()
     }
@@ -120,7 +120,7 @@ impl Default for DeletionsKey {
 
 /// PostingList key - maps centroid ID to vector IDs.
 ///
-/// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
+/// Key layout: `[subsystem | segment | version | tag | centroid_id:u64-BE]` (12 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostingListKey {
     pub(crate) centroid_id: VectorId,
@@ -137,7 +137,7 @@ impl PostingListKey {
     }
 
     pub(crate) fn encode_prefix_for_level(level: u8) -> Bytes {
-        let mut buf = BytesMut::with_capacity(4);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 1);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         VectorId::encode_level_prefix(&mut buf, level);
         buf.freeze()
@@ -150,7 +150,7 @@ impl PostingListKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(11);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 8);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         self.centroid_id.encode(&mut buf);
         buf.freeze()
@@ -170,7 +170,7 @@ impl PostingListKey {
 
     /// Returns a range covering all posting list keys.
     pub fn all_posting_lists_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -178,7 +178,7 @@ impl PostingListKey {
 
 /// IdDictionary key - maps external string IDs to internal u64 vector IDs.
 ///
-/// Key layout: `[subsystem | version | tag | external_id:TerminatedBytes]` (variable)
+/// Key layout: `[subsystem | segment | version | tag | external_id:TerminatedBytes]` (variable)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdDictionaryKey {
     pub external_id: String,
@@ -227,7 +227,7 @@ impl IdDictionaryKey {
 
     /// Returns a range covering all ID dictionary keys.
     pub fn all_ids_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -247,7 +247,7 @@ impl IdDictionaryKey {
 
 /// VectorData key - stores raw vector bytes.
 ///
-/// Key layout: `[subsystem | version | tag | vector_id:u64-BE]` (11 bytes)
+/// Key layout: `[subsystem | segment | version | tag | vector_id:u64-BE]` (12 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorDataKey {
     pub(crate) vector_id: VectorId,
@@ -264,7 +264,7 @@ impl VectorDataKey {
     }
 
     pub(crate) fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(11);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 8);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         self.vector_id.encode(&mut buf);
         buf.freeze()
@@ -285,7 +285,7 @@ impl VectorDataKey {
     /// Returns a range covering all vector data keys.
     #[allow(dead_code)]
     pub(crate) fn all_vectors_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -293,7 +293,7 @@ impl VectorDataKey {
 
 /// VectorIndexData key - stores durable posting assignments for a data vector.
 ///
-/// Key layout: `[subsystem | version | tag | vector_id:u64-BE]` (11 bytes)
+/// Key layout: `[subsystem | segment | version | tag | vector_id:u64-BE]` (12 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorIndexDataKey {
     pub(crate) vector_id: VectorId,
@@ -310,7 +310,7 @@ impl VectorIndexDataKey {
     }
 
     pub(crate) fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(11);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 8);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         self.vector_id.encode(&mut buf);
         buf.freeze()
@@ -331,7 +331,7 @@ impl VectorIndexDataKey {
 
 /// MetadataIndex key - inverted index mapping metadata values to vector IDs.
 ///
-/// Key layout: `[subsystem | version | tag | field:TerminatedBytes | value:FieldValue]` (variable)
+/// Key layout: `[subsystem | segment | version | tag | field:TerminatedBytes | value:FieldValue]` (variable)
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetadataIndexKey {
     pub field: String,
@@ -392,7 +392,7 @@ impl MetadataIndexKey {
 
     /// Returns a range covering all metadata index keys.
     pub fn all_indexes_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -400,7 +400,7 @@ impl MetadataIndexKey {
 
 /// SeqBlock key - singleton record storing sequence allocation state.
 ///
-/// Key layout: `[subsystem | version | tag]` (3 bytes)
+/// Key layout: `[subsystem | segment | version | tag]` (4 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeqBlockKey;
 
@@ -410,7 +410,7 @@ impl RecordKey for SeqBlockKey {
 
 impl SeqBlockKey {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         buf.freeze()
     }
@@ -428,7 +428,7 @@ impl SeqBlockKey {
 
 /// CentroidSeqBlock key - singleton record storing centroid sequence allocation state.
 ///
-/// Key layout: `[subsystem | version | tag]` (3 bytes)
+/// Key layout: `[subsystem | segment | version | tag]` (4 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidSeqBlockKey;
 
@@ -438,7 +438,7 @@ impl RecordKey for CentroidSeqBlockKey {
 
 impl CentroidSeqBlockKey {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         buf.freeze()
     }
@@ -456,7 +456,7 @@ impl CentroidSeqBlockKey {
 
 /// CentroidStats key - per-centroid vector count for rebalance triggers.
 ///
-/// Key layout: `[subsystem | version | tag | level:u8 | centroid_id:u64-BE]` (12 bytes)
+/// Key layout: `[subsystem | segment | version | tag | centroid_id:u64-BE]` (12 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CentroidStatsKey {
     pub(crate) centroid_id: VectorId,
@@ -473,7 +473,7 @@ impl CentroidStatsKey {
     }
 
     pub(crate) fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(12);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 8);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         self.centroid_id.encode(&mut buf);
         buf.freeze()
@@ -493,7 +493,7 @@ impl CentroidStatsKey {
 
 /// CentroidInfo key - per-centroid metadata for the centroid tree.
 ///
-/// Key layout: `[subsystem | version | tag | centroid_id:u64-BE]` (11 bytes)
+/// Key layout: `[subsystem | segment | version | tag | centroid_id:u64-BE]` (12 bytes)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CentroidInfoKey {
     pub(crate) centroid_id: VectorId,
@@ -510,7 +510,7 @@ impl CentroidInfoKey {
     }
 
     pub(crate) fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(11);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 8);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         self.centroid_id.encode(&mut buf);
         buf.freeze()
@@ -530,7 +530,7 @@ impl CentroidInfoKey {
     /// Returns a range covering all centroid info keys.
     #[allow(dead_code)]
     pub(crate) fn all_centroid_infos_range() -> BytesRange {
-        let mut buf = BytesMut::with_capacity(3);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
         Self::RECORD_TYPE.write_prefix(&mut buf);
         BytesRange::prefix(buf.freeze())
     }
@@ -777,7 +777,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded.len(), 4);
     }
 
     #[test]
@@ -830,7 +830,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded.len(), 4);
     }
 
     #[test]
@@ -844,7 +844,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded.len(), 4);
     }
 
     #[test]
@@ -888,7 +888,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 11);
+        assert_eq!(encoded.len(), 12);
     }
 
     #[test]
@@ -919,7 +919,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 11);
+        assert_eq!(encoded.len(), 12);
     }
 
     #[test]
@@ -1019,7 +1019,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded.len(), 4);
     }
 
     #[test]
@@ -1033,7 +1033,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 3);
+        assert_eq!(encoded.len(), 4);
     }
 
     #[test]
@@ -1061,7 +1061,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 11);
+        assert_eq!(encoded.len(), 12);
     }
 
     #[test]
@@ -1092,7 +1092,7 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 11);
+        assert_eq!(encoded.len(), 12);
     }
 
     #[test]
@@ -1181,9 +1181,10 @@ mod tests {
 
     #[test]
     fn should_reject_wrong_version() {
-        // given
+        // given - layout is [subsystem | segment | version | tag]
         let mut buf = BytesMut::new();
         buf.put_u8(crate::serde::SUBSYSTEM);
+        buf.put_u8(RecordType::CollectionMeta.segment().as_byte());
         buf.put_u8(0x99); // Wrong version
         buf.put_u8(RecordType::CollectionMeta.tag().as_byte());
 

@@ -30,7 +30,7 @@ use crate::listing::ListingCache;
 use crate::listing::LogKeyIterator;
 use crate::model::{AppendOutput, Record, Segment, SegmentId, Sequence};
 use crate::range::{normalize_segment_id, normalize_sequence};
-use crate::reader::{LogIterator, LogRead, LogReadView};
+use crate::reader::{Inspection, LogIterator, LogRead, LogReadView};
 use crate::segment::SegmentCache;
 use crate::serde::SEQ_BLOCK_KEY;
 use crate::view_tracker::{ViewEntry, ViewTracker};
@@ -500,11 +500,15 @@ impl LogRead for LogDb {
         Ok(view.scan_with_options(key, seq_range, &options))
     }
 
-    async fn count(&self, key: Bytes, seq_range: impl RangeBounds<Sequence> + Send) -> Result<u64> {
+    async fn inspect(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> Result<Inspection> {
         self.sync_reads().await?;
         let seq_range = normalize_sequence(&seq_range);
         let view = self.read_view.read().await;
-        view.count(key, seq_range).await
+        view.inspect(key, seq_range).await
     }
 
     async fn list_keys(
@@ -840,7 +844,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::reader::LogDbReader;
+    use crate::reader::{LogDbReader, SegmentReadStats};
 
     fn test_config() -> Config {
         Config {
@@ -2477,6 +2481,163 @@ mod tests {
         assert_eq!(reader.count(Bytes::from("k"), 2..7).await.unwrap(), 5);
     }
 
+    #[tokio::test]
+    async fn slate_inspect_reports_record_distribution() {
+        // Slatedb-backed inspect reports how a segment's records are spread
+        // across the L0 and sorted-run tiers. Built with its own Db handle so
+        // we can force a memtable->L0 flush; a plain `log.flush()` only
+        // flushes the WAL, leaving the data in the memtable where the SST
+        // walk would never see it.
+        use common::storage::slate::SlateDbStorage;
+        use slatedb::config::{DbReaderOptions, FlushOptions, FlushType};
+        use slatedb::object_store::memory::InMemory;
+        use slatedb::{DbBuilder, DbReader, SstReader};
+
+        let path = "/test/inspect_read_amp";
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        // Install the routing extractor so this matches production: writes
+        // land in per-segment trees, not the default tree. Without it the
+        // count walk would still pass via the default tree and never exercise
+        // the segment path.
+        let db = Arc::new(
+            DbBuilder::new(path, object_store.clone())
+                .with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn common::Storage> = Arc::new(SlateDbStorage::new(db.clone()));
+
+        let reader = DbReader::builder(path, object_store.clone())
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_millis(5),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let sst_reader = SstReader::new(path, object_store, None, None);
+        let direct = Arc::new(crate::direct::LogDirect::from_components(
+            Arc::new(reader),
+            sst_reader,
+        ));
+
+        let log = LogDb::new_with_direct(storage, direct).await.unwrap();
+        log.try_append(
+            (0..10u8)
+                .map(|i| Record {
+                    key: Bytes::from("k"),
+                    value: Bytes::from(vec![i]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        log.flush().await.unwrap();
+        // Push the memtable into an L0 SST so the manifest walk has data.
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // The DbReader's manifest snapshot polls at 5ms; loop until it has
+        // picked up the flushed SST so the read-amp assertions don't race
+        // the poll. `count` is already correct meanwhile via the tail scan.
+        // The data may land in L0 or be compacted into a sorted run by the
+        // writer's compaction scheduler; either way it becomes visible in the
+        // manifest as a persisted SST. Wait for that.
+        // Records land in L0 or get compacted into a sorted run by the
+        // writer's scheduler; either way they become visible as persisted
+        // SST records. Wait for that.
+        let mut inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
+        for _ in 0..200 {
+            let r = &inspection.reads;
+            if r.l0.records + r.sorted_runs.records >= 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
+        }
+
+        assert_eq!(inspection.total, 10);
+        assert_eq!(
+            inspection.segments.len(),
+            1,
+            "default segmentation keeps everything in segment 0"
+        );
+        let seg = &inspection.segments[0];
+        assert_eq!(seg.count, 10);
+        let reads = seg
+            .reads
+            .expect("slatedb-backed read should report tier distribution");
+        // All 10 records are persisted in this one segment's tree, split
+        // across the L0 and sorted-run tiers.
+        assert_eq!(
+            reads.l0.records + reads.sorted_runs.records,
+            10,
+            "every record is attributed to a tier (l0={}, sr={})",
+            reads.l0.records,
+            reads.sorted_runs.records
+        );
+        let tier_ssts = reads.l0.ssts_with_data + reads.sorted_runs.ssts_with_data;
+        assert!(
+            tier_ssts >= 1,
+            "the records must live in at least one tier's SST"
+        );
+        // The top-level aggregate mirrors the single segment.
+        assert_eq!(inspection.reads, reads);
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_no_sst_stats_without_direct() {
+        // In-memory backend has no LogDirect, so count falls back to a scan
+        // and per-segment read stats are unavailable (reads = None).
+        let storage = StorageBuilder::new(&StorageConfig::InMemory)
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let log = LogDb::from_storage(
+            storage,
+            None,
+            SegmentConfig::default(),
+            RetentionConfig::default(),
+            ReadVisibility::Memory,
+            Arc::new(SystemClock),
+            None,
+        )
+        .await
+        .unwrap();
+        log.try_append(
+            (0..4u8)
+                .map(|i| Record {
+                    key: Bytes::from("k"),
+                    value: Bytes::from(vec![i]),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        log.flush().await.unwrap();
+
+        let inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
+        assert_eq!(inspection.total, 4);
+        assert_eq!(
+            inspection.reads,
+            SegmentReadStats::default(),
+            "no SST walk on the scan path, so the aggregate is empty"
+        );
+        assert_eq!(inspection.segments.len(), 1);
+        let seg = &inspection.segments[0];
+        assert_eq!(seg.count, 4);
+        assert!(
+            seg.reads.is_none(),
+            "scan fallback has no SST-level detail to report"
+        );
+    }
+
     /// Helper: creates a SlateDB-backed storage using an in-memory object store.
     /// With `start_paused = true`, SlateDB's WAL flush timer is frozen so writes
     /// remain non-durable until an explicit `flush()` call.
@@ -2504,8 +2665,11 @@ mod tests {
 
         let path = "/test/slate_with_direct";
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        // Route writes into per-segment trees as production does; the count
+        // walk must find data in segments, not the (empty) default tree.
         let db = Arc::new(
             DbBuilder::new(path, object_store.clone())
+                .with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
                 .build()
                 .await
                 .unwrap(),

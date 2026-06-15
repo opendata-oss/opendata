@@ -23,9 +23,13 @@ impl VectorDbAdmin {
     /// Open a vector database for administrative operations.
     pub async fn open(config: Config) -> Result<Self> {
         let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = StorageBuilder::new(&config.storage)
+        let builder = StorageBuilder::new(&config.storage)
             .await
-            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?
+            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
+        // Install the same segment extractor the writer uses (RFC-0006); the
+        // extractor name is persisted in the manifest and validated on open, so
+        // an admin client opening a segmented database must match it.
+        let storage = crate::storage::segment_extractor::builder_with_vector_segments(builder)
             .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
             .build()
             .await

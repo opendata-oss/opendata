@@ -7,6 +7,7 @@ pub mod slate;
 pub mod sst_blocks;
 pub mod util;
 
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -225,7 +226,7 @@ pub trait StorageIterator {
 /// access and point-in-time snapshots. By extracting these common operations,
 /// we can write code that works with both storage types.
 #[async_trait]
-pub trait StorageRead: Send + Sync {
+pub trait StorageRead: Any + Send + Sync {
     /// Retrieves a single record by exact key.
     ///
     /// Returns `Ok(None)` if the key is not present.

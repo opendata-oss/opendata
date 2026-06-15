@@ -73,7 +73,10 @@ pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendOutput, LogEntry, Record, Segment, SegmentId, Sequence};
 
-pub use reader::{LogDbReader, LogIterator, LogRead};
+pub use common::{L0Stats, SortedRunStats};
+pub use reader::{
+    Inspection, LogDbReader, LogIterator, LogRead, SegmentInspection, SegmentReadStats,
+};
 pub use slatedb::SstBlockSize;
 
 // Re-export proto types for use by clients

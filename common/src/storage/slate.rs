@@ -107,6 +107,12 @@ impl SlateDbStorage {
         }
     }
 
+    /// Returns the underlying SlateDB instance. Useful for callers that need to access
+    /// slatedb-specific features like `DbStatus`
+    pub fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
     ///
     /// This adapter can be used when constructing a SlateDB database with a merge operator:

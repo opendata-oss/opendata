@@ -2,8 +2,8 @@
 //!
 //! A term's posting list is a sequence of typed blocks written one after
 //! another to the end of the value buffer. Each `Postings` block holds up to
-//! [`TARGET_POSTINGS_PER_BLOCK`] `(doc_id, freq, norm)` triples in strictly
-//! descending `doc_id` order. Each `Postings` block is preceded by a `Skip`
+//! [`TARGET_POSTINGS_PER_BLOCK`] `(id, freq, norm)` triples in strictly
+//! descending `id` order. Each `Postings` block is preceded by a `Skip`
 //! block that summarises the postings block's last id and serialized byte
 //! length, so a future query path can iterate without parsing the full
 //! payload. Multiple `(Skip, Postings)` pairs may appear in a single value;
@@ -24,23 +24,23 @@
 //! Postings (type = 0x00) payload
 //! ┌──────────────────────────────────────────────────────────────────┐
 //! │  count:        u32   (1..=256 entries actually used)             │
-//! │  base_id:      u64   (highest doc id in block)                   │
-//! │  docs_encoding: u8   (0 = bitpacked gaps, 1 = u64 varint gaps)   │
-//! │  -- if docs_encoding == 0:                                        │
-//! │     docs_bits:    u8                                              │
-//! │     docs_packed:  docs_bits * 32 bytes (BitPacker8x of 256 gaps) │
-//! │  -- if docs_encoding == 1:                                        │
-//! │     docs_varint:  count u64 LEB128 unsigned varints              │
+//! │  base_id:      u64   (highest id in block)                       │
+//! │  ids_encoding: u8   (0 = bitpacked gaps, 1 = u64 varint gaps)    │
+//! │  -- if ids_encoding == 0:                                        │
+//! │     ids_bits:    u8                                              │
+//! │     ids_packed:  ids_bits * 32 bytes (BitPacker8x of 256 gaps)   │
+//! │  -- if ids_encoding == 1:                                        │
+//! │     ids_varint:  count u64 LEB128 unsigned varints               │
 //! │  freqs_bits:   u8                                                │
 //! │  freqs_packed: freqs_bits * 32 bytes (BitPacker8x of 256 freqs)  │
 //! │  norms:        count bytes                                       │
 //! └──────────────────────────────────────────────────────────────────┘
 //!
-//! `docs_*` carries gaps between consecutive doc ids in descending order:
-//! `gap[0] = 0` (the delta from the first doc id to itself) and
-//! `gap[i] = doc_ids[i-1] - doc_ids[i]` for `i > 0`. The encoder builds the
+//! `ids_*` carries gaps between consecutive ids in descending order:
+//! `gap[0] = 0` (the delta from the first id to itself) and
+//! `gap[i] = ids[i-1] - ids[i]` for `i > 0`. The encoder builds the
 //! gap array first, then picks bitpacked when every gap fits in `u32` and
-//! falls back to per-gap LEB128 unsigned varints (`docs_encoding = 1`)
+//! falls back to per-gap LEB128 unsigned varints (`ids_encoding = 1`)
 //! otherwise.
 //!
 //! Skip (type = 0x01) payload
@@ -61,15 +61,15 @@
 //! value's bytes — preserving the global descending-id ordering.
 //!
 //! TODO(rfc-0006 milestone 1+): once the FTS compaction filter lands, it
-//! will rewrite postings into uniform 256-document `Postings` blocks (each
+//! will rewrite postings into uniform 256-entry `Postings` blocks (each
 //! preceded by a refreshed `Skip`) and prune any stale ids removed via the
 //! deletions bitmap. The variable-size last block today is a Milestone 0
 //! artifact of merge-by-concat with batches of arbitrary size.
 
+use super::EncodingError;
+use crate::serde::vector_id::VectorId;
 use bitpacking::{BitPacker, BitPacker8x};
 use bytes::{BufMut, Bytes, BytesMut};
-
-use super::EncodingError;
 
 const BLOCK_LEN: usize = BitPacker8x::BLOCK_LEN;
 
@@ -80,40 +80,43 @@ pub(crate) const TARGET_POSTINGS_PER_BLOCK: usize = BLOCK_LEN;
 const BLOCK_TYPE_POSTINGS: u8 = 0x00;
 const BLOCK_TYPE_SKIP: u8 = 0x01;
 
-/// Doc-id `gaps` packed via [`BitPacker8x`]. Used when every gap fits in `u32`.
-const DOC_ENCODING_BITPACKED: u8 = 0;
+/// id `gaps` packed via [`BitPacker8x`]. Used when every gap fits in `u32`.
+const IDS_ENCODING_BITPACKED: u8 = 0;
 
-/// Doc-id `gaps` written one-by-one as unsigned LEB128 `u64` varints. Used
+/// id `gaps` written one-by-one as unsigned LEB128 `u64` varints. Used
 /// when at least one gap exceeds [`u32::MAX`].
-const DOC_ENCODING_VARINT: u8 = 1;
+const IDS_ENCODING_VARINT: u8 = 1;
 
 /// A single posting entry within a `Postings` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PostingEntry {
-    pub(crate) doc_id: u64,
+    pub(crate) id: VectorId,
     pub(crate) freq: u32,
     pub(crate) norm: u8,
 }
 
-/// A `Postings` block: a run of `PostingEntry` in descending `doc_id` order.
+/// A `Postings` block: a run of `PostingEntry` in descending `id` order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PostingsBlock {
-    /// Entries, sorted by descending `doc_id`.
+    /// Entries, sorted by descending `id`.
     pub(crate) entries: Vec<PostingEntry>,
 }
 
 impl PostingsBlock {
     pub(crate) fn from_descending(entries: Vec<PostingEntry>) -> Self {
         debug_assert!(
-            entries.windows(2).all(|w| w[0].doc_id > w[1].doc_id),
+            entries.windows(2).all(|w| w[0].id > w[1].id),
             "PostingsBlock entries must be strictly descending"
         );
         debug_assert!(entries.len() <= BLOCK_LEN);
         Self { entries }
     }
 
-    pub(crate) fn last_id(&self) -> u64 {
-        self.entries.last().map(|e| e.doc_id).unwrap_or(0)
+    pub(crate) fn last_id(&self) -> VectorId {
+        self.entries
+            .last()
+            .map(|e| e.id)
+            .unwrap_or(VectorId::data_vector_id(0))
     }
 
     /// Encode just the payload (no type tag or length prefix).
@@ -125,18 +128,18 @@ impl PostingsBlock {
             return;
         }
 
-        let base_id = self.entries[0].doc_id;
+        let base_id = self.entries[0].id.id();
         buf.put_u64_le(base_id);
 
-        // Build the gap array first so we can choose the doc-id encoding
-        // based on the max gap. `gap[0]` is always 0 (the first doc id is
+        // Build the gap array first so we can choose the id encoding
+        // based on the max gap. `gap[0]` is always 0 (the first id is
         // its own delta); subsequent gaps are positive because the block is
         // strictly descending.
         let mut gaps = Vec::with_capacity(count);
         gaps.push(0u64);
         let mut max_gap = 0u64;
         for window in self.entries.windows(2) {
-            let g = window[0].doc_id - window[1].doc_id;
+            let g = window[0].id.id() - window[1].id.id();
             max_gap = max_gap.max(g);
             gaps.push(g);
         }
@@ -144,22 +147,22 @@ impl PostingsBlock {
         let bitpacker = BitPacker8x::new();
 
         if max_gap <= u32::MAX as u64 {
-            buf.put_u8(DOC_ENCODING_BITPACKED);
+            buf.put_u8(IDS_ENCODING_BITPACKED);
             // Pad the tail with zeros — zero is `<= max_gap`, so this never
             // widens num_bits beyond what the real data requires.
-            let mut docs = [0u32; BLOCK_LEN];
+            let mut ids = [0u32; BLOCK_LEN];
             for (i, &g) in gaps.iter().enumerate() {
-                docs[i] = g as u32;
+                ids[i] = g as u32;
             }
-            let docs_bits = bitpacker.num_bits(&docs);
-            buf.put_u8(docs_bits);
-            let docs_bytes = docs_bits as usize * (BLOCK_LEN / 8);
-            let mut packed = vec![0u8; docs_bytes];
-            let written = bitpacker.compress(&docs, &mut packed, docs_bits);
-            debug_assert_eq!(written, docs_bytes);
+            let ids_bits = bitpacker.num_bits(&ids);
+            buf.put_u8(ids_bits);
+            let ids_bytes = ids_bits as usize * (BLOCK_LEN / 8);
+            let mut packed = vec![0u8; ids_bytes];
+            let written = bitpacker.compress(&ids, &mut packed, ids_bits);
+            debug_assert_eq!(written, ids_bytes);
             buf.extend_from_slice(&packed);
         } else {
-            buf.put_u8(DOC_ENCODING_VARINT);
+            buf.put_u8(IDS_ENCODING_VARINT);
             for &g in &gaps {
                 write_u64_varint(buf, g);
             }
@@ -218,41 +221,41 @@ impl PostingsBlock {
 
         let bitpacker = BitPacker8x::new();
 
-        // docs_encoding byte
+        // ids_encoding byte
         if cursor.is_empty() {
             return Err(EncodingError {
-                message: "postings block payload too short for docs_encoding".to_string(),
+                message: "postings block payload too short for ids_encoding".to_string(),
             });
         }
-        let docs_encoding = cursor[0];
+        let ids_encoding = cursor[0];
         cursor = &cursor[1..];
 
-        let gaps: Vec<u64> = match docs_encoding {
-            DOC_ENCODING_BITPACKED => {
+        let gaps: Vec<u64> = match ids_encoding {
+            IDS_ENCODING_BITPACKED => {
                 if cursor.is_empty() {
                     return Err(EncodingError {
-                        message: "postings block payload too short for docs_bits".to_string(),
+                        message: "postings block payload too short for ids_bits".to_string(),
                     });
                 }
-                let docs_bits = cursor[0];
+                let ids_bits = cursor[0];
                 cursor = &cursor[1..];
-                let docs_bytes = docs_bits as usize * (BLOCK_LEN / 8);
-                if cursor.len() < docs_bytes {
+                let ids_bytes = ids_bits as usize * (BLOCK_LEN / 8);
+                if cursor.len() < ids_bytes {
                     return Err(EncodingError {
                         message: format!(
-                            "postings block truncated within docs section: need {}, have {}",
-                            docs_bytes,
+                            "postings block truncated within ids section: need {}, have {}",
+                            ids_bytes,
                             cursor.len()
                         ),
                     });
                 }
-                let mut docs = [0u32; BLOCK_LEN];
-                let consumed = bitpacker.decompress(&cursor[..docs_bytes], &mut docs, docs_bits);
-                debug_assert_eq!(consumed, docs_bytes);
-                cursor = &cursor[docs_bytes..];
-                docs[..count].iter().map(|&g| g as u64).collect()
+                let mut ids = [0u32; BLOCK_LEN];
+                let consumed = bitpacker.decompress(&cursor[..ids_bytes], &mut ids, ids_bits);
+                debug_assert_eq!(consumed, ids_bytes);
+                cursor = &cursor[ids_bytes..];
+                ids[..count].iter().map(|&g| g as u64).collect()
             }
-            DOC_ENCODING_VARINT => {
+            IDS_ENCODING_VARINT => {
                 let mut gaps = Vec::with_capacity(count);
                 for _ in 0..count {
                     let (g, used) = read_u64_varint(cursor)?;
@@ -263,23 +266,23 @@ impl PostingsBlock {
             }
             other => {
                 return Err(EncodingError {
-                    message: format!("unknown postings docs_encoding: 0x{:02x}", other),
+                    message: format!("unknown postings ids_encoding: 0x{:02x}", other),
                 });
             }
         };
 
-        // Reconstruct doc ids from gaps. `gap[0]` is 0 so doc_ids[0] == base_id.
-        let mut doc_ids = Vec::with_capacity(count);
+        // Reconstruct ids from gaps. `gap[0]` is 0 so ids[0] == base_id.
+        let mut ids = Vec::with_capacity(count);
         let mut current = base_id;
         for (i, &g) in gaps.iter().enumerate() {
             if i == 0 {
-                doc_ids.push(current);
+                ids.push(current);
                 continue;
             }
             current = current.checked_sub(g).ok_or_else(|| EncodingError {
-                message: format!("gap {} underflows running doc id {}", g, current),
+                message: format!("gap {} underflows running id {}", g, current),
             })?;
-            doc_ids.push(current);
+            ids.push(current);
         }
 
         // freqs
@@ -320,7 +323,7 @@ impl PostingsBlock {
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
             entries.push(PostingEntry {
-                doc_id: doc_ids[i],
+                id: VectorId::from_raw(ids[i]),
                 freq: freqs[i],
                 norm: norms[i],
             });
@@ -368,13 +371,13 @@ fn read_u64_varint(buf: &[u8]) -> Result<(u64, usize), EncodingError> {
 /// For Milestone 0 `impacts` is reserved per the RFC shape but always empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SkipBlock {
-    pub(crate) last_id: u64,
+    pub(crate) last_id: VectorId,
     pub(crate) length: u64,
 }
 
 impl SkipBlock {
     fn encode_payload(&self, buf: &mut BytesMut) {
-        buf.put_u64_le(self.last_id);
+        buf.put_u64_le(self.last_id.id());
         buf.put_u16_le(0); // impacts_count, always 0 in M0
         buf.put_u64_le(self.length);
     }
@@ -389,9 +392,9 @@ impl SkipBlock {
                 ),
             });
         }
-        let last_id = u64::from_le_bytes([
+        let last_id = VectorId::from_raw(u64::from_le_bytes([
             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
+        ]));
         let impacts_count = u16::from_le_bytes([buf[8], buf[9]]);
         // Milestone 0 always writes 0 impacts; tolerate but ignore higher counts.
         let mut cursor = &buf[10..];
@@ -424,7 +427,7 @@ pub(crate) enum TermPostingsBlock {
 
 /// Decoded view of a term's posting list.
 ///
-/// Blocks appear in descending `doc_id` order: each `Skip` is immediately
+/// Blocks appear in descending `id` order: each `Skip` is immediately
 /// followed by the `Postings` block it describes, and successive pairs cover
 /// strictly lower id ranges.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -442,9 +445,9 @@ impl TermPostingsValue {
         if postings.is_empty() {
             return Self::default();
         }
-        postings.sort_unstable_by_key(|p| std::cmp::Reverse(p.doc_id));
-        // De-dup defensively; a single document should appear at most once per term per batch.
-        postings.dedup_by_key(|e| e.doc_id);
+        postings.sort_unstable_by_key(|p| std::cmp::Reverse(p.id));
+        // De-dup defensively; a single id should appear at most once per term per batch.
+        postings.dedup_by_key(|e| e.id);
 
         let mut blocks = Vec::new();
         for chunk in postings.chunks(TARGET_POSTINGS_PER_BLOCK) {
@@ -461,7 +464,7 @@ impl TermPostingsValue {
         Self { blocks }
     }
 
-    /// Iterate all decoded posting entries in descending `doc_id` order across blocks.
+    /// Iterate all decoded posting entries in descending `id` order across blocks.
     pub(crate) fn iter_entries(&self) -> impl Iterator<Item = &PostingEntry> {
         self.blocks.iter().flat_map(|block| match block {
             TermPostingsBlock::Postings(p) => p.entries.iter(),
@@ -564,8 +567,12 @@ pub(crate) fn merge_batch_term_postings(existing: Option<Bytes>, operands: &[Byt
 mod tests {
     use super::*;
 
-    fn entry(doc_id: u64, freq: u32, norm: u8) -> PostingEntry {
-        PostingEntry { doc_id, freq, norm }
+    fn entry(id: u64, freq: u32, norm: u8) -> PostingEntry {
+        PostingEntry {
+            id: VectorId::from_raw(id),
+            freq,
+            norm,
+        }
     }
 
     #[test]
@@ -598,7 +605,7 @@ mod tests {
         assert_eq!(decoded.blocks.len(), 2);
         assert!(matches!(decoded.blocks[0], TermPostingsBlock::Skip(_)));
         assert!(matches!(decoded.blocks[1], TermPostingsBlock::Postings(_)));
-        // Entries descending by doc id with original freq/norm preserved.
+        // Entries descending by id with original freq/norm preserved.
         let entries: Vec<_> = decoded.iter_entries().copied().collect();
         assert_eq!(
             entries,
@@ -625,7 +632,7 @@ mod tests {
         assert_eq!(entries.len(), n);
         // Strictly descending
         for w in entries.windows(2) {
-            assert!(w[0].doc_id > w[1].doc_id);
+            assert!(w[0].id > w[1].id);
         }
     }
 
@@ -663,7 +670,7 @@ mod tests {
         let decoded = TermPostingsValue::decode_from_bytes(&merged).unwrap();
 
         // then - ids are globally descending
-        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.doc_id).collect();
+        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.id.id()).collect();
         assert_eq!(ids, vec![11, 10, 2, 1]);
     }
 
@@ -678,7 +685,7 @@ mod tests {
         let decoded = TermPostingsValue::decode_from_bytes(&merged).unwrap();
 
         // then - ids globally descending
-        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.doc_id).collect();
+        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.id.id()).collect();
         assert_eq!(ids, vec![5, 1]);
     }
 
@@ -718,7 +725,7 @@ mod tests {
             .unwrap();
 
         // then - last_id is the lowest id in the following postings block; length matches
-        assert_eq!(skip.last_id, 10);
+        assert_eq!(skip.last_id.id(), 10);
         let postings_payload_len = {
             let postings = value
                 .blocks
@@ -736,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn should_use_bitpacked_doc_encoding_when_gaps_fit_in_u32() {
+    fn should_use_bitpacked_id_encoding_when_gaps_fit_in_u32() {
         // given
         let value = TermPostingsValue::from_postings(vec![
             entry(100, 1, 1),
@@ -744,41 +751,41 @@ mod tests {
             entry(1, 1, 1),
         ]);
 
-        // when - inspect the raw payload for the docs_encoding byte
+        // when - inspect the raw payload for the ids_encoding byte
         let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
             panic!("expected postings block")
         };
         let mut payload = BytesMut::new();
         p.encode_payload(&mut payload);
-        // count(4) + base_id(8) = 12, then docs_encoding byte
-        let docs_encoding = payload[12];
+        // count(4) + base_id(8) = 12, then ids_encoding byte
+        let ids_encoding = payload[12];
 
         // then
-        assert_eq!(docs_encoding, DOC_ENCODING_BITPACKED);
+        assert_eq!(ids_encoding, IDS_ENCODING_BITPACKED);
 
         // and - encode/decode round-trips identical entries
         let encoded = value.encode_to_bytes();
         let decoded = TermPostingsValue::decode_from_bytes(&encoded).unwrap();
-        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.doc_id).collect();
+        let ids: Vec<u64> = decoded.iter_entries().map(|e| e.id.id()).collect();
         assert_eq!(ids, vec![100, 50, 1]);
     }
 
     #[test]
-    fn should_switch_to_varint_doc_encoding_when_gap_exceeds_u32() {
+    fn should_switch_to_varint_id_encoding_when_gap_exceeds_u32() {
         // given - gap between two consecutive entries exceeds u32::MAX
         let huge = (u32::MAX as u64) + 2; // gap will be 1 too big for u32
         let value = TermPostingsValue::from_postings(vec![entry(huge, 1, 5), entry(0, 2, 7)]);
 
-        // when - inspect docs_encoding byte
+        // when - inspect ids_encoding byte
         let TermPostingsBlock::Postings(p) = &value.blocks[1] else {
             panic!("expected postings block")
         };
         let mut payload = BytesMut::new();
         p.encode_payload(&mut payload);
-        let docs_encoding = payload[12];
+        let ids_encoding = payload[12];
 
         // then
-        assert_eq!(docs_encoding, DOC_ENCODING_VARINT);
+        assert_eq!(ids_encoding, IDS_ENCODING_VARINT);
 
         // and - encode/decode preserves the original entries (huge id and all)
         let encoded = value.encode_to_bytes();
@@ -830,7 +837,7 @@ mod tests {
         assert_eq!(entries.len(), postings.len());
         // Original postings sorted descending should match decoded order.
         let mut expected = postings;
-        expected.sort_unstable_by_key(|e| std::cmp::Reverse(e.doc_id));
+        expected.sort_unstable_by_key(|e| std::cmp::Reverse(e.id));
         assert_eq!(entries, expected);
     }
 }
