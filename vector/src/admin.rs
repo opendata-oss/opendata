@@ -2,11 +2,10 @@ use crate::db::VectorDb;
 use crate::error::{Error, Result};
 use crate::model::Config;
 use crate::serde::vector_id::VectorId;
-use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::validator::validate as validate_tree_index;
 use common::Storage;
-use common::{StorageBuilder, StorageSemantics};
+use common::StorageBuilder;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -22,18 +21,22 @@ pub struct VectorDbAdmin {
 impl VectorDbAdmin {
     /// Open a vector database for administrative operations.
     pub async fn open(config: Config) -> Result<Self> {
-        let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
         let builder = StorageBuilder::new(&config.storage)
             .await
             .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
-        // Install the same segment extractor the writer uses (RFC-0006); the
-        // extractor name is persisted in the manifest and validated on open, so
-        // an admin client opening a segmented database must match it.
-        let storage = crate::storage::segment_extractor::builder_with_vector_segments(builder)
-            .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
-            .build()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
+        // Build storage with the shared vector wiring (per-segment routing
+        // extractor, merge operator, FTS compaction filter). The extractor name
+        // is persisted in the manifest and validated on open, so an admin client
+        // opening a segmented database must match it.
+        //
+        // The writer's custom compaction *scheduler* (which forces a major FTS
+        // compaction once deletes cross the threshold) is deliberately NOT
+        // installed here — we pass `None`. It is driven by an in-memory delete
+        // tracker that only the writer's flusher updates; with no flusher the
+        // admin client has no signal to act on, so it keeps SlateDB's default
+        // size-tiered scheduler. The filter still runs correctly on whatever
+        // compactions size-tiered schedules.
+        let storage = crate::storage::build_vector_storage(&config, builder, None).await?;
         Ok(Self { config, storage })
     }
 
