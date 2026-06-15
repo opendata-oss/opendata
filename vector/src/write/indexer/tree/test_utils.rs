@@ -204,6 +204,7 @@ impl IndexerOpTestHarnessBuilder {
                                     Field::string(field_spec.name.clone(), field_value.clone())
                                 })
                                 .collect(),
+                            Vec::new(),
                         );
                         delta.search_index.add_to_posting(
                             *centroid_id,
