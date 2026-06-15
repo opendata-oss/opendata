@@ -116,6 +116,13 @@ impl SlateReadHandle {
         sst_blocks::count_in_range(&self.source.manifest(), &self.sst_reader, range).await
     }
 
+    /// Returns the live manifest snapshot for metadata-only inspection — e.g.
+    /// summarizing how data is distributed across the LSM tree. Reads no SST
+    /// files; each call reflects the latest flushed state of the live source.
+    pub fn manifest(&self) -> VersionedManifest {
+        self.source.manifest()
+    }
+
     /// Returns the `last_entry` key bound of every SST in the live manifest —
     /// both L0 and the compacted sorted runs.
     ///
@@ -124,7 +131,7 @@ impl SlateReadHandle {
     /// durable tip. Reads the same manifest source as the count path, so a
     /// frontier built from it shares the snapshot the reader scans.
     pub fn sst_key_bounds(&self) -> Vec<Bytes> {
-        let manifest = self.source.manifest();
+        let manifest = self.manifest();
         manifest
             .l0()
             .iter()

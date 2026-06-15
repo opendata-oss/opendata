@@ -2465,6 +2465,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "log-inspect"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "clap",
+ "opendata-common",
+ "opendata-log",
+ "serde_yaml",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lrlex"
 version = "0.13.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

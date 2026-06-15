@@ -740,6 +740,21 @@ impl LogDbReader {
         })
     }
 
+    /// Summarizes how the log's data is distributed across the SlateDB LSM
+    /// tree: per-segment SST counts, sorted-run structure, and estimated
+    /// sizes, taken from the reader's current manifest snapshot.
+    ///
+    /// Returns `Ok(None)` for in-memory backends, which have no manifest. The
+    /// summary is derived from manifest metadata only and reads no SST files,
+    /// so it is cheap to call repeatedly.
+    pub async fn tree_summary(&self) -> Result<Option<crate::tree::TreeSummary>> {
+        let view = self.read_view.read().await;
+        Ok(view
+            .slate
+            .as_ref()
+            .map(|slate| crate::tree::TreeSummary::from_manifest(&slate.manifest())))
+    }
+
     /// Spawns a background task that periodically refreshes the segment cache.
     ///
     /// This path fully reloads segments from storage on each tick so a
