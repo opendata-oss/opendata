@@ -80,9 +80,17 @@ impl Default for CentroidsKey {
     }
 }
 
+/// Trailing discriminator bytes for the two singleton records that share the
+/// `Deletions` tag (RFC-0006). The sentinel's `0x00` sorts before the bitmap's
+/// `0xff`, so a last-run compaction always observes the sentinel first.
+pub(crate) const DELETIONS_SENTINEL_DISCRIMINATOR: u8 = 0x00;
+pub(crate) const DELETIONS_DISCRIMINATOR: u8 = 0xff;
+
 /// Deletions key - singleton record storing the FTS deletions bitmap.
 ///
-/// Key layout: `[subsystem | segment | version | tag]` (4 bytes)
+/// Key layout: `[subsystem | segment | version | tag | 0xff]` (5 bytes). The
+/// trailing `0xff` sorts the bitmap *after* the [`DeletionsSentinelKey`], which
+/// shares the same prefix and tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionsKey;
 
@@ -96,23 +104,85 @@ impl DeletionsKey {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 1);
         Self::RECORD_TYPE.write_prefix(&mut buf);
+        buf.put_u8(DELETIONS_DISCRIMINATOR);
         buf.freeze()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        if buf.len() < PREFIX_AND_TAG_LEN {
+        if buf.len() < PREFIX_AND_TAG_LEN + 1 {
             return Err(EncodingError {
                 message: "Buffer too short for DeletionsKey".to_string(),
             });
         }
         validate_key_prefix::<Self>(buf)?;
+        if buf[PREFIX_AND_TAG_LEN] != DELETIONS_DISCRIMINATOR {
+            return Err(EncodingError {
+                message: format!(
+                    "DeletionsKey discriminator mismatch: expected {:#04x}, got {:#04x}",
+                    DELETIONS_DISCRIMINATOR, buf[PREFIX_AND_TAG_LEN]
+                ),
+            });
+        }
         Ok(DeletionsKey)
     }
 }
 
 impl Default for DeletionsKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Deletions sentinel key - singleton marker written on *every* FTS write batch.
+///
+/// Key layout: `[subsystem | segment | version | tag | 0x00]` (5 bytes). It
+/// shares the `Deletions` tag with [`DeletionsKey`], but its trailing `0x00`
+/// sorts it first among all FTS records. The compaction filter uses it as a
+/// start-of-stream marker: it must observe the sentinel before any other FTS
+/// key, which proves the compaction was not resumed mid-stream and anchors the
+/// start of the filter's phase state machine. Its value is an opaque dummy
+/// (RFC-0006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionsSentinelKey;
+
+impl RecordKey for DeletionsSentinelKey {
+    const RECORD_TYPE: RecordType = RecordType::Deletions;
+}
+
+impl DeletionsSentinelKey {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN + 1);
+        Self::RECORD_TYPE.write_prefix(&mut buf);
+        buf.put_u8(DELETIONS_SENTINEL_DISCRIMINATOR);
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < PREFIX_AND_TAG_LEN + 1 {
+            return Err(EncodingError {
+                message: "Buffer too short for DeletionsSentinelKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        if buf[PREFIX_AND_TAG_LEN] != DELETIONS_SENTINEL_DISCRIMINATOR {
+            return Err(EncodingError {
+                message: format!(
+                    "DeletionsSentinelKey discriminator mismatch: expected {:#04x}, got {:#04x}",
+                    DELETIONS_SENTINEL_DISCRIMINATOR, buf[PREFIX_AND_TAG_LEN]
+                ),
+            });
+        }
+        Ok(DeletionsSentinelKey)
+    }
+}
+
+impl Default for DeletionsSentinelKey {
     fn default() -> Self {
         Self::new()
     }
@@ -653,6 +723,17 @@ impl VectorFieldStatsKey {
         self.vector_id.encode(&mut buf);
         buf.freeze()
     }
+
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
+        if buf.len() < PREFIX_AND_TAG_LEN + 8 {
+            return Err(EncodingError {
+                message: "Buffer too short for VectorFieldStatsKey".to_string(),
+            });
+        }
+        validate_key_prefix::<Self>(buf)?;
+        let vector_id = VectorId::decode(&mut &buf[PREFIX_AND_TAG_LEN..])?;
+        Ok(Self { vector_id })
+    }
 }
 
 /// FieldStats key — `[prefix | field_len:u16 LE | field]`. Per-field FTS
@@ -842,9 +923,37 @@ mod tests {
         let encoded = key.encode();
         let decoded = DeletionsKey::decode(&encoded).unwrap();
 
-        // then
+        // then - prefix + tag + the `0xff` deletions discriminator
         assert_eq!(decoded, key);
-        assert_eq!(encoded.len(), 4);
+        assert_eq!(encoded.len(), PREFIX_AND_TAG_LEN + 1);
+        assert_eq!(*encoded.last().unwrap(), DELETIONS_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn should_round_trip_deletions_sentinel_key() {
+        // given
+        let key = DeletionsSentinelKey::new();
+
+        // when
+        let encoded = key.encode();
+        let decoded = DeletionsSentinelKey::decode(&encoded).unwrap();
+
+        // then - prefix + tag + the `0x00` sentinel discriminator
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), PREFIX_AND_TAG_LEN + 1);
+        assert_eq!(*encoded.last().unwrap(), DELETIONS_SENTINEL_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn should_sort_sentinel_before_deletions() {
+        // given - the sentinel and the deletions bitmap share the same record tag
+        // when - both are encoded
+        let sentinel = DeletionsSentinelKey::new().encode();
+        let deletions = DeletionsKey::new().encode();
+
+        // then - the sentinel sorts strictly before the deletions bitmap, so a
+        // last-run compaction always observes it first
+        assert!(sentinel < deletions);
     }
 
     #[test]
@@ -1177,6 +1286,32 @@ mod tests {
 
         // then
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn should_encode_and_decode_vector_field_stats_key() {
+        // given
+        let key = VectorFieldStatsKey::new(VectorId::data_vector_id(42));
+
+        // when
+        let encoded = key.encode();
+        let decoded = VectorFieldStatsKey::decode(&encoded).unwrap();
+
+        // then - round-trips and the suffix is exactly the 8-byte BE vector id
+        assert_eq!(decoded, key);
+        assert_eq!(encoded.len(), PREFIX_AND_TAG_LEN + 8);
+    }
+
+    #[test]
+    fn should_reject_truncated_vector_field_stats_key() {
+        // given - a valid key with its final id byte chopped off
+        let encoded = VectorFieldStatsKey::new(VectorId::data_vector_id(42)).encode();
+
+        // when
+        let result = VectorFieldStatsKey::decode(&encoded[..encoded.len() - 1]);
+
+        // then
+        assert!(result.is_err());
     }
 
     #[test]

@@ -168,6 +168,7 @@ impl WriteVectors {
                 vector_id,
                 vec![centroid],
                 Self::collect_indexed_fields(&self.opts, &insert.attributes),
+                insert.text_attribute_summaries.keys().cloned().collect(),
             );
             for (attr_name, attr_value) in &insert.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
@@ -199,8 +200,13 @@ impl WriteVectors {
                 })?;
             delta.forward_index.delete_vector(old_vector_id);
             // RFC-0006: hide the replaced internal id on the FTS query path via
-            // the Deletions bitmap (postings/term-stats are left in place).
+            // the Deletions bitmap (postings/term-stats are left in place), and
+            // apply the per-field FieldStats delete deltas for the fields the
+            // replaced vector populated.
             delta.fts_index.add_deleted_vector_id(old_vector_id);
+            delta
+                .fts_index
+                .record_field_deletes(&old_vector_index_data.fts_fields);
             for old_centroid in old_vector_index_data.postings {
                 delta
                     .search_index
@@ -223,6 +229,7 @@ impl WriteVectors {
                 vector_id,
                 vec![centroid],
                 Self::collect_indexed_fields(&self.opts, &write.attributes),
+                write.text_attribute_summaries.keys().cloned().collect(),
             );
             for (attr_name, attr_value) in &write.attributes {
                 if attr_name == VECTOR_FIELD_NAME {
@@ -251,8 +258,13 @@ impl WriteVectors {
                 .forward_index
                 .delete_external_id_and_vector(external_id, vector_id);
             // RFC-0006: hide the deleted internal id on the FTS query path via
-            // the Deletions bitmap (postings/term-stats are left in place).
+            // the Deletions bitmap (postings/term-stats are left in place), and
+            // apply the per-field FieldStats delete deltas for the fields the
+            // deleted vector populated.
             delta.fts_index.add_deleted_vector_id(vector_id);
+            delta
+                .fts_index
+                .record_field_deletes(&old_vector_index_data.fts_fields);
             for old_centroid in old_vector_index_data.postings {
                 delta
                     .search_index
@@ -565,6 +577,7 @@ impl ReassignVectors {
                 r.reassignment.vector_id,
                 vec![r.new_centroid],
                 r.index_data.indexed_fields,
+                r.index_data.fts_fields,
             );
         }
         Ok(nreassigned)

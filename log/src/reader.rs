@@ -17,7 +17,6 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::{ReaderConfig, ScanOptions, SegmentConfig};
-use crate::direct::LogDirect;
 use crate::error::{Error, Result};
 use crate::listing::LogKeyIterator;
 use crate::model::{LogEntry, Segment, SegmentId, Sequence};
@@ -26,15 +25,17 @@ use crate::segment::{LogSegment, SegmentCache};
 use crate::serde::LogEntryKey;
 use crate::storage::{LogStorageRead as _, SegmentIterator};
 use common::storage::factory::create_storage_read;
-use common::{L0Stats, SortedRunStats, StorageRead, StorageReaderRuntime, StorageSemantics};
+use common::{
+    L0Stats, SlateReadHandle, SortedRunStats, StorageRead, StorageReaderRuntime, StorageSemantics,
+};
 
 /// How a key's records in one segment's slice of the query are distributed
 /// across that segment's LSM tree — the L0 tier vs the sorted-run tier.
 ///
-/// Present only when the read went through the SST-walk path (a `LogDirect`
-/// handle is available). A scan fallback — the in-memory backend, or a
-/// SlateDB config whose object store is in-memory — reports `None` via
-/// [`SegmentInspection::reads`], since no manifest walk occurs.
+/// Present only when the read went through the SST-walk path (the storage
+/// returned a [`SlateReadHandle`]). A scan fallback — the in-memory backend —
+/// reports `None` via [`SegmentInspection::reads`], since no manifest walk
+/// occurs.
 ///
 /// `l0.records + sorted_runs.records` is the persisted-SST portion of the
 /// segment's count; not-yet-flushed writes are reported as
@@ -76,7 +77,7 @@ pub struct SegmentInspection {
     pub tail_scanned: u64,
     /// How the segment's persisted records split across L0 and sorted runs,
     /// or `None` when the count was produced entirely by a scan (no
-    /// `LogDirect`; see [`SegmentReadStats`]).
+    /// [`SlateReadHandle`]; see [`SegmentReadStats`]).
     pub reads: Option<SegmentReadStats>,
 }
 
@@ -330,7 +331,18 @@ fn segment_window(segments: &[LogSegment], i: usize, query: &Range<Sequence>) ->
 /// Wrapped in `Arc<RwLock<_>>` by both consumers.
 pub(crate) struct LogReadView {
     pub(crate) storage: Arc<dyn StorageRead>,
-    pub(crate) direct: Option<Arc<LogDirect>>,
+    /// Count capability for the SST-walk path, or `None` for non-slatedb
+    /// backends (count then falls back to a scan). Obtained once from the
+    /// backing storage via [`StorageRead::slate_read`]: for `LogDbReader` that
+    /// is the same handle `storage` reads through; for `LogDb` it carries the
+    /// live writer `Db`, since the snapshot in `storage` exposes no manifest.
+    pub(crate) slate: Option<SlateReadHandle>,
+    /// Exclusive upper sequence bound of the data `storage` exposes. The count
+    /// path clamps its query to this so the manifest walk — which may read a
+    /// fresher live manifest than a pinned snapshot — never counts records
+    /// beyond what a scan would return. `u64::MAX` when reads aren't
+    /// snapshot-pinned (the standalone reader).
+    pub(crate) snapshot_horizon: Sequence,
     pub(crate) segments: SegmentCache,
 }
 
@@ -338,19 +350,23 @@ impl LogReadView {
     /// Creates a new `LogReadView`.
     pub(crate) fn new(
         storage: Arc<dyn StorageRead>,
-        direct: Option<Arc<LogDirect>>,
+        slate: Option<SlateReadHandle>,
+        snapshot_horizon: Sequence,
         segments: SegmentCache,
     ) -> Self {
         Self {
             storage,
-            direct,
+            slate,
+            snapshot_horizon,
             segments,
         }
     }
 
-    /// Replaces the underlying storage snapshot with a new one.
-    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<dyn StorageRead>) {
+    /// Replaces the underlying storage snapshot with a new one, along with the
+    /// exclusive sequence horizon that snapshot exposes.
+    pub(crate) fn update_snapshot(&mut self, snapshot: Arc<dyn StorageRead>, horizon: Sequence) {
         self.storage = snapshot;
+        self.snapshot_horizon = horizon;
     }
 
     /// Reloads segments from the current storage snapshot.
@@ -388,16 +404,22 @@ impl LogReadView {
     /// per-segment record-distribution breakdown.
     ///
     /// Fans out across overlapping segments — clipped to each segment's
-    /// window. When [`LogDirect`] is available, walks persisted SSTs via
-    /// `count_in_range` (capturing per-tier stats) for the bulk count and
-    /// scans `(covered_to, seg_hi)` to pick up anything still in the
-    /// memtable. Otherwise falls back to a plain scan tally with no
-    /// SST-level detail.
+    /// window. When the storage exposes a [`SlateReadHandle`], walks persisted
+    /// SSTs via `count_in_range` (capturing per-tier stats) for the bulk count
+    /// and scans `(covered_to, seg_hi)` to pick up anything still in the
+    /// memtable. Otherwise falls back to a plain scan tally with no SST-level
+    /// detail.
+    ///
+    /// The query is first clamped to [`snapshot_horizon`](Self::snapshot_horizon):
+    /// the manifest the walk reads may be fresher than the snapshot scans see,
+    /// so without the clamp the count could include records the reader's view
+    /// hasn't yet exposed. Clamping keeps `count` consistent with `scan`.
     pub(crate) async fn inspect(
         &self,
         key: Bytes,
         seq_range: Range<Sequence>,
     ) -> Result<Inspection> {
+        let seq_range = seq_range.start..seq_range.end.min(self.snapshot_horizon);
         let segments = self.segments.find_covering(&seq_range);
         let mut inspection = Inspection {
             total: 0,
@@ -409,9 +431,9 @@ impl LogReadView {
             if window.start >= window.end {
                 continue;
             }
-            let seg = match self.direct.as_deref() {
-                Some(direct) => {
-                    self.inspect_segment_via_direct(direct, segment, &key, window)
+            let seg = match &self.slate {
+                Some(slate) => {
+                    self.inspect_segment_via_slate(slate, segment, &key, window)
                         .await?
                 }
                 None => SegmentInspection {
@@ -432,23 +454,24 @@ impl LogReadView {
         Ok(inspection)
     }
 
-    /// Inspects entries in a single segment slice using [`LogDirect`].
+    /// Inspects entries in a single segment slice using a [`SlateReadHandle`].
     ///
     /// Walks persisted SSTs via `count_in_range` and tops up with a tail
-    /// scan above the witness key. The tail scan covers two cases at once:
-    /// writes still in the memtable, and writes flushed since `direct`'s
-    /// manifest snapshot was taken (the DbReader polls, so its view can lag
-    /// the writer). The tail's contribution is reported separately as
-    /// [`SegmentInspection::tail_scanned`] so the SST stats stay honest.
-    async fn inspect_segment_via_direct(
+    /// scan above the witness key. The tail scan covers writes not yet in the
+    /// manifest's SSTs (still in the memtable, or — for the standalone reader —
+    /// flushed since the `DbReader` last polled). Its contribution is reported
+    /// separately as [`SegmentInspection::tail_scanned`] so the SST stats stay
+    /// honest. Records above `covered_to` that haven't reached `storage`'s
+    /// snapshot are excluded by `inspect`'s horizon clamp.
+    async fn inspect_segment_via_slate(
         &self,
-        direct: &LogDirect,
+        slate: &SlateReadHandle,
         segment: &LogSegment,
         key: &Bytes,
         window: Range<Sequence>,
     ) -> Result<SegmentInspection> {
         let byte_range = LogEntryKey::scan_range(segment, key, window.clone());
-        let result = direct.count_in_range(&byte_range).await?;
+        let result = slate.count_in_range(&byte_range).await?;
         // LogDb is append-only, so only puts contribute. Tombstones or
         // merges in this byte range would indicate an unsupported op.
         let sst_count = result.counts.num_puts;
@@ -626,12 +649,17 @@ impl LogDbReader {
         )
         .await
         .map_err(|e| Error::Storage(e.to_string()))?;
-        let direct = LogDirect::maybe_from_storage_config(&config.storage)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .map(Arc::new);
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments)));
+        // The count capability reads through the same handle the reader scans,
+        // so count and scan share a view. Reads aren't snapshot-pinned, so no
+        // horizon clamp.
+        let slate = storage.slate_read();
+        let read_view = Arc::new(RwLock::new(LogReadView::new(
+            storage,
+            slate,
+            Sequence::MAX,
+            segments,
+        )));
 
         let (shutdown_tx, refresh_task) =
             Self::spawn_refresh_task(Arc::clone(&read_view), config.refresh_interval);
@@ -652,7 +680,10 @@ impl LogDbReader {
     /// so it is cheap to call repeatedly.
     pub async fn tree_summary(&self) -> Result<Option<crate::tree::TreeSummary>> {
         let view = self.read_view.read().await;
-        Ok(view.direct.as_deref().map(LogDirect::tree_summary))
+        Ok(view
+            .slate
+            .as_ref()
+            .map(|slate| crate::tree::TreeSummary::from_manifest(&slate.manifest())))
     }
 
     /// Spawns a background task that periodically refreshes the segment cache.
@@ -691,29 +722,19 @@ impl LogDbReader {
         (shutdown_tx, task)
     }
 
-    /// Creates a LogDbReader from an existing storage implementation.
+    /// Creates a LogDbReader from an existing storage implementation. The
+    /// storage doubles as the slate source, so a slatedb-backed handle with an
+    /// attached `SstReader` exercises the SST-walk count path.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn StorageRead>) -> Result<Self> {
-        Self::new_inner(storage, None).await
-    }
-
-    /// Creates a LogDbReader paired with a `LogDirect` handle so tests can
-    /// exercise the SST-walk count path through the reader.
-    #[cfg(test)]
-    pub(crate) async fn new_with_direct(
-        storage: Arc<dyn StorageRead>,
-        direct: Arc<LogDirect>,
-    ) -> Result<Self> {
-        Self::new_inner(storage, Some(direct)).await
-    }
-
-    #[cfg(test)]
-    async fn new_inner(
-        storage: Arc<dyn StorageRead>,
-        direct: Option<Arc<LogDirect>>,
-    ) -> Result<Self> {
         let segments = SegmentCache::open(storage.as_ref(), SegmentConfig::default()).await?;
-        let read_view = Arc::new(RwLock::new(LogReadView::new(storage, direct, segments)));
+        let slate = storage.slate_read();
+        let read_view = Arc::new(RwLock::new(LogReadView::new(
+            storage,
+            slate,
+            Sequence::MAX,
+            segments,
+        )));
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             read_view,

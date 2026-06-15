@@ -88,7 +88,7 @@ pub(crate) trait LogStorageRead: StorageRead {
 
     /// Counts log entries for a key within a segment and sequence range by
     /// scanning every record and tallying. Use this as a fallback when no
-    /// [`LogDirect`](crate::direct::LogDirect) handle is available.
+    /// [`SlateReadHandle`](common::SlateReadHandle) is available.
     async fn count_entries(
         &self,
         segment: &LogSegment,

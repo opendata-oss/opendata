@@ -348,31 +348,12 @@ impl LogDb {
         Ok(())
     }
 
-    /// Creates a LogDb from an existing storage implementation.
+    /// Creates a LogDb from an existing storage implementation. A slatedb
+    /// storage with an attached `SstReader` exercises the SST-walk count path.
     #[cfg(test)]
     pub(crate) async fn new(storage: Arc<dyn common::Storage>) -> Result<Self> {
         Self::from_storage(
             storage,
-            None,
-            SegmentConfig::default(),
-            RetentionConfig::default(),
-            ReadVisibility::Memory,
-            Arc::new(SystemClock),
-            None,
-        )
-        .await
-    }
-
-    /// Creates a LogDb with a paired `LogDirect` handle so tests can
-    /// exercise the SST-walk count path.
-    #[cfg(test)]
-    pub(crate) async fn new_with_direct(
-        storage: Arc<dyn common::Storage>,
-        direct: Arc<crate::direct::LogDirect>,
-    ) -> Result<Self> {
-        Self::from_storage(
-            storage,
-            Some(direct),
             SegmentConfig::default(),
             RetentionConfig::default(),
             ReadVisibility::Memory,
@@ -387,7 +368,6 @@ impl LogDb {
     pub(crate) async fn new_durable(storage: Arc<dyn common::Storage>) -> Result<Self> {
         Self::from_storage(
             storage,
-            None,
             SegmentConfig::default(),
             RetentionConfig::default(),
             ReadVisibility::Remote,
@@ -404,7 +384,6 @@ impl LogDb {
     /// compaction scheduler reads the cell.
     async fn from_storage(
         storage: Arc<dyn common::Storage>,
-        direct: Option<Arc<crate::direct::LogDirect>>,
         segment_config: SegmentConfig,
         retention_config: RetentionConfig,
         read_visibility: ReadVisibility,
@@ -456,9 +435,15 @@ impl LogDb {
         let initial_next_sequence = written_rx.borrow().next_sequence;
         let writer_task = handle.spawn(writer);
 
+        // The read view scans a pinned snapshot, but `DbSnapshot` exposes no
+        // manifest — so the count capability reads the live writer `Db` via the
+        // writer storage's `slate_read`. The snapshot's sequence horizon
+        // (`initial_next_sequence`, advanced by the subscriber) clamps the count
+        // so it never runs ahead of the snapshot.
         let read_view = Arc::new(RwLock::new(LogReadView::new(
             snapshot as Arc<dyn common::StorageRead>,
-            direct,
+            storage.slate_read(),
+            initial_next_sequence,
             segment_cache,
         )));
 
@@ -626,11 +611,6 @@ impl LogDbBuilder {
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let direct = crate::direct::LogDirect::maybe_from_storage_config(&self.config.storage)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .map(Arc::new);
-
         let clock: Arc<dyn Clock> = self.clock.unwrap_or_else(|| Arc::new(SystemClock));
 
         // Hand the cell to `from_storage` only when we installed the supplier.
@@ -639,7 +619,6 @@ impl LogDbBuilder {
 
         LogDb::from_storage(
             storage,
-            direct,
             self.config.segmentation,
             self.config.retention,
             self.config.read_visibility,
@@ -657,11 +636,12 @@ async fn advance_read_view_to(
     known_segment_id: &mut Option<SegmentId>,
     known_deleted_segment_id: &mut Option<SegmentId>,
     snapshot: Arc<dyn common::storage::StorageSnapshot>,
+    horizon: Sequence,
     new_segment_id: Option<SegmentId>,
     new_deleted_segment_id: Option<SegmentId>,
 ) {
     let mut rv = read_view.write().await;
-    rv.update_snapshot(snapshot as Arc<dyn common::StorageRead>);
+    rv.update_snapshot(snapshot as Arc<dyn common::StorageRead>, horizon);
 
     if new_segment_id != *known_segment_id {
         match rv.refresh_segments(*known_segment_id).await {
@@ -708,6 +688,7 @@ async fn try_advance_durable(
                 known_segment_id,
                 known_deleted_segment_id,
                 advanced.snapshot,
+                advanced.next_sequence,
                 advanced.last_segment_id,
                 advanced.last_deleted_segment_id,
             )
@@ -792,6 +773,7 @@ fn spawn_subscriber(
                             &mut known_segment_id,
                             &mut known_deleted_segment_id,
                             view.snapshot,
+                            view.next_sequence,
                             view.last_segment_id,
                             view.last_deleted_segment_id,
                         )
@@ -2428,7 +2410,6 @@ mod tests {
             .unwrap();
         let log = LogDb::from_storage(
             storage.clone(),
-            None,
             SegmentConfig {
                 seal_interval: Some(Duration::from_nanos(1)),
             },
@@ -2459,11 +2440,11 @@ mod tests {
     #[tokio::test]
     async fn slate_reader_count_sees_flushed_data() {
         // Slatedb-backed reader: writes go through LogDb, get flushed, then
-        // the reader's count_in_range path walks the same manifest.
-        let (storage, direct) = slate_storage_with_direct().await;
-        let log = LogDb::new_with_direct(storage.clone(), direct.clone())
-            .await
-            .unwrap();
+        // the reader's count_in_range path walks the same manifest. Reader and
+        // writer share the storage handle, so the reader's slate_read sees the
+        // writer's data.
+        let storage = slate_storage_with_sst_reader().await;
+        let log = LogDb::new(storage.clone()).await.unwrap();
         log.try_append(
             (0..10u8)
                 .map(|i| Record {
@@ -2476,7 +2457,7 @@ mod tests {
         .unwrap();
         log.flush().await.unwrap();
 
-        let reader = LogDbReader::new_with_direct(storage, direct).await.unwrap();
+        let reader = LogDbReader::new(storage).await.unwrap();
         assert_eq!(reader.count(Bytes::from("k"), ..).await.unwrap(), 10);
         assert_eq!(reader.count(Bytes::from("k"), 2..7).await.unwrap(), 5);
     }
@@ -2489,9 +2470,9 @@ mod tests {
         // a plain `log.flush()` only flushes the WAL, leaving the data in the
         // memtable where the manifest walk would never see it.
         use common::storage::slate::SlateDbStorage;
-        use slatedb::config::{DbReaderOptions, FlushOptions, FlushType};
+        use slatedb::config::{FlushOptions, FlushType};
         use slatedb::object_store::memory::InMemory;
-        use slatedb::{DbBuilder, DbReader, SstReader};
+        use slatedb::{DbBuilder, SstReader};
 
         let path = "/test/inspect_read_amp";
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -2506,23 +2487,13 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let storage: Arc<dyn common::Storage> = Arc::new(SlateDbStorage::new(db.clone()));
-
-        let reader = DbReader::builder(path, object_store.clone())
-            .with_options(DbReaderOptions {
-                manifest_poll_interval: Duration::from_millis(5),
-                ..Default::default()
-            })
-            .build()
-            .await
-            .unwrap();
+        // The count path reads the live writer manifest off this same `db`,
+        // bound to the same in-memory object store via the SstReader.
         let sst_reader = SstReader::new(path, object_store, None, None);
-        let direct = Arc::new(crate::direct::LogDirect::from_components(
-            Arc::new(reader),
-            sst_reader,
-        ));
+        let storage: Arc<dyn common::Storage> =
+            Arc::new(SlateDbStorage::new(db.clone()).with_sst_reader(sst_reader));
 
-        let log = LogDb::new_with_direct(storage, direct).await.unwrap();
+        let log = LogDb::new(storage).await.unwrap();
         log.try_append(
             (0..10u8)
                 .map(|i| Record {
@@ -2541,15 +2512,11 @@ mod tests {
         .await
         .unwrap();
 
-        // The DbReader's manifest snapshot polls at 5ms; loop until it has
-        // picked up the flushed SST so the read-amp assertions don't race
-        // the poll. `count` is already correct meanwhile via the tail scan.
-        // The data may land in L0 or be compacted into a sorted run by the
-        // writer's compaction scheduler; either way it becomes visible in the
-        // manifest as a persisted SST. Wait for that.
-        // Records land in L0 or get compacted into a sorted run by the
-        // writer's scheduler; either way they become visible as persisted
-        // SST records. Wait for that.
+        // The count path reads the live writer manifest, so the flushed SST is
+        // visible immediately. The writer's compaction scheduler may still move
+        // the data from L0 into a sorted run asynchronously; either tier counts
+        // as a persisted SST record, so loop until the read-amp assertions see
+        // all 10 (`count` is already correct meanwhile via the tail scan).
         let mut inspection = log.inspect(Bytes::from("k"), ..).await.unwrap();
         for _ in 0..200 {
             let r = &inspection.reads;
@@ -2590,9 +2557,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_reports_no_sst_stats_without_direct() {
-        // In-memory backend has no LogDirect, so count falls back to a scan
-        // and per-segment read stats are unavailable (reads = None).
+    async fn inspect_reports_no_sst_stats_without_slate() {
+        // In-memory backend returns no slate handle, so count falls back to a
+        // scan and per-segment read stats are unavailable (reads = None).
         let storage = StorageBuilder::new(&StorageConfig::InMemory)
             .await
             .unwrap()
@@ -2601,7 +2568,6 @@ mod tests {
             .unwrap();
         let log = LogDb::from_storage(
             storage,
-            None,
             SegmentConfig::default(),
             RetentionConfig::default(),
             ReadVisibility::Memory,
@@ -2652,18 +2618,16 @@ mod tests {
         Arc::new(SlateDbStorage::new(Arc::new(db)))
     }
 
-    /// Same as [`slate_storage`] but also builds a [`LogDirect`] handle
-    /// sharing the same in-memory object store. `InMemory` instances are
-    /// process-local, so storage and direct must share the same `Arc` for
-    /// the direct path to see what storage writes.
-    async fn slate_storage_with_direct() -> (Arc<dyn common::Storage>, Arc<crate::direct::LogDirect>)
-    {
+    /// Same as [`slate_storage`] but attaches an `SstReader` bound to the same
+    /// in-memory object store, so [`common::StorageRead::slate_read`] serves the
+    /// SST-walk count path. `InMemory` instances are process-local, so the
+    /// SstReader must share the storage's `Arc` to see what the writer writes.
+    async fn slate_storage_with_sst_reader() -> Arc<dyn common::Storage> {
         use common::storage::slate::SlateDbStorage;
-        use slatedb::config::DbReaderOptions;
         use slatedb::object_store::memory::InMemory;
-        use slatedb::{DbBuilder, DbReader, SstReader};
+        use slatedb::{DbBuilder, SstReader};
 
-        let path = "/test/slate_with_direct";
+        let path = "/test/slate_with_sst_reader";
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
         // Route writes into per-segment trees as production does; the count
         // walk must find data in segments, not the (empty) default tree.
@@ -2674,23 +2638,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let storage: Arc<dyn common::Storage> = Arc::new(SlateDbStorage::new(db));
-
-        // Short manifest poll interval so the reader picks up freshly-
-        // flushed writes quickly — otherwise the slate count tests would
-        // race the default 1s polling tick.
-        let reader_options = DbReaderOptions {
-            manifest_poll_interval: Duration::from_millis(5),
-            ..Default::default()
-        };
-        let reader = DbReader::builder(path, object_store.clone())
-            .with_options(reader_options)
-            .build()
-            .await
-            .unwrap();
         let sst_reader = SstReader::new(path, object_store, None, None);
-        let direct = crate::direct::LogDirect::from_components(Arc::new(reader), sst_reader);
-        (storage, Arc::new(direct))
+        Arc::new(SlateDbStorage::new(db).with_sst_reader(sst_reader))
     }
 
     #[tokio::test(start_paused = true)]
@@ -2831,8 +2780,8 @@ mod tests {
     /// covered_to).
     #[tokio::test]
     async fn slate_count_sees_both_flushed_and_unflushed() {
-        let (storage, direct) = slate_storage_with_direct().await;
-        let log = LogDb::new_with_direct(storage, direct).await.unwrap();
+        let storage = slate_storage_with_sst_reader().await;
+        let log = LogDb::new(storage).await.unwrap();
 
         // First batch — flush to put these into an L0 SST.
         log.try_append(
