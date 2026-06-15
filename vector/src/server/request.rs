@@ -225,6 +225,7 @@ impl SearchRequest {
             query,
             options: SearchOptions {
                 nprobe: proto_request.nprobe.map(|n| n as usize),
+                ..Default::default()
             },
         })
     }
@@ -278,6 +279,7 @@ impl SearchRequest {
             query,
             options: SearchOptions {
                 nprobe: json_request.nprobe.map(|n| n as usize),
+                ..Default::default()
             },
         })
     }
