@@ -16,6 +16,7 @@ pub(crate) mod term_postings;
 pub(crate) mod term_stats;
 pub mod vector_bitmap;
 pub mod vector_data;
+pub(crate) mod vector_field_stats;
 pub(crate) mod vector_id;
 pub mod vector_index_data;
 

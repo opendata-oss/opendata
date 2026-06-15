@@ -8,8 +8,8 @@ use crate::serde::collection_meta::DistanceMetric;
 use crate::serde::deletions::DeletionsValue;
 use crate::serde::field_stats::FieldStatsValue;
 use crate::serde::key::{
-    CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey, FieldStatsKey, PostingListKey,
-    TermPostingsKey, TermStatsKey, VectorDataKey,
+    CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey, DeletionsSentinelKey,
+    FieldStatsKey, PostingListKey, TermPostingsKey, TermStatsKey, VectorDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
@@ -159,11 +159,12 @@ impl ForwardIndexDelta {
         vector_id: VectorId,
         postings: Vec<VectorId>,
         indexed_fields: Vec<Field>,
+        fts_fields: Vec<String>,
     ) {
         assert!(vector_id.is_data_vector());
         self.vector_index_updates.insert(
             vector_id,
-            VectorIndexDataValue::new(postings, indexed_fields),
+            VectorIndexDataValue::new(postings, indexed_fields, fts_fields),
         );
     }
 
@@ -610,8 +611,12 @@ pub(crate) struct FtsIndexDelta {
     term_postings: HashMap<(String, String), Vec<PostingEntry>>,
     /// (field, term) -> signed delta to the term's document frequency.
     term_doc_freq_delta: HashMap<(String, String), i64>,
-    /// field -> (doc-count delta, total-length delta).
-    field_stats_delta: HashMap<String, (i64, i64)>,
+    /// field -> signed `(count, total_length, deletes)` corpus-stat delta. The
+    /// indexer only increments: inserts add `count +1` / `total_length +len`,
+    /// deletes (and the old side of an upsert) add `deletes +1`. The compaction
+    /// filter decrements all three when it applies the delete at the last sorted
+    /// run (RFC-0006).
+    field_stats_delta: HashMap<String, (i64, i64, i64)>,
     /// Internal vector ids deleted or replaced in this batch. On freeze these
     /// are merged into the singleton `Deletions` bitmap so the BM25 query path
     /// can hide them without retracting postings/term-stats.
@@ -665,8 +670,8 @@ impl FtsIndexDelta {
                 *self.term_doc_freq_delta.entry(key).or_default() += 1;
             }
             let entry = self.field_stats_delta.entry(field.clone()).or_default();
-            entry.0 += 1;
-            entry.1 += summary.length as i64;
+            entry.0 += 1; // count
+            entry.1 += summary.length as i64; // total_length
         }
     }
 
@@ -674,6 +679,22 @@ impl FtsIndexDelta {
     /// accumulated set is merged into the singleton `Deletions` bitmap.
     pub(crate) fn add_deleted_vector_id(&mut self, vector_id: VectorId) {
         self.deleted_vector_ids.insert(vector_id.id());
+    }
+
+    /// Record a `deletes +1` per-field `FieldStats` delta for a deleted (or
+    /// replaced) vector, given the set of FTS fields it populated (read from its
+    /// [`VectorIndexData`](crate::serde::vector_index_data::VectorIndexDataValue)).
+    ///
+    /// The indexer only ever *increments* `FieldStats` (count/total_length on
+    /// insert, deletes on delete); the compaction filter decrements all three
+    /// when it applies the delete at the last sorted run. So `count` here is
+    /// untouched — it tracks total documents written to the field and is
+    /// retired by the filter once the delete is compacted away (RFC-0006).
+    pub(crate) fn record_field_deletes(&mut self, fts_fields: &[String]) {
+        for field in fts_fields {
+            let entry = self.field_stats_delta.entry(field.clone()).or_default();
+            entry.2 += 1; // deletes
+        }
     }
 
     fn freeze(self, output_ops: &mut Vec<RecordOp>) {
@@ -692,6 +713,20 @@ impl FtsIndexDelta {
             has_text_fields: _,
         } = self;
 
+        // Always emit the deletions sentinel (a tiny dummy Put), even with no
+        // deletes. It sorts before every other FTS key, so a last-run compaction
+        // always observes it first — co-located with the data being compacted —
+        // anchoring the filter's phase machine and proving the compaction was not
+        // resumed mid-stream. The deletions bitmap itself stays conditional below,
+        // keeping ingest cheap (RFC-0006).
+        output_ops.push(RecordOp::Put(
+            Record::new(
+                DeletionsSentinelKey::new().encode(),
+                Bytes::from_static(&[0u8]),
+            )
+            .into(),
+        ));
+
         for ((field, term), entries) in term_postings {
             let value = TermPostingsValue::from_postings(entries);
             let key = TermPostingsKey::new(&field, &term).encode();
@@ -709,12 +744,12 @@ impl FtsIndexDelta {
             output_ops.push(RecordOp::Merge(Record::new(key, value).into()));
         }
 
-        for (field, (count_delta, total_delta)) in field_stats_delta {
-            if count_delta == 0 && total_delta == 0 {
+        for (field, (count, total_length, deletes)) in field_stats_delta {
+            if count == 0 && total_length == 0 && deletes == 0 {
                 continue;
             }
             let key = FieldStatsKey::new(&field).encode();
-            let value = FieldStatsValue::new(count_delta, total_delta, 0).encode_to_bytes();
+            let value = FieldStatsValue::new(count, total_length, deletes).encode_to_bytes();
             output_ops.push(RecordOp::Merge(Record::new(key, value).into()));
         }
 
@@ -1014,18 +1049,63 @@ mod tests {
         assert!(ops.is_empty());
     }
 
+    /// Returns the value of the first `Merge` op whose key matches, if any.
+    fn find_merge(ops: &[RecordOp], key: &[u8]) -> Option<Bytes> {
+        ops.iter().find_map(|op| match op {
+            RecordOp::Merge(m) if m.record.key.as_ref() == key => Some(m.record.value.clone()),
+            _ => None,
+        })
+    }
+
     #[test]
-    fn should_emit_deletions_when_collection_has_text_fields() {
-        // given - the same delete, but the collection declares text fields
+    fn should_emit_field_stats_on_insert() {
+        // given - one text doc indexed into field "body" (length 3)
         let mut delta = FtsIndexDelta::new(true);
-        delta.add_deleted_vector_id(VectorId::data_vector_id(7));
+        let mut summaries = HashMap::new();
+        summaries.insert(
+            "body".to_string(),
+            TextAttributeSummary {
+                terms: std::collections::BTreeMap::from([("fox".to_string(), 1usize)]),
+                length: 3,
+            },
+        );
+        delta.add_text_summaries(VectorId::data_vector_id(1), &summaries);
 
         // when
         let mut ops = Vec::new();
         delta.freeze(&mut ops);
 
-        // then - the deletions bitmap merge is emitted
-        assert_eq!(ops.len(), 1);
+        // then - FieldStats for "body": count +1, total_length +3, deletes 0
+        let body = find_merge(&ops, &FieldStatsKey::new("body").encode()).unwrap();
+        assert_eq!(
+            FieldStatsValue::decode_from_bytes(&body).unwrap(),
+            FieldStatsValue::new(1, 3, 0)
+        );
+    }
+
+    #[test]
+    fn should_emit_deletions_and_field_delete_deltas() {
+        // given - a deleted vector that populated fields "body" and "title"
+        let mut delta = FtsIndexDelta::new(true);
+        delta.add_deleted_vector_id(VectorId::data_vector_id(7));
+        delta.record_field_deletes(&["body".to_string(), "title".to_string()]);
+
+        // when
+        let mut ops = Vec::new();
+        delta.freeze(&mut ops);
+
+        // then - the deletions bitmap is emitted
+        assert!(find_merge(&ops, &DeletionsKey::new().encode()).is_some());
+        // and each field's FieldStats gains a pending delete; `count` is left to
+        // the compaction filter to retire when the delete is applied.
+        for field in ["body", "title"] {
+            let fs = find_merge(&ops, &FieldStatsKey::new(field).encode()).unwrap();
+            assert_eq!(
+                FieldStatsValue::decode_from_bytes(&fs).unwrap(),
+                FieldStatsValue::new(0, 0, 1),
+                "field {field}"
+            );
+        }
     }
 
     async fn setup() -> (Arc<dyn Storage>, VectorIndexState) {
@@ -1128,7 +1208,7 @@ mod tests {
     }
 
     fn make_index_value(postings: Vec<VectorId>) -> VectorIndexDataValue {
-        VectorIndexDataValue::new(postings, make_indexed_fields())
+        VectorIndexDataValue::new(postings, make_indexed_fields(), Vec::new())
     }
 
     fn make_indexed_fields() -> Vec<Field> {
@@ -1242,7 +1322,12 @@ mod tests {
 
         // when:
         let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1265,7 +1350,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut delta = ForwardIndexDelta::new(&state);
         let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1288,7 +1378,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut delta = ForwardIndexDelta::new(&state);
         let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1314,7 +1409,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut delta = ForwardIndexDelta::new(&state);
         let old_id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        delta.update_vector_index_data(old_id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            old_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1324,7 +1424,12 @@ mod tests {
         let mut delta = ForwardIndexDelta::new(&state);
         delta.delete_external_id_and_vector("v1".to_string(), old_id);
         let new_id = delta.add_vector("v1", &make_attributes(vec![3.0, 4.0]));
-        delta.update_vector_index_data(new_id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            new_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1359,7 +1464,12 @@ mod tests {
         // when
         let mut delta = ForwardIndexDelta::new(&state);
         let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         delta.delete_external_id_and_vector("v1".to_string(), id);
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
@@ -1943,7 +2053,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let stored_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(stored_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            stored_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1968,7 +2083,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let stored_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(stored_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            stored_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1986,7 +2106,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -2005,7 +2130,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -2030,7 +2160,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -2051,7 +2186,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -2070,7 +2210,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -2079,6 +2224,7 @@ mod tests {
             vector_id,
             vec![leaf_centroid(2), leaf_centroid(3)],
             make_indexed_fields(),
+            Vec::new(),
         );
         let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
@@ -2096,7 +2242,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
