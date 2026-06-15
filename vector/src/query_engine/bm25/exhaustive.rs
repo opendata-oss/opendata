@@ -7,61 +7,23 @@
 //! scoring cost. Forward-index lookups are deferred to the lookup operator.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use common::storage::StorageRead;
 
+use super::{BM25Score, dedupe_query_terms, load_field_stats, load_term_stats};
 use crate::error::Result;
 use crate::math::bm25;
 use crate::model::Bm25Query;
 use crate::query_engine::collectors::{Collector, TopK};
 use crate::query_engine::filter::PreparedFilter;
 use crate::query_engine::operator::Operator;
-use crate::query_engine::types::{Score, ScoredVectorId};
-use crate::serde::field_stats::FieldStatsValue;
-use crate::serde::key::{FieldStatsKey, TermPostingsKey, TermStatsKey};
+use crate::query_engine::types::ScoredVectorId;
+use crate::serde::key::TermPostingsKey;
 use crate::serde::term_postings::{PostingEntry, TermPostingsValue};
-use crate::serde::term_stats::TermStatsValue;
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::VectorId;
-use crate::text;
-
-/// A BM25 relevance score, where a higher raw value is more relevant.
-///
-/// Wraps the raw score so it participates in the generic [`Score`] ordering,
-/// which ranks better scores *first* (`Ordering::Less`). BM25 is "higher is
-/// better", so the natural `f32` order is inverted here; `score` still returns
-/// the raw value for the public `SearchResult.score`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BM25Score(pub(crate) f32);
-
-impl Score for BM25Score {
-    fn score(&self) -> f32 {
-        self.0
-    }
-}
-
-impl PartialEq for BM25Score {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for BM25Score {}
-
-impl PartialOrd for BM25Score {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for BM25Score {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Higher relevance ranks first, so invert the natural f32 order.
-        other.0.total_cmp(&self.0)
-    }
-}
 
 /// Scores a BM25 query: walks the union of the query terms' posting lists and
 /// produces the ranked `ScoredVectorId`s.
@@ -93,46 +55,30 @@ impl BM25Operator {
     }
 
     /// Load postings + term stats for each query term and wrap them as
-    /// [`TermScorer`]s carrying precomputed IDF. Terms with no documents are
-    /// omitted.
+    /// [`TermScorer`]s carrying precomputed IDF, fetching all terms
+    /// concurrently. Terms with no documents are omitted.
     async fn open_term_scorers(
         &self,
         field: &str,
         terms: &[String],
         n_docs: u64,
     ) -> Result<Vec<TermScorer>> {
-        let mut scorers = Vec::with_capacity(terms.len());
-        for term in terms {
-            let postings = self.load_term_postings(field, term).await?;
-            let stats = self.load_term_stats(field, term).await?;
+        let loads = terms.iter().map(|term| async move {
+            let stats = load_term_stats(self.storage.as_ref(), field, term).await?;
             let n_t = stats.freq.max(0) as u64;
             if n_t == 0 {
-                continue;
+                return Ok::<Option<TermScorer>, crate::error::Error>(None);
             }
+            let postings = self.load_term_postings(field, term).await?;
             // Block iteration order is already descending by doc id.
             let entries: Vec<PostingEntry> = postings.iter_entries().copied().collect();
             if entries.is_empty() {
-                continue;
+                return Ok(None);
             }
-            scorers.push(TermScorer::new(entries, bm25::idf(n_docs, n_t)));
-        }
-        Ok(scorers)
-    }
-
-    async fn load_field_stats(&self, field: &str) -> Result<FieldStatsValue> {
-        let key = FieldStatsKey::new(field).encode();
-        match self.storage.get(key).await? {
-            Some(record) => Ok(FieldStatsValue::decode_from_bytes(&record.value)?),
-            None => Ok(FieldStatsValue::default()),
-        }
-    }
-
-    async fn load_term_stats(&self, field: &str, term: &str) -> Result<TermStatsValue> {
-        let key = TermStatsKey::new(field, term).encode();
-        match self.storage.get(key).await? {
-            Some(record) => Ok(TermStatsValue::decode_from_bytes(&record.value)?),
-            None => Ok(TermStatsValue::default()),
-        }
+            Ok(Some(TermScorer::new(entries, bm25::idf(n_docs, n_t))))
+        });
+        let scorers: Vec<Option<TermScorer>> = futures::future::try_join_all(loads).await?;
+        Ok(scorers.into_iter().flatten().collect())
     }
 
     async fn load_term_postings(&self, field: &str, term: &str) -> Result<TermPostingsValue> {
@@ -155,7 +101,7 @@ impl Operator<Vec<ScoredVectorId<BM25Score>>> for BM25Operator {
         }
 
         // Per-field corpus stats are required to compute IDF / avgdl.
-        let field_stats = self.load_field_stats(&self.query.field).await?;
+        let field_stats = load_field_stats(self.storage.as_ref(), &self.query.field).await?;
         let n_docs = field_stats.count.max(0) as u64;
         if n_docs == 0 || field_stats.total_length <= 0 {
             return Ok(collector.finish());
@@ -295,24 +241,12 @@ impl PartialOrd for ScorerHead {
     }
 }
 
-/// Tokenize a BM25 query string and drop duplicate terms while preserving
-/// first-seen order.
-fn dedupe_query_terms(query: &str) -> Vec<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut unique = Vec::new();
-    for term in text::tokenize(query) {
-        if seen.insert(term.clone()) {
-            unique.push(term);
-        }
-    }
-    unique
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::VectorDb;
     use crate::model::{Config, Filter, MetadataFieldSpec, Vector};
+    use crate::query_engine::types::Score;
     use crate::serde::FieldType;
     use crate::serde::collection_meta::DistanceMetric;
     use crate::storage::VectorDbStorageReadExt;

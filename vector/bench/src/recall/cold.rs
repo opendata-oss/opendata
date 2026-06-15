@@ -84,6 +84,7 @@ pub async fn run(
                     &q,
                     SearchOptions {
                         nprobe: Some(dataset.nprobe),
+                        ..Default::default()
                     },
                 )
                 .await?;

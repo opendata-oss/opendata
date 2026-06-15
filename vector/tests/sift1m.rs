@@ -146,6 +146,7 @@ async fn sift1m_recall() {
                 &q,
                 SearchOptions {
                     nprobe: Some(nprobe),
+                    ..SearchOptions::default()
                 },
             )
             .await
@@ -257,6 +258,7 @@ async fn sift100k_recall() {
                 &q,
                 SearchOptions {
                     nprobe: Some(nprobe),
+                    ..SearchOptions::default()
                 },
             )
             .await
