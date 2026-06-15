@@ -5,8 +5,8 @@
 //! selected by `target_mb_per_sec`:
 //!
 //! - **Closed-loop** (`target_mb_per_sec` absent or `<= 0`): writers append as
-//!   fast as the database accepts, measuring the throughput *ceiling*. This is
-//!   the original behavior, and answers "does the ceiling move with cardinality?"
+//!   fast as the database accepts, measuring the throughput *ceiling* — it
+//!   answers "does the ceiling move with cardinality?"
 //! - **Open-loop** (`target_mb_per_sec > 0`): writers pace appends against a
 //!   fixed offered write rate, so the offered load is what we configured rather
 //!   than whatever the database happened to accept. For the cardinality sweep the
