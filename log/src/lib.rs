@@ -48,7 +48,6 @@
 
 mod compaction;
 mod config;
-mod direct;
 mod error;
 mod listing;
 mod log;

@@ -18,6 +18,7 @@ pub use storage::factory::{
     create_object_store, create_storage_read, new_slatedb_compactor_builder,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
+pub use storage::slate::SlateReadHandle;
 pub use storage::sst_blocks::{
     BlockOpCounts, CountResult, L0Stats, SortedRunStats, WalkStats, count_in_range,
 };
