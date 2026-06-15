@@ -91,4 +91,11 @@ impl LogDirect {
     ) -> StorageResult<sst_blocks::CountResult> {
         sst_blocks::count_in_range(&self.reader.manifest(), &self.sst_reader, range).await
     }
+
+    /// Summarizes how data is distributed across the LSM tree from the current
+    /// manifest snapshot. Derived from manifest metadata only — reads no SST
+    /// files.
+    pub(crate) fn tree_summary(&self) -> crate::tree::TreeSummary {
+        crate::tree::TreeSummary::from_manifest(&self.reader.manifest())
+    }
 }

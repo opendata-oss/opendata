@@ -61,6 +61,7 @@ mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 mod storage;
+mod tree;
 mod view_tracker;
 mod writer;
 
@@ -78,6 +79,7 @@ pub use reader::{
     Inspection, LogDbReader, LogIterator, LogRead, SegmentInspection, SegmentReadStats,
 };
 pub use slatedb::SstBlockSize;
+pub use tree::{LevelSummary, SegmentTree, TreeSummary};
 
 // Re-export proto types for use by clients
 #[cfg(feature = "http-server")]
