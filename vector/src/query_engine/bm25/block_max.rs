@@ -3,7 +3,7 @@
 //! Scores a BM25 query without visiting every document in the union of the
 //! query terms' posting lists. The structure is a Rust port of Lucene's
 //! `MaxScoreBulkScorer`
-//! (https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/search/MaxScoreBulkScorer.java):
+//! (<https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/search/MaxScoreBulkScorer.java>):
 //!
 //! - Documents are scored in ascending id order, in **outer windows** aligned
 //!   to posting-block boundaries so per-block impacts give tight score bounds.
