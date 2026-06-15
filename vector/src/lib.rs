@@ -57,8 +57,8 @@ pub use admin::VectorDbAdmin;
 pub use db::{VectorDb, VectorDbRead};
 pub use error::{Error, Result};
 pub use model::{
-    Attribute, AttributeValue, Bm25Query, Config, DistanceMetric, FieldSelection, FieldType,
-    Filter, MetadataFieldSpec, Query, ReaderConfig, ScoreBy, SearchOptions, SearchResult, Vector,
-    VectorBuilder,
+    Attribute, AttributeValue, Bm25Query, Bm25Scorer, Config, DistanceMetric, FieldSelection,
+    FieldType, Filter, MetadataFieldSpec, Query, ReaderConfig, ScoreBy, SearchOptions,
+    SearchResult, Vector, VectorBuilder,
 };
 pub use reader::VectorDbReader;
