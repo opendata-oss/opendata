@@ -30,7 +30,6 @@ use crate::serde::posting_list::{PostingListValue, PostingUpdate};
 use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
-use crate::storage::merge_operator::VectorDbMergeOperator;
 use crate::text;
 use crate::write::delta::{TextAttributeSummary, VectorDbOp, VectorDbOpDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
@@ -45,9 +44,9 @@ use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
 use common::Record;
 use common::SequenceAllocator;
+use common::StorageBuilder;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
-use common::{StorageBuilder, StorageSemantics};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -142,6 +141,23 @@ pub struct VectorDb {
 
     /// snapshot state for queries
     last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
+
+    /// Background task that refreshes the FTS compaction scheduler's
+    /// delete-pressure tracker from the persisted per-field `FieldStats`
+    /// (RFC-0006). Wrapped so it is aborted when the database is dropped — it
+    /// holds an `Arc<dyn Storage>` clone and would otherwise keep polling.
+    /// `VectorDb` deliberately does *not* implement `Drop` itself (that would
+    /// forbid the field moves in `close`); the guard's own `Drop` handles it.
+    fts_stats_poller: AbortOnDrop,
+}
+
+/// Aborts the wrapped background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl VectorDb {
@@ -208,17 +224,20 @@ impl VectorDb {
         centroids: Vec<Vec<f32>>,
         builder: StorageBuilder,
     ) -> Result<Self> {
-        let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        // Route each vector segment (Default/ANN/FTS) into its own SlateDB
-        // segment so the FTS segment can be compacted independently (RFC-0006).
-        // No-op for the in-memory backend.
-        let storage = crate::storage::segment_extractor::builder_with_vector_segments(builder)
-            .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
-            .build()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
+        // In-memory FTS delete-pressure counters, shared between the custom
+        // compaction scheduler (which reads them to decide when to force a major
+        // FTS compaction) and the flusher (which refreshes them after each
+        // flush). The writer drives the scheduler, so the tracker is passed to
+        // `build_vector_storage` to enable it. RFC-0006.
+        let fts_delete_tracker = crate::storage::compaction_scheduler::FtsDeleteTracker::shared();
+        let storage = crate::storage::build_vector_storage(
+            &config,
+            builder,
+            Some(fts_delete_tracker.clone()),
+        )
+        .await?;
 
-        Self::load_or_init_db(storage, config, centroids).await
+        Self::load_or_init_db(storage, config, centroids, fts_delete_tracker).await
     }
 
     /// Create a vector database with the given storage, configuration, and centroids.
@@ -231,6 +250,7 @@ impl VectorDb {
         storage: Arc<dyn Storage>,
         config: Config,
         centroids: Vec<Vec<f32>>,
+        fts_delete_tracker: Arc<crate::storage::compaction_scheduler::FtsDeleteTracker>,
     ) -> Result<Self> {
         let seq_key = SeqBlockKey.encode();
         let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
@@ -282,6 +302,18 @@ impl VectorDb {
             last_applied_snapshot.clone(),
         );
 
+        // Poll the persisted per-field FieldStats into the scheduler's in-memory
+        // delete-pressure tracker (RFC-0006). Kept separate from the flush path
+        // so the scheduler's view is refreshed even when no writes are flowing
+        // (e.g. while a forced compaction is draining deletes).
+        let fts_stats_poller = AbortOnDrop(
+            crate::storage::compaction_scheduler::spawn_fts_field_stats_poller(
+                Arc::clone(&storage),
+                fts_delete_tracker,
+                config.fts_stats_poll_interval,
+            ),
+        );
+
         let coordinator_config = WriteCoordinatorConfig {
             queue_capacity: 1000,
             flush_interval: Duration::from_secs(5),
@@ -301,6 +333,7 @@ impl VectorDb {
             storage,
             write_coordinator,
             last_applied_snapshot,
+            fts_stats_poller,
         })
     }
 
@@ -867,6 +900,10 @@ impl VectorDb {
     /// closed. For SlateDB-backed storage, this also releases the database
     /// fence.
     pub async fn close(self) -> Result<()> {
+        // Stop the FieldStats poller before closing storage so it can't issue a
+        // read against a closing/fenced db (the guard's Drop would also abort it,
+        // but only after `storage.close()`).
+        self.fts_stats_poller.0.abort();
         self.flush().await?;
         self.write_coordinator
             .stop()
@@ -973,6 +1010,7 @@ mod tests {
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
     use crate::serde::vector_id::VectorId;
+    use crate::storage::merge_operator::VectorDbMergeOperator;
     use common::StorageConfig;
     use opendata_macros::storage_test;
     use std::time::Duration;
@@ -1023,9 +1061,14 @@ mod tests {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
-            .await
-            .unwrap();
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
 
         let vectors = vec![
             Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -1064,9 +1107,14 @@ mod tests {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
-            .await
-            .unwrap();
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
 
         // First write
         let vector1 = Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -1140,10 +1188,14 @@ mod tests {
         let centroids = create_test_centroids(3);
 
         {
-            let db =
-                VectorDb::load_or_init_db(Arc::clone(&storage), config.clone(), centroids.clone())
-                    .await
-                    .unwrap();
+            let db = VectorDb::load_or_init_db(
+                Arc::clone(&storage),
+                config.clone(),
+                centroids.clone(),
+                crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+            )
+            .await
+            .unwrap();
             let vectors = vec![
                 Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
                     .attribute("category", "shoes")
@@ -1159,9 +1211,14 @@ mod tests {
         }
 
         // when - reopen database (centroids should be loaded from storage)
-        let db2 = VectorDb::load_or_init_db(Arc::clone(&storage), config, vec![])
-            .await
-            .unwrap();
+        let db2 = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            vec![],
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
 
         // then - should be able to search (dictionary and centroids loaded from storage)
         let results = db2
@@ -1482,9 +1539,14 @@ mod tests {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
-            .await
-            .unwrap();
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
         db.write(vec![
             Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
                 .attribute("category", "shoes")
@@ -1639,9 +1701,14 @@ mod tests {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
-            .await
-            .unwrap();
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
         db.write(vec![
             Vector::builder("a", vec![1.0, 0.0, 0.0])
                 .attribute("category", "x")
@@ -1694,9 +1761,14 @@ mod tests {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
-            .await
-            .unwrap();
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
         db.write(vec![
             Vector::builder("id-1", vec![1.0, 0.0, 0.0])
                 .attribute("category", "shoes")
