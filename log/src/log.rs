@@ -445,6 +445,7 @@ impl LogDb {
             storage.slate_read(),
             initial_next_sequence,
             segment_cache,
+            initial_next_sequence,
         )));
 
         let (epoch_watcher, durable_sequence_rx, read_subscriber_task) = spawn_subscriber(
@@ -2816,6 +2817,78 @@ mod tests {
         // should contribute (covered_to from count_in_range is below the
         // range start, so scan_lo gets pulled to seg_lo).
         assert_eq!(log.count(Bytes::from("k"), 7..).await.unwrap(), 3);
+    }
+
+    // ---- next_sequence (resumable scan) tests ----
+
+    #[tokio::test]
+    async fn next_sequence_lifts_idle_key_to_global_frontier() {
+        // Writes land only on a hot key. A drained scan of an idle key should
+        // still resume at the global frontier — the whole point of the
+        // cross-key lift — rather than at 0.
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v1"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v2"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // `scan` runs `sync_reads`, so the read view (and its frontier) reflects
+        // the appends above before the iterator is built.
+        let mut iter = log.scan(Bytes::from("cold"), ..).await.unwrap();
+        assert!(
+            iter.next().await.unwrap().is_none(),
+            "the cold key has no records"
+        );
+        assert_eq!(
+            iter.next_sequence(),
+            3,
+            "idle-key scan resumes at the frontier set by the hot key's writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_sequence_resumes_past_consumed_tail() {
+        let log = LogDb::open(test_config()).await.unwrap();
+        log.try_append(vec![
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("k"),
+                value: Bytes::from("v1"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        let mut iter = log.scan(Bytes::from("k"), ..).await.unwrap();
+        let mut last = None;
+        while let Some(e) = iter.next().await.unwrap() {
+            last = Some(e.sequence);
+        }
+        assert_eq!(last, Some(1));
+        // Drained: resume one past the last record, at the frontier.
+        let resume = iter.next_sequence();
+        assert_eq!(resume, 2);
+
+        // Resuming from there sees nothing new and reports the same frontier —
+        // the idle-poll steady state.
+        let mut iter2 = log.scan(Bytes::from("k"), resume..).await.unwrap();
+        assert!(iter2.next().await.unwrap().is_none());
+        assert_eq!(iter2.next_sequence(), 2);
     }
 
     // ---- durable_sequence tests ----

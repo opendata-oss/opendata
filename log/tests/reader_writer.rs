@@ -284,6 +284,96 @@ async fn reader_drops_expired_segments_after_retention_deletes_metadata() {
 }
 
 #[tokio::test]
+async fn reader_idle_key_resumes_at_sealed_frontier() {
+    // A standalone reader has no writer watermark, so its scan of an idle key
+    // resumes at the sealed-segment boundary (RFC 0007): the start of the
+    // active segment, below which everything lives in sealed segments. This
+    // lets an idle follower skip sealed history instead of rescanning from 0.
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let storage = local_storage_config(&temp_dir);
+
+    let writer = LogDb::open(Config {
+        storage: storage.clone(),
+        segmentation: SegmentConfig {
+            seal_interval: Some(Duration::from_millis(50)),
+        },
+        ..Default::default()
+    })
+    .await
+    .expect("Failed to open writer");
+
+    // Three records land in the first segment (seq 0, 1, 2).
+    writer
+        .try_append(vec![
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v1"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v2"),
+            },
+        ])
+        .await
+        .expect("Failed to append first batch");
+    writer.flush().await.expect("Failed to flush first batch");
+
+    // Past the seal interval, the next append seals the first segment and
+    // starts a second one at seq 3 — the sealed boundary.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    writer
+        .try_append(vec![Record {
+            key: Bytes::from("hot"),
+            value: Bytes::from("v3"),
+        }])
+        .await
+        .expect("Failed to append second batch");
+    writer.flush().await.expect("Failed to flush second batch");
+
+    let reader = LogDbReader::open(ReaderConfig {
+        storage,
+        refresh_interval: Duration::from_millis(20),
+    })
+    .await
+    .expect("Failed to open reader");
+
+    // Wait until the reader has discovered both segments.
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+        || async {
+            reader
+                .list_segments(..)
+                .await
+                .map(|segments| segments.len() == 2)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let mut iter = reader
+        .scan(Bytes::from("cold"), ..)
+        .await
+        .expect("Failed to scan idle key");
+    assert!(
+        iter.next().await.expect("Failed to scan").is_none(),
+        "the cold key has no records"
+    );
+    assert_eq!(
+        iter.next_sequence(),
+        3,
+        "idle-key scan resumes at the sealed boundary (start of the active segment)"
+    );
+
+    reader.close().await;
+    writer.close().await.expect("Failed to close writer");
+}
+
+#[tokio::test]
 async fn flush_guarantees_durability_across_reopen() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let storage = local_storage_config(&temp_dir);

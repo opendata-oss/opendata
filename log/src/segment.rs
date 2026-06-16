@@ -110,6 +110,20 @@ impl SegmentCache {
         self.segments.values().next_back().cloned()
     }
 
+    /// Exclusive sequence below which all records live in sealed segments.
+    ///
+    /// This is the start of the most recent segment: every earlier segment has
+    /// been sealed (a later one was created past it) and is fully durable, so a
+    /// reader that has these segments has observed everything below it. The
+    /// active segment's own contents are not counted — its end is not recorded
+    /// in metadata. Returns 0 when no segments exist.
+    ///
+    /// Coarse (advances only at seal boundaries), but a sound frontier for a
+    /// standalone reader that has no writer watermark. See RFC 0007.
+    pub(crate) fn sealed_frontier(&self) -> u64 {
+        self.latest().map_or(0, |seg| seg.meta().start_seq)
+    }
+
     /// Returns the id of the oldest (lowest-id) live segment, if any.
     ///
     /// Combined with [`SegmentCache::latest`], this characterises the live
@@ -738,6 +752,29 @@ mod tests {
         assert_eq!(meta.start_seq, 42);
         assert_eq!(meta.start_time_ms, 5000);
         assert_eq!(records[0].options, PutOptions { ttl: Ttl::NoExpiry })
+    }
+
+    #[storage_test]
+    async fn sealed_frontier_is_start_of_latest_segment(storage: Arc<dyn Storage>) {
+        let mut cache = SegmentCache::open(storage.as_ref(), SegmentConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(cache.sealed_frontier(), 0, "no segments: nothing sealed");
+
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        assert_eq!(
+            cache.sealed_frontier(),
+            0,
+            "a single (active) segment seals nothing below its start"
+        );
+
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(100, 2000)).await;
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(250, 3000)).await;
+        assert_eq!(
+            cache.sealed_frontier(),
+            250,
+            "everything below the latest segment's start is in sealed segments"
+        );
     }
 
     #[storage_test]
