@@ -17,7 +17,7 @@ combines two cooperating mechanisms:
    key advances the watermark for all keys.
 2. **Sequence-aware SST filtering** — per-SST filter metadata lets a scan with an
    advanced cursor skip entire tables, so a higher watermark actually prunes I/O.
-   Two filter policies cover the tree: a global-sequence-range policy that prunes
+   Two filter policies cover the tree: a sequence-range policy that prunes
    by sequence (table-level on recent data, per-key once compacted) and a prefix
    bloom that prunes by key.
 
@@ -166,11 +166,14 @@ a reader only applies a filter it can decode.
 
 We register **two policies**, complementary by LSM level:
 
-- **Global-sequence-range policy.** Every SST stores a table-level min/max global
-  sequence (~16 bytes); a scan passes its cursor `N` as context and the filter
-  returns *no match* when `max < N`. This is exact in **L0**, where single-writer,
-  time-ordered flushes have disjoint, monotonic ranges — a caught-up cursor skips
-  all but the newest L0(s).
+- **Sequence-range policy.** Every SST stores a table-level min/max sequence (~16
+  bytes). Because every scan is segment-scoped (see Evaluation path) and the reader
+  holds the segment's `start_seq`, the policy stores sequences **relative** to their
+  segment — exactly what the key encodes — and the scan relativizes its cursor to
+  `N_rel = N − start_seq` before passing it as context. The filter returns *no match*
+  when `max < N_rel`. This is exact in **L0**, where single-writer, time-ordered
+  flushes have disjoint, monotonic ranges — a caught-up cursor skips all but the
+  newest L0(s).
 
   A single range is coarse on **compacted** SSTs: key-range compaction merges many
   keys across a wide window, so the overall `max` stays high even when the scanned
@@ -199,9 +202,16 @@ We register **two policies**, complementary by LSM level:
   fall back to the table `max` for the rest. That keeps the size ceiling while
   preserving the per-key ranges that matter most.
 
-  The builder records *global* sequence (`segment_start + relative_seq`), which the
-  key alone does not carry; the policy resolves `segment_id → start_seq` to compute
-  it.
+  Storing relative sequences keeps the builder **stateless** — it reads `relative_seq`
+  straight off the key, with no `segment_id → start_seq` resolution. This stays sound
+  even when a compacted SST mixes segments: the per-key map keys on
+  `hash(segment_id ‖ user_key)`, so each entry's range shares one segment base and is
+  internally consistent, while the table-level range mixes bases but still bounds any
+  single-segment query from above (a matching entry has `relative_seq ≤ table_max`, so
+  it is never skipped; other segments only inflate the bound — lost selectivity, never
+  a false negative). An earlier design stored *global* sequence and resolved
+  `segment_id → start_seq` at build time; relative storage drops the resolver and all
+  build-time state.
 
 - **Prefix bloom policy.** The builder hashes the **log-key** prefix of each entry
   — the `subsystem | version | segment_id | record_type | user_key` prefix up to
@@ -238,21 +248,26 @@ blob := version  : u8
         if flags.per_key:
             count : var_u64
             entry × count, sorted by hash (binary-searched at query):
-                hash      : u64          # 64-bit key hash, same family as the
-                                         #   prefix bloom; collisions union ranges
+                hash      : u64          # 64-bit FNV-1a + fmix64 of the
+                                         #   (segment, user_key) prefix; need not
+                                         #   match the bloom hash (private to this
+                                         #   filter); collisions union ranges
                 min       : var_u64
                 max_delta : var_u64
 ```
 
-Each range is stored as `min + (max − min)` so the varints stay small — the delta
-is bounded by the records the SST holds, not the absolute sequence.
+All stored sequences are **relative** to the entry's segment (see above). Each range
+is stored as `min + (max − min)` so the varints stay small — the delta is bounded by
+the records the SST holds, and relative sequences keep `min` small too.
 
-The cursor reaches the filter through `FilterContext::Inline`: bytes `0..8` hold
-`N` as a big-endian `u64`, the remainder reserved (zero). `decode` parses the blob
-into `{ table: (min, max), per_key: Option<[(hash, min, max)]> }`. The resume
-predicate uses only `max` (`might_match` reads `N`, looks up `hash(K)` in `per_key`
-when present — binary search, absent → `table.max` — else `table.max`, and returns
-`max ≥ N`); `min` is carried for a future bounded-scan upper-bound prune and is
+The cursor reaches the filter through `FilterContext::Inline`: bytes `0..8` hold the
+segment-relative cursor `N_rel = N − start_seq` as a big-endian `u64`, the remainder
+reserved (zero). A missing context (or an unrecognized variant) means "cannot prune",
+so the filter matches. `decode` parses the blob into
+`{ table: (min, max), per_key: Option<[(hash, min, max)]> }`. The resume predicate
+uses only `max` (`might_match` reads `N_rel`, looks up `hash(K)` in `per_key` when
+present — binary search, absent → `table.max` — else `table.max`, and returns
+`max ≥ N_rel`); `min` is carried for a future bounded-scan upper-bound prune and is
 otherwise unused.
 
 Compatibility: an incompatible format change bumps the policy `name`, so a reader
@@ -265,10 +280,13 @@ treated as match-everything.
 SlateDB evaluates SST filters on `get` and `scan_prefix`, but **not** on plain
 range `scan`. A per-key scan is naturally a prefix scan — all sequences for a key
 share the prefix `…|segment_id|record_type|key`, with `seq` as the suffix — so it
-runs as `scan_prefix` over that prefix, with the cursor `N` supplied as filter
-context. This requires an upstream SlateDB change to let `scan_prefix` accept a
-**sub-range**, so the scan can begin at `N` within the key's prefix instead of
-re-reading the key's whole history while still evaluating the filters.
+runs as `scan_prefix` over that prefix, with the segment-relativized cursor supplied
+as filter context (threaded through `StorageRead::scan_prefix_iter`). Pruning then
+drops whole SSTs the cursor has outrun. A surviving SST is still read from the start
+of the key's history; letting the scan *begin* at the cursor within the prefix needs
+an upstream SlateDB change to accept a **sub-range** on `scan_prefix`, which would
+avoid re-reading already-seen records — an optimization, not a correctness gap, and
+out of scope here.
 
 ## Wire surface
 
@@ -281,10 +299,12 @@ or wire today, so this is purely additive.
 The standalone reader's SST bound is the sequence of the bound *key*, not the SST's
 maximum sequence, so within the newest SST it can fall short of the true tip — a
 caught-up follower may re-scan that SST once before finding it empty. The
-global-sequence-range policy's per-SST `max` is that maximum, so sourcing the
-frontier from it instead would close that part of the gap (the newest SST's `max` is
-its exact tip), eliminating the redundant scan — while changing only how
-`LogReadView.frontier` is computed, not the `next_sequence` contract.
+sequence-range policy's per-SST `max` is that maximum; since it is stored relative
+to the segment, the global frontier is `start_seq + table_max` for an SST in the
+active segment. Sourcing the frontier from that would close this part of the gap
+(the newest SST's `max` is its exact tip), eliminating the redundant scan — while
+changing only how `LogReadView.frontier` is computed, not the `next_sequence`
+contract.
 
 This is a tightening, not an unblock: the flush-granular frontier above already works
 today with no upstream change. The tighter version needs a way to *read* a stored
