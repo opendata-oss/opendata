@@ -234,6 +234,22 @@ impl StorageRead for SlateDbStorage {
         Ok(Box::new(SlateDbIterator { iter }))
     }
 
+    /// Slatedb consults its SST-level filters on `scan_prefix` but not on
+    /// `scan`, so routing prefix scans through this path is what lets a
+    /// configured `PrefixExtractor` actually skip SSTs.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let iter = self
+            .db
+            .scan_prefix_with_options(prefix, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
     fn slate_read(&self) -> Option<SlateReadHandle> {
         self.sst_reader.as_ref().map(|sst_reader| SlateReadHandle {
             // Live writer manifest: reflects everything flushed so far.
@@ -298,6 +314,19 @@ impl StorageRead for SlateDbStorageSnapshot {
         let iter = self
             .snapshot
             .scan_with_options(range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let iter = self
+            .snapshot
+            .scan_prefix_with_options(prefix, &default_scan_options())
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -506,6 +535,19 @@ impl StorageRead for SlateDbStorageReader {
         let iter = self
             .reader
             .scan_with_options(range, &default_scan_options())
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let iter = self
+            .reader
+            .scan_prefix_with_options(prefix, &default_scan_options())
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))

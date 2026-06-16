@@ -142,10 +142,14 @@ impl RecordType {
 const SEGMENT_ID_OFFSET: usize = KEY_PREFIX_LEN;
 
 /// Offset of the record-type tag byte inside a log key, after the segment id.
-const RECORD_TYPE_OFFSET: usize = SEGMENT_ID_OFFSET + 4;
+pub(crate) const RECORD_TYPE_OFFSET: usize = SEGMENT_ID_OFFSET + 4;
 
 /// Length of the segmented key prefix: `[subsystem, version, seg_id(4), record_type]`.
-const SEGMENTED_PREFIX_LEN: usize = RECORD_TYPE_OFFSET + 1;
+pub(crate) const SEGMENTED_PREFIX_LEN: usize = RECORD_TYPE_OFFSET + 1;
+
+/// Length of a fully-serialized [`SegmentMetaKey`]: the 7-byte segmented prefix
+/// plus a 4-byte described-segment-id suffix.
+pub(crate) const SEGMENT_META_KEY_LEN: usize = SEGMENTED_PREFIX_LEN + 4;
 
 /// Writes the segmented prefix into `buf`:
 /// `[subsystem, version, seg_id BE, record_type]`.
@@ -265,6 +269,24 @@ impl LogEntryKey {
         BytesRange::new(Bound::Included(start_key), Bound::Excluded(end_key))
     }
 
+    /// Returns the storage key prefix shared by every entry for `(segment, key)`.
+    ///
+    /// The prefix is `[sub, ver, segment_id, 0x10, terminated_key]`, ending at
+    /// the terminator byte that closes the user key. Every entry under this
+    /// `(segment, key)` differs only in the trailing `var_u64(relative_seq)`,
+    /// so a prefix scan returns the full set of entries in sequence order and
+    /// lets the caller narrow on `sequence` client-side.
+    ///
+    /// This is the prefix that `LogKeyPrefixExtractor` produces for LogEntry
+    /// keys, so a `scan_prefix` against this byte string is the form that lets
+    /// slatedb's bloom filter skip SSTs whose `(segment, key)` is absent.
+    pub fn scan_prefix(segment: &LogSegment, key: &[u8]) -> Bytes {
+        let mut buf = BytesMut::new();
+        write_segmented_prefix(&mut buf, segment.id(), RecordType::LogEntry.tag().as_byte());
+        terminated_bytes::serialize(key, &mut buf);
+        buf.freeze()
+    }
+
     /// Builds a complete scan key with segment prefix and relative sequence.
     fn build_scan_key(segment: &LogSegment, key: &[u8], seq: u64) -> Bytes {
         let relative_seq = seq.saturating_sub(segment.meta().start_seq);
@@ -299,7 +321,7 @@ impl SegmentMetaKey {
 
     /// Encodes the key to bytes for storage
     pub fn serialize(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(SEGMENTED_PREFIX_LEN + 4);
+        let mut buf = BytesMut::with_capacity(SEGMENT_META_KEY_LEN);
         write_segmented_prefix(
             &mut buf,
             SYSTEM_SEGMENT_ID,
@@ -596,6 +618,42 @@ mod tests {
         assert_eq!(serialized.len(), 10);
         // relative_seq = 5 as varint: length code 0, value 5
         assert_eq!(serialized[9], 0x05);
+    }
+
+    #[test]
+    fn should_share_scan_prefix_with_scan_range_endpoints() {
+        // given
+        let segment = LogSegment::new(7, SegmentMeta::new(1000, 0));
+        let user_key = Bytes::from("orders");
+
+        // when
+        let prefix = LogEntryKey::scan_prefix(&segment, &user_key);
+        let range = LogEntryKey::scan_range(&segment, &user_key, 1000..2000);
+
+        // then — the prefix must be the shared prefix of the range endpoints,
+        // ending at the terminator byte (the 0x00 that closes terminated_bytes).
+        let start = match range.start_bound() {
+            Bound::Included(b) => b.clone(),
+            _ => unreachable!(),
+        };
+        let end = match range.end_bound() {
+            Bound::Excluded(b) => b.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            start.starts_with(&prefix),
+            "range start {:02x?} must start with prefix {:02x?}",
+            start.as_ref(),
+            prefix.as_ref(),
+        );
+        assert!(
+            end.starts_with(&prefix),
+            "range end {:02x?} must start with prefix {:02x?}",
+            end.as_ref(),
+            prefix.as_ref(),
+        );
+        // The prefix ends with the terminated_bytes terminator (0x00).
+        assert_eq!(prefix.last(), Some(&0x00));
     }
 
     #[test]

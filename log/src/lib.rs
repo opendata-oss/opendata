@@ -49,6 +49,7 @@
 mod compaction;
 mod config;
 mod error;
+mod filter_prefix;
 mod listing;
 mod log;
 mod model;
