@@ -114,7 +114,11 @@ impl VectorDbFlusher {
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.validate(snapshot.clone()).await;
+        // Reload the in-memory deletions bitmap for the BM25 query path. The
+        // compaction scheduler's delete-pressure counters are maintained
+        // separately by the corpus-stats poller, not here (RFC-0006).
         let fts_deletions = Arc::new(snapshot.get_deletions().await.map_err(|e| e.to_string())?);
+
         let stored_reader = StoredCentroidReader::new(
             self.opts.dimensions as usize,
             snapshot.clone(),

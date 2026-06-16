@@ -22,10 +22,11 @@
 
 use std::sync::Arc;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use common::StorageBuilder;
 use slatedb::{PrefixExtractor, PrefixTarget};
 
-use crate::serde::{KEY_VERSION, SUBSYSTEM};
+use crate::serde::{KEY_VERSION, SUBSYSTEM, Segment};
 
 /// Routing prefix length: `[subsystem(1), segment(1), version(1)]`.
 ///
@@ -33,6 +34,22 @@ use crate::serde::{KEY_VERSION, SUBSYSTEM};
 /// extracted prefix so all record types within a segment share one routing
 /// prefix and land in the same SlateDB segment.
 pub(crate) const ROUTING_PREFIX_LEN: usize = 3;
+
+/// Builds the 3-byte routing prefix `[subsystem, segment, version]` that this
+/// extractor returns for every key in `segment`.
+///
+/// This is the single source of truth for a segment's routing prefix: both the
+/// extractor (which routes records into SlateDB segments) and the compaction
+/// policy (which names a segment for a full compaction via
+/// `CompactionRequest::FullSegment`) derive their prefixes from here so the two
+/// can't drift.
+pub(crate) fn segment_routing_prefix(segment: Segment) -> Bytes {
+    let mut buf = BytesMut::with_capacity(ROUTING_PREFIX_LEN);
+    buf.put_u8(SUBSYSTEM);
+    buf.put_u8(segment.as_byte());
+    buf.put_u8(KEY_VERSION);
+    buf.freeze()
+}
 
 /// Stable, persisted identifier for this extractor's routing rules. Bump
 /// whenever the routing logic changes in a way that would re-route existing
@@ -236,6 +253,25 @@ mod tests {
         let extractor = VectorSegmentExtractor;
         let bad = [SUBSYSTEM, 0x00, 0xFF, 0x10];
         let _ = extractor.prefix_len(&point(&bad));
+    }
+
+    #[test]
+    fn should_build_routing_prefix_matching_extracted_bytes() {
+        // given - an FTS-segment key and the standalone prefix helper
+        let extractor = VectorSegmentExtractor;
+        let fts_key = DeletionsKey::new().encode();
+
+        // when
+        let n = extractor.prefix_len(&point(&fts_key)).unwrap();
+        let helper_prefix = segment_routing_prefix(crate::serde::Segment::Fts);
+
+        // then - the helper produces exactly the bytes the extractor extracts,
+        // so the compaction policy and the extractor can never disagree on which
+        // SlateDB segment the FTS records live in.
+        assert_eq!(n, ROUTING_PREFIX_LEN);
+        assert_eq!(helper_prefix.len(), ROUTING_PREFIX_LEN);
+        assert_eq!(helper_prefix.as_ref(), &fts_key[..n]);
+        assert_eq!(helper_prefix[1], crate::serde::Segment::Fts.as_byte());
     }
 
     #[test]

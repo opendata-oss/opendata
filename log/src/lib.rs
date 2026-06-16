@@ -48,7 +48,6 @@
 
 mod compaction;
 mod config;
-mod direct;
 mod error;
 mod filter_prefix;
 mod listing;
@@ -62,6 +61,7 @@ mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 mod storage;
+mod tree;
 mod view_tracker;
 mod writer;
 
@@ -74,8 +74,12 @@ pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendOutput, LogEntry, Record, Segment, SegmentId, Sequence};
 
-pub use reader::{LogDbReader, LogIterator, LogRead};
+pub use common::{L0Stats, SortedRunStats};
+pub use reader::{
+    Inspection, LogDbReader, LogIterator, LogRead, SegmentInspection, SegmentReadStats,
+};
 pub use slatedb::SstBlockSize;
+pub use tree::{LevelSummary, SegmentTree, TreeSummary};
 
 // Re-export proto types for use by clients
 #[cfg(feature = "http-server")]

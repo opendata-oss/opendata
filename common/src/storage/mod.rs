@@ -7,6 +7,7 @@ pub mod slate;
 pub mod sst_blocks;
 pub mod util;
 
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use bytes::Bytes;
 use uuid::Uuid;
 
 use crate::BytesRange;
+use crate::storage::slate::SlateReadHandle;
 
 /// Identifies a checkpoint of a storage backend at a point in time.
 ///
@@ -225,7 +227,7 @@ pub trait StorageIterator {
 /// access and point-in-time snapshots. By extracting these common operations,
 /// we can write code that works with both storage types.
 #[async_trait]
-pub trait StorageRead: Send + Sync {
+pub trait StorageRead: Any + Send + Sync {
     /// Retrieves a single record by exact key.
     ///
     /// Returns `Ok(None)` if the key is not present.
@@ -267,6 +269,18 @@ pub trait StorageRead: Send + Sync {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Returns a handle to this backend's slatedb resources (a manifest
+    /// snapshot + an `SstReader`) for the SST-walk count path, or `None` when
+    /// the backend isn't slatedb or has no SST reader attached.
+    ///
+    /// This is a deliberate, single-method leak of slatedb internals rather
+    /// than a storage-neutral abstraction: counting via the manifest needs
+    /// concrete slatedb types, and callers that don't get a handle fall back
+    /// to a plain scan. See [`SlateReadHandle`].
+    fn slate_read(&self) -> Option<SlateReadHandle> {
+        None
     }
 
     /// Closes the storage, releasing any resources.

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use super::config::{BlockCacheConfig, ObjectStoreConfig, StorageConfig};
+use super::config::{BlockCacheConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
@@ -17,7 +17,7 @@ pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 pub use slatedb::db_cache::{CachedEntry, CachedKey, SplitCache};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
-use slatedb::{DbReader, FilterPolicy};
+use slatedb::{DbReader, FilterPolicy, SstReader};
 use tracing::info;
 use uuid::Uuid;
 
@@ -57,7 +57,12 @@ pub struct StorageBuilder {
 
 enum StorageBuilderInner {
     InMemory,
-    SlateDb(Box<DbBuilder<String>>),
+    SlateDb {
+        db_builder: Box<DbBuilder<String>>,
+        /// Built alongside the writer so [`SlateDbStorage::slate_read`] can
+        /// serve the count path from the same path/object store/cache.
+        sst_reader: SstReader,
+    },
 }
 
 impl StorageBuilder {
@@ -74,27 +79,27 @@ impl StorageBuilder {
             StorageConfig::InMemory => StorageBuilderInner::InMemory,
             StorageConfig::SlateDb(slate_config) => {
                 let object_store = create_object_store(&slate_config.object_store)?;
-                let settings = match &slate_config.settings_path {
-                    Some(path) => Settings::from_file(path).map_err(|e| {
-                        StorageError::Storage(format!(
-                            "Failed to load SlateDB settings from {}: {}",
-                            path, e
-                        ))
-                    })?,
-                    None => Settings::load().unwrap_or_default(),
-                };
+                let settings = load_slatedb_settings(slate_config)?;
                 info!(
                     "create slatedb storage with config: {:?}, settings: {:?}",
                     slate_config, settings
                 );
+                let cache =
+                    build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?;
                 let mut db_builder =
-                    DbBuilder::new(slate_config.path.clone(), object_store).with_settings(settings);
-                if let Some(cache) =
-                    build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
-                {
+                    DbBuilder::new(slate_config.path.clone(), object_store.clone())
+                        .with_settings(settings);
+                if let Some(cache) = cache.clone() {
                     db_builder = db_builder.with_db_cache(cache);
                 }
-                StorageBuilderInner::SlateDb(Box::new(db_builder))
+                // Share the writer's path/object store/cache so the count path
+                // reads the same SSTs the writer produces.
+                let sst_reader =
+                    SstReader::new(slate_config.path.clone(), object_store, cache, None);
+                StorageBuilderInner::SlateDb {
+                    db_builder: Box::new(db_builder),
+                    sst_reader,
+                }
             }
         };
         Ok(Self {
@@ -118,8 +123,15 @@ impl StorageBuilder {
     ///
     /// For InMemory storage this is a no-op.
     pub fn map_slatedb(mut self, f: impl FnOnce(DbBuilder<String>) -> DbBuilder<String>) -> Self {
-        if let StorageBuilderInner::SlateDb(db) = self.inner {
-            self.inner = StorageBuilderInner::SlateDb(Box::new(f(*db)));
+        if let StorageBuilderInner::SlateDb {
+            db_builder,
+            sst_reader,
+        } = self.inner
+        {
+            self.inner = StorageBuilderInner::SlateDb {
+                db_builder: Box::new(f(*db_builder)),
+                sst_reader,
+            };
         }
         self
     }
@@ -136,7 +148,10 @@ impl StorageBuilder {
                 };
                 Ok(Arc::new(storage))
             }
-            StorageBuilderInner::SlateDb(db_builder) => {
+            StorageBuilderInner::SlateDb {
+                db_builder,
+                sst_reader,
+            } => {
                 let mut db_builder = *db_builder;
                 db_builder = db_builder.with_metrics_recorder(Arc::new(MetricsRsRecorder));
                 if let Some(op) = self.semantics.merge_operator {
@@ -149,7 +164,9 @@ impl StorageBuilder {
                 let db = db_builder.build().await.map_err(|e| {
                     StorageError::Storage(format!("Failed to create SlateDB: {}", e))
                 })?;
-                Ok(Arc::new(SlateDbStorage::new(Arc::new(db))))
+                Ok(Arc::new(
+                    SlateDbStorage::new(Arc::new(db)).with_sst_reader(sst_reader),
+                ))
             }
         }
     }
@@ -260,6 +277,37 @@ impl StorageSemantics {
     }
 }
 
+pub fn new_slatedb_compactor_builder(
+    config: &StorageConfig,
+) -> StorageResult<Option<CompactorBuilder<String>>> {
+    match config {
+        StorageConfig::InMemory => Ok(None),
+        StorageConfig::SlateDb(slate_config) => {
+            let object_store = create_object_store(&slate_config.object_store)?;
+            let settings = load_slatedb_settings(slate_config)?;
+            match settings.compactor_options {
+                Some(compactor_options) => Ok(Some(
+                    CompactorBuilder::new(slate_config.path.clone(), object_store)
+                        .with_options(compactor_options),
+                )),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+fn load_slatedb_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings> {
+    match &slate_config.settings_path {
+        Some(path) => Ok(Settings::from_file(path).map_err(|e| {
+            StorageError::Storage(format!(
+                "Failed to load SlateDB settings from {}: {}",
+                path, e
+            ))
+        })?),
+        None => Ok(Settings::load().unwrap_or_default()),
+    }
+}
+
 /// Creates an object store from configuration without initializing SlateDB.
 ///
 /// This is useful for cleanup operations where you need to access the object store
@@ -332,7 +380,17 @@ pub async fn create_storage_read(
                 create_object_store(&slate_config.object_store)?
             };
 
-            let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
+            // Prefer the runtime-provided cache (owned by the caller); fall
+            // back to the config-driven split cache. SlateDB drives cache
+            // shutdown from `DbReader::close()`, so we don't hold a handle.
+            // The reader and its count-path `SstReader` share this cache.
+            let cache = if let Some(cache) = runtime.block_cache {
+                Some(cache)
+            } else {
+                build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
+            };
+
+            let mut builder = DbReader::builder(slate_config.path.clone(), object_store.clone())
                 .with_options(reader_options)
                 .with_metrics_recorder(Arc::new(MetricsRsRecorder));
             if let Some(checkpoint_id) = runtime.checkpoint_id {
@@ -345,20 +403,16 @@ pub async fn create_storage_read(
             if let Some(policies) = semantics.filter_policies {
                 builder = builder.with_filter_policies(policies);
             }
-            // Prefer the runtime-provided cache (owned by the caller); fall
-            // back to the config-driven split cache. SlateDB drives cache
-            // shutdown from `DbReader::close()`, so we don't hold a handle.
-            if let Some(cache) = runtime.block_cache {
-                builder = builder.with_db_cache(cache);
-            } else if let Some(cache) =
-                build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
-            {
+            if let Some(cache) = cache.clone() {
                 builder = builder.with_db_cache(cache);
             }
             let reader = builder.build().await.map_err(|e| {
                 StorageError::Storage(format!("Failed to create SlateDB reader: {}", e))
             })?;
-            Ok(Arc::new(SlateDbStorageReader::new(Arc::new(reader))))
+            let sst_reader = SstReader::new(slate_config.path.clone(), object_store, cache, None);
+            Ok(Arc::new(
+                SlateDbStorageReader::new(Arc::new(reader)).with_sst_reader(sst_reader),
+            ))
         }
     }
 }
@@ -849,5 +903,28 @@ mod tests {
         let storage = StorageBuilder::new(&config).await.unwrap().build().await;
 
         assert!(storage.is_ok());
+    }
+
+    #[test]
+    fn new_slatedb_compactor_builder_should_be_none_for_in_memory() {
+        // given / when - the in-memory backend has no compactor to configure
+        let builder = new_slatedb_compactor_builder(&StorageConfig::InMemory).unwrap();
+
+        // then
+        assert!(builder.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_slatedb_compactor_builder_should_be_some_for_slatedb() {
+        // given - a SlateDb config (default settings enable compaction)
+        let tmp = tempfile::tempdir().unwrap();
+        let config = slatedb_config_with_local_dir(tmp.path());
+
+        // when
+        let builder = new_slatedb_compactor_builder(&config).unwrap();
+
+        // then - a compactor builder is produced for consumers to configure and
+        // install via `StorageBuilder::map_slatedb`.
+        assert!(builder.is_some());
     }
 }

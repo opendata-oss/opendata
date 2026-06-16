@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::storage::sst_blocks;
 use crate::storage::{MergeOptions, PutOptions};
 use crate::{
     BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
@@ -13,9 +14,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::IterationOrder;
 use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
+use slatedb::manifest::VersionedManifest;
 use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
-    MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
+    MergeOperatorError, SstReader, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
 
@@ -68,6 +70,60 @@ fn default_scan_options() -> ScanOptions {
     }
 }
 
+/// Where a [`SlateReadHandle`] reads its manifest from. Both variants expose a
+/// live `manifest()`, so each count reflects the latest flushed state.
+enum ManifestSource {
+    /// The writer's `Db` — the manifest is always current.
+    Db(Arc<Db>),
+    /// A reader's `DbReader` — the manifest reflects its last poll.
+    Reader(Arc<DbReader>),
+}
+
+impl ManifestSource {
+    fn manifest(&self) -> VersionedManifest {
+        match self {
+            ManifestSource::Db(db) => db.manifest(),
+            ManifestSource::Reader(reader) => reader.manifest(),
+        }
+    }
+}
+
+/// Self-contained slatedb resources for the SST-walk count path, returned by
+/// [`StorageRead::slate_read`].
+///
+/// Owns a manifest source (a live `Db`/`DbReader`) plus an [`SstReader`] pinned
+/// to the same path + object store. This is a deliberate, single-method leak of
+/// slatedb internals: the count path needs a manifest and an SST reader,
+/// neither of which belongs on the storage-neutral trait. The handle is
+/// `'static`, so callers can hold it for the lifetime of a read view rather
+/// than re-deriving it per call.
+///
+/// Each [`count_in_range`](SlateReadHandle::count_in_range) reads the manifest
+/// fresh from the live source, so counts reflect the latest flushed state
+/// without a second polling handle to keep in sync.
+pub struct SlateReadHandle {
+    source: ManifestSource,
+    sst_reader: Arc<SstReader>,
+}
+
+impl SlateReadHandle {
+    /// Counts physical write operations in `range` by walking the live
+    /// manifest's persisted SSTs. See [`sst_blocks::count_in_range`].
+    pub async fn count_in_range(
+        &self,
+        range: &BytesRange,
+    ) -> StorageResult<sst_blocks::CountResult> {
+        sst_blocks::count_in_range(&self.source.manifest(), &self.sst_reader, range).await
+    }
+
+    /// Returns the live manifest snapshot for metadata-only inspection — e.g.
+    /// summarizing how data is distributed across the LSM tree. Reads no SST
+    /// files; each call reflects the latest flushed state of the live source.
+    pub fn manifest(&self) -> VersionedManifest {
+        self.source.manifest()
+    }
+}
+
 /// SlateDB-backed implementation of the Storage trait.
 ///
 /// SlateDB is an embedded key-value store built on object storage, providing
@@ -76,6 +132,11 @@ pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
     durable_tx: watch::Sender<u64>,
     durable_bridge_abort: tokio::task::AbortHandle,
+    /// SST reader for the [`StorageRead::slate_read`] count path. Built by the
+    /// production constructors ([`crate::StorageBuilder`]); `None` for the bare
+    /// `new` used in tests that only exercise get/scan, where `slate_read`
+    /// falls back to `None`. `Arc` so the handle can outlive a borrow of `self`.
+    sst_reader: Option<Arc<SstReader>>,
 }
 
 impl SlateDbStorage {
@@ -104,7 +165,21 @@ impl SlateDbStorage {
             db,
             durable_tx,
             durable_bridge_abort: task.abort_handle(),
+            sst_reader: None,
         }
+    }
+
+    /// Attaches an [`SstReader`] so [`StorageRead::slate_read`] can serve the
+    /// SST-walk count path. Built against the same path + object store as `db`.
+    pub fn with_sst_reader(mut self, sst_reader: SstReader) -> Self {
+        self.sst_reader = Some(Arc::new(sst_reader));
+        self
+    }
+
+    /// Returns the underlying SlateDB instance. Useful for callers that need to access
+    /// slatedb-specific features like `DbStatus`
+    pub fn db(&self) -> &Arc<Db> {
+        &self.db
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
@@ -173,6 +248,14 @@ impl StorageRead for SlateDbStorage {
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    fn slate_read(&self) -> Option<SlateReadHandle> {
+        self.sst_reader.as_ref().map(|sst_reader| SlateReadHandle {
+            // Live writer manifest: reflects everything flushed so far.
+            source: ManifestSource::Db(Arc::clone(&self.db)),
+            sst_reader: Arc::clone(sst_reader),
+        })
     }
 
     async fn close(&self) -> StorageResult<()> {
@@ -405,12 +488,26 @@ impl From<MergeOptions> for slatedb::config::MergeOptions {
 /// allowing multiple readers to coexist with a single writer.
 pub struct SlateDbStorageReader {
     reader: Arc<DbReader>,
+    /// SST reader for the [`StorageRead::slate_read`] count path; see
+    /// [`SlateDbStorage::sst_reader`].
+    sst_reader: Option<Arc<SstReader>>,
 }
 
 impl SlateDbStorageReader {
     /// Creates a new SlateDbStorageReader wrapping the given DbReader.
     pub fn new(reader: Arc<DbReader>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            sst_reader: None,
+        }
+    }
+
+    /// Attaches an [`SstReader`] so [`StorageRead::slate_read`] can serve the
+    /// SST-walk count path. Built against the same path + object store as the
+    /// `DbReader`.
+    pub fn with_sst_reader(mut self, sst_reader: SstReader) -> Self {
+        self.sst_reader = Some(Arc::new(sst_reader));
+        self
     }
 }
 
@@ -454,6 +551,15 @@ impl StorageRead for SlateDbStorageReader {
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    fn slate_read(&self) -> Option<SlateReadHandle> {
+        self.sst_reader.as_ref().map(|sst_reader| SlateReadHandle {
+            // The DbReader's last-polled manifest. Scans on this same handle
+            // read the same view, so count and scan stay consistent.
+            source: ManifestSource::Reader(Arc::clone(&self.reader)),
+            sst_reader: Arc::clone(sst_reader),
+        })
     }
 
     async fn close(&self) -> StorageResult<()> {

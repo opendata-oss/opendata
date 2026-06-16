@@ -234,6 +234,24 @@ pub struct Config {
     /// names are accepted with types inferred from the first write.
     pub metadata_fields: Vec<MetadataFieldSpec>,
 
+    /// Fraction of outstanding FTS deletes (relative to live vectors) above
+    /// which a major compaction of the FTS segment is forced (RFC-0006).
+    ///
+    /// The custom compaction scheduler watches the in-memory deletions-bitmap
+    /// cardinality versus the live-vector count; once the ratio reaches this
+    /// threshold it triggers a full compaction of the FTS segment to apply the
+    /// accumulated deletes and shrink the in-memory bitmap. Defaults to `0.20`
+    /// (20%). Only affects SlateDB storage with compaction enabled.
+    #[serde(default = "default_delete_compaction_threshold")]
+    pub delete_compaction_threshold: f64,
+
+    /// How often the FieldStats poller refreshes the FTS compaction scheduler's
+    /// in-memory per-field delete-pressure tracker from the persisted
+    /// `FieldStats` records (RFC-0006). Defaults to 5s. Only affects SlateDB
+    /// storage with compaction enabled.
+    #[serde(default = "default_fts_stats_poll_interval", with = "duration_secs")]
+    pub fts_stats_poll_interval: Duration,
+
     /// Buffer consumer configuration. When `Some`, the server starts a
     /// background task that ingests vectors from an `opendata-buffer` queue.
     #[cfg(feature = "buffer")]
@@ -253,10 +271,23 @@ impl Default for Config {
             split_search_neighbourhood: 0,
             query_pruning_factor: None,
             metadata_fields: Vec::new(),
+            delete_compaction_threshold: default_delete_compaction_threshold(),
+            fts_stats_poll_interval: default_fts_stats_poll_interval(),
             #[cfg(feature = "buffer")]
             buffer_consumer: None,
         }
     }
+}
+
+/// Default fraction of outstanding FTS deletes that triggers a major
+/// compaction of the FTS segment (RFC-0006, 20%).
+pub(crate) fn default_delete_compaction_threshold() -> f64 {
+    0.20
+}
+
+/// Default FTS field-stats poll interval (RFC-0006, 5s).
+pub(crate) fn default_fts_stats_poll_interval() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// Configuration for the embedded buffer consumer task.
@@ -320,6 +351,30 @@ fn default_buffer_gc_grace_period() -> Duration {
 pub struct SearchOptions {
     /// Number of centroids to probe during search.
     pub nprobe: Option<usize>,
+    /// BM25 scoring algorithm override (default: [`Bm25Scorer::BlockMax`]).
+    pub bm25_scorer: Option<Bm25Scorer>,
+}
+
+/// Which scoring algorithm the BM25 query path uses.
+///
+/// `BlockMax` (the default) prunes non-competitive documents with
+/// BlockMaxScore (RFC-0006 Milestone 3). `Exhaustive` scores every document
+/// in the union of the query terms' posting lists; it exists as a reference
+/// implementation and for benchmarking the pruned path against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bm25Scorer {
+    /// Score every candidate document (RFC-0006 Milestone 0 path).
+    Exhaustive,
+    /// Skip non-competitive documents using BlockMaxScore, accumulating
+    /// essential clauses in a dense doc-id-indexed window buffer. Fastest
+    /// when doc ids are dense.
+    #[default]
+    BlockMax,
+    /// BlockMaxScore with posting-count-sized windows and sort-merge
+    /// accumulation. Holds up when the doc id space is sparse (heavy
+    /// delete/update churn leaves permanent id gaps), where `BlockMax`'s
+    /// dense window buffer degrades.
+    BlockMaxSparse,
 }
 
 /// Configuration for a read-only vector database client.
