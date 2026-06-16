@@ -4,6 +4,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod burst_read;
 mod follow;
 mod ingest;
 mod read;
@@ -15,6 +16,7 @@ fn benchmarks() -> Vec<Box<dyn Benchmark>> {
     vec![
         Box::new(ingest::IngestBenchmark::new()),
         Box::new(follow::FollowBenchmark::new()),
+        Box::new(burst_read::BurstReadBenchmark::new()),
     ]
 }
 
