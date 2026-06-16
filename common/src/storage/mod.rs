@@ -252,20 +252,28 @@ pub trait StorageRead: Any + Send + Sync {
     /// without a block read. Backends without such filters fall back to a range
     /// scan over the prefix.
     ///
+    /// `subrange` restricts the scan to a range of key *suffixes* relative to
+    /// `prefix` (a bound `s` denotes the full key `prefix ++ s`); an unbounded
+    /// subrange scans every key under the prefix. Prefix-filter backends pass
+    /// it through to slatedb's `scan_prefix`, which uses it both to bound the
+    /// iterator and to prune SSTs by key range.
+    ///
     /// `filter_context` is an opaque payload forwarded to the backend's custom
     /// filter policies (ignored by built-in filters and by backends without
     /// filter support); a scan parametrizes its filters through it. See
     /// [`slatedb::FilterContext`].
     ///
     /// The default implementation delegates to [`Self::scan_iter`] with the
-    /// range derived from the prefix, which preserves correctness for any
-    /// backend; backends that can do better should override this.
+    /// range derived from the prefix and subrange, which preserves correctness
+    /// for any backend; backends that can do better should override this.
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        subrange: BytesRange,
         _filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
-        self.scan_iter(BytesRange::prefix(prefix)).await
+        self.scan_iter(BytesRange::from_prefix_and_subrange(&prefix, &subrange))
+            .await
     }
 
     /// Collects all records in the range into a Vec.

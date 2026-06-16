@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use common::clock::Clock;
 use slatedb::object_store::path::Path;
-use slatedb::object_store::{ObjectStore, PutPayload};
+use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

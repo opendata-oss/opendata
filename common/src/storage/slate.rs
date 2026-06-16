@@ -1,3 +1,4 @@
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::storage::sst_blocks;
@@ -68,6 +69,20 @@ fn default_scan_options() -> ScanOptions {
         order: IterationOrder::Ascending,
         filter_context: None,
     }
+}
+
+/// Borrows a suffix [`BytesRange`] as `(Bound<&[u8]>, Bound<&[u8]>)`, the shape
+/// slatedb's `scan_prefix_with_options` wants for its subrange argument. The
+/// returned bounds borrow `subrange`, which must outlive the scan call.
+fn subrange_bounds(subrange: &BytesRange) -> (Bound<&[u8]>, Bound<&[u8]>) {
+    fn as_slice(bound: &Bound<Bytes>) -> Bound<&[u8]> {
+        match bound {
+            Bound::Included(b) => Bound::Included(b.as_ref()),
+            Bound::Excluded(b) => Bound::Excluded(b.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        }
+    }
+    (as_slice(&subrange.start), as_slice(&subrange.end))
 }
 
 /// Where a [`SlateReadHandle`] reads its manifest from. Both variants expose a
@@ -242,12 +257,13 @@ impl StorageRead for SlateDbStorage {
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        subrange: BytesRange,
         filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .db
-            .scan_prefix_with_options(prefix, &options)
+            .scan_prefix_with_options(prefix, subrange_bounds(&subrange), &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -326,12 +342,13 @@ impl StorageRead for SlateDbStorageSnapshot {
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        subrange: BytesRange,
         filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .snapshot
-            .scan_prefix_with_options(prefix, &options)
+            .scan_prefix_with_options(prefix, subrange_bounds(&subrange), &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -549,12 +566,13 @@ impl StorageRead for SlateDbStorageReader {
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        subrange: BytesRange,
         filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .reader
-            .scan_prefix_with_options(prefix, &options)
+            .scan_prefix_with_options(prefix, subrange_bounds(&subrange), &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))

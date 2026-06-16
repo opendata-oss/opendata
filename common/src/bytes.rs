@@ -95,6 +95,39 @@ impl BytesRange {
             end: Unbounded,
         }
     }
+
+    /// Builds the range of keys that start with `prefix`, restricted to the
+    /// suffix range `subrange`.
+    ///
+    /// A subrange bound `s` denotes the full key `prefix ++ s`. Because every
+    /// key in the range shares the prefix, ordering suffixes is the same as
+    /// ordering full keys. An unbounded subrange start means "from the bare
+    /// prefix"; an unbounded subrange end means "to the end of the prefix's
+    /// keyspace".
+    ///
+    /// This mirrors slatedb's `scan_prefix` subrange semantics, so the
+    /// non-prefix-filter fallback (a plain range scan) covers exactly the keys
+    /// a prefix-aware backend would.
+    pub fn from_prefix_and_subrange(prefix: &[u8], subrange: &BytesRange) -> Self {
+        let concat = |suffix: &Bytes| {
+            let mut key = BytesMut::with_capacity(prefix.len() + suffix.len());
+            key.extend_from_slice(prefix);
+            key.extend_from_slice(suffix);
+            key.freeze()
+        };
+        let start = match &subrange.start {
+            Included(s) => Included(concat(s)),
+            Excluded(s) => Excluded(concat(s)),
+            Unbounded if prefix.is_empty() => Unbounded,
+            Unbounded => Included(Bytes::copy_from_slice(prefix)),
+        };
+        let end = match &subrange.end {
+            Included(e) => Included(concat(e)),
+            Excluded(e) => Excluded(concat(e)),
+            Unbounded => lex_increment(prefix).map(Excluded).unwrap_or(Unbounded),
+        };
+        Self::new(start, end)
+    }
 }
 
 impl RangeBounds<Bytes> for BytesRange {

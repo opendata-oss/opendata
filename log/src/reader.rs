@@ -718,7 +718,9 @@ impl LogDbReader {
         let storage: Arc<dyn StorageRead> = create_storage_read(
             &config.storage,
             StorageReaderRuntime::new(),
-            StorageSemantics::new().with_filter_policies(crate::filter_sequence::filter_policies()),
+            StorageSemantics::new()
+                .with_filter_policies(crate::filter_sequence::filter_policies())
+                .with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared()),
             reader_options,
         )
         .await

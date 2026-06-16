@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use slatedb::object_store::ObjectStore;
 use slatedb::object_store::path::Path;
+use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ConsumerConfig;
