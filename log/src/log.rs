@@ -572,19 +572,20 @@ impl LogDbBuilder {
             .map_err(|e| Error::Storage(e.to_string()))?
             .with_semantics(
                 StorageSemantics::new()
-                    .with_filter_policies(crate::filter_prefix::bloom_filter_policies()),
+                    .with_filter_policies(crate::filter_sequence::filter_policies()),
             );
         // Route every log record to a SlateDB segment keyed by the 6-byte
         // routing prefix `[subsystem, version, segment_id]`. No-op for the
         // in-memory backend; for slatedb-backed storage this installs the
         // extractor on the underlying `DbBuilder` (see RFC 0024).
         //
-        // The bloom filter policy is an orthogonal slatedb axis: the
-        // `LogKeyPrefixExtractor` hashes only the logical `(segment,
-        // user_key)` prefix into per-SST bloom filters (see its module
-        // doc for the contract). `whole_key_filtering=false` because the
-        // extracted prefix already discriminates everything we need to
-        // probe — adding per-key hashes would only inflate the filter.
+        // The filter policies are an orthogonal slatedb axis (see RFC 0007):
+        // the `LogKeyPrefixExtractor` bloom hashes the logical `(segment,
+        // user_key)` prefix into per-SST bloom filters to prune SSTs that
+        // cannot contain the key (`whole_key_filtering=false` — the extracted
+        // prefix discriminates everything we probe), and the sequence-range
+        // filter prunes SSTs whose records for the key all sit below a scan's
+        // resume cursor. Writer, compactor, and reader must share the same set.
         let sb = sb.map_slatedb(|db| {
             db.with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
         });
@@ -607,7 +608,7 @@ impl LogDbBuilder {
                 db.with_compactor_builder(
                     CompactorBuilder::new(path, object_store)
                         .with_scheduler_supplier(supplier)
-                        .with_filter_policies(crate::filter_prefix::bloom_filter_policies()),
+                        .with_filter_policies(crate::filter_sequence::filter_policies()),
                 )
             })
         } else {

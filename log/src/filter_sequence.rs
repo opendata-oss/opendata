@@ -43,11 +43,6 @@
 //! version decodes to a match-everything filter. Bump the name on an
 //! incompatible format change.
 
-// The policy is fully implemented and unit-tested here but not yet on any build
-// or read path: it is registered with slatedb in the wiring commit and consulted
-// with a cursor in the read-path commit (RFC 0007). Remove this once wired.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -110,6 +105,9 @@ fn prefix_hash(prefix: &[u8]) -> u64 {
 /// Encodes a relative resume cursor into the inline filter context a scan
 /// passes to [`Filter::might_match`]: bytes `0..8` hold the cursor as a
 /// big-endian `u64`, the remainder reserved (zero).
+// Consulted by the read path in the next commit (RFC 0007); until then it is
+// exercised only by this module's tests.
+#[allow(dead_code)]
 pub(crate) fn sequence_filter_context(relative_cursor: Sequence) -> FilterContext {
     let mut payload = [0u8; 64];
     payload[..8].copy_from_slice(&relative_cursor.to_be_bytes());
@@ -147,6 +145,18 @@ fn relative_seq_and_prefix(key: &[u8]) -> Option<(u64, &[u8])> {
     let mut rest = &key[end..];
     let relative = var_u64::deserialize(&mut rest).ok()?;
     Some((relative, &key[..end]))
+}
+
+/// The full set of SST filter policies for the log key space, shared by writers,
+/// compactors, and standalone readers so all three agree on filter
+/// encoding/decoding: the prefix bloom (prunes SSTs that cannot contain the key)
+/// plus the sequence-range filter (prunes SSTs whose records for the key are all
+/// below the scan cursor). The two layer rather than split by level — see RFC
+/// 0007 Part 2.
+pub(crate) fn filter_policies() -> Vec<Arc<dyn FilterPolicy>> {
+    let mut policies = crate::filter_prefix::bloom_filter_policies();
+    policies.push(Arc::new(SequenceRangeFilterPolicy));
+    policies
 }
 
 /// The custom [`FilterPolicy`]. Stateless: the builder needs nothing beyond the
@@ -574,6 +584,134 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// End-to-end test that drives a real SlateDB-backed LogDb with the
+    /// sequence-range policy registered. Because the read path does not yet
+    /// pass a cursor (next commit), the filter is built and persisted but never
+    /// prunes — so this verifies the builder/decoder round-trip through real
+    /// flush + compaction without dropping data, across **multiple segments**
+    /// (so compacted SSTs carry per-key entries from several segment bases — the
+    /// case relative storage must get right). A builder that mis-parsed keys, or
+    /// a decoder that corrupted ranges, would surface here as missing entries.
+    ///
+    /// Lives in the crate rather than `tests/` so it sits next to the policy.
+    mod integration_tests {
+        use bytes::Bytes;
+        use common::StorageConfig;
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+        use tempfile::TempDir;
+
+        use crate::config::Config;
+        use crate::log::LogDb;
+        use crate::model::Record;
+        use crate::reader::LogRead;
+
+        fn slatedb_storage_config(temp_dir: &TempDir) -> StorageConfig {
+            StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: "log-data".to_string(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: temp_dir.path().to_string_lossy().to_string(),
+                }),
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+            })
+        }
+
+        /// Appends `count` records for `key`, labelled `v-{offset}..` so the
+        /// reader can assert exact ordering, in flush-sized chunks.
+        async fn append_run(log: &LogDb, key: &Bytes, offset: usize, count: usize) {
+            for chunk in (offset..offset + count).collect::<Vec<_>>().chunks(100) {
+                let records: Vec<Record> = chunk
+                    .iter()
+                    .map(|i| Record {
+                        key: key.clone(),
+                        value: Bytes::from(format!("v-{i}")),
+                    })
+                    .collect();
+                log.try_append(records).await.expect("append");
+            }
+        }
+
+        #[tokio::test]
+        async fn filter_does_not_drop_entries_across_segments_and_reopen() {
+            // given
+            let temp_dir = TempDir::new().expect("tempdir");
+            let storage = slatedb_storage_config(&temp_dir);
+            let keys = [
+                Bytes::from_static(b"orders"),
+                Bytes::from_static(b"shipments"),
+            ];
+            // Per (key, segment) run size, and the number of segments. Total
+            // entries (2 keys * 600 * 3 = 3600) crosses slatedb's default
+            // min_filter_keys (1000) so compacted SSTs build filter blocks.
+            let run = 600usize;
+            let segments = 3usize;
+
+            // when — write `run` entries per key into each of `segments`
+            // segments, sealing between them so each key's data spans multiple
+            // segment bases in the compacted tree.
+            {
+                let log = LogDb::open(Config {
+                    storage: storage.clone(),
+                    ..Default::default()
+                })
+                .await
+                .expect("open LogDb");
+                for seg in 0..segments {
+                    if seg > 0 {
+                        log.seal_segment().await.expect("seal");
+                    }
+                    for key in &keys {
+                        append_run(&log, key, seg * run, run).await;
+                    }
+                }
+                log.flush().await.expect("flush");
+                log.close().await.expect("close");
+            }
+
+            // then — reopen and scan each key back in full, in order.
+            let log = LogDb::open(Config {
+                storage,
+                ..Default::default()
+            })
+            .await
+            .expect("reopen LogDb");
+
+            let total = run * segments;
+            for key in &keys {
+                let mut iter = log.scan(key.clone(), ..).await.expect("scan");
+                let mut seen: Vec<Bytes> = Vec::with_capacity(total);
+                while let Some(entry) = iter.next().await.expect("read") {
+                    seen.push(entry.value);
+                }
+                assert_eq!(
+                    seen.len(),
+                    total,
+                    "filter must not drop stored entries for {key:?}; got {} of {total}",
+                    seen.len(),
+                );
+                for (i, value) in seen.iter().enumerate() {
+                    assert_eq!(value, &Bytes::from(format!("v-{i}")));
+                }
+            }
+
+            // Absent key: scan returns empty (the registered filters must not
+            // route reads to data under a different key).
+            let mut iter = log
+                .scan(Bytes::from_static(b"absent"), ..)
+                .await
+                .expect("scan");
+            assert!(
+                iter.next().await.expect("read").is_none(),
+                "scan for absent user key must return empty",
+            );
+
+            log.close().await.expect("close");
         }
     }
 }
