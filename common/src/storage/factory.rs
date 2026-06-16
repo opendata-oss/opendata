@@ -328,8 +328,8 @@ fn load_slatedb_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<S
 /// This is useful for cleanup operations where you need to access the object store
 /// after the database has been closed.
 pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
-    match config {
-        ObjectStoreConfig::InMemory => Ok(Arc::new(object_store::memory::InMemory::new())),
+    let store: Arc<dyn ObjectStore> = match config {
+        ObjectStoreConfig::InMemory => Arc::new(object_store::memory::InMemory::new()),
         ObjectStoreConfig::Aws(aws_config) => {
             let store = object_store::aws::AmazonS3Builder::from_env()
                 .with_region(&aws_config.region)
@@ -338,7 +338,7 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
                 .map_err(|e| {
                     StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
                 })?;
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
         ObjectStoreConfig::Local(local_config) => {
             std::fs::create_dir_all(&local_config.path).map_err(|e| {
@@ -351,9 +351,26 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
                 .map_err(|e| {
                 StorageError::Storage(format!("Failed to create local filesystem store: {}", e))
             })?;
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
-    }
+    };
+    // Wrap so object-store GET requests are tallied (the benchmark's GETs/poll
+    // signal). Transparent delegation; negligible overhead.
+    Ok(super::counting::count_object_store(store))
+}
+
+/// Build a standalone in-memory block cache (foyer, memory-only) that can be
+/// shared across multiple storage handles.
+///
+/// Injected via [`StorageReaderRuntime::with_block_cache`], one shared cache
+/// lets a pool of readers serve the same immutable SST blocks from a single
+/// cache instead of each re-fetching and re-caching them — avoiding the
+/// redundant object-store GETs that per-handle caches incur.
+pub fn create_in_memory_block_cache(capacity_bytes: u64) -> Arc<dyn DbCache> {
+    Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: capacity_bytes,
+        ..Default::default()
+    }))
 }
 
 /// Creates a read-only storage instance based on configuration.

@@ -189,6 +189,25 @@ impl Bench {
         )
     }
 
+    /// Like [`histogram`](Bench::histogram), but attaches additional labels to the
+    /// metric key. Use this to carry a dimension (e.g. a lag bucket) as a label, so
+    /// a family of related series shares one metric name and is distinguished by the
+    /// label when exported.
+    pub fn histogram_labeled(
+        &self,
+        name: &'static str,
+        labels: &[(&'static str, &'static str)],
+    ) -> metrics::Histogram {
+        let labels: Vec<metrics::Label> = labels
+            .iter()
+            .map(|(k, v)| metrics::Label::new(*k, *v))
+            .collect();
+        self.recorder.register_histogram(
+            &metrics::Key::from_parts(name, labels),
+            &metrics::Metadata::new("bench", metrics::Level::INFO, None),
+        )
+    }
+
     /// Write summary metrics.
     ///
     /// Use this for final results or computed aggregates at the end of a benchmark
@@ -232,18 +251,23 @@ impl Bench {
         Ok(())
     }
 
+    /// Print the run's parameter/label header. Called when the point begins, so
+    /// the configuration is visible up front; [`summarize`](Self::summarize) then
+    /// prints the metrics when it completes.
+    pub fn print_params(&self) {
+        let all_labels = self.spec.all_labels();
+        if all_labels.is_empty() {
+            return;
+        }
+        let labels_str: Vec<_> = all_labels
+            .iter()
+            .map(|l| format!("{}={}", l.name, l.value))
+            .collect();
+        println!("  [{}]", labels_str.join(", "));
+    }
+
     /// Print summary to console with nice formatting.
     fn print_summary(&self, summary: &Summary) {
-        // Print labels header
-        let all_labels = self.spec.all_labels();
-        if !all_labels.is_empty() {
-            let labels_str: Vec<_> = all_labels
-                .iter()
-                .map(|l| format!("{}={}", l.name, l.value))
-                .collect();
-            println!("  [{}]", labels_str.join(", "));
-        }
-
         // Find max metric name length for alignment
         let max_name_len = summary
             .metrics

@@ -234,7 +234,11 @@ pub async fn run(benchmarks: Vec<Box<dyn Benchmark>>) -> anyhow::Result<()> {
             };
 
             let bencher = Bencher::new(bench_config, benchmark.name(), benchmark.labels()).await?;
-            benchmark.run(bencher.bench(p, duration)).await?;
+            let bench = bencher.bench(p, duration);
+            // Print the params when the point begins; the summary follows when it
+            // completes.
+            bench.print_params();
+            benchmark.run(bench).await?;
 
             bench_counter += 1;
         }

@@ -55,6 +55,7 @@ mod listing;
 mod log;
 mod model;
 mod range;
+mod read_stats;
 mod reader;
 mod segment;
 mod segment_extractor;
@@ -74,6 +75,7 @@ pub use error::{AppendError, AppendResult, Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendOutput, LogEntry, Record, Segment, SegmentId, Sequence};
+pub use read_stats::{empty_segment_scans, segment_scans};
 
 pub use common::{L0Stats, SortedRunStats};
 pub use reader::{

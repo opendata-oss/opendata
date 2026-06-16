@@ -24,7 +24,7 @@ use crate::range::{normalize_segment_id, normalize_sequence};
 use crate::segment::{LogSegment, SegmentCache};
 use crate::serde::LogEntryKey;
 use crate::storage::{LogStorageRead as _, SegmentIterator};
-use common::storage::factory::create_storage_read;
+use common::storage::factory::{DbCache, create_storage_read};
 use common::{
     L0Stats, SlateReadHandle, SortedRunStats, StorageRead, StorageReaderRuntime, StorageSemantics,
 };
@@ -711,13 +711,42 @@ impl LogDbReader {
     /// # }
     /// ```
     pub async fn open(config: ReaderConfig) -> Result<Self> {
+        Self::open_with_runtime(config, StorageReaderRuntime::new()).await
+    }
+
+    /// Opens a read-only view that shares the given block cache instead of
+    /// building its own.
+    ///
+    /// Pass the same `block_cache` to a pool of readers so they serve the same
+    /// immutable SST blocks from one cache, rather than each re-fetching and
+    /// re-caching them — which otherwise multiplies object-store GETs by the
+    /// number of readers. The cache is kept alive for as long as the readers
+    /// that hold it.
+    pub async fn open_with_block_cache(
+        config: ReaderConfig,
+        block_cache: Arc<dyn DbCache>,
+    ) -> Result<Self> {
+        Self::open_with_runtime(
+            config,
+            StorageReaderRuntime::new().with_block_cache(block_cache),
+        )
+        .await
+    }
+
+    /// Shared body of [`open`](Self::open) and
+    /// [`open_with_block_cache`](Self::open_with_block_cache): build the
+    /// read-only storage from `runtime` and spawn the refresh task.
+    async fn open_with_runtime(
+        config: ReaderConfig,
+        runtime: StorageReaderRuntime,
+    ) -> Result<Self> {
         let reader_options = slatedb::config::DbReaderOptions {
             manifest_poll_interval: config.refresh_interval,
             ..Default::default()
         };
         let storage: Arc<dyn StorageRead> = create_storage_read(
             &config.storage,
-            StorageReaderRuntime::new(),
+            runtime,
             StorageSemantics::new()
                 .with_filter_policies(crate::filter_sequence::filter_policies())
                 .with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared()),
@@ -907,6 +936,10 @@ pub struct LogIterator {
     /// Set once `next()` has returned `None` — i.e. the scan reached the end of
     /// its range within the snapshot rather than being abandoned early.
     drained: bool,
+    /// Entries yielded by the segment currently being scanned. Used to flag a
+    /// scan that returned nothing for the key (`read_stats::empty_segment_scans`)
+    /// once that segment is exhausted.
+    current_segment_yielded: u64,
 }
 
 impl LogIterator {
@@ -929,6 +962,7 @@ impl LogIterator {
             frontier,
             last_yielded: None,
             drained: false,
+            current_segment_yielded: 0,
         }
     }
 
@@ -964,6 +998,7 @@ impl LogIterator {
             frontier,
             last_yielded: None,
             drained: false,
+            current_segment_yielded: 0,
         }
     }
 
@@ -974,9 +1009,15 @@ impl LogIterator {
             if let Some(iter) = &mut self.current_iter {
                 if let Some(entry) = iter.next().await? {
                     self.last_yielded = Some(entry.sequence);
+                    self.current_segment_yielded += 1;
                     return Ok(Some(entry));
                 }
-                // Current segment exhausted, move to next
+                // Current segment exhausted. A scan that produced nothing for
+                // the key is pure read amplification — the segment covered the
+                // sequence range but held no records for it.
+                if self.current_segment_yielded == 0 {
+                    crate::read_stats::record_empty_segment_scan();
+                }
                 self.current_iter = None;
                 self.current_segment_idx += 1;
             }
@@ -1029,6 +1070,8 @@ impl LogIterator {
             .storage
             .scan_entries(segment, &self.key, self.seq_range.clone())
             .await?;
+        crate::read_stats::record_segment_scan();
+        self.current_segment_yielded = 0;
         self.current_iter = Some(iter);
         Ok(true)
     }
