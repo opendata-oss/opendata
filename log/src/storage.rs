@@ -73,11 +73,17 @@ pub(crate) trait LogStorageRead: StorageRead {
     /// Returns an iterator that yields `LogEntry` values in sequence order.
     ///
     /// Issues a prefix scan over the `(segment, key)` prefix rather than a
-    /// bounded range so that backends with prefix-aware bloom filters
-    /// (slatedb's `BloomFilterPolicy` with `LogKeyPrefixExtractor`) can skip
-    /// SSTs that contain no entries for this `(segment, key)`. The seq range
-    /// is enforced client-side by [`SegmentIterator`], which early-exits
-    /// once `sequence >= seq_range.end`.
+    /// bounded range so that backends with prefix-aware SST filters can skip
+    /// tables for this `(segment, key)`: slatedb's `BloomFilterPolicy` with
+    /// `LogKeyPrefixExtractor` skips SSTs that contain no entries for the key,
+    /// and the sequence-range filter skips SSTs whose entries for the key all
+    /// sit below the scan's resume cursor. The cursor is relativized to this
+    /// segment (the filter stores relative sequences — see
+    /// [`crate::filter_sequence`]) and passed as the filter context.
+    ///
+    /// The seq range is still enforced client-side by [`SegmentIterator`],
+    /// which early-exits once `sequence >= seq_range.end`; filter pruning only
+    /// drops whole SSTs, so the iterator remains the source of exactness.
     async fn scan_entries(
         &self,
         segment: &LogSegment,
@@ -85,7 +91,10 @@ pub(crate) trait LogStorageRead: StorageRead {
         seq_range: Range<u64>,
     ) -> Result<SegmentIterator> {
         let prefix = LogEntryKey::scan_prefix(segment, key);
-        let inner = self.scan_prefix_iter(prefix).await?;
+        let relative_cursor = seq_range.start.saturating_sub(segment.meta().start_seq);
+        let filter_context =
+            Some(crate::filter_sequence::sequence_filter_context(relative_cursor));
+        let inner = self.scan_prefix_iter(prefix, filter_context).await?;
         Ok(SegmentIterator::new(
             inner,
             seq_range,

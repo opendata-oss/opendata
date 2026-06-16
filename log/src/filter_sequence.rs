@@ -105,9 +105,6 @@ fn prefix_hash(prefix: &[u8]) -> u64 {
 /// Encodes a relative resume cursor into the inline filter context a scan
 /// passes to [`Filter::might_match`]: bytes `0..8` hold the cursor as a
 /// big-endian `u64`, the remainder reserved (zero).
-// Consulted by the read path in the next commit (RFC 0007); until then it is
-// exercised only by this module's tests.
-#[allow(dead_code)]
 pub(crate) fn sequence_filter_context(relative_cursor: Sequence) -> FilterContext {
     let mut payload = [0u8; 64];
     payload[..8].copy_from_slice(&relative_cursor.to_be_bytes());
@@ -710,6 +707,90 @@ mod tests {
                 iter.next().await.expect("read").is_none(),
                 "scan for absent user key must return empty",
             );
+
+            log.close().await.expect("close");
+        }
+
+        /// End-to-end check that the sequence-range filter, now consulted with a
+        /// relative cursor on the scan path, prunes *soundly*: a `scan(key, N..)`
+        /// must return exactly the entries with `sequence >= N`, across reopen,
+        /// compaction, and multiple segments. A false-negative bug — a wrong
+        /// relativization, or pruning an SST that actually holds matching
+        /// records — would drop entries near the cursor and fail here.
+        /// (The magnitude of pruning is covered by the `might_match` unit tests;
+        /// this guards the safety property that activating it drops nothing.)
+        #[tokio::test]
+        async fn cursor_scan_returns_exactly_entries_at_or_above_cursor() {
+            // given — one key spanning 3 sealed segments, enough to flush and
+            // compact (a single key keeps global sequences contiguous, so the
+            // ground truth is easy to reason about).
+            let temp_dir = TempDir::new().expect("tempdir");
+            let storage = slatedb_storage_config(&temp_dir);
+            let key = Bytes::from_static(b"orders");
+            let run = 800usize;
+            let segments = 3usize;
+            {
+                let log = LogDb::open(Config {
+                    storage: storage.clone(),
+                    ..Default::default()
+                })
+                .await
+                .expect("open LogDb");
+                for seg in 0..segments {
+                    if seg > 0 {
+                        log.seal_segment().await.expect("seal");
+                    }
+                    append_run(&log, &key, seg * run, run).await;
+                }
+                log.flush().await.expect("flush");
+                log.close().await.expect("close");
+            }
+
+            let log = LogDb::open(Config {
+                storage,
+                ..Default::default()
+            })
+            .await
+            .expect("reopen LogDb");
+
+            // Ground truth: the full (sequence, value) stream in order.
+            let mut truth: Vec<(u64, Bytes)> = Vec::new();
+            let mut iter = log.scan(key.clone(), ..).await.expect("scan");
+            while let Some(entry) = iter.next().await.expect("read") {
+                truth.push((entry.sequence, entry.value));
+            }
+            assert_eq!(truth.len(), run * segments, "full scan ground truth");
+
+            // For cursors at the start, both segment-boundary regions, an exact
+            // entry sequence, the last entry, and just past the end, the
+            // cursor-bounded scan must equal the ground truth filtered to
+            // `sequence >= cursor`.
+            let last_seq = truth.last().unwrap().0;
+            let cursors = [
+                truth[0].0,
+                truth[run - 1].0,     // end of segment 0
+                truth[run].0,         // start of segment 1
+                truth[run * 2].0,     // start of segment 2
+                truth[truth.len() / 2].0,
+                last_seq,
+                last_seq + 1,         // past the end → empty
+            ];
+            for cursor in cursors {
+                let expected: Vec<(u64, Bytes)> = truth
+                    .iter()
+                    .filter(|(seq, _)| *seq >= cursor)
+                    .cloned()
+                    .collect();
+                let mut got: Vec<(u64, Bytes)> = Vec::with_capacity(expected.len());
+                let mut iter = log.scan(key.clone(), cursor..).await.expect("scan");
+                while let Some(entry) = iter.next().await.expect("read") {
+                    got.push((entry.sequence, entry.value));
+                }
+                assert_eq!(
+                    got, expected,
+                    "scan(key, {cursor}..) must return exactly sequences >= {cursor}",
+                );
+            }
 
             log.close().await.expect("close");
         }

@@ -16,7 +16,7 @@ use slatedb::IterationOrder;
 use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::manifest::VersionedManifest;
 use slatedb::{
-    Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
+    Db, DbIterator, DbReader, DbSnapshot, FilterContext, MergeOperator as SlateDbMergeOperator,
     MergeOperatorError, SstReader, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
@@ -236,15 +236,18 @@ impl StorageRead for SlateDbStorage {
 
     /// Slatedb consults its SST-level filters on `scan_prefix` but not on
     /// `scan`, so routing prefix scans through this path is what lets a
-    /// configured `PrefixExtractor` actually skip SSTs.
+    /// configured `PrefixExtractor` (and custom `FilterPolicy`, parametrized by
+    /// `filter_context`) actually skip SSTs.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .db
-            .scan_prefix_with_options(prefix, &default_scan_options())
+            .scan_prefix_with_options(prefix, &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -323,10 +326,12 @@ impl StorageRead for SlateDbStorageSnapshot {
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .snapshot
-            .scan_prefix_with_options(prefix, &default_scan_options())
+            .scan_prefix_with_options(prefix, &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -544,10 +549,12 @@ impl StorageRead for SlateDbStorageReader {
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .reader
-            .scan_prefix_with_options(prefix, &default_scan_options())
+            .scan_prefix_with_options(prefix, &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))

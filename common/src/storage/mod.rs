@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use slatedb::FilterContext;
 use uuid::Uuid;
 
 use crate::BytesRange;
@@ -244,18 +245,25 @@ pub trait StorageRead: Any + Send + Sync {
 
     /// Returns an iterator over records whose key starts with `prefix`.
     ///
-    /// Backends that support prefix-aware bloom filters (e.g. SlateDB with a
-    /// configured `PrefixExtractor`) consult those filters here, allowing
-    /// SSTs that contain no matching keys to be skipped without a block
-    /// read. Backends without such filters fall back to a range scan over
-    /// the prefix.
+    /// Backends that support prefix-aware SST filters (e.g. SlateDB with a
+    /// configured `PrefixExtractor` or custom `FilterPolicy`) consult those
+    /// filters here, allowing SSTs that contain no matching keys — or, with
+    /// `filter_context`, no keys past a caller-supplied cursor — to be skipped
+    /// without a block read. Backends without such filters fall back to a range
+    /// scan over the prefix.
     ///
-    /// The default implementation delegates to [`Self::scan_iter`] with
-    /// the range derived from the prefix, which preserves correctness for
-    /// any backend; backends that can do better should override this.
+    /// `filter_context` is an opaque payload forwarded to the backend's custom
+    /// filter policies (ignored by built-in filters and by backends without
+    /// filter support); a scan parametrizes its filters through it. See
+    /// [`slatedb::FilterContext`].
+    ///
+    /// The default implementation delegates to [`Self::scan_iter`] with the
+    /// range derived from the prefix, which preserves correctness for any
+    /// backend; backends that can do better should override this.
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        _filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         self.scan_iter(BytesRange::prefix(prefix)).await
     }
