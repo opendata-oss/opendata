@@ -29,6 +29,8 @@ use log::{AppendError, Config, LogDb, LogDbBuilder, Record, SstBlockSize};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::workload;
+
 const MICROS_PER_SEC: f64 = 1_000_000.0;
 /// Bytes per "MB" for the throughput target — decimal megabytes, matching how
 /// the achieved `throughput_bytes` is reported (raw bytes / elapsed seconds).
@@ -301,13 +303,9 @@ impl Benchmark for IngestBenchmark {
         );
 
         // Deterministic key space, shared (read-only) across all writer tasks.
-        let keys = Arc::new(
-            (0..num_keys)
-                .map(|i| Bytes::from(format!("{:0>width$}", i, width = key_length)))
-                .collect::<Vec<Bytes>>(),
-        );
-        let value = Bytes::from(vec![b'x'; value_size]);
-        let record_size = key_length + value_size;
+        let keys = Arc::new(workload::keys(num_keys, key_length));
+        let value = workload::value_template(value_size);
+        let record_size = workload::record_size(key_length, value_size);
 
         // Convert the MB/s target into an aggregate records/sec rate, then split
         // it evenly across the writer tasks. `per_task_rate <= 0` ⇒ closed-loop.

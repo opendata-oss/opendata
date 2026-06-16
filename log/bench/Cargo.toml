@@ -8,9 +8,12 @@ publish = false
 bencher.workspace = true
 bytes.workspace = true
 log = { path = "..", package = "opendata-log" }
+common.workspace = true
 anyhow.workspace = true
+metrics-util = "0.18"
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator.workspace = true
