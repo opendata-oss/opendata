@@ -176,11 +176,16 @@ We register **two policies**, complementary by LSM level:
   keys across a wide window, so the overall `max` stays high even when the scanned
   key's records are all old. To recover precision, the builder additionally stores
   a per-key map `{key-hash → [min, max]}`, but only when it fits a byte budget `B`
-  — otherwise it is omitted (all-or-nothing). The budget is exceeded exactly when
-  an SST has many keys (an L0), where the table range already suffices, so the
-  enrichment is dropped only where it is not needed. Keys are stored as hashes,
-  keeping the map compact for arbitrary key sizes; a collision unions two ranges,
-  costing selectivity but never soundness. (Lookup is specified under
+  — otherwise it is omitted (all-or-nothing). Overflow is benign on high-key
+  **L0s** (the table range already suffices there, and a caught-up cursor sits
+  above them). It is *not* benign on a high-cardinality **compacted** SST: there
+  the table `max` can stay high because of *other* keys, so an idle key's stale
+  data stays unskippable — exactly the case the per-key map exists for. So
+  all-or-nothing trades precision for predictable size, and on dense compacted
+  SSTs that trade can cost an idle key a redundant scan until the partial-coverage
+  strategy below (retain the lowest-`max` keys) is in play. Keys are stored as
+  hashes, keeping the map compact for arbitrary key sizes; a collision unions two
+  ranges, costing selectivity but never soundness. (Lookup is specified under
   Serialization.)
 
   The encoding is chosen per-SST at build time and rebuilt on compaction, so as a
@@ -188,18 +193,26 @@ We register **two policies**, complementary by LSM level:
   automatically — precision improves monotonically with compaction, under a hard
   per-SST size ceiling. Per-key ranges remain SST-wide: a sparse, long-lived key
   spanning the whole table is not narrowed (block-level ranges would be a secondary
-  index, out of scope), and if a budget-bound SST ever warrants partial coverage,
-  the principled choice is to keep the lowest-`max` (most skippable) keys.
+  index, out of scope). For the dense compacted SST that overflows `B`, the
+  mitigation is **partial coverage**: spend the budget on the lowest-`max` keys —
+  whose data is oldest, hence most likely skippable by a caught-up cursor — and
+  fall back to the table `max` for the rest. That keeps the size ceiling while
+  preserving the per-key ranges that matter most.
 
   The builder records *global* sequence (`segment_start + relative_seq`), which the
   key alone does not carry; the policy resolves `segment_id → start_seq` to compute
   it.
 
-- **Prefix bloom policy.** The builder hashes the key prefix of each entry; at
-  read time the filter rules out any SST that cannot contain the scanned key.
-  This is strongest at the **compacted levels**: as data sorts, each SST covers a
-  narrower key range, so fewer distinct logs per SST and a higher skip rate. It is
-  weak in L0, where each flush spans many keys.
+- **Prefix bloom policy.** The builder hashes the **log-key** prefix of each entry
+  — the `subsystem | version | segment_id | record_type | user_key` prefix up to
+  the user key — and at read time rules out any SST that cannot contain the
+  scanned key. This is a *distinct* extractor from the SlateDB **segment
+  extractor** used for segment routing, which keys on `segment_id` alone: a bloom
+  over `segment_id` would prune nothing useful (every active-segment SST shares
+  the id), whereas blooming on `(segment_id, …, user_key)` is what gives per-key
+  pruning. It is strongest at the **compacted levels**: as data sorts, each SST
+  covers a narrower key range, so fewer distinct logs per SST and a higher skip
+  rate. It is weak in L0, where each flush spans many keys.
 
 ### Composition
 
