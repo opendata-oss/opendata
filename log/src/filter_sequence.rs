@@ -768,12 +768,12 @@ mod tests {
             let last_seq = truth.last().unwrap().0;
             let cursors = [
                 truth[0].0,
-                truth[run - 1].0,     // end of segment 0
-                truth[run].0,         // start of segment 1
-                truth[run * 2].0,     // start of segment 2
+                truth[run - 1].0, // end of segment 0
+                truth[run].0,     // start of segment 1
+                truth[run * 2].0, // start of segment 2
                 truth[truth.len() / 2].0,
                 last_seq,
-                last_seq + 1,         // past the end → empty
+                last_seq + 1, // past the end → empty
             ];
             for cursor in cursors {
                 let expected: Vec<(u64, Bytes)> = truth

@@ -92,8 +92,9 @@ pub(crate) trait LogStorageRead: StorageRead {
     ) -> Result<SegmentIterator> {
         let prefix = LogEntryKey::scan_prefix(segment, key);
         let relative_cursor = seq_range.start.saturating_sub(segment.meta().start_seq);
-        let filter_context =
-            Some(crate::filter_sequence::sequence_filter_context(relative_cursor));
+        let filter_context = Some(crate::filter_sequence::sequence_filter_context(
+            relative_cursor,
+        ));
         let inner = self.scan_prefix_iter(prefix, filter_context).await?;
         Ok(SegmentIterator::new(
             inner,
