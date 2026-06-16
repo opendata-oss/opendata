@@ -122,28 +122,6 @@ impl SlateReadHandle {
     pub fn manifest(&self) -> VersionedManifest {
         self.source.manifest()
     }
-
-    /// Returns the `last_entry` key bound of every SST in the live manifest —
-    /// both L0 and the compacted sorted runs.
-    ///
-    /// Used to derive a resumable-scan frontier (RFC 0007 in the log crate):
-    /// the maximum decodable sequence among these bounds is a lower bound on the
-    /// durable tip. Reads the same manifest source as the count path, so a
-    /// frontier built from it shares the snapshot the reader scans.
-    pub fn sst_key_bounds(&self) -> Vec<Bytes> {
-        let manifest = self.manifest();
-        manifest
-            .l0()
-            .iter()
-            .chain(
-                manifest
-                    .compacted()
-                    .iter()
-                    .flat_map(|run| run.sst_views.iter()),
-            )
-            .filter_map(|view| view.sst.info.last_entry.clone())
-            .collect()
-    }
 }
 
 /// SlateDB-backed implementation of the Storage trait.

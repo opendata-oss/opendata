@@ -434,18 +434,27 @@ impl LogReadView {
     /// The frontier implied by the durable SST key bounds: one past the highest
     /// bound sequence that decodes as a `LogEntry` in the active segment.
     ///
-    /// The bounds come from `self.storage` — the same reader (and snapshot) the
-    /// scans use — so the frontier can never outrun what a scan observes.
-    /// `deserialize` validates the `LogEntry` tag (listings, metadata, and other
-    /// types error out), and the `segment_id` check confirms the bound sits in
-    /// the active segment, so its `start_seq` is the correct decode base.
+    /// Walks the live manifest's per-SST `last_entry` bounds — both L0 and the
+    /// compacted sorted runs. The manifest comes from `self.slate`, which shares
+    /// the reader (and snapshot) the scans use, so the frontier can never outrun
+    /// what a scan observes. `deserialize` validates the `LogEntry` tag
+    /// (listings, metadata, and other types error out), and the `segment_id`
+    /// check confirms the bound sits in the active segment, so its `start_seq`
+    /// is the correct decode base.
     fn l0_bound_frontier(&self) -> Option<Sequence> {
         let latest = self.segments.latest()?;
-        self.slate
-            .as_ref()?
-            .sst_key_bounds()
+        let manifest = self.slate.as_ref()?.manifest();
+        manifest
+            .l0()
             .iter()
-            .filter_map(|bound| decode_l0_bound(bound.as_ref(), &latest))
+            .chain(
+                manifest
+                    .compacted()
+                    .iter()
+                    .flat_map(|run| run.sst_views.iter()),
+            )
+            .filter_map(|view| view.sst.info.last_entry.as_deref())
+            .filter_map(|bound| decode_l0_bound(bound, &latest))
             .max()
     }
 
