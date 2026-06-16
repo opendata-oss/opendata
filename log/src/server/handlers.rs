@@ -108,15 +108,6 @@ pub async fn handle_scan(
         }
         tokio::time::sleep(poll_interval.min(remaining)).await;
 
-        // Short-circuit: if nothing has been observed past our cursor, there is
-        // no work to do — skip the scan entirely (no read view lock contention,
-        // no segment lookup, no storage range read).
-        let observed = state.log.observed_sequence().await;
-        if range.start >= observed {
-            next_sequence = next_sequence.max(observed);
-            continue;
-        }
-
         let (entries, ns) = scan_entries(&state, key.clone(), range.clone(), limit).await?;
         next_sequence = ns;
         if !entries.is_empty() {

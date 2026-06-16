@@ -316,21 +316,6 @@ impl LogDb {
         self.durable_sequence_rx.clone()
     }
 
-    /// Returns the exclusive global sequence the read view currently observes:
-    /// every record with `seq < observed_sequence()` is visible to scans, and
-    /// nothing at or beyond it is. This is the frontier
-    /// [`LogIterator::next_sequence`](crate::LogIterator::next_sequence) lifts
-    /// to on a drained scan (see RFC 0007).
-    ///
-    /// Cheap — a read-lock load, no storage I/O — so the scan handler can skip
-    /// work entirely while a follower's cursor is `>= observed_sequence()`.
-    /// Internal: external callers resume off `LogIterator::next_sequence`, so
-    /// this exists only for the HTTP scan handler's idle-poll short-circuit.
-    #[cfg(feature = "http-server")]
-    pub(crate) async fn observed_sequence(&self) -> Sequence {
-        self.read_view.read().await.frontier
-    }
-
     /// Waits for read-side visibility to reach the current requirement.
     async fn sync_reads(&self) -> Result<()> {
         let (target, durability) = match self.read_visibility {
