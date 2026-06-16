@@ -154,6 +154,26 @@ fn prefix_len_for_point(bytes: &[u8]) -> usize {
     }
 }
 
+/// Byte length of the `(segment, user_key)` prefix of a **LogEntry** key or
+/// scan-prefix: the bytes through the user-key terminator, excluding any
+/// trailing `var_u64(relative_seq)`. Returns `None` for malformed input, a
+/// record type other than `LogEntry`, or a LogEntry whose terminator is not
+/// present in `bytes`.
+///
+/// Shared with [`crate::filter_sequence`] so the sequence-range filter hashes
+/// exactly the prefix bytes this extractor feeds the bloom — keeping the two
+/// filters' per-key identities aligned. Unlike [`prefix_len_for_point`], this
+/// never panics: it is fed both stored keys and caller-supplied scan prefixes.
+pub(crate) fn log_entry_prefix_len(bytes: &[u8]) -> Option<usize> {
+    if !has_segmented_prefix(bytes) {
+        return None;
+    }
+    match decode_record_type(bytes[RECORD_TYPE_OFFSET])? {
+        RecordType::LogEntry => terminated_bytes::find_terminator_end(bytes, SEGMENTED_PREFIX_LEN),
+        _ => None,
+    }
+}
+
 /// Computes the prefix length for a caller-supplied scan prefix. Returns
 /// `None` when this impl cannot guarantee the truncation invariant
 /// described in the module doc.
