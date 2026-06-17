@@ -33,7 +33,7 @@ use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
 use common::StorageConfig;
 use common::storage::config::ObjectStoreConfig;
-use log::{Config, LogDb, LogDbReader, ReaderConfig};
+use log::{Config, LogDb, LogDbReader, ReaderConfig, Record};
 use metrics_util::Summary as Sketch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -74,6 +74,10 @@ fn smoke_params() -> Params {
     p.insert("write_mb_per_sec", "10");
     // Write burst size B (records appended per admission). Constant for now.
     p.insert("burst_size", "8");
+    // Records per write-path append call. Several bursts are packed into one
+    // `try_append` so the per-call cost doesn't cap throughput (the gap vs. the
+    // ingest bench). Decoupled from burst_size, which stays a workload knob.
+    p.insert("write_batch_size", "100");
     // Read paging: records per poll while following a key's cursor.
     p.insert("page_size", "32");
     // Backoff after a read that finds nothing visible, so readers don't busy-spin
@@ -114,9 +118,12 @@ struct Shared {
     value: Bytes,
     record_size: u64,
     burst_size: usize,
-    /// Per-writer interval between bursts that holds the aggregate write rate at
+    /// Records per `try_append` (records, not keys): several bursts are packed
+    /// into one append so the per-call cost doesn't cap write throughput.
+    write_batch_size: usize,
+    /// Per-writer interval between batches that holds the aggregate write rate at
     /// the target; zero means unpaced (closed-loop).
-    burst_interval: Duration,
+    batch_interval: Duration,
     page_size: usize,
     empty_backoff: Duration,
     seed: u64,
@@ -128,6 +135,7 @@ struct Shared {
     // Write tallies.
     write_records: AtomicU64,
     write_bytes: AtomicU64,
+    queue_full: AtomicU64,
     // Read tallies.
     reads: AtomicU64,
     polls: AtomicU64,
@@ -137,7 +145,7 @@ struct Shared {
 
     // Service-time sketches.
     poll_us: Mutex<Sketch>,
-    burst_us: Mutex<Sketch>,
+    write_us: Mutex<Sketch>,
 }
 
 impl Shared {
@@ -150,8 +158,13 @@ impl Shared {
     }
 }
 
-/// Writer task: repeatedly sample a key from the Zipf and append a burst of
-/// `B` records to it, growing the resident population as new keys are discovered.
+/// Writer task: build a batch by sampling `keys_per_batch` keys from the Zipf and
+/// appending a burst of `B` records to each, then offer the whole batch in one
+/// `try_append`. Batching across bursts (rather than one append per burst)
+/// amortizes the write-path cost — a burst of `B` records per call makes the
+/// per-call overhead the throughput ceiling, exactly the gap vs. the ingest
+/// bench. Newly sampled keys grow the resident population; a batch rejected for
+/// `QueueFull` is dropped and counted (the open-loop saturation signal).
 async fn write_worker(
     shared: Arc<Shared>,
     idx: usize,
@@ -160,36 +173,51 @@ async fn write_worker(
 ) -> anyhow::Result<()> {
     let zipf = Zipf::new(shared.n, shared.skew);
     let mut rng = SplitMix64::new(worker_seed(shared.seed, ROLE_WRITE, idx));
-    let mut bursts_done: u32 = 0;
+    let keys_per_batch = (shared.write_batch_size / shared.burst_size).max(1);
+    let mut batches_done: u32 = 0;
     while !cancel.is_cancelled() {
-        let key_idx = zipf.sample(&mut rng);
-        let key = workload::key_at(key_idx, shared.key_length);
+        // Pack `keys_per_batch` bursts into one append; remember the sampled
+        // keys so we only mark them resident if the batch is accepted.
+        let mut batch = Vec::with_capacity(keys_per_batch * shared.burst_size);
+        let mut sampled = Vec::with_capacity(keys_per_batch);
+        for _ in 0..keys_per_batch {
+            let key_idx = zipf.sample(&mut rng);
+            sampled.push(key_idx);
+            let key = workload::key_at(key_idx, shared.key_length);
+            for _ in 0..shared.burst_size {
+                batch.push(Record {
+                    key: key.clone(),
+                    value: shared.value.clone(),
+                });
+            }
+        }
+        let n_records = batch.len() as u64;
+
         let t0 = Instant::now();
-        shared
-            .store
-            .append_burst(key.clone(), shared.value.clone(), shared.burst_size)
-            .await?;
+        let accepted = shared.store.try_offer(batch).await?;
         let us = t0.elapsed().as_micros() as f64;
 
-        if shared.mark_resident(key_idx) {
-            shared.distinct.fetch_add(1, Ordering::Relaxed);
+        if accepted {
+            for key_idx in sampled {
+                if shared.mark_resident(key_idx) {
+                    shared.distinct.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            shared.write_records.fetch_add(n_records, Ordering::Relaxed);
+            shared
+                .write_bytes
+                .fetch_add(n_records * shared.record_size, Ordering::Relaxed);
+            shared.write_us.lock().unwrap().add(us);
+        } else {
+            shared.queue_full.fetch_add(1, Ordering::Relaxed);
         }
-        shared
-            .write_records
-            .fetch_add(shared.burst_size as u64, Ordering::Relaxed);
-        shared.write_bytes.fetch_add(
-            shared.burst_size as u64 * shared.record_size,
-            Ordering::Relaxed,
-        );
-        shared.burst_us.lock().unwrap().add(us);
 
         // Open-loop pacing: hold the aggregate write rate at the target so the
-        // write load is a constant across the N/R sweep rather than drifting
-        // with the system's closed-loop ceiling. `burst_interval == 0` means
-        // unpaced (write as fast as accepted).
-        bursts_done += 1;
-        if !shared.burst_interval.is_zero() {
-            let next = pace_start + shared.burst_interval * bursts_done;
+        // write load is constant across the N/R sweep rather than drifting with
+        // the system's closed-loop ceiling. `batch_interval == 0` means unpaced.
+        batches_done += 1;
+        if !shared.batch_interval.is_zero() {
+            let next = pace_start + shared.batch_interval * batches_done;
             let now = Instant::now();
             if next > now {
                 tokio::time::sleep(next - now).await;
@@ -301,6 +329,9 @@ impl Benchmark for KeyScaleBenchmark {
         let write_concurrency: usize = params.get_parse::<usize>("write_concurrency")?.max(1);
         let read_concurrency: usize = params.get_parse::<usize>("read_concurrency")?.max(1);
         let burst_size: usize = params.get_parse::<usize>("burst_size")?.max(1);
+        let write_batch_size: usize = params
+            .get_parse::<usize>("write_batch_size")?
+            .max(burst_size);
         let write_mb_per_sec: f64 = params.get_parse("write_mb_per_sec")?;
         let page_size: usize = params.get_parse::<usize>("page_size")?.max(1);
         let empty_backoff = Duration::from_millis(params.get_parse("empty_backoff_ms")?);
@@ -351,13 +382,16 @@ impl Benchmark for KeyScaleBenchmark {
         };
         let logdb_store = Arc::new(LogDbStore::with_reader(writer, reader));
 
-        // Per-writer burst interval that holds the aggregate write rate at the
-        // target. Zero when unpaced (write_mb_per_sec <= 0).
+        // Per-writer interval between batches that holds the aggregate write rate
+        // at the target. Zero when unpaced (write_mb_per_sec <= 0). The interval
+        // is sized to the actual records per batch (keys_per_batch * burst_size).
         let record_size = workload::record_size(key_length, value_size) as f64;
-        let burst_interval = if write_mb_per_sec > 0.0 {
+        let keys_per_batch = (write_batch_size / burst_size).max(1);
+        let records_per_batch = keys_per_batch * burst_size;
+        let batch_interval = if write_mb_per_sec > 0.0 {
             let target_records_per_sec = write_mb_per_sec * 1_000_000.0 / record_size;
             let per_writer_rate = target_records_per_sec / write_concurrency as f64;
-            Duration::from_secs_f64(burst_size as f64 / per_writer_rate)
+            Duration::from_secs_f64(records_per_batch as f64 / per_writer_rate)
         } else {
             Duration::ZERO
         };
@@ -371,7 +405,8 @@ impl Benchmark for KeyScaleBenchmark {
             value: workload::value_template(value_size),
             record_size: workload::record_size(key_length, value_size) as u64,
             burst_size,
-            burst_interval,
+            write_batch_size,
+            batch_interval,
             page_size,
             empty_backoff,
             seed,
@@ -379,13 +414,14 @@ impl Benchmark for KeyScaleBenchmark {
             distinct: AtomicU64::new(0),
             write_records: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
+            queue_full: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             polls: AtomicU64::new(0),
             read_records: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
             empty_reads: AtomicU64::new(0),
             poll_us: Mutex::new(Sketch::with_defaults()),
-            burst_us: Mutex::new(Sketch::with_defaults()),
+            write_us: Mutex::new(Sketch::with_defaults()),
         });
 
         // Spawn both pools. There is no warm-up: the population grows from empty
@@ -518,8 +554,12 @@ fn build_summary(shared: &Shared, elapsed: f64, n: usize, skew: f64) -> Summary 
             "write_mb_per_sec",
             write_bytes as f64 / elapsed / 1_000_000.0,
         )
-        .add("burst_service_us_p50", q(&shared.burst_us, 0.5))
-        .add("burst_service_us_p99", q(&shared.burst_us, 0.99))
+        .add(
+            "write_queue_full",
+            shared.queue_full.load(Ordering::Relaxed) as f64,
+        )
+        .add("write_service_us_p50", q(&shared.write_us, 0.5))
+        .add("write_service_us_p99", q(&shared.write_us, 0.99))
         .add("elapsed_ms", elapsed * 1000.0)
 }
 
