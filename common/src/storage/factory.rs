@@ -183,6 +183,7 @@ impl StorageBuilder {
 #[derive(Default, Clone)]
 pub struct StorageReaderRuntime {
     pub(crate) block_cache: Option<Arc<dyn DbCache>>,
+    pub(crate) meta_cache: Option<Arc<dyn DbCache>>,
     pub(crate) object_store: Option<Arc<dyn ObjectStore>>,
     pub(crate) checkpoint_id: Option<Uuid>,
 }
@@ -206,6 +207,20 @@ impl StorageReaderRuntime {
     /// This option only affects SlateDB storage; it is ignored for in-memory storage.
     pub fn with_block_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
         self.block_cache = Some(cache);
+        self
+    }
+
+    /// Sets a dedicated metadata cache for SlateDB reads.
+    ///
+    /// When set, the reader wraps the (optional) block cache and this cache in a
+    /// [`SplitCache`] that routes data blocks to the block cache and SST
+    /// index/filter/stats blocks here. A dedicated metadata cache keeps those
+    /// pruning-critical blocks resident even when large sequential scans churn
+    /// the data cache, which a single shared cache cannot guarantee.
+    ///
+    /// This option only affects SlateDB storage; it is ignored for in-memory storage.
+    pub fn with_meta_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
+        self.meta_cache = Some(cache);
         self
     }
 
@@ -412,11 +427,22 @@ pub async fn create_storage_read(
                 create_object_store(&slate_config.object_store)?
             };
 
-            // Prefer the runtime-provided cache (owned by the caller); fall
-            // back to the config-driven split cache. SlateDB drives cache
-            // shutdown from `DbReader::close()`, so we don't hold a handle.
-            // The reader and its count-path `SstReader` share this cache.
-            let cache = if let Some(cache) = runtime.block_cache {
+            // Prefer the runtime-provided cache(s); fall back to the
+            // config-driven split cache. SlateDB drives cache shutdown from
+            // `DbReader::close()`, so we don't hold a handle. The reader and its
+            // count-path `SstReader` share this cache.
+            //
+            // A runtime metadata cache forces a `SplitCache` so data-block churn
+            // can't evict the pruning-critical index/filter/stats blocks; a
+            // runtime block cache alone is used directly (data and metadata
+            // share it, the historical behavior).
+            let cache = if runtime.meta_cache.is_some() {
+                let split = SplitCache::new()
+                    .with_block_cache(runtime.block_cache)
+                    .with_meta_cache(runtime.meta_cache)
+                    .build();
+                Some(Arc::new(split) as Arc<dyn DbCache>)
+            } else if let Some(cache) = runtime.block_cache {
                 Some(cache)
             } else {
                 build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?

@@ -137,6 +137,7 @@ fn smoke_params() -> Params {
     p.insert("seal_interval_ms", "500");
     // Reader.
     p.insert("block_cache_mb", "0");
+    p.insert("meta_cache_mb", "0");
     p.insert("refresh_interval_ms", "1000");
     p.insert("warmup_secs", "3");
     p
@@ -212,6 +213,13 @@ impl Benchmark for BurstReadBenchmark {
             Some(v) => v.parse()?,
             None => 0,
         };
+        // Dedicated metadata cache (MiB; 0 = none). When > 0, SST index/filter/
+        // stats blocks are cached separately from data blocks, so large scans
+        // churning the data cache can't evict the pruning-critical metadata.
+        let meta_cache_mb: u64 = match params.get("meta_cache_mb") {
+            Some(v) => v.parse()?,
+            None => 0,
+        };
 
         // ---- Concurrent live write load (drifting hot active-set) ----
         // `arrival_active_keys = 0` (default) keeps the corpus static during
@@ -272,9 +280,12 @@ impl Benchmark for BurstReadBenchmark {
             storage: storage_config,
             refresh_interval: Duration::from_millis(refresh_interval_ms),
         };
-        let reader = if block_cache_mb > 0 {
-            let cache = common::create_in_memory_block_cache(block_cache_mb * 1024 * 1024);
-            LogDbReader::open_with_block_cache(reader_config, cache).await?
+        let block_cache = (block_cache_mb > 0)
+            .then(|| common::create_in_memory_block_cache(block_cache_mb << 20));
+        let meta_cache =
+            (meta_cache_mb > 0).then(|| common::create_in_memory_block_cache(meta_cache_mb << 20));
+        let reader = if block_cache.is_some() || meta_cache.is_some() {
+            LogDbReader::open_with_caches(reader_config, block_cache, meta_cache).await?
         } else {
             LogDbReader::open(reader_config).await?
         };

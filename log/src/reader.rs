@@ -733,6 +733,27 @@ impl LogDbReader {
         .await
     }
 
+    /// Opens a read-only view with separate data- and metadata-block caches.
+    ///
+    /// When `meta_cache` is provided, SST index/filter/stats blocks are cached
+    /// separately from data blocks, so large sequential scans churning the data
+    /// cache cannot evict the pruning-critical metadata. Either cache may be
+    /// `None`; passing both `None` is equivalent to [`open`](Self::open).
+    pub async fn open_with_caches(
+        config: ReaderConfig,
+        block_cache: Option<Arc<dyn DbCache>>,
+        meta_cache: Option<Arc<dyn DbCache>>,
+    ) -> Result<Self> {
+        let mut runtime = StorageReaderRuntime::new();
+        if let Some(cache) = block_cache {
+            runtime = runtime.with_block_cache(cache);
+        }
+        if let Some(cache) = meta_cache {
+            runtime = runtime.with_meta_cache(cache);
+        }
+        Self::open_with_runtime(config, runtime).await
+    }
+
     /// Shared body of [`open`](Self::open) and
     /// [`open_with_block_cache`](Self::open_with_block_cache): build the
     /// read-only storage from `runtime` and spawn the refresh task.

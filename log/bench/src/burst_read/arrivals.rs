@@ -233,7 +233,9 @@ pub async fn run_writer(
         })
         .collect();
     if state.recording() {
-        state.bursts.fetch_add(active.len() as u64, Ordering::Relaxed);
+        state
+            .bursts
+            .fetch_add(active.len() as u64, Ordering::Relaxed);
     }
 
     let paced = per_writer_rate > 0.0;
@@ -276,7 +278,9 @@ pub async fn run_writer(
         if accepted {
             // Appends drive lag in every phase (a returning reader must see the
             // backlog that grew while it was away); tallies are measure-only.
-            state.lag.record_appended(global_id, state.batch_size as u64);
+            state
+                .lag
+                .record_appended(global_id, state.batch_size as u64);
             if state.recording() {
                 state
                     .records_written
