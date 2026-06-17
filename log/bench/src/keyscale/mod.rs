@@ -21,8 +21,6 @@
 //! cache-independent signals are segment scans and object-store GETs per poll: if
 //! those stay flat as distinct keys grow, an idle key is genuinely free.
 
-mod zipf;
-
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::read::store::{Cursor, LogDbStore, LogStore};
 use crate::workload;
-use zipf::{SplitMix64, Zipf};
+use crate::zipf::{SplitMix64, Zipf};
 
 pub struct KeyScaleBenchmark;
 

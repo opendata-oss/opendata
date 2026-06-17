@@ -181,6 +181,19 @@ impl LogDbStore {
         }
     }
 
+    /// Like [`try_arrival`](Self::try_arrival), but on accept returns the new
+    /// append frontier — the sequence just past the last record written — so a
+    /// "start at the tail" reader can resume from it. `None` means the batch was
+    /// dropped (`QueueFull`).
+    pub async fn try_append_frontier(&self, records: Vec<Record>) -> anyhow::Result<Option<u64>> {
+        let n = records.len() as u64;
+        match self.writer.try_append(records).await {
+            Ok(out) => Ok(Some(out.start_sequence + n)),
+            Err(AppendError::QueueFull(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Append a batch of records, retrying on `QueueFull`. Used for bulk pre-fill,
     /// where batching amortizes the write path and avoids one round-trip per record.
     pub async fn append_batch(&self, mut records: Vec<Record>) -> anyhow::Result<()> {

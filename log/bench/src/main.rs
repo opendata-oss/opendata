@@ -8,8 +8,10 @@ mod burst_read;
 mod follow;
 mod ingest;
 mod keyscale;
+mod proxy;
 mod read;
 mod workload;
+mod zipf;
 
 use bencher::Benchmark;
 
@@ -19,6 +21,7 @@ fn benchmarks() -> Vec<Box<dyn Benchmark>> {
         Box::new(follow::FollowBenchmark::new()),
         Box::new(burst_read::BurstReadBenchmark::new()),
         Box::new(keyscale::KeyScaleBenchmark::new()),
+        Box::new(proxy::ProxyBenchmark::new()),
     ]
 }
 

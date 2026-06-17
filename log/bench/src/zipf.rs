@@ -30,6 +30,17 @@ impl SplitMix64 {
     pub fn next_f64(&mut self) -> f64 {
         ((self.next_u64() >> 11) as f64 + 0.5) * (1.0 / (1u64 << 53) as f64)
     }
+
+    /// An exponentially-distributed interval (seconds) at the given rate
+    /// (events/sec), for Poisson arrivals. Returns infinity for a non-positive
+    /// rate.
+    pub fn exp_interval_secs(&mut self, rate: f64) -> f64 {
+        if rate <= 0.0 {
+            return f64::INFINITY;
+        }
+        // Inverse-CDF: -ln(1-u)/rate. next_f64() ∈ [0,1) so (1-u) ∈ (0,1].
+        -(1.0 - self.next_f64()).ln() / rate
+    }
 }
 
 /// `ln(1 + x) / x`, accurate near zero (limit 1).
