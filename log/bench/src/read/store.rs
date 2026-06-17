@@ -153,6 +153,22 @@ impl LogDbStore {
         })
     }
 
+    /// Append one arrival batch on the live write path, open-loop: a full write
+    /// queue (`QueueFull`) is the saturation signal, so the batch is dropped and
+    /// `Ok(false)` returned (the caller counts it as offered-but-rejected) rather
+    /// than retried — retrying would be coordinated omission against the offered
+    /// rate. `Ok(true)` = accepted; any other append error is terminal.
+    ///
+    /// Contrast with [`append_batch`](Self::append_batch), which *retries* on
+    /// `QueueFull` and is used for bulk pre-fill where we want every record landed.
+    pub async fn try_arrival(&self, records: Vec<Record>) -> anyhow::Result<bool> {
+        match self.writer.try_append(records).await {
+            Ok(_) => Ok(true),
+            Err(AppendError::QueueFull(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Append a batch of records, retrying on `QueueFull`. Used for bulk pre-fill,
     /// where batching amortizes the write path and avoids one round-trip per record.
     pub async fn append_batch(&self, mut records: Vec<Record>) -> anyhow::Result<()> {

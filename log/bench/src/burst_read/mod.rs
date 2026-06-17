@@ -9,11 +9,15 @@
 //! `(active_sessions, session_duration, key_cardinality)` — "how many logs can be
 //! actively queried relative to the number of keys."
 //!
-//! Readers are independent of writers (no concurrent arrivals): the corpus is
-//! built once in a prefill phase and is static during measurement. The burst
-//! write pattern's only role here is to shape the on-disk layout — prefill
-//! scatters each key's records across segments (see [`prefill`]) so the reader
-//! pays realistic segment fan-out.
+//! The prefill always runs: it scatters each key's records across segments (see
+//! [`prefill`]) so a catch-up read pays realistic segment fan-out. With
+//! `arrival_active_keys = 0` the corpus is then *static* during measurement and
+//! the bench measures pure catch-up cost. With `arrival_active_keys > 0` a
+//! concurrent drifting hot active-set of bursty writers (see [`arrivals`]) runs
+//! through warm-up and measure, so a reader that catches up then *follows a live
+//! tail* — turning what would be an empty tail-poll on a static corpus into a
+//! real incremental read. The reader/writer overlap is partial and bursty by
+//! design (a key is hot only while in the active set).
 //!
 //! `session_duration` walks between two read patterns over that fixed pool:
 //! long/forever ⇒ a consistent set of readers consuming few keys deeply; short ⇒
@@ -21,6 +25,7 @@
 //! cursor. A run proceeds prefill → warm-up → measure over one live database, with
 //! polls served by one standalone reader (the layer that scales).
 
+mod arrivals;
 mod driver;
 mod metrics;
 mod prefill;
@@ -43,7 +48,8 @@ use tokio_util::sync::CancellationToken;
 use crate::read::lag::{LAG_BUCKET_LABELS, LagTracker, NUM_LAG_BUCKETS};
 use crate::read::store::{LogDbStore, LogStore};
 use crate::workload;
-use metrics::ReadMetrics;
+use arrivals::ArrivalState;
+use metrics::{ReadMetrics, WriteMetrics};
 
 /// Phase while warming up: workload runs, metrics are discarded.
 const PHASE_WARMUP: u8 = 0;
@@ -74,8 +80,8 @@ pub struct ReadState {
     /// Gap between successive polls within a session (`0` = back-to-back).
     poll_interval: Duration,
 
-    // ---- Phase ----
-    phase: AtomicU8,
+    // ---- Phase (shared with the arrival writers) ----
+    phase: Arc<AtomicU8>,
 
     // ---- Measure-window tallies ----
     polls_completed: AtomicU64,
@@ -207,6 +213,43 @@ impl Benchmark for BurstReadBenchmark {
             None => 0,
         };
 
+        // ---- Concurrent live write load (drifting hot active-set) ----
+        // `arrival_active_keys = 0` (default) keeps the corpus static during
+        // measurement — pure catch-up cost. `> 0` runs `num_writer_tasks` bursty
+        // writers through warm-up and measure so caught-up readers follow a live
+        // tail; each hot key gets `arrival_burst_size` records (in
+        // `arrival_batch_size` chunks) before churning out. `arrival_mb_per_sec = 0`
+        // (default) is closed-loop (write as fast as accepted); `> 0` paces the
+        // offered write rate open-loop.
+        let arrival_active_keys: usize = match params.get("arrival_active_keys") {
+            Some(v) => v.parse()?,
+            None => 0,
+        }
+        .min(cardinality);
+        let arrival_burst_size: usize = match params.get("arrival_burst_size") {
+            Some(v) => v.parse::<usize>()?.max(1),
+            None => burst_size,
+        };
+        let arrival_batch_size: usize = match params.get("arrival_batch_size") {
+            Some(v) => v.parse::<usize>()?.max(1),
+            None => 10,
+        }
+        .min(arrival_burst_size);
+        let arrival_mb_per_sec: f64 = match params.get("arrival_mb_per_sec") {
+            Some(v) => v.parse()?,
+            None => 0.0,
+        };
+        // Capped at the active set: every writer should drive >= 1 mid-burst key.
+        let num_writer_tasks: usize = match params.get("num_writer_tasks") {
+            Some(v) => v.parse::<usize>()?.max(1),
+            None => 4,
+        }
+        .min(arrival_active_keys.max(1));
+        let seed: u64 = match params.get("seed") {
+            Some(v) => v.parse()?,
+            None => 1,
+        };
+
         // The standalone reader is the system under test, so a shared object store
         // (Local/Aws) is required — an in-memory store is per-handle and the reader
         // would observe none of the writer's prefill.
@@ -267,18 +310,20 @@ impl Benchmark for BurstReadBenchmark {
                 .map(|_| Mutex::new(Sketch::with_defaults()))
                 .collect()
         };
+        // Phase is shared by the reader pool and the arrival writers.
+        let phase = Arc::new(AtomicU8::new(PHASE_WARMUP));
         let store_dyn: Arc<dyn LogStore> = logdb_store.clone();
         let state = Arc::new(ReadState {
             store: store_dyn,
-            keys,
+            keys: keys.clone(),
             cursors: (0..cardinality).map(|_| AtomicU64::new(0)).collect(),
             touched: (0..cardinality).map(|_| AtomicBool::new(false)).collect(),
-            lag,
+            lag: lag.clone(),
             metrics: read_metrics,
             page_size,
             session_duration,
             poll_interval: Duration::from_millis(poll_interval_ms),
-            phase: AtomicU8::new(PHASE_WARMUP),
+            phase: phase.clone(),
             polls_completed: AtomicU64::new(0),
             records_consumed: AtomicU64::new(0),
             bytes_consumed: AtomicU64::new(0),
@@ -299,6 +344,52 @@ impl Benchmark for BurstReadBenchmark {
                 cancel.clone(),
             )));
         }
+
+        // Launch the concurrent live write load (if enabled). Writers run through
+        // warm-up and measure so the system reaches steady state under write load
+        // before measurement; their tallies are gated to the measure window.
+        let target_records_per_sec = arrival_mb_per_sec * 1_000_000.0 / record_size as f64;
+        let arrival_state = if arrival_active_keys > 0 {
+            let per_writer_rate = if target_records_per_sec > 0.0 {
+                target_records_per_sec / num_writer_tasks as f64
+            } else {
+                0.0
+            };
+            let astate = Arc::new(ArrivalState::new(
+                logdb_store.clone(),
+                keys.clone(),
+                value.clone(),
+                record_size,
+                arrival_burst_size,
+                arrival_batch_size,
+                num_writer_tasks,
+                lag.clone(),
+                phase.clone(),
+                WriteMetrics::new(&bench),
+            ));
+            // Distribute the active set across writers; the first
+            // `active_keys % num_writer_tasks` writers get one extra so the per-writer
+            // counts sum to exactly `arrival_active_keys`.
+            let base = arrival_active_keys / num_writer_tasks;
+            let extra = arrival_active_keys % num_writer_tasks;
+            let pace_start = Instant::now();
+            let mut writers = Vec::with_capacity(num_writer_tasks);
+            for t in 0..num_writer_tasks {
+                let active_count = base + if t < extra { 1 } else { 0 };
+                writers.push(tokio::spawn(arrivals::run_writer(
+                    t,
+                    active_count,
+                    per_writer_rate,
+                    arrivals::writer_seed(seed, t),
+                    pace_start,
+                    astate.clone(),
+                    cancel.clone(),
+                )));
+            }
+            Some((astate, writers))
+        } else {
+            None
+        };
 
         // Phase 2 — Warm-up: workers run, metrics discarded; the reader picks up the
         // prefilled corpus and the block cache reaches steady state.
@@ -327,9 +418,20 @@ impl Benchmark for BurstReadBenchmark {
         for h in handles {
             h.await??;
         }
+        // Join the arrival writers (if any) and keep their state for the summary.
+        let arrival = match arrival_state {
+            Some((astate, writers)) => {
+                for w in writers {
+                    w.await??;
+                }
+                Some(astate)
+            }
+            None => None,
+        };
 
         let summary = build_summary(SummaryInputs {
             state: &state,
+            arrival: arrival.as_deref(),
             elapsed_secs,
             active_sessions,
             session_duration,
@@ -337,6 +439,11 @@ impl Benchmark for BurstReadBenchmark {
             rounds,
             prefill_records_per_sec,
             prefill_bytes_per_sec,
+            arrival_active_keys,
+            arrival_burst_size,
+            arrival_batch_size,
+            num_writer_tasks,
+            arrival_target_records_per_sec: target_records_per_sec,
             gets_total,
             get_bytes_total,
             segment_scans_total,
@@ -347,6 +454,7 @@ impl Benchmark for BurstReadBenchmark {
 
         // Drop the shared state so `logdb_store` is the sole owner, then close.
         drop(state);
+        drop(arrival);
         if let Ok(store) = Arc::try_unwrap(logdb_store) {
             store.close().await?;
         }
@@ -358,6 +466,8 @@ impl Benchmark for BurstReadBenchmark {
 /// Bundle of values the summary is built from.
 struct SummaryInputs<'a> {
     state: &'a ReadState,
+    /// Present only when the concurrent write load was enabled.
+    arrival: Option<&'a ArrivalState>,
     elapsed_secs: f64,
     active_sessions: usize,
     session_duration: Option<Duration>,
@@ -365,6 +475,11 @@ struct SummaryInputs<'a> {
     rounds: usize,
     prefill_records_per_sec: f64,
     prefill_bytes_per_sec: f64,
+    arrival_active_keys: usize,
+    arrival_burst_size: usize,
+    arrival_batch_size: usize,
+    num_writer_tasks: usize,
+    arrival_target_records_per_sec: f64,
     gets_total: u64,
     get_bytes_total: u64,
     segment_scans_total: u64,
@@ -444,6 +559,39 @@ fn build_summary(inp: SummaryInputs<'_>) -> Summary {
         )
         .add("residual_backlog_records", s.lag.total_lag() as f64)
         .add("elapsed_ms", inp.elapsed_ms);
+
+    // Concurrent write load — only when arrivals were enabled. The offered load
+    // (drifting hot active-set); the read-side effect shows up in the lag buckets
+    // and per-lag service latency below (caught-up readers now follow a live tail).
+    if let Some(a) = inp.arrival {
+        let records_written = a.records_written();
+        summary = summary
+            .add("arrival_active_keys", inp.arrival_active_keys as f64)
+            .add("arrival_burst_size", inp.arrival_burst_size as f64)
+            .add("arrival_batch_size", inp.arrival_batch_size as f64)
+            .add("num_writer_tasks", inp.num_writer_tasks as f64)
+            .add("arrival_records_written", records_written as f64)
+            .add("arrival_records_per_sec", records_written as f64 / elapsed)
+            .add("arrival_bytes_per_sec", a.bytes_written() as f64 / elapsed)
+            .add("arrival_bursts", a.bursts() as f64)
+            .add("arrival_queue_full_batches", a.queue_full_batches() as f64);
+        // Open-loop only: how much of the offered write rate held, plus the
+        // schedule lag (the coordinated-omission backstop; ~0 unless the writer
+        // path can't keep up with the offered rate).
+        if inp.arrival_target_records_per_sec > 0.0 {
+            summary = summary
+                .add(
+                    "arrival_target_records_per_sec",
+                    inp.arrival_target_records_per_sec,
+                )
+                .add(
+                    "arrival_sustained_frac",
+                    (records_written as f64 / elapsed) / inp.arrival_target_records_per_sec,
+                )
+                .add("arrival_sched_lag_us_mean", a.sched_lag_us_mean())
+                .add("arrival_sched_lag_us_max", a.sched_lag_us_max());
+        }
+    }
 
     // Per-poll lag distribution (how far behind reads were at poll time).
     for (b, label) in LAG_BUCKET_LABELS.iter().enumerate() {

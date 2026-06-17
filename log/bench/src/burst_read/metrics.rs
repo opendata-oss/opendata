@@ -11,6 +11,29 @@ use bencher::{Bench, Counter, Histogram};
 
 use crate::read::lag::{LAG_BUCKET_LABELS, NUM_LAG_BUCKETS};
 
+/// Live write-path metric handles for the concurrent arrival load (the drifting
+/// hot active-set writers). Present only when arrivals are enabled
+/// (`arrival_active_keys > 0`); a static-corpus run leaves these unused.
+#[derive(Clone)]
+pub struct WriteMetrics {
+    /// Records appended by the arrival writers.
+    pub records: Counter,
+    /// Value bytes appended by the arrival writers.
+    pub bytes: Counter,
+    /// Per-batch append service time, microseconds.
+    pub batch_latency_us: Histogram,
+}
+
+impl WriteMetrics {
+    pub fn new(bench: &Bench) -> Self {
+        Self {
+            records: bench.counter("arrival_records"),
+            bytes: bench.counter("arrival_bytes"),
+            batch_latency_us: bench.histogram("arrival_batch_latency_us"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ReadMetrics {
     /// Polls completed (across all sessions).
