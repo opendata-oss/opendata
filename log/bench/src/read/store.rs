@@ -42,6 +42,16 @@ pub trait LogStore: Send + Sync {
     /// Append one record to a key's log; the arrival path.
     async fn append(&self, key: Bytes, payload: Bytes) -> anyhow::Result<()>;
 
+    /// Append `count` copies of `payload` under `key` as a single burst. The
+    /// default appends one at a time; implementations that can batch should
+    /// override this so a burst is one write-path round-trip, not `count`.
+    async fn append_burst(&self, key: Bytes, payload: Bytes, count: usize) -> anyhow::Result<()> {
+        for _ in 0..count {
+            self.append(key.clone(), payload.clone()).await?;
+        }
+        Ok(())
+    }
+
     /// Read up to `max` records for `key` starting at `cursor`; the follow path.
     /// Returns how much was drained and the cursor to resume from next time.
     async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput>;
@@ -197,6 +207,18 @@ impl LogStore for LogDbStore {
             value: payload,
         }])
         .await
+    }
+
+    async fn append_burst(&self, key: Bytes, payload: Bytes, count: usize) -> anyhow::Result<()> {
+        // One batched `try_append` per burst, amortizing the write path instead
+        // of paying a round-trip per record.
+        let records = (0..count)
+            .map(|_| Record {
+                key: key.clone(),
+                value: payload.clone(),
+            })
+            .collect();
+        self.append_batch(records).await
     }
 
     async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput> {
