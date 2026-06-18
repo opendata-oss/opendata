@@ -816,6 +816,17 @@ impl LogDbReader {
             .map(|slate| crate::tree::TreeSummary::from_manifest(&slate.manifest())))
     }
 
+    /// The reader's current visibility frontier: the highest sequence it has
+    /// caught up to (the sealed-segment boundary, lifted by any observed L0).
+    ///
+    /// This is an approximate "now" for seeding a live-tail read on a standalone
+    /// reader that has no in-process view of the writer — it lags the writer's
+    /// true tail by roughly the seal interval plus the reader's refresh interval.
+    /// It advances as the reader refreshes its segment cache.
+    pub async fn frontier(&self) -> Sequence {
+        self.read_view.read().await.frontier
+    }
+
     /// Spawns a background task that periodically refreshes the segment cache.
     ///
     /// This path fully reloads segments from storage on each tick so a

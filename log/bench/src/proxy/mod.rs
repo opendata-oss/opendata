@@ -35,12 +35,12 @@ use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
 use common::StorageConfig;
 use common::storage::config::ObjectStoreConfig;
-use log::{Config, LogDb, LogDbReader, ReaderConfig, Record};
+use log::{AppendError, Config, LogDb, LogDbReader, ReaderConfig, Record};
 use metrics_util::Summary as Sketch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::read::store::{Cursor, LogDbStore, LogStore};
+use crate::read::store::{Cursor, LogDbStore, LogStore, PollOutput};
 use crate::workload;
 use crate::zipf::{SplitMix64, Zipf};
 
@@ -57,6 +57,75 @@ enum ConsumeModel {
     LiveTail,
     /// Resume from the log's last-saved position, drain the gap, then follow.
     Persistent,
+}
+
+/// Which half of the workload this process runs. `Both` is the single-process
+/// path (writer + reader in one node); `Writer`/`Reader` split them across nodes
+/// of a multi-node deployment that share one object store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Both,
+    Writer,
+    Reader,
+}
+
+/// The storage handle(s) this process holds, per its [`Role`]. A reader node has
+/// no `LogDb` writer (the writer is elsewhere); it polls a standalone reader and
+/// seeds live-tail from the reader's own [`LogDbReader::frontier`].
+enum Backend {
+    Writer(LogDb),
+    Reader(LogDbReader),
+    Both(LogDbStore),
+}
+
+impl Backend {
+    /// Append a batch; on accept return the new append frontier, `None` on
+    /// `QueueFull` (dropped). Writer/Both only.
+    async fn try_append_frontier(&self, records: Vec<Record>) -> anyhow::Result<Option<u64>> {
+        match self {
+            Backend::Both(store) => store.try_append_frontier(records).await,
+            Backend::Writer(db) => {
+                let n = records.len() as u64;
+                match db.try_append(records).await {
+                    Ok(out) => Ok(Some(out.start_sequence + n)),
+                    Err(AppendError::QueueFull(_)) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Backend::Reader(_) => unreachable!("reader role does not write"),
+        }
+    }
+
+    /// Drain up to `max` records for `key` from `cursor`. Reader/Both only.
+    async fn poll(&self, key: Bytes, cursor: Cursor, max: usize) -> anyhow::Result<PollOutput> {
+        match self {
+            Backend::Both(store) => store.poll(key, cursor, max).await,
+            Backend::Reader(r) => LogDbStore::drain(r, key, cursor, max).await,
+            Backend::Writer(_) => unreachable!("writer role does not read"),
+        }
+    }
+
+    /// The reader's visibility frontier (reader role), for seeding live-tail.
+    async fn reader_frontier(&self) -> u64 {
+        match self {
+            Backend::Reader(r) => r.frontier().await,
+            _ => 0,
+        }
+    }
+
+    async fn close(self) -> anyhow::Result<()> {
+        match self {
+            Backend::Both(store) => store.close().await,
+            Backend::Writer(db) => {
+                db.close().await?;
+                Ok(())
+            }
+            Backend::Reader(r) => {
+                r.close().await;
+                Ok(())
+            }
+        }
+    }
 }
 
 pub struct ProxyBenchmark;
@@ -77,9 +146,15 @@ impl Default for ProxyBenchmark {
 /// Requires a shared object store (Local/Aws): the proxy is a standalone reader.
 fn smoke_params() -> Params {
     let mut p = Params::new();
+    // Role: "both" runs writer + reader in one process (single-node, default);
+    // "writer"/"reader" split them across nodes sharing one object store.
+    p.insert("role", "both");
     // Population.
     p.insert("key_population", "100000");
     p.insert("zipf_skew", "1.1");
+    // Key distribution: "zipf" (realistic) or "uniform" (clean for the partition
+    // sweep — P-independent, so only the reader's slice changes).
+    p.insert("key_distribution", "zipf");
     p.insert("key_length", "16");
     p.insert("value_size", "128");
     // Write load (held constant; builds the population during warmup + measure).
@@ -125,23 +200,38 @@ fn task_seed(run_seed: u64, role: u64, idx: usize) -> u64 {
     SplitMix64::new(mixed).next_u64()
 }
 
+/// Local key distribution within the sampled span.
+enum KeyDist {
+    /// Skewed — a hot head per span (the realistic/default workload).
+    Zipf(Zipf),
+    /// Every key equally likely. P-independent, so partitioning only changes the
+    /// reader's slice (not the write layout) — the clean choice for isolating the
+    /// range-partition / cache-locality effect.
+    Uniform,
+}
+
 /// Samples a key index, optionally within a partition. The key space `[0, n)` is
-/// split into `num_partitions` equal sub-ranges, each an *independent, offset*
-/// Zipf (so every partition has its own hot head and is equally active). A
-/// `fixed_partition` confines sampling to one partition (a range-partitioned
-/// reader); `None` picks a partition uniformly each draw (the writer, and the
-/// random-load-balanced reader). With `num_partitions == 1` this is exactly a
-/// global Zipf over `[0, n)` (no extra RNG draw — preserves the unpartitioned
-/// workload byte-for-byte).
+/// split into `num_partitions` equal sub-ranges. A `fixed_partition` confines
+/// sampling to one partition (a range-partitioned reader); `None` picks a
+/// partition uniformly each draw (the writer, and the random-load-balanced
+/// reader). With `num_partitions == 1` this is a plain distribution over `[0, n)`
+/// (no extra RNG draw — preserves the unpartitioned workload byte-for-byte).
 struct KeySampler {
-    zipf: Zipf,
+    dist: KeyDist,
+    span: usize,
     partition_width: usize,
     num_partitions: usize,
     fixed_partition: Option<usize>,
 }
 
 impl KeySampler {
-    fn new(n: usize, num_partitions: usize, skew: f64, fixed_partition: Option<usize>) -> Self {
+    fn new(
+        n: usize,
+        num_partitions: usize,
+        skew: f64,
+        uniform: bool,
+        fixed_partition: Option<usize>,
+    ) -> Self {
         let num_partitions = num_partitions.max(1);
         let partition_width = (n / num_partitions).max(1);
         let span = if num_partitions <= 1 {
@@ -149,8 +239,14 @@ impl KeySampler {
         } else {
             partition_width
         };
+        let dist = if uniform {
+            KeyDist::Uniform
+        } else {
+            KeyDist::Zipf(Zipf::new(span, skew))
+        };
         Self {
-            zipf: Zipf::new(span, skew),
+            dist,
+            span,
             partition_width,
             num_partitions,
             fixed_partition,
@@ -158,7 +254,10 @@ impl KeySampler {
     }
 
     fn sample(&self, rng: &mut SplitMix64) -> usize {
-        let local = self.zipf.sample(rng);
+        let local = match &self.dist {
+            KeyDist::Zipf(z) => z.sample(rng),
+            KeyDist::Uniform => (rng.next_u64() % self.span as u64) as usize,
+        };
         if self.num_partitions <= 1 {
             return local;
         }
@@ -170,10 +269,13 @@ impl KeySampler {
 }
 
 struct Shared {
-    store: Arc<LogDbStore>,
+    store: Arc<Backend>,
     // Population / workload.
     n: usize,
     skew: f64,
+    /// Uniform key distribution instead of Zipf (P-independent; isolates the
+    /// range-partition / cache-locality effect).
+    uniform_keys: bool,
     key_length: usize,
     value: Bytes,
     record_size: u64,
@@ -258,7 +360,13 @@ async fn write_worker(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     // Writers cover all partitions (fixed_partition = None).
-    let sampler = KeySampler::new(shared.n, shared.num_partitions, shared.skew, None);
+    let sampler = KeySampler::new(
+        shared.n,
+        shared.num_partitions,
+        shared.skew,
+        shared.uniform_keys,
+        None,
+    );
     let mut rng = SplitMix64::new(task_seed(shared.seed_write(), ROLE_WRITE, idx));
     let keys_per_batch = (shared.write_batch_size / shared.burst_size).max(1);
     let mut batches_done: u32 = 0;
@@ -407,6 +515,7 @@ async fn run_arrivals(shared: Arc<Shared>, session_rate: f64, cancel: Cancellati
         shared.n,
         shared.num_partitions,
         shared.skew,
+        shared.uniform_keys,
         shared.reader_partition,
     );
     let mut rng = SplitMix64::new(task_seed(shared.seed_arrival(), ROLE_ARRIVAL, 0));
@@ -509,6 +618,22 @@ impl Benchmark for ProxyBenchmark {
         let snapshot_interval_ms: u64 = params.get_parse::<u64>("snapshot_interval_ms")?.max(1);
         let seed: u64 = params.get_parse("seed")?;
 
+        let role = match params.get("role").unwrap_or("both") {
+            "both" => Role::Both,
+            "writer" => Role::Writer,
+            "reader" => Role::Reader,
+            other => bail!("unknown role '{other}' (expected 'both', 'writer', or 'reader')"),
+        };
+        let do_write = matches!(role, Role::Both | Role::Writer);
+        let do_read = matches!(role, Role::Both | Role::Reader);
+
+        // Key distribution within a span: zipf (default, realistic) or uniform
+        // (P-independent — the clean choice for the partition/locality sweep).
+        let uniform_keys = match params.get("key_distribution").unwrap_or("zipf") {
+            "zipf" => false,
+            "uniform" => true,
+            other => bail!("unknown key_distribution '{other}' (expected 'zipf' or 'uniform')"),
+        };
         // Partitioning. `reader_partition = "all"` (default) reads the whole
         // keyspace (random LB); a number confines the proxy to that partition.
         let num_partitions: usize = params.get_parse::<usize>("num_partitions")?.max(1);
@@ -543,29 +668,40 @@ impl Benchmark for ProxyBenchmark {
             );
         }
 
-        // Writer.
-        let mut config = Config {
-            storage: storage_config.clone(),
-            ..Default::default()
+        // Open only the handle(s) this role needs — a reader node never opens a
+        // `LogDb` writer (that would fence the real writer on another node).
+        let open_writer = || async {
+            let mut config = Config {
+                storage: storage_config.clone(),
+                ..Default::default()
+            };
+            config.segmentation.seal_interval = seal_interval;
+            LogDb::open(config).await
         };
-        config.segmentation.seal_interval = seal_interval;
-        let writer = LogDb::open(config).await?;
-
-        // Proxy: a single standalone reader, optional split cache.
-        let reader_config = ReaderConfig {
-            storage: storage_config,
-            refresh_interval: Duration::from_millis(refresh_interval_ms),
+        let open_reader = || async {
+            let reader_config = ReaderConfig {
+                storage: storage_config.clone(),
+                refresh_interval: Duration::from_millis(refresh_interval_ms),
+            };
+            let block_cache = (block_cache_mb > 0)
+                .then(|| common::create_in_memory_block_cache(block_cache_mb << 20));
+            let meta_cache = (meta_cache_mb > 0)
+                .then(|| common::create_in_memory_block_cache(meta_cache_mb << 20));
+            if block_cache.is_some() || meta_cache.is_some() {
+                LogDbReader::open_with_caches(reader_config, block_cache, meta_cache).await
+            } else {
+                LogDbReader::open(reader_config).await
+            }
         };
-        let block_cache = (block_cache_mb > 0)
-            .then(|| common::create_in_memory_block_cache(block_cache_mb << 20));
-        let meta_cache =
-            (meta_cache_mb > 0).then(|| common::create_in_memory_block_cache(meta_cache_mb << 20));
-        let reader = if block_cache.is_some() || meta_cache.is_some() {
-            LogDbReader::open_with_caches(reader_config, block_cache, meta_cache).await?
-        } else {
-            LogDbReader::open(reader_config).await?
+        let backend = match role {
+            Role::Both => Backend::Both(LogDbStore::with_reader(
+                open_writer().await?,
+                open_reader().await?,
+            )),
+            Role::Writer => Backend::Writer(open_writer().await?),
+            Role::Reader => Backend::Reader(open_reader().await?),
         };
-        let store = Arc::new(LogDbStore::with_reader(writer, reader));
+        let store = Arc::new(backend);
 
         let record_size = workload::record_size(key_length, value_size) as f64;
         let keys_per_batch = (write_batch_size / burst_size).max(1);
@@ -587,6 +723,7 @@ impl Benchmark for ProxyBenchmark {
             store: store.clone(),
             n,
             skew,
+            uniform_keys,
             key_length,
             value: workload::value_template(value_size),
             record_size: record_size as u64,
@@ -625,22 +762,39 @@ impl Benchmark for ProxyBenchmark {
         // so the population and caches reach steady state, then measure.
         let cancel = CancellationToken::new();
         let pace_start = Instant::now();
-        let mut writers = Vec::with_capacity(write_concurrency);
-        for w in 0..write_concurrency {
-            writers.push(tokio::spawn(write_worker(
-                shared.clone(),
-                w,
-                pace_start,
-                cancel.clone(),
-            )));
+        let mut writers = Vec::new();
+        if do_write {
+            for w in 0..write_concurrency {
+                writers.push(tokio::spawn(write_worker(
+                    shared.clone(),
+                    w,
+                    pace_start,
+                    cancel.clone(),
+                )));
+            }
+        }
+        // Reader node: there is no in-process writer publishing the frontier, so
+        // seed live-tail "now" from the reader's own visibility frontier. Warmup
+        // then absorbs the (bounded, ~seal-interval) seed gap before measuring.
+        if matches!(role, Role::Reader) {
+            let f = shared.store.reader_frontier().await;
+            shared.append_frontier.store(f, Ordering::Relaxed);
         }
         // Closed-loop: spawn exactly `num_followers` forever-followers, each on a
         // Zipf-sampled log — occupancy is fixed at C, the directly-swept "how many
         // logs followed at once". Open-loop: run the Poisson arrival generator.
         let mut followers = Vec::new();
-        let arrivals = if closed_loop {
+        let arrivals = if !do_read {
+            None
+        } else if closed_loop {
             let mut rng = SplitMix64::new(task_seed(shared.seed_arrival(), ROLE_ARRIVAL, 0));
-            let sampler = KeySampler::new(n, shared.num_partitions, skew, shared.reader_partition);
+            let sampler = KeySampler::new(
+                n,
+                shared.num_partitions,
+                skew,
+                shared.uniform_keys,
+                shared.reader_partition,
+            );
             for i in 0..num_followers {
                 let key_idx = sampler.sample(&mut rng);
                 // Even phase offset across the cadence so polls don't herd.

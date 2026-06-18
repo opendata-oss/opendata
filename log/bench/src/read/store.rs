@@ -133,8 +133,9 @@ impl LogDbStore {
 
     /// Drain up to `max` records for `key` starting at `cursor`, using `reader`
     /// (either the writer's [`LogDb`] or a standalone [`LogDbReader`] — both
-    /// implement [`LogRead`]).
-    async fn drain<R: LogRead + Sync>(
+    /// implement [`LogRead`]). `pub(crate)` so role-split benchmarks can poll a
+    /// raw reader handle directly.
+    pub(crate) async fn drain<R: LogRead + Sync>(
         reader: &R,
         key: Bytes,
         cursor: Cursor,
