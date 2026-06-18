@@ -100,6 +100,10 @@ fn smoke_params() -> Params {
     p.insert("poll_interval_ms", "1000");
     p.insert("consume_model", "live_tail"); // or "persistent"
     p.insert("page_size", "32");
+    // Partitioning: split the keyspace into offset-Zipf partitions. 1 = global
+    // (unpartitioned). reader_partition "all" = random LB; a number = read one.
+    p.insert("num_partitions", "1");
+    p.insert("reader_partition", "all");
     // Runaway backstop: cap concurrent sessions (0 = unlimited).
     p.insert("max_inflight", "0");
     // Storage / reader.
@@ -121,6 +125,50 @@ fn task_seed(run_seed: u64, role: u64, idx: usize) -> u64 {
     SplitMix64::new(mixed).next_u64()
 }
 
+/// Samples a key index, optionally within a partition. The key space `[0, n)` is
+/// split into `num_partitions` equal sub-ranges, each an *independent, offset*
+/// Zipf (so every partition has its own hot head and is equally active). A
+/// `fixed_partition` confines sampling to one partition (a range-partitioned
+/// reader); `None` picks a partition uniformly each draw (the writer, and the
+/// random-load-balanced reader). With `num_partitions == 1` this is exactly a
+/// global Zipf over `[0, n)` (no extra RNG draw — preserves the unpartitioned
+/// workload byte-for-byte).
+struct KeySampler {
+    zipf: Zipf,
+    partition_width: usize,
+    num_partitions: usize,
+    fixed_partition: Option<usize>,
+}
+
+impl KeySampler {
+    fn new(n: usize, num_partitions: usize, skew: f64, fixed_partition: Option<usize>) -> Self {
+        let num_partitions = num_partitions.max(1);
+        let partition_width = (n / num_partitions).max(1);
+        let span = if num_partitions <= 1 {
+            n
+        } else {
+            partition_width
+        };
+        Self {
+            zipf: Zipf::new(span, skew),
+            partition_width,
+            num_partitions,
+            fixed_partition,
+        }
+    }
+
+    fn sample(&self, rng: &mut SplitMix64) -> usize {
+        let local = self.zipf.sample(rng);
+        if self.num_partitions <= 1 {
+            return local;
+        }
+        let part = self
+            .fixed_partition
+            .unwrap_or((rng.next_u64() % self.num_partitions as u64) as usize);
+        part * self.partition_width + local
+    }
+}
+
 struct Shared {
     store: Arc<LogDbStore>,
     // Population / workload.
@@ -139,6 +187,11 @@ struct Shared {
     write_records: AtomicU64,
     write_bytes: AtomicU64,
     queue_full: AtomicU64,
+    // Partitioning: split the key space into `num_partitions` offset-Zipf
+    // sub-ranges. Writers cover all of them (uniform); the proxy reads
+    // `reader_partition` (Some = range-partitioned, None = all = random LB).
+    num_partitions: usize,
+    reader_partition: Option<usize>,
     // Read / session side.
     consume_model: ConsumeModel,
     /// Persistent per-log saved position (next sequence), read at session start
@@ -204,14 +257,15 @@ async fn write_worker(
     pace_start: Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let zipf = Zipf::new(shared.n, shared.skew);
+    // Writers cover all partitions (fixed_partition = None).
+    let sampler = KeySampler::new(shared.n, shared.num_partitions, shared.skew, None);
     let mut rng = SplitMix64::new(task_seed(shared.seed_write(), ROLE_WRITE, idx));
     let keys_per_batch = (shared.write_batch_size / shared.burst_size).max(1);
     let mut batches_done: u32 = 0;
     while !cancel.is_cancelled() {
         let mut batch = Vec::with_capacity(keys_per_batch * shared.burst_size);
         for _ in 0..keys_per_batch {
-            let key_idx = zipf.sample(&mut rng);
+            let key_idx = sampler.sample(&mut rng);
             let key = workload::key_at(key_idx, shared.key_length);
             for _ in 0..shared.burst_size {
                 batch.push(Record {
@@ -349,7 +403,12 @@ async fn run_session(
 /// samples a log by Zipf and spawns a session; dispatch lag (scheduled → started)
 /// is the pool-saturation backstop.
 async fn run_arrivals(shared: Arc<Shared>, session_rate: f64, cancel: CancellationToken) {
-    let zipf = Zipf::new(shared.n, shared.skew);
+    let sampler = KeySampler::new(
+        shared.n,
+        shared.num_partitions,
+        shared.skew,
+        shared.reader_partition,
+    );
     let mut rng = SplitMix64::new(task_seed(shared.seed_arrival(), ROLE_ARRIVAL, 0));
     let t0 = Instant::now();
     let mut next_secs = 0.0f64;
@@ -373,7 +432,7 @@ async fn run_arrivals(shared: Arc<Shared>, session_rate: f64, cancel: Cancellati
             continue;
         }
 
-        let key_idx = zipf.sample(&mut rng);
+        let key_idx = sampler.sample(&mut rng);
         if shared.recording() {
             let lag = Instant::now().saturating_duration_since(due);
             shared
@@ -450,6 +509,20 @@ impl Benchmark for ProxyBenchmark {
         let snapshot_interval_ms: u64 = params.get_parse::<u64>("snapshot_interval_ms")?.max(1);
         let seed: u64 = params.get_parse("seed")?;
 
+        // Partitioning. `reader_partition = "all"` (default) reads the whole
+        // keyspace (random LB); a number confines the proxy to that partition.
+        let num_partitions: usize = params.get_parse::<usize>("num_partitions")?.max(1);
+        let reader_partition = match params.get("reader_partition").unwrap_or("all") {
+            "all" => None,
+            v => {
+                let p: usize = v.parse()?;
+                if p >= num_partitions {
+                    bail!("reader_partition {p} out of range for num_partitions {num_partitions}");
+                }
+                Some(p)
+            }
+        };
+
         let seal_interval = match params.get("seal_interval_ms") {
             Some(v) => match v.parse::<u64>()? {
                 0 => None,
@@ -524,6 +597,8 @@ impl Benchmark for ProxyBenchmark {
             write_records: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
             queue_full: AtomicU64::new(0),
+            num_partitions,
+            reader_partition,
             consume_model,
             saved_cursors,
             page_size,
@@ -565,9 +640,9 @@ impl Benchmark for ProxyBenchmark {
         let mut followers = Vec::new();
         let arrivals = if closed_loop {
             let mut rng = SplitMix64::new(task_seed(shared.seed_arrival(), ROLE_ARRIVAL, 0));
-            let zipf = Zipf::new(n, skew);
+            let sampler = KeySampler::new(n, shared.num_partitions, skew, shared.reader_partition);
             for i in 0..num_followers {
-                let key_idx = zipf.sample(&mut rng);
+                let key_idx = sampler.sample(&mut rng);
                 // Even phase offset across the cadence so polls don't herd.
                 let phase = poll_interval.mul_f64(i as f64 / num_followers as f64);
                 let active = shared.active_sessions.fetch_add(1, Ordering::Relaxed) + 1;
@@ -760,6 +835,11 @@ fn build_summary(
     Summary::new()
         .add("key_population", n as f64)
         .add("zipf_skew", skew)
+        .add("num_partitions", shared.num_partitions as f64)
+        .add(
+            "reader_partition",
+            shared.reader_partition.map(|p| p as f64).unwrap_or(-1.0),
+        )
         .add("consume_model_persistent", model)
         .add("offered_session_rate", session_rate)
         // Occupancy (the headline "concurrent sessions").
