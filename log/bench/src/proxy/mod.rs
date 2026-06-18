@@ -162,7 +162,12 @@ struct Shared {
     // Sketches.
     poll_us: Mutex<Sketch>,
     /// Poll scheduling lag (cadence poll firing late) — the reader-saturation knee.
+    /// Cumulative over the run, for the summary percentiles.
     poll_sched_lag_us: Mutex<Sketch>,
+    /// Same lag, but rotated each snapshot so the progress rows and the stability
+    /// verdict see per-interval lag (flat = steady, rising = diverging) rather
+    /// than the inherently-drifting cumulative p99.
+    poll_sched_lag_interval: Mutex<Sketch>,
     /// Session dispatch lag (arrival → task start) — the pool-saturation backstop.
     dispatch_lag_us: Mutex<Sketch>,
     /// Records a session consumed (per persistent session, the backlog drained).
@@ -293,12 +298,9 @@ async fn run_session(
                 tokio::time::sleep(due - now).await;
             }
             if shared.recording() {
-                let lag = Instant::now().saturating_duration_since(due);
-                shared
-                    .poll_sched_lag_us
-                    .lock()
-                    .unwrap()
-                    .add(lag.as_micros() as f64);
+                let lag_us = Instant::now().saturating_duration_since(due).as_micros() as f64;
+                shared.poll_sched_lag_us.lock().unwrap().add(lag_us);
+                shared.poll_sched_lag_interval.lock().unwrap().add(lag_us);
             }
         }
 
@@ -538,6 +540,7 @@ impl Benchmark for ProxyBenchmark {
             bytes_consumed: AtomicU64::new(0),
             poll_us: Mutex::new(Sketch::with_defaults()),
             poll_sched_lag_us: Mutex::new(Sketch::with_defaults()),
+            poll_sched_lag_interval: Mutex::new(Sketch::with_defaults()),
             dispatch_lag_us: Mutex::new(Sketch::with_defaults()),
             session_records: Mutex::new(Sketch::with_defaults()),
             seed,
@@ -586,12 +589,19 @@ impl Benchmark for ProxyBenchmark {
 
         tokio::time::sleep(Duration::from_secs_f64(warmup_secs)).await;
 
-        // Measure.
+        // Measure. Lag columns are per-interval: p50 is the baseline the verdict
+        // tracks, p99 the tail (spiky from periodic refresh).
         println!(
             "  {:>9} {:>10} {:>11} {:>11} {:>13} {:>13}",
-            "occ", "sess/s", "polls/s", "rec/s", "pollag_p99us", "displag_p99us"
+            "occ", "sess/s", "polls/s", "rec/s", "pollag_p50us", "pollag_p99us"
         );
         shared.phase.store(PHASE_MEASURE, Ordering::Relaxed);
+        // Snapshot process-wide cost counters at measure start; the deltas over
+        // the window are the read cost. (These are global, so they include the
+        // writers' compaction GETs, but the polling followers dominate GET volume.)
+        let gets_at = common::object_store_gets();
+        let get_bytes_at = common::object_store_get_bytes();
+        let segment_scans_at = log::segment_scans();
         let runner = bench.start();
         let snapshot_dt = Duration::from_millis(snapshot_interval_ms);
         let (mut prev_polls, mut prev_sess, mut prev_rec) = (0u64, 0u64, 0u64);
@@ -612,17 +622,27 @@ impl Benchmark for ProxyBenchmark {
             let polls = shared.polls.load(Ordering::Relaxed);
             let sess = shared.sessions_completed.load(Ordering::Relaxed);
             let rec = shared.records_consumed.load(Ordering::Relaxed);
-            let q = |s: &Mutex<Sketch>| s.lock().unwrap().quantile(0.99).unwrap_or(0.0);
-            let lag_p99 = q(&shared.poll_sched_lag_us);
-            lag_traj.push(lag_p99);
+            // Per-interval lag: read this window's p50 and p99, then reset so the
+            // next snapshot reflects only its own interval (no cumulative drift).
+            // The verdict tracks p50 (the baseline — flat when healthy, climbs
+            // only under real saturation); p99 is shown for tail visibility but is
+            // noisy (periodic refresh spikes), so it's a poor divergence signal.
+            let (lag_p50, lag_p99) = {
+                let mut g = shared.poll_sched_lag_interval.lock().unwrap();
+                let p50 = g.quantile(0.5).unwrap_or(0.0);
+                let p99 = g.quantile(0.99).unwrap_or(0.0);
+                *g = Sketch::with_defaults();
+                (p50, p99)
+            };
+            lag_traj.push(lag_p50);
             println!(
                 "  {:>9} {:>10.0} {:>11.0} {:>11.0} {:>13.0} {:>13.0}",
                 active,
                 (sess - prev_sess) as f64 / dt,
                 (polls - prev_polls) as f64 / dt,
                 (rec - prev_rec) as f64 / dt,
+                lag_p50,
                 lag_p99,
-                q(&shared.dispatch_lag_us),
             );
             prev_polls = polls;
             prev_sess = sess;
@@ -630,6 +650,9 @@ impl Benchmark for ProxyBenchmark {
             prev_t = Instant::now();
         }
         let elapsed = runner.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+        let gets_total = common::object_store_gets().saturating_sub(gets_at);
+        let get_bytes_total = common::object_store_get_bytes().saturating_sub(get_bytes_at);
+        let segment_scans_total = log::segment_scans().saturating_sub(segment_scans_at);
         let mean_occupancy = if total_dt > 0.0 {
             occ_integral / total_dt
         } else {
@@ -637,18 +660,28 @@ impl Benchmark for ProxyBenchmark {
         };
         shared.phase.store(PHASE_DONE, Ordering::Relaxed);
 
-        // Stability verdict: compare the cumulative lag p99 at the run's midpoint
-        // to its end. A steady run barely moves; a diverging one climbs. Compared
-        // at mid/end (not from the start) to skip the cold-start ramp. Emitted as
-        // a parseable line so the limit-search runner can classify each point.
+        // Stability verdict from the per-interval lag trajectory: compare the
+        // lag around the run's midpoint to its end. A steady run holds ~flat
+        // (ratio ≈ 1); a diverging one climbs. Both endpoints are averaged over a
+        // window to smooth snapshot noise, and the midpoint (not the start) is the
+        // baseline so the cold-start ramp is excluded. Emitted as a parseable line
+        // so the limit-search runner can classify each point.
+        let mean = |s: &[f64]| {
+            if s.is_empty() {
+                0.0
+            } else {
+                s.iter().sum::<f64>() / s.len() as f64
+            }
+        };
         let (lag_mid, lag_end) = if lag_traj.is_empty() {
             (0.0, 0.0)
         } else {
-            let mid = lag_traj[lag_traj.len() / 2];
-            // Mean of the last ~quarter, to smooth snapshot noise.
-            let tail_start = lag_traj.len().saturating_sub(lag_traj.len() / 4).max(1) - 1;
-            let tail = &lag_traj[tail_start..];
-            let end = tail.iter().sum::<f64>() / tail.len() as f64;
+            let n = lag_traj.len();
+            let win = (n / 4).max(1);
+            // Average a window centered on the midpoint, and one at the tail.
+            let mid_lo = (n / 2).saturating_sub(win / 2);
+            let mid = mean(&lag_traj[mid_lo..(mid_lo + win).min(n)]);
+            let end = mean(&lag_traj[n - win..]);
             (mid, end)
         };
         let lag_ratio = if lag_mid > 0.0 {
@@ -678,6 +711,9 @@ impl Benchmark for ProxyBenchmark {
             mean_occupancy,
             lag_mid,
             lag_end,
+            gets_total,
+            get_bytes_total,
+            segment_scans_total,
             n,
             skew,
             session_rate,
@@ -700,6 +736,9 @@ fn build_summary(
     mean_occupancy: f64,
     lag_mid: f64,
     lag_end: f64,
+    gets_total: u64,
+    get_bytes_total: u64,
+    segment_scans_total: u64,
     n: usize,
     skew: f64,
     session_rate: f64,
@@ -749,6 +788,34 @@ fn build_summary(
         .add("read_bytes_per_sec", per_sec(bytes))
         .add("poll_service_us_p50", q(&shared.poll_us, 0.5))
         .add("poll_service_us_p99", q(&shared.poll_us, 0.99))
+        // Object-store read cost (the price of cardinality). read_amplification =
+        // bytes fetched from the store per byte delivered to followers; gets and
+        // segment scans are normalized per poll.
+        .add("object_store_get_bytes_per_sec", per_sec(get_bytes_total))
+        .add(
+            "read_amplification",
+            if bytes > 0 {
+                get_bytes_total as f64 / bytes as f64
+            } else {
+                0.0
+            },
+        )
+        .add(
+            "gets_per_poll",
+            if polls > 0 {
+                gets_total as f64 / polls as f64
+            } else {
+                0.0
+            },
+        )
+        .add(
+            "segments_per_poll",
+            if polls > 0 {
+                segment_scans_total as f64 / polls as f64
+            } else {
+                0.0
+            },
+        )
         // Per-session consumption (persistent: the backlog drained).
         .add("session_records_p50", q(&shared.session_records, 0.5))
         .add("session_records_max", q(&shared.session_records, 1.0))
