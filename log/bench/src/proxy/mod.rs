@@ -600,6 +600,9 @@ impl Benchmark for ProxyBenchmark {
         // closed-loop (forever-followers never "complete") and open-loop.
         let mut occ_integral = 0.0f64;
         let mut total_dt = 0.0f64;
+        // Per-snapshot cumulative poll-scheduling-lag p99, for the stability
+        // verdict: a steady run holds ~flat, a saturated one keeps climbing.
+        let mut lag_traj: Vec<f64> = Vec::new();
         while runner.keep_running() {
             tokio::time::sleep(snapshot_dt).await;
             let dt = prev_t.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
@@ -610,13 +613,15 @@ impl Benchmark for ProxyBenchmark {
             let sess = shared.sessions_completed.load(Ordering::Relaxed);
             let rec = shared.records_consumed.load(Ordering::Relaxed);
             let q = |s: &Mutex<Sketch>| s.lock().unwrap().quantile(0.99).unwrap_or(0.0);
+            let lag_p99 = q(&shared.poll_sched_lag_us);
+            lag_traj.push(lag_p99);
             println!(
                 "  {:>9} {:>10.0} {:>11.0} {:>11.0} {:>13.0} {:>13.0}",
                 active,
                 (sess - prev_sess) as f64 / dt,
                 (polls - prev_polls) as f64 / dt,
                 (rec - prev_rec) as f64 / dt,
-                q(&shared.poll_sched_lag_us),
+                lag_p99,
                 q(&shared.dispatch_lag_us),
             );
             prev_polls = polls;
@@ -632,6 +637,30 @@ impl Benchmark for ProxyBenchmark {
         };
         shared.phase.store(PHASE_DONE, Ordering::Relaxed);
 
+        // Stability verdict: compare the cumulative lag p99 at the run's midpoint
+        // to its end. A steady run barely moves; a diverging one climbs. Compared
+        // at mid/end (not from the start) to skip the cold-start ramp. Emitted as
+        // a parseable line so the limit-search runner can classify each point.
+        let (lag_mid, lag_end) = if lag_traj.is_empty() {
+            (0.0, 0.0)
+        } else {
+            let mid = lag_traj[lag_traj.len() / 2];
+            // Mean of the last ~quarter, to smooth snapshot noise.
+            let tail_start = lag_traj.len().saturating_sub(lag_traj.len() / 4).max(1) - 1;
+            let tail = &lag_traj[tail_start..];
+            let end = tail.iter().sum::<f64>() / tail.len() as f64;
+            (mid, end)
+        };
+        let lag_ratio = if lag_mid > 0.0 {
+            lag_end / lag_mid
+        } else {
+            0.0
+        };
+        println!(
+            "STABILITY poll_sched_lag_us_mid={:.0} poll_sched_lag_us_end={:.0} ratio={:.2}",
+            lag_mid, lag_end, lag_ratio
+        );
+
         cancel.cancel();
         for w in writers {
             w.await??;
@@ -643,7 +672,16 @@ impl Benchmark for ProxyBenchmark {
             f.await?;
         }
 
-        let summary = build_summary(&shared, elapsed, mean_occupancy, n, skew, session_rate);
+        let summary = build_summary(
+            &shared,
+            elapsed,
+            mean_occupancy,
+            lag_mid,
+            lag_end,
+            n,
+            skew,
+            session_rate,
+        );
         bench.summarize(summary).await?;
 
         drop(shared);
@@ -655,10 +693,13 @@ impl Benchmark for ProxyBenchmark {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_summary(
     shared: &Shared,
     elapsed: f64,
     mean_occupancy: f64,
+    lag_mid: f64,
+    lag_end: f64,
     n: usize,
     skew: f64,
     session_rate: f64,
@@ -696,6 +737,10 @@ fn build_summary(
         // Saturation signals (the knee).
         .add("poll_sched_lag_us_p50", q(&shared.poll_sched_lag_us, 0.5))
         .add("poll_sched_lag_us_p99", q(&shared.poll_sched_lag_us, 0.99))
+        // Stability: cumulative lag p99 at the run's midpoint vs. end. A steady
+        // run holds the ratio near 1; a diverging one climbs well above it.
+        .add("poll_sched_lag_us_mid", lag_mid)
+        .add("poll_sched_lag_us_end", lag_end)
         .add("dispatch_lag_us_p50", q(&shared.dispatch_lag_us, 0.5))
         .add("dispatch_lag_us_p99", q(&shared.dispatch_lag_us, 0.99))
         // Read throughput / cost.
