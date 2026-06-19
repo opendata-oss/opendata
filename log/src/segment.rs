@@ -79,6 +79,13 @@ pub(crate) struct SegmentCache {
     segments: BTreeMap<u64, LogSegment>,
     /// Configuration for segment management.
     config: SegmentConfig,
+    /// Accumulated storage bytes (serialized key + value of log entries)
+    /// written to the active (latest) segment. Drives size-based sealing.
+    ///
+    /// In-memory only: reset to zero when a new segment is created and on
+    /// startup. See [`SegmentConfig::seal_byte_limit`] for the soft-target
+    /// semantics this implies.
+    active_bytes: u64,
 }
 
 impl SegmentCache {
@@ -93,7 +100,11 @@ impl SegmentCache {
             segments.insert(segment.meta.start_seq, segment);
         }
 
-        Ok(Self { segments, config })
+        Ok(Self {
+            segments,
+            config,
+            active_bytes: 0,
+        })
     }
 
     /// Creates an empty cache for testing.
@@ -102,6 +113,7 @@ impl SegmentCache {
         Self {
             segments: BTreeMap::new(),
             config: SegmentConfig::default(),
+            active_bytes: 0,
         }
     }
 
@@ -234,7 +246,13 @@ impl SegmentCache {
     ) -> SegmentAssignment {
         let latest = self.latest();
         let needs_new_segment = force_seal
-            || Self::should_roll(self.config.seal_interval, current_time_ms, latest.as_ref());
+            || Self::should_roll(
+                self.config.seal_interval,
+                self.config.seal_byte_limit,
+                current_time_ms,
+                self.active_bytes,
+                latest.as_ref(),
+            );
 
         if needs_new_segment {
             let segment_id = latest.map(|s| s.id + 1).unwrap_or(FIRST_USER_SEGMENT_ID);
@@ -248,6 +266,9 @@ impl SegmentCache {
 
             let segment = LogSegment::new(segment_id, meta);
             self.insert(segment.clone());
+            // The new segment starts empty; the bytes for this batch are added
+            // after the write commits (see `record_active_bytes`).
+            self.active_bytes = 0;
             SegmentAssignment {
                 segment,
                 is_new: true,
@@ -261,10 +282,17 @@ impl SegmentCache {
         }
     }
 
-    /// Checks if a new segment should be created based on seal interval.
+    /// Checks if a new segment should be created.
+    ///
+    /// Rolls when either threshold is reached: the active segment's age has
+    /// met `seal_interval`, or its accumulated `active_bytes` has met
+    /// `seal_byte_limit`. With no thresholds set, only the absence of any
+    /// segment forces a roll.
     fn should_roll(
         seal_interval: Option<Duration>,
+        seal_byte_limit: Option<u64>,
         current_time_ms: i64,
+        active_bytes: u64,
         latest: Option<&LogSegment>,
     ) -> bool {
         // No latest segment means we need to create the first one
@@ -272,14 +300,29 @@ impl SegmentCache {
             return true;
         };
 
-        // No seal interval means we never roll (use existing segment)
-        let Some(seal_interval) = seal_interval else {
-            return false;
-        };
+        // Time-based trigger.
+        if let Some(seal_interval) = seal_interval {
+            let seal_interval_ms = seal_interval.as_millis() as i64;
+            let segment_age_ms = current_time_ms - latest.meta().start_time_ms;
+            if segment_age_ms >= seal_interval_ms {
+                return true;
+            }
+        }
 
-        let seal_interval_ms = seal_interval.as_millis() as i64;
-        let segment_age_ms = current_time_ms - latest.meta().start_time_ms;
-        segment_age_ms >= seal_interval_ms
+        // Size-based trigger.
+        if seal_byte_limit.is_some_and(|limit| active_bytes >= limit) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Records `bytes` of committed log-entry data against the active segment.
+    ///
+    /// Called after a write commits so the running total reflects only durable
+    /// data. Drives the size-based seal check in [`should_roll`].
+    pub(crate) fn record_active_bytes(&mut self, bytes: u64) {
+        self.active_bytes = self.active_bytes.saturating_add(bytes);
     }
 }
 
@@ -574,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn should_roll_returns_false_when_no_seal_interval() {
         // given: no seal interval, no latest segment
-        let should_roll = SegmentCache::should_roll(None, 1000, None);
+        let should_roll = SegmentCache::should_roll(None, None, 1000, 0, None);
 
         // then: should roll (no segment exists)
         assert!(should_roll);
@@ -586,7 +629,7 @@ mod tests {
         let seal_interval = Some(Duration::from_secs(3600));
 
         // when
-        let should_roll = SegmentCache::should_roll(seal_interval, 1000, None);
+        let should_roll = SegmentCache::should_roll(seal_interval, None, 1000, 0, None);
 
         // then: should roll to create first segment
         assert!(should_roll);
@@ -600,7 +643,8 @@ mod tests {
 
         // when: current time is 1000 + 30 minutes
         let current_time_ms = 1000 + 30 * 60 * 1000;
-        let should_roll = SegmentCache::should_roll(seal_interval, current_time_ms, Some(&segment));
+        let should_roll =
+            SegmentCache::should_roll(seal_interval, None, current_time_ms, 0, Some(&segment));
 
         // then
         assert!(!should_roll);
@@ -614,7 +658,8 @@ mod tests {
 
         // when: current time is 1000 + 2 hours
         let current_time_ms = 1000 + 2 * 60 * 60 * 1000;
-        let should_roll = SegmentCache::should_roll(seal_interval, current_time_ms, Some(&segment));
+        let should_roll =
+            SegmentCache::should_roll(seal_interval, None, current_time_ms, 0, Some(&segment));
 
         // then
         assert!(should_roll);
@@ -628,7 +673,8 @@ mod tests {
 
         // when: current time is exactly at the interval boundary
         let current_time_ms = 1000 + 60 * 60 * 1000;
-        let should_roll = SegmentCache::should_roll(seal_interval, current_time_ms, Some(&segment));
+        let should_roll =
+            SegmentCache::should_roll(seal_interval, None, current_time_ms, 0, Some(&segment));
 
         // then: at boundary should roll
         assert!(should_roll);
@@ -640,10 +686,59 @@ mod tests {
         let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
 
         // when
-        let should_roll = SegmentCache::should_roll(None, 999999999, Some(&segment));
+        let should_roll = SegmentCache::should_roll(None, None, 999999999, 0, Some(&segment));
 
         // then: never rolls without seal_interval when segment exists
         assert!(!should_roll);
+    }
+
+    #[tokio::test]
+    async fn should_roll_returns_false_when_under_byte_limit() {
+        // given: byte limit of 1000, segment with 500 accumulated bytes
+        let seal_byte_limit = Some(1000);
+        let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
+
+        // when: well within both time and size
+        let should_roll =
+            SegmentCache::should_roll(None, seal_byte_limit, 1000, 500, Some(&segment));
+
+        // then
+        assert!(!should_roll);
+    }
+
+    #[tokio::test]
+    async fn should_roll_returns_true_when_byte_limit_reached() {
+        // given: byte limit of 1000, segment exactly at the limit
+        let seal_byte_limit = Some(1000);
+        let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
+
+        // when: at the boundary, no time trigger
+        let should_roll =
+            SegmentCache::should_roll(None, seal_byte_limit, 1000, 1000, Some(&segment));
+
+        // then: at boundary should roll
+        assert!(should_roll);
+    }
+
+    #[tokio::test]
+    async fn should_roll_rolls_on_size_before_time_when_both_set() {
+        // given: both triggers configured, size exceeded but time not
+        let seal_interval = Some(Duration::from_secs(3600));
+        let seal_byte_limit = Some(1000);
+        let segment = LogSegment::new(FIRST_USER_SEGMENT_ID, SegmentMeta::new(0, 1000));
+
+        // when: 1 minute later (within interval) but over the byte limit
+        let current_time_ms = 1000 + 60 * 1000;
+        let should_roll = SegmentCache::should_roll(
+            seal_interval,
+            seal_byte_limit,
+            current_time_ms,
+            2000,
+            Some(&segment),
+        );
+
+        // then: size trigger fires even though the interval has not elapsed
+        assert!(should_roll);
     }
 
     #[storage_test]
@@ -674,6 +769,7 @@ mod tests {
         // given: segment exists, within seal interval
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
+            ..Default::default()
         };
         let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
@@ -696,6 +792,7 @@ mod tests {
         // given: segment at time 1000, seal interval 1 hour
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
+            ..Default::default()
         };
         let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
@@ -718,6 +815,7 @@ mod tests {
         // given: segment exists, within seal interval
         let config = SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
+            ..Default::default()
         };
         let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
         write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
@@ -731,6 +829,36 @@ mod tests {
         assert!(assignment.is_new);
         assert_eq!(assignment.segment.id(), FIRST_USER_SEGMENT_ID + 1);
         assert_eq!(cache.all().len(), 2);
+    }
+
+    #[storage_test]
+    async fn assign_segment_rolls_and_resets_on_byte_limit(storage: Arc<dyn Storage>) {
+        // given: a byte limit of 1000 and an active segment that has
+        // accumulated 1500 bytes (over the limit). No seal_interval, so only
+        // size can trigger a roll.
+        let config = SegmentConfig {
+            seal_byte_limit: Some(1000),
+            ..Default::default()
+        };
+        let mut cache = SegmentCache::open(storage.as_ref(), config).await.unwrap();
+        write_segment(storage.as_ref(), &mut cache, SegmentMeta::new(0, 1000)).await;
+        cache.record_active_bytes(1500);
+        let mut records = Vec::new();
+
+        // when: a new batch arrives
+        let assignment = cache.assign_segment(2000, 100, &mut records, false);
+
+        // then: a new segment is created and the byte counter is reset
+        assert!(assignment.is_new);
+        assert_eq!(assignment.segment.id(), FIRST_USER_SEGMENT_ID + 1);
+        assert_eq!(cache.active_bytes, 0);
+
+        // and: a subsequent batch under the limit stays in the same segment
+        cache.record_active_bytes(500);
+        let mut records2 = Vec::new();
+        let assignment2 = cache.assign_segment(3000, 200, &mut records2, false);
+        assert!(!assignment2.is_new);
+        assert_eq!(assignment2.segment.id(), FIRST_USER_SEGMENT_ID + 1);
     }
 
     #[storage_test]

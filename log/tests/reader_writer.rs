@@ -179,6 +179,7 @@ async fn reader_drops_expired_segments_after_retention_deletes_metadata() {
         storage: storage.clone(),
         segmentation: SegmentConfig {
             seal_interval: Some(Duration::from_millis(100)),
+            ..Default::default()
         },
         retention: RetentionConfig {
             retention: Some(Duration::from_millis(100)),
@@ -296,6 +297,7 @@ async fn reader_idle_key_resumes_at_sealed_frontier() {
         storage: storage.clone(),
         segmentation: SegmentConfig {
             seal_interval: Some(Duration::from_millis(50)),
+            ..Default::default()
         },
         ..Default::default()
     })

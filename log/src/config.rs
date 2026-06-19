@@ -187,11 +187,33 @@ pub struct SegmentConfig {
     /// // Create a new segment every hour
     /// let config = SegmentConfig {
     ///     seal_interval: Some(Duration::from_secs(3600)),
+    ///     ..Default::default()
     /// };
     /// ```
     #[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
     #[serde(default)]
     pub seal_interval: Option<Duration>,
+
+    /// Maximum accumulated storage bytes in the active segment before it is
+    /// sealed.
+    ///
+    /// "Storage bytes" counts the serialized key plus value of each log entry
+    /// written to the segment (bookkeeping records such as listings and
+    /// segment metadata are not counted). When the active segment reaches this
+    /// many bytes, the next append rolls a new segment. Combines with
+    /// [`seal_interval`](Self::seal_interval): whichever threshold is reached
+    /// first triggers a seal.
+    ///
+    /// This is a soft target. The check uses bytes committed *before* the
+    /// current batch, so a segment may exceed the limit by up to one batch.
+    /// The running total is in-memory and resets to zero on restart, so the
+    /// active segment at startup may grow by up to one additional limit before
+    /// sealing. Both overshoots are bounded and acceptable for size-based
+    /// partitioning.
+    ///
+    /// When `None` (the default), size-based sealing is disabled.
+    #[serde(default)]
+    pub seal_byte_limit: Option<u64>,
 }
 
 /// Retention policy configuration.
@@ -414,7 +436,10 @@ mod tests {
 
     fn config_with(retention: Option<Duration>, seal_interval: Option<Duration>) -> Config {
         Config {
-            segmentation: SegmentConfig { seal_interval },
+            segmentation: SegmentConfig {
+                seal_interval,
+                ..Default::default()
+            },
             retention: RetentionConfig {
                 retention,
                 ..RetentionConfig::default()

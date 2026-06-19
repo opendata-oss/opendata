@@ -2098,6 +2098,7 @@ mod tests {
             storage: StorageConfig::InMemory,
             segmentation: SegmentConfig {
                 seal_interval: Some(seal_interval),
+                ..Default::default()
             },
             retention: RetentionConfig {
                 retention: Some(retention),
@@ -2361,6 +2362,7 @@ mod tests {
             storage: StorageConfig::InMemory,
             segmentation: SegmentConfig {
                 seal_interval: Some(Duration::from_nanos(1)),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -2427,6 +2429,7 @@ mod tests {
             storage.clone(),
             SegmentConfig {
                 seal_interval: Some(Duration::from_nanos(1)),
+                ..Default::default()
             },
             RetentionConfig::default(),
             ReadVisibility::Memory,

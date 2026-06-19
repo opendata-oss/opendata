@@ -9,7 +9,10 @@ use log::{Config, Error, LogCompactionOptions, LogDb, RetentionConfig, SegmentCo
 fn in_memory_with(retention: Option<Duration>, seal_interval: Option<Duration>) -> Config {
     Config {
         storage: StorageConfig::InMemory,
-        segmentation: SegmentConfig { seal_interval },
+        segmentation: SegmentConfig {
+            seal_interval,
+            ..Default::default()
+        },
         retention: RetentionConfig {
             retention,
             ..RetentionConfig::default()
