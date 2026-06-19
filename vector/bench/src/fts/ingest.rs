@@ -1,4 +1,4 @@
-//! INGEST phase: stream the synthetic corpus into a fresh `VectorDb`.
+//! INGEST phase: stream the configured FTS corpus into a fresh `VectorDb`.
 //!
 //! Opens a fresh `VectorDb` at phase start, generates documents on a
 //! background thread in fixed-size chunks, writes them in small batches,
@@ -7,14 +7,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Local;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use vector::{Vector, VectorDb};
 
-use crate::fts::corpus::{CorpusGenerator, Doc};
+use crate::fts::corpus;
 use crate::fts::{BODY_FIELD, FtsSpec, open_db};
 use crate::recall::ingest_default_memory_bytes;
 
@@ -37,10 +36,12 @@ pub async fn run(spec: &FtsSpec, config: &vector::Config) -> anyhow::Result<Inge
 async fn ingest(spec: &FtsSpec, db: &VectorDb) -> anyhow::Result<IngestSummary> {
     let num_docs = spec.num_docs as u64;
     println!(
-        "  Streaming {} synthetic docs (vocab={}, zipf_s={}, avg_len={}, dim={}) in chunks of {}",
-        num_docs, spec.vocab_size, spec.zipf_s, spec.avg_doc_len, spec.dimensions, DOC_CHUNK_SIZE
+        "  Streaming up to {} {} in chunks of {}",
+        num_docs,
+        corpus::corpus_description(spec),
+        DOC_CHUNK_SIZE
     );
-    let (mut stream, gen_thread) = spawn_doc_stream(spec, DOC_CHUNK_SIZE);
+    let (mut stream, gen_thread) = corpus::spawn_doc_stream(spec.clone(), DOC_CHUNK_SIZE);
 
     let ingest_start = Instant::now();
     let ingested_counter = Arc::new(AtomicU64::new(0));
@@ -52,6 +53,7 @@ async fn ingest(spec: &FtsSpec, db: &VectorDb) -> anyhow::Result<IngestSummary> 
     let mut batch_idx = 0usize;
     let mut docs_written = 0usize;
     while let Some(chunk) = stream.recv().await {
+        let chunk = chunk?;
         docs_written += chunk.len();
         println!(
             "  Generated chunk: {} docs ({} / {})",
@@ -89,7 +91,10 @@ async fn ingest(spec: &FtsSpec, db: &VectorDb) -> anyhow::Result<IngestSummary> 
         .join()
         .map_err(|_| anyhow::anyhow!("doc generation thread panicked"))?;
     if docs_written != spec.num_docs {
-        anyhow::bail!("generated {} docs but expected {}", docs_written, num_docs);
+        println!(
+            "  Corpus ended after {} docs (requested {})",
+            docs_written, num_docs
+        );
     }
     db.flush().await?;
     let ingest_secs = ingest_start.elapsed().as_secs_f64();
@@ -99,38 +104,18 @@ async fn ingest(spec: &FtsSpec, db: &VectorDb) -> anyhow::Result<IngestSummary> 
         .await
         .map_err(|e| anyhow::anyhow!("ingest throughput monitor panicked: {e}"))?;
 
+    let written_docs = docs_written as u64;
     println!(
         "  Ingested {} docs in {:.1}s ({:.0} docs/s)",
-        num_docs,
+        written_docs,
         ingest_secs,
-        num_docs as f64 / ingest_secs,
+        written_docs as f64 / ingest_secs,
     );
 
     Ok(IngestSummary {
-        num_docs,
+        num_docs: written_docs,
         ingest_secs,
     })
-}
-
-/// Spawn a thread that generates corpus chunks and streams them through a
-/// bounded channel, so generation overlaps with writes without ever
-/// materializing the whole corpus.
-fn spawn_doc_stream(
-    spec: &FtsSpec,
-    chunk_size: usize,
-) -> (mpsc::Receiver<Vec<Doc>>, thread::JoinHandle<()>) {
-    let mut generator = CorpusGenerator::new(spec);
-    let (tx, rx) = mpsc::channel(1);
-
-    let handle = thread::spawn(move || {
-        while let Some(chunk) = generator.next_chunk(chunk_size) {
-            if tx.blocking_send(chunk).is_err() {
-                return;
-            }
-        }
-    });
-
-    (rx, handle)
 }
 
 /// Spawn a task that samples the ingest counter once per minute and logs

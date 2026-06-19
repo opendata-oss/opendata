@@ -7,7 +7,7 @@
 
 use crate::error::Result;
 use crate::math::bm25::ScoreContext;
-use crate::query_engine::bm25::essential::{HitList, ScoreWindow};
+use crate::query_engine::bm25::essential::{Candidates, HitList, ScoreWindow};
 use crate::serde::term_postings::{DecodedPostingsBlock, TermPostingsView};
 
 /// Sentinel: no documents at or beyond this id (data-vector ids use the low
@@ -32,6 +32,8 @@ pub(super) struct TermScorer {
     pos: usize,
     /// Memoized per-block max score contribution.
     block_max_scores: Vec<Option<f32>>,
+    /// Reusable per-block hit buffer for batched scoring.
+    score_buf: Vec<f32>,
 }
 
 impl TermScorer {
@@ -47,6 +49,7 @@ impl TermScorer {
             decoded: DecodedPostingsBlock::default(),
             pos: 0,
             block_max_scores,
+            score_buf: Vec::new(),
         };
         scorer.load_block(0)?;
         Ok(scorer)
@@ -89,7 +92,7 @@ impl TermScorer {
     }
 
     /// Advance the cursor to the next posting.
-    #[inline]
+    #[cfg(test)]
     pub(super) fn next(&mut self) -> Result<()> {
         self.pos += 1;
         if self.pos < self.decoded.ids.len() {
@@ -226,9 +229,9 @@ impl TermScorer {
     /// accumulator, leaving the cursor at the first posting `>= up_to`.
     /// Slot `i` of the window corresponds to doc id `window_min + i`.
     ///
-    /// This is the term-at-a-time batch loop: for each decoded block it runs
-    /// a tight scalar loop over the block's parallel arrays. Vectorization
-    /// (RFC-0006 future work) will replace the loop body, not the structure.
+    /// This is the term-at-a-time batch loop: for each decoded block it
+    /// scores the block's parallel `(freq, norm)` columns as a batch, then
+    /// scatters the resulting hits into the dense doc-id window.
     pub(super) fn score_window_into(
         &mut self,
         window_min: u64,
@@ -240,13 +243,52 @@ impl TermScorer {
         while self.doc < up_to {
             let ids = &self.decoded.ids;
             let end = self.pos + ids[self.pos..].partition_point(|&id| id < up_to);
-            let run = ids[self.pos..end]
-                .iter()
-                .zip(&self.decoded.freqs[self.pos..end])
-                .zip(&self.decoded.norms[self.pos..end]);
-            for ((&id, &freq), &norm) in run {
+            let len = end - self.pos;
+            self.score_buf.resize(len, 0.0);
+            ctx.score_hits(
+                self.idf,
+                &self.decoded.freqs[self.pos..end],
+                &self.decoded.norms[self.pos..end],
+                &mut self.score_buf,
+            );
+            for (&id, &hit) in ids[self.pos..end].iter().zip(&self.score_buf) {
                 let slot = (id - window_min) as usize;
-                window.add(slot, ctx.score_hit(self.idf, freq, norm));
+                window.add(slot, hit);
+            }
+            if end < ids.len() {
+                self.pos = end;
+                self.set_current();
+                return Ok(());
+            }
+            self.load_block(self.block_idx + 1)?;
+        }
+        Ok(())
+    }
+
+    /// Append up to `limit` postings in `[self.doc, up_to)` directly to
+    /// the candidate buffer for a single essential clause.
+    pub(super) fn collect_candidates_limited_into(
+        &mut self,
+        up_to: u64,
+        limit: usize,
+        ctx: &ScoreContext,
+        candidates: &mut Candidates,
+    ) -> Result<()> {
+        while self.doc < up_to && candidates.len() < limit {
+            let ids = &self.decoded.ids;
+            let block_end = self.pos + ids[self.pos..].partition_point(|&id| id < up_to);
+            let remaining = limit - candidates.len();
+            let end = block_end.min(self.pos + remaining);
+            let len = end - self.pos;
+            self.score_buf.resize(len, 0.0);
+            ctx.score_hits(
+                self.idf,
+                &self.decoded.freqs[self.pos..end],
+                &self.decoded.norms[self.pos..end],
+                &mut self.score_buf,
+            );
+            for (&doc, &hit) in ids[self.pos..end].iter().zip(&self.score_buf) {
+                candidates.push(doc, hit as f64);
             }
             if end < ids.len() {
                 self.pos = end;
@@ -264,7 +306,7 @@ impl TermScorer {
     ///
     /// The merge strategy's counterpart to
     /// [`score_window_into`](Self::score_window_into): the same
-    /// term-at-a-time batch loop over the block's decoded arrays, but
+    /// term-at-a-time batch scoring over the block's decoded arrays, but
     /// appending sequentially instead of scattering into id-indexed slots.
     pub(super) fn collect_hits_into(
         &mut self,
@@ -276,12 +318,14 @@ impl TermScorer {
             let ids = &self.decoded.ids;
             let end = self.pos + ids[self.pos..].partition_point(|&id| id < up_to);
             out.docs.extend_from_slice(&ids[self.pos..end]);
-            let run = self.decoded.freqs[self.pos..end]
-                .iter()
-                .zip(&self.decoded.norms[self.pos..end]);
-            for (&freq, &norm) in run {
-                out.hits.push(ctx.score_hit(self.idf, freq, norm));
-            }
+            let old_len = out.hits.len();
+            out.hits.resize(old_len + end - self.pos, 0.0);
+            ctx.score_hits(
+                self.idf,
+                &self.decoded.freqs[self.pos..end],
+                &self.decoded.norms[self.pos..end],
+                &mut out.hits[old_len..],
+            );
             if end < ids.len() {
                 self.pos = end;
                 self.set_current();

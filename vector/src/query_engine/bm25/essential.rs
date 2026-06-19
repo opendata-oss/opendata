@@ -265,11 +265,12 @@ impl EssentialScorer for DenseWindowScorer {
                 .iter_mut()
                 .min_by_key(|ws| ws.scorer.doc())
                 .expect("score_window requires an essential scorer");
-            while ws.scorer.doc() < up_to && candidates.len() < SINGLE_CLAUSE_BATCH {
-                let hit = ws.scorer.current_hit(ctx);
-                candidates.push(ws.scorer.doc(), hit as f64);
-                ws.scorer.next()?;
-            }
+            ws.scorer.collect_candidates_limited_into(
+                up_to,
+                SINGLE_CLAUSE_BATCH,
+                ctx,
+                candidates,
+            )?;
             return Ok(());
         }
 
