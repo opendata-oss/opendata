@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use super::config::{BlockCacheConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+use super::counting::GetCounters;
 use super::in_memory::InMemoryStorage;
 use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegistry};
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
@@ -343,6 +344,32 @@ fn load_slatedb_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<S
 /// This is useful for cleanup operations where you need to access the object store
 /// after the database has been closed.
 pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
+    // Wrap so object-store GET requests are tallied into the process-global
+    // counters (the benchmark's GETs/poll signal). Transparent delegation.
+    Ok(super::counting::count_object_store(create_object_store_inner(
+        config,
+    )?))
+}
+
+/// Like [`create_object_store`], but also returns a [`GetCounters`] handle bound
+/// to this store. Its GETs feed both the process-global tallies and the returned
+/// handle, so a caller sharing a process with other stores (e.g. a standalone
+/// reader co-resident with a writer + compactor) can measure just this store's
+/// object-store reads. Inject the store via
+/// [`StorageReaderRuntime::with_object_store`] and keep the handle to read it.
+pub fn create_counted_object_store(
+    config: &ObjectStoreConfig,
+) -> StorageResult<(Arc<dyn ObjectStore>, GetCounters)> {
+    let handle = GetCounters::new();
+    let store = super::counting::count_object_store_with(
+        create_object_store_inner(config)?,
+        handle.clone(),
+    );
+    Ok((store, handle))
+}
+
+/// Builds the raw (uncounted) object store from configuration.
+fn create_object_store_inner(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
     let store: Arc<dyn ObjectStore> = match config {
         ObjectStoreConfig::InMemory => Arc::new(object_store::memory::InMemory::new()),
         ObjectStoreConfig::Aws(aws_config) => {
@@ -369,9 +396,7 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
             Arc::new(store)
         }
     };
-    // Wrap so object-store GET requests are tallied (the benchmark's GETs/poll
-    // signal). Transparent delegation; negligible overhead.
-    Ok(super::counting::count_object_store(store))
+    Ok(store)
 }
 
 /// Build a standalone in-memory block cache (foyer, memory-only) that can be

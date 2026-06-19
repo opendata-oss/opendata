@@ -39,19 +39,79 @@ pub fn object_store_get_bytes() -> u64 {
     GET_BYTES.load(Ordering::Relaxed)
 }
 
-/// Wrap `inner` so its GET requests are counted into the process-global tallies.
-pub fn count_object_store(inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
-    Arc::new(CountingObjectStore { inner })
+/// A per-handle GET tally.
+///
+/// The process-global [`object_store_get_bytes`] aggregates every store the
+/// process opens, so when several stores share a process — e.g. a standalone
+/// reader co-resident with a writer and its compactor — it can't attribute GETs
+/// to one of them. Attach a `GetCounters` to a single store via
+/// [`count_object_store_with`] and the caller that holds the (clonable) handle
+/// can read just that store's GETs. Stores with a handle feed *both* their
+/// handle and the global aggregate, so the global stays a true process total.
+#[derive(Clone, Debug, Default)]
+pub struct GetCounters(Arc<GetCountersInner>);
+
+#[derive(Debug, Default)]
+struct GetCountersInner {
+    gets: AtomicU64,
+    get_bytes: AtomicU64,
 }
 
-fn record_get(bytes: u64) {
-    GETS.fetch_add(1, Ordering::Relaxed);
-    GET_BYTES.fetch_add(bytes, Ordering::Relaxed);
+impl GetCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// GET requests counted into this handle so far.
+    pub fn gets(&self) -> u64 {
+        self.0.gets.load(Ordering::Relaxed)
+    }
+
+    /// Bytes returned by GETs counted into this handle so far.
+    pub fn get_bytes(&self) -> u64 {
+        self.0.get_bytes.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, gets: u64, bytes: u64) {
+        self.0.gets.fetch_add(gets, Ordering::Relaxed);
+        self.0.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Wrap `inner` so its GET requests are counted into the process-global tallies.
+pub fn count_object_store(inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+    Arc::new(CountingObjectStore {
+        inner,
+        handle: None,
+    })
+}
+
+/// Wrap `inner` so its GET requests feed both the process-global tallies and the
+/// given per-handle counter, letting the caller measure this store in isolation.
+pub fn count_object_store_with(
+    inner: Arc<dyn ObjectStore>,
+    handle: GetCounters,
+) -> Arc<dyn ObjectStore> {
+    Arc::new(CountingObjectStore {
+        inner,
+        handle: Some(handle),
+    })
 }
 
 #[derive(Debug)]
 struct CountingObjectStore {
     inner: Arc<dyn ObjectStore>,
+    handle: Option<GetCounters>,
+}
+
+impl CountingObjectStore {
+    fn record_get(&self, gets: u64, bytes: u64) {
+        GETS.fetch_add(gets, Ordering::Relaxed);
+        GET_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(handle) = &self.handle {
+            handle.record(gets, bytes);
+        }
+    }
 }
 
 impl std::fmt::Display for CountingObjectStore {
@@ -71,7 +131,7 @@ impl ObjectStore for CountingObjectStore {
         let is_head = options.head;
         let result = self.inner.get_opts(location, options).await?;
         if !is_head {
-            record_get(result.range.end.saturating_sub(result.range.start));
+            self.record_get(1, result.range.end.saturating_sub(result.range.start));
         }
         Ok(result)
     }
@@ -80,9 +140,8 @@ impl ObjectStore for CountingObjectStore {
         let results = self.inner.get_ranges(location, ranges).await?;
         // One GET per requested range (inner may coalesce on the wire, but each
         // range is a logical fetch).
-        GETS.fetch_add(ranges.len() as u64, Ordering::Relaxed);
         let total: usize = results.iter().map(|b| b.len()).sum();
-        GET_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+        self.record_get(ranges.len() as u64, total as u64);
         Ok(results)
     }
 

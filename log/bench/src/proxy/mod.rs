@@ -33,8 +33,8 @@ use std::time::Duration;
 use anyhow::bail;
 use bencher::{Bench, Benchmark, Params, Summary};
 use bytes::Bytes;
-use common::StorageConfig;
 use common::storage::config::ObjectStoreConfig;
+use common::{GetCounters, StorageConfig, StorageReaderRuntime, create_counted_object_store};
 use log::{AppendError, Config, LogDb, LogDbReader, ReaderConfig, Record};
 use metrics_util::Summary as Sketch;
 use tokio::time::Instant;
@@ -327,6 +327,10 @@ struct Shared {
     dispatch_lag_us: Mutex<Sketch>,
     /// Records a session consumed (per persistent session, the backlog drained).
     session_records: Mutex<Sketch>,
+    /// Per-handle GET counter for the reader's object store, when this role opens
+    /// one (Both/Reader). Lets read cost be measured apart from the co-resident
+    /// writer's compaction, which also feeds the process-global GET counter.
+    reader_get_counters: Option<GetCounters>,
     seed: u64,
 }
 
@@ -667,6 +671,11 @@ impl Benchmark for ProxyBenchmark {
                  none of the writer's data"
             );
         }
+        // Safe after the check above: a shared store is always SlateDb-backed.
+        let object_store_config = match &storage_config {
+            StorageConfig::SlateDb(c) => c.object_store.clone(),
+            StorageConfig::InMemory => unreachable!("object_store_is_shared rejected InMemory"),
+        };
 
         // Open only the handle(s) this role needs — a reader node never opens a
         // `LogDb` writer (that would fence the real writer on another node).
@@ -678,28 +687,43 @@ impl Benchmark for ProxyBenchmark {
             config.segmentation.seal_interval = seal_interval;
             LogDb::open(config).await
         };
+        // Give the reader its OWN object store carrying a dedicated GET counter,
+        // injected via the runtime. `object_store_get_bytes` is process-global,
+        // so in `role=both` it also tallies the writer's compaction GETs; this
+        // handle measures the reader's object-store reads in isolation (the
+        // read_amplification / locality signal).
         let open_reader = || async {
             let reader_config = ReaderConfig {
                 storage: storage_config.clone(),
                 refresh_interval: Duration::from_millis(refresh_interval_ms),
             };
-            let block_cache = (block_cache_mb > 0)
-                .then(|| common::create_in_memory_block_cache(block_cache_mb << 20));
-            let meta_cache = (meta_cache_mb > 0)
-                .then(|| common::create_in_memory_block_cache(meta_cache_mb << 20));
-            if block_cache.is_some() || meta_cache.is_some() {
-                LogDbReader::open_with_caches(reader_config, block_cache, meta_cache).await
-            } else {
-                LogDbReader::open(reader_config).await
+            let (object_store, get_counters) = create_counted_object_store(&object_store_config)?;
+            let mut runtime = StorageReaderRuntime::new().with_object_store(object_store);
+            if block_cache_mb > 0 {
+                runtime = runtime
+                    .with_block_cache(common::create_in_memory_block_cache(block_cache_mb << 20));
             }
+            if meta_cache_mb > 0 {
+                runtime = runtime
+                    .with_meta_cache(common::create_in_memory_block_cache(meta_cache_mb << 20));
+            }
+            let reader = LogDbReader::open_with_runtime(reader_config, runtime).await?;
+            Ok::<_, anyhow::Error>((reader, get_counters))
         };
-        let backend = match role {
-            Role::Both => Backend::Both(LogDbStore::with_reader(
-                open_writer().await?,
-                open_reader().await?,
-            )),
-            Role::Writer => Backend::Writer(open_writer().await?),
-            Role::Reader => Backend::Reader(open_reader().await?),
+        let (backend, reader_get_counters) = match role {
+            Role::Both => {
+                let writer = open_writer().await?;
+                let (reader, counters) = open_reader().await?;
+                (
+                    Backend::Both(LogDbStore::with_reader(writer, reader)),
+                    Some(counters),
+                )
+            }
+            Role::Writer => (Backend::Writer(open_writer().await?), None),
+            Role::Reader => {
+                let (reader, counters) = open_reader().await?;
+                (Backend::Reader(reader), Some(counters))
+            }
         };
         let store = Arc::new(backend);
 
@@ -755,6 +779,7 @@ impl Benchmark for ProxyBenchmark {
             poll_sched_lag_interval: Mutex::new(Sketch::with_defaults()),
             dispatch_lag_us: Mutex::new(Sketch::with_defaults()),
             session_records: Mutex::new(Sketch::with_defaults()),
+            reader_get_counters,
             seed,
         });
 
@@ -830,6 +855,12 @@ impl Benchmark for ProxyBenchmark {
         // writers' compaction GETs, but the polling followers dominate GET volume.)
         let gets_at = common::object_store_gets();
         let get_bytes_at = common::object_store_get_bytes();
+        // Reader-only GET tallies (None for writer-only role; falls back to the
+        // global below, which for a writer process is its own GETs anyway).
+        let (reader_gets_at, reader_get_bytes_at) = match &shared.reader_get_counters {
+            Some(c) => (c.gets(), c.get_bytes()),
+            None => (0, 0),
+        };
         let segment_scans_at = log::segment_scans();
         let runner = bench.start();
         let snapshot_dt = Duration::from_millis(snapshot_interval_ms);
@@ -881,6 +912,15 @@ impl Benchmark for ProxyBenchmark {
         let elapsed = runner.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
         let gets_total = common::object_store_gets().saturating_sub(gets_at);
         let get_bytes_total = common::object_store_get_bytes().saturating_sub(get_bytes_at);
+        // Reader-only GETs over the window; fall back to the process global when
+        // there's no dedicated reader handle (writer-only role).
+        let (reader_gets_total, reader_get_bytes_total) = match &shared.reader_get_counters {
+            Some(c) => (
+                c.gets().saturating_sub(reader_gets_at),
+                c.get_bytes().saturating_sub(reader_get_bytes_at),
+            ),
+            None => (gets_total, get_bytes_total),
+        };
         let segment_scans_total = log::segment_scans().saturating_sub(segment_scans_at);
         let mean_occupancy = if total_dt > 0.0 {
             occ_integral / total_dt
@@ -940,8 +980,9 @@ impl Benchmark for ProxyBenchmark {
             mean_occupancy,
             lag_mid,
             lag_end,
-            gets_total,
             get_bytes_total,
+            reader_gets_total,
+            reader_get_bytes_total,
             segment_scans_total,
             n,
             skew,
@@ -965,8 +1006,9 @@ fn build_summary(
     mean_occupancy: f64,
     lag_mid: f64,
     lag_end: f64,
-    gets_total: u64,
     get_bytes_total: u64,
+    reader_gets_total: u64,
+    reader_get_bytes_total: u64,
     segment_scans_total: u64,
     n: usize,
     skew: f64,
@@ -1022,14 +1064,17 @@ fn build_summary(
         .add("read_bytes_per_sec", per_sec(bytes))
         .add("poll_service_us_p50", q(&shared.poll_us, 0.5))
         .add("poll_service_us_p99", q(&shared.poll_us, 0.99))
-        // Object-store read cost (the price of cardinality). read_amplification =
-        // bytes fetched from the store per byte delivered to followers; gets and
-        // segment scans are normalized per poll.
-        .add("object_store_get_bytes_per_sec", per_sec(get_bytes_total))
+        // Object-store read cost (the price of cardinality). These use the
+        // READER's own GET counter, so in role=both they exclude the writer's
+        // compaction GETs (object_store_get_bytes is process-global and would
+        // otherwise swamp the reader's reads). read_amplification = bytes the
+        // reader fetched per byte delivered to followers; gets and segment scans
+        // are normalized per poll.
+        .add("object_store_get_bytes_per_sec", per_sec(reader_get_bytes_total))
         .add(
             "read_amplification",
             if bytes > 0 {
-                get_bytes_total as f64 / bytes as f64
+                reader_get_bytes_total as f64 / bytes as f64
             } else {
                 0.0
             },
@@ -1037,10 +1082,16 @@ fn build_summary(
         .add(
             "gets_per_poll",
             if polls > 0 {
-                gets_total as f64 / polls as f64
+                reader_gets_total as f64 / polls as f64
             } else {
                 0.0
             },
+        )
+        // The rest of the process-global GETs: in role=both this is the writer's
+        // compaction; in an isolated reader/writer process it's ~0.
+        .add(
+            "compaction_get_bytes_per_sec",
+            per_sec(get_bytes_total.saturating_sub(reader_get_bytes_total)),
         )
         .add(
             "segments_per_poll",

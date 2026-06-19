@@ -754,10 +754,15 @@ impl LogDbReader {
         Self::open_with_runtime(config, runtime).await
     }
 
-    /// Shared body of [`open`](Self::open) and
-    /// [`open_with_block_cache`](Self::open_with_block_cache): build the
-    /// read-only storage from `runtime` and spawn the refresh task.
-    async fn open_with_runtime(
+    /// Opens a read-only view from a fully-specified [`StorageReaderRuntime`].
+    ///
+    /// The advanced entry point behind [`open`](Self::open) and the
+    /// `open_with_*` helpers: it builds the read-only storage from `runtime` and
+    /// spawns the refresh task. Use it directly to inject a runtime the helpers
+    /// don't cover — e.g. a custom object store (via
+    /// [`StorageReaderRuntime::with_object_store`]) carrying its own GET counter,
+    /// so a reader sharing a process with a writer can be measured in isolation.
+    pub async fn open_with_runtime(
         config: ReaderConfig,
         runtime: StorageReaderRuntime,
     ) -> Result<Self> {

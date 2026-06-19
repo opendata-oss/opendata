@@ -13,11 +13,11 @@ pub use serde::seq_block::SeqBlock;
 pub use storage::config::{
     BlockCacheConfig, FoyerHybridCacheConfig, ObjectStoreConfig, StorageConfig,
 };
-pub use storage::counting::{object_store_get_bytes, object_store_gets};
+pub use storage::counting::{GetCounters, object_store_get_bytes, object_store_gets};
 pub use storage::factory::{
     CompactorBuilder, DbBuilder, DbCache, StorageBuilder, StorageReaderRuntime, StorageSemantics,
-    create_in_memory_block_cache, create_object_store, create_storage_read,
-    new_slatedb_compactor_builder,
+    create_counted_object_store, create_in_memory_block_cache, create_object_store,
+    create_storage_read, new_slatedb_compactor_builder,
 };
 pub use storage::loader::{LoadMetadata, LoadResult, LoadSpec, Loadable, Loader};
 pub use storage::slate::SlateReadHandle;
