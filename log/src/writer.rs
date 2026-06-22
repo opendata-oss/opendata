@@ -341,11 +341,15 @@ impl LogWriter {
             .assign_new_keys(assignment.segment.id(), &keys, &mut puts);
 
         // 4. Build log entry records
-        self.add_entries(&assignment.segment, base_seq, &write.records, &mut puts);
+        let entry_bytes =
+            self.add_entries(&assignment.segment, base_seq, &write.records, &mut puts);
 
         // 5. Write to storage and broadcast
         let ops: Vec<RecordOp> = puts.into_iter().map(RecordOp::Put).collect();
         self.apply_and_broadcast(ops, Some(&assignment)).await?;
+
+        // 6. Account committed bytes against the active segment (size-based seal).
+        self.segment_cache.record_active_bytes(entry_bytes);
 
         Ok(Some(AppendOutput {
             start_sequence: base_seq,
@@ -507,14 +511,18 @@ impl LogWriter {
     }
 
     /// Builds log entry storage records from user records and appends them.
+    ///
+    /// Returns the total storage bytes (serialized key + value) of the entries
+    /// appended, used to drive size-based segment sealing.
     fn add_entries(
         &self,
         segment: &LogSegment,
         base_sequence: u64,
         user_records: &[UserRecord],
         records: &mut Vec<PutRecordOp>,
-    ) {
+    ) -> u64 {
         let segment_start_seq = segment.meta().start_seq;
+        let mut entry_bytes: u64 = 0;
         for (i, user_record) in user_records.iter().enumerate() {
             let sequence = base_sequence + i as u64;
             let entry_key = LogEntryKey::new(segment.id(), user_record.key.clone(), sequence);
@@ -522,11 +530,13 @@ impl LogWriter {
                 entry_key.serialize(segment_start_seq),
                 user_record.value.clone(),
             );
+            entry_bytes += (storage_record.key.len() + storage_record.value.len()) as u64;
             records.push(PutRecordOp::new_with_options(
                 storage_record,
                 PutOptions { ttl: NoExpiry },
             ));
         }
+        entry_bytes
     }
 }
 

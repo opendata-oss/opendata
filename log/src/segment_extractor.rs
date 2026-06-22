@@ -441,6 +441,7 @@ mod integration_tests {
             storage: storage.clone(),
             segmentation: SegmentConfig {
                 seal_interval: Some(Duration::from_secs(1)),
+                ..Default::default()
             },
             ..Default::default()
         })

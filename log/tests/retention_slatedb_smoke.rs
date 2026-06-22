@@ -29,6 +29,7 @@ async fn slatedb_open_with_retention_and_compaction_options() {
         storage: local_storage_config(&temp_dir),
         segmentation: SegmentConfig {
             seal_interval: Some(Duration::from_secs(3600)),
+            ..Default::default()
         },
         retention: RetentionConfig {
             retention: Some(Duration::from_secs(86400)),

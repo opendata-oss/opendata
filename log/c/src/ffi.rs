@@ -355,7 +355,10 @@ pub(crate) unsafe fn build_config(
     };
     Ok(Config {
         storage,
-        segmentation: SegmentConfig { seal_interval },
+        segmentation: SegmentConfig {
+            seal_interval,
+            ..Default::default()
+        },
         read_visibility: match config.read_visibility {
             OPENDATA_LOG_READ_VISIBILITY_REMOTE => ReadVisibility::Remote,
             OPENDATA_LOG_READ_VISIBILITY_MEMORY => ReadVisibility::Memory,
