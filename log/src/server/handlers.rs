@@ -36,7 +36,7 @@ use crate::{
 /// [`LogRead`] implementation shared by both variants; write methods are only
 /// meaningful on the read-write variant.
 #[derive(Clone)]
-pub enum LogBackend {
+pub(crate) enum LogBackend {
     /// Full read-write log.
     ReadWrite(Arc<LogDb>),
     /// Read-only view that periodically discovers data written elsewhere.
@@ -121,7 +121,7 @@ impl LogBackend {
 
 /// Shared application state.
 #[derive(Clone)]
-pub struct AppState {
+pub(crate) struct AppState {
     pub log: LogBackend,
     pub metrics: Arc<Metrics>,
 }
@@ -130,7 +130,7 @@ pub struct AppState {
 ///
 /// Supports both `Content-Type: application/protobuf` and `Content-Type: application/protobuf+json`.
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_append(
+pub(crate) async fn handle_append(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
@@ -167,7 +167,7 @@ pub async fn handle_append(
 ///
 /// Returns response in format matching the `Accept` header.
 /// Supports long-polling via `follow=true` and `timeout_ms` parameters.
-pub async fn handle_scan(
+pub(crate) async fn handle_scan(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<ScanParams>,
@@ -269,7 +269,7 @@ async fn scan_entries(
 /// Handle GET /api/v1/log/keys
 ///
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_list_keys(
+pub(crate) async fn handle_list_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<ListKeysParams>,
@@ -295,7 +295,7 @@ pub async fn handle_list_keys(
 /// Handle GET /api/v1/log/segments
 ///
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_list_segments(
+pub(crate) async fn handle_list_segments(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<ListSegmentsParams>,
@@ -320,7 +320,7 @@ pub async fn handle_list_segments(
 /// Handle GET /api/v1/log/count
 ///
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_count(
+pub(crate) async fn handle_count(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<CountParams>,
@@ -336,14 +336,14 @@ pub async fn handle_count(
 }
 
 /// Handle GET /metrics
-pub async fn handle_metrics(State(state): State<AppState>) -> String {
+pub(crate) async fn handle_metrics(State(state): State<AppState>) -> String {
     state.metrics.encode()
 }
 
 /// Handle GET /-/healthy
 ///
 /// Returns 200 OK if the service is running.
-pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
+pub(crate) async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
     (axum::http::StatusCode::OK, "OK")
 }
 
@@ -351,7 +351,9 @@ pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
 ///
 /// Returns 200 OK if the service is ready to serve requests.
 /// Performs a lightweight storage check to verify the log backend is accessible.
-pub async fn handle_ready(State(state): State<AppState>) -> (axum::http::StatusCode, &'static str) {
+pub(crate) async fn handle_ready(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, &'static str) {
     // Verify storage is accessible with a lightweight read operation.
     // This reads the sequence block key, which verifies the storage backend
     // is responding without scanning or listing data.
