@@ -11,6 +11,9 @@ entries clustered on disk.
 
 ## Quickstart
 
+This path uses the HTTP API. For embedded Rust usage, see
+[Rust Quickstart](#rust-quickstart).
+
 Prerequisites: `curl` and `jq`
 
 ### 1. Run the HTTP server
@@ -44,6 +47,71 @@ curl -s 'http://localhost:8080/api/v1/log/scan?key=orders' | jq .
 Other endpoints: `GET /api/v1/log/keys`, `GET /api/v1/log/segments`,
 `GET /api/v1/log/count`, and `/-/ready`. See [RFC 0004](rfcs/0004-http-apis.md)
 for the full HTTP surface.
+
+## Rust Quickstart
+
+Use `LogDb` directly when you want to embed the log in a Rust application
+instead of calling the HTTP server.
+
+### 1. Add dependencies
+
+```bash
+cargo add opendata-log opendata-common bytes
+cargo add tokio --features macros,rt-multi-thread
+```
+
+The library crate names are `log` and `common`, so the imports use those names.
+
+### 2. Append and read records
+
+```rust
+use bytes::Bytes;
+use common::StorageConfig;
+use log::{Config, LogDb, LogRead, Record};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let log = LogDb::open(Config {
+        storage: StorageConfig::InMemory,
+        ..Default::default()
+    })
+    .await?;
+
+    let appended = log
+        .try_append(vec![
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-1"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-2"),
+            },
+        ])
+        .await?;
+
+    // `try_append` returns before durability is guaranteed. Use `flush` when
+    // you need all prior appends to be persisted before continuing.
+    log.flush().await?;
+
+    let mut entries = log
+        .scan(Bytes::from("orders"), appended.start_sequence..)
+        .await?;
+
+    while let Some(entry) = entries.next().await? {
+        println!(
+            "seq={} value={}",
+            entry.sequence,
+            String::from_utf8_lossy(&entry.value)
+        );
+    }
+
+    Ok(())
+}
+```
+
+`StorageConfig::InMemory` keeps the example disposable. Use
+`Config::default()` for a local SlateDB-backed log rooted under `.data`.
 
 ## Data Model
 
