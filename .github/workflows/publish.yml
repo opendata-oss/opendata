@@ -31,8 +31,136 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
+  # Compute the version(s) that will be published and render a preview to the
+  # run summary. Publishes nothing — its only side effect is the summary a
+  # reviewer reads before approving the gated `publish` job below.
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: 2838764
+          private-key: ${{ secrets.GHA_BOT_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Record SHA
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Read current versions
+        id: current
+        run: |
+          read_version() {
+            cargo metadata --format-version 1 --no-deps \
+              | jq -r ".packages[] | select(.name==\"$1\") | .version"
+          }
+          echo "crate=$(read_version '${{ inputs.crate }}')" >> "$GITHUB_OUTPUT"
+          echo "common=$(read_version 'opendata-common')" >> "$GITHUB_OUTPUT"
+
+      - name: Check for common changes
+        id: common-changes
+        run: |
+          LATEST_TAG=$(git describe --tags --match "opendata-common/v*" --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No previous common tag found, treating as changed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$(git diff "$LATEST_TAG" HEAD -- common/)" ]; then
+            echo "Changes detected in common/ since $LATEST_TAG"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No changes in common/ since $LATEST_TAG"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump common version (preview)
+        if: steps.common-changes.outputs.changed == 'true'
+        run: cargo set-version -p opendata-common --bump patch
+
+      - name: Bump version (preview)
+        run: cargo set-version -p ${{ inputs.crate }} --bump ${{ inputs.bump }}
+
+      - name: Read new versions
+        id: new
+        run: |
+          read_version() {
+            cargo metadata --format-version 1 --no-deps \
+              | jq -r ".packages[] | select(.name==\"$1\") | .version"
+          }
+          echo "crate=$(read_version '${{ inputs.crate }}')" >> "$GITHUB_OUTPUT"
+          echo "common=$(read_version 'opendata-common')" >> "$GITHUB_OUTPUT"
+
+      - name: Write release preview
+        env:
+          CRATE: ${{ inputs.crate }}
+          BUMP: ${{ inputs.bump }}
+          CUR_VERSION: ${{ steps.current.outputs.crate }}
+          NEW_VERSION: ${{ steps.new.outputs.crate }}
+          COMMON_CHANGED: ${{ steps.common-changes.outputs.changed }}
+          CUR_COMMON: ${{ steps.current.outputs.common }}
+          NEW_COMMON: ${{ steps.new.outputs.common }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          {
+            echo "## 📦 Release preview: \`$CRATE\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Crate | \`$CRATE\` |"
+            echo "| Bump | \`$BUMP\` |"
+            echo "| Version | \`$CUR_VERSION\` → \`$NEW_VERSION\` |"
+            echo "| Tag | \`$CRATE/v$NEW_VERSION\` |"
+            echo "| Commit | \`${SHA:0:12}\` |"
+            if [ "$COMMON_CHANGED" = "true" ]; then
+              echo "| opendata-common | changed → \`$CUR_COMMON\` → \`$NEW_COMMON\` (tag \`opendata-common/v$NEW_COMMON\`) |"
+            else
+              echo "| opendata-common | no changes — not published |"
+            fi
+            echo ""
+
+            CRATE_DIR="${CRATE#opendata-}"
+            LATEST_TAG=$(git describe --tags --match "$CRATE/v*" --abbrev=0 2>/dev/null || echo "")
+            if [ -z "$LATEST_TAG" ]; then
+              echo "### Commits in \`$CRATE_DIR/\` (no previous release tag found)"
+              RANGE="HEAD"
+            else
+              echo "### Commits in \`$CRATE_DIR/\` since \`$LATEST_TAG\`"
+              RANGE="$LATEST_TAG..HEAD"
+            fi
+            echo ""
+            LOG=$(git log "$RANGE" --pretty=format:'- %h %s (%an)' -- "$CRATE_DIR/")
+            if [ -z "$LOG" ]; then
+              echo "_No commits touching \`$CRATE_DIR/\` in this range._"
+            else
+              echo "$LOG"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Gated behind the `release` environment, whose required reviewers are the
+  # `opendata-oss/committers` team (the people who can merge PRs). The run
+  # pauses here until any one committer reads the preview from `prepare` and
+  # approves. Reviewer membership is managed on the team, not in this file.
+  # Pinned to the validated commit so nothing shifts between preview and publish.
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: release
     steps:
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
@@ -56,6 +184,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
       - name: Configure git
@@ -150,12 +279,12 @@ jobs:
       - name: Push commit and common tag
         if: steps.common-changes.outputs.changed == 'true'
         run: |
-          git push origin HEAD
+          git push origin HEAD:main
           git push origin "opendata-common/v${{ steps.common-version.outputs.common_version }}"
 
       - name: Push commit
         if: steps.common-changes.outputs.changed != 'true'
-        run: git push origin HEAD
+        run: git push origin HEAD:main
 
       - name: Publish selected crate
         env:
