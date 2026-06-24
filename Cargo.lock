@@ -3012,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-common"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-log"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "async-trait",
