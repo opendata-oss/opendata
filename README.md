@@ -13,7 +13,6 @@ Today OpenData includes:
 - **[Log](log/README.md)**: replayable event streams and durable data movement
 - **[Timeseries](timeseries/README.md)**: Prometheus-compatible metrics storage
 - **[Vector](vector/README.md)**: large-scale semantic search and retrieval
-- **[KeyValue](keyvalue/README.md)**: object-store-native key-value storage
 
 Every OpenData database inherits the durability, scalability, and economics of object storage.
 
