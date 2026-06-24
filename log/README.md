@@ -65,13 +65,11 @@ key and then by sequence, so any entry is located by `(segment_id, key,
 sequence)`. Segments are also the unit of compaction and retention; how they are
 sealed is covered under [Design](#design).
 
-If you come from Kafka, the mapping is straightforward. LogDb's key is closer to
-a *topic partition* than to a Kafka message key — it names the stream, and the
-value is the payload (there is no separate per-message key within a stream). The
-global sequence number behaves exactly like the offset of a *single* Kafka
-partition: one append-ordered stream over every record. What LogDb adds on top is
-efficient per-key access, so you can read an individual key's log directly
-instead of consuming the whole partition and filtering it yourself.
+If you come from Kafka, a record's key and value mean the same thing here — what
+LogDb drops is topics and partitions. There is nothing to declare or size up
+front; you append to a key and read it back. The global sequence number is the
+one offset-like coordinate, ordering every record across all keys, and LogDb
+makes reading any single key's log within that stream efficient.
 
 ## Design
 
