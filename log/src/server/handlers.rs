@@ -3,6 +3,7 @@
 //! Per RFC 0004, handlers support both binary protobuf (`application/protobuf`)
 //! and ProtoJSON (`application/protobuf+json`) formats.
 
+use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,17 +16,113 @@ use axum::http::HeaderMap;
 use super::error::ApiError;
 use super::metrics::Metrics;
 use super::proto::{
-    AppendResponse, CountResponse, KeysResponse, ScanResponse, Segment, SegmentsResponse, Value,
+    AppendResponse, CountResponse, KeysResponse, ScanResponse, Segment as ProtoSegment,
+    SegmentsResponse, Value,
 };
 use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{ApiResponse, ResponseFormat, to_api_response};
-use crate::LogDb;
+use crate::error::AppendError;
 use crate::reader::LogRead;
+use crate::{
+    AppendOutput, AppendResult, LogDb, LogDbReader, LogIterator, LogKeyIterator, Record, Segment,
+    SegmentId, Sequence,
+};
+
+/// Storage backend behind the HTTP server.
+///
+/// A full read-write [`LogDb`] exposes every route; a [`LogDbReader`] backs a
+/// read-only gateway where the append route is not registered (see
+/// [`LogServer`](super::http::LogServer)). Read methods delegate to the
+/// [`LogRead`] implementation shared by both variants; write methods are only
+/// meaningful on the read-write variant.
+#[derive(Clone)]
+pub enum LogBackend {
+    /// Full read-write log.
+    ReadWrite(Arc<LogDb>),
+    /// Read-only view that periodically discovers data written elsewhere.
+    ReadOnly(Arc<LogDbReader>),
+}
+
+impl LogBackend {
+    /// Appends records to the log.
+    ///
+    /// Errors on a read-only backend. The append route is not registered in
+    /// read-only mode, so this arm is a defensive guard rather than a reachable
+    /// code path.
+    pub async fn try_append(&self, records: Vec<Record>) -> AppendResult<AppendOutput> {
+        match self {
+            Self::ReadWrite(log) => log.try_append(records).await,
+            Self::ReadOnly(_) => Err(AppendError::Storage("log gateway is read-only".to_string())),
+        }
+    }
+
+    /// Flushes pending writes. A no-op on a read-only backend.
+    pub async fn flush(&self) -> crate::Result<()> {
+        match self {
+            Self::ReadWrite(log) => log.flush().await,
+            Self::ReadOnly(_) => Ok(()),
+        }
+    }
+
+    /// Verifies the storage backend is reachable (readiness probe).
+    pub async fn check_storage(&self) -> crate::Result<()> {
+        match self {
+            Self::ReadWrite(log) => log.check_storage().await,
+            Self::ReadOnly(reader) => reader.check_storage().await,
+        }
+    }
+
+    /// Scans entries for a key within a sequence range.
+    pub async fn scan(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> crate::Result<LogIterator> {
+        match self {
+            Self::ReadWrite(log) => log.scan(key, seq_range).await,
+            Self::ReadOnly(reader) => reader.scan(key, seq_range).await,
+        }
+    }
+
+    /// Counts entries for a key within a sequence range.
+    pub async fn count(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> crate::Result<u64> {
+        match self {
+            Self::ReadWrite(log) => log.count(key, seq_range).await,
+            Self::ReadOnly(reader) => reader.count(key, seq_range).await,
+        }
+    }
+
+    /// Lists distinct keys within a segment range.
+    pub async fn list_keys(
+        &self,
+        segment_range: impl RangeBounds<SegmentId> + Send,
+    ) -> crate::Result<LogKeyIterator> {
+        match self {
+            Self::ReadWrite(log) => log.list_keys(segment_range).await,
+            Self::ReadOnly(reader) => reader.list_keys(segment_range).await,
+        }
+    }
+
+    /// Lists segments overlapping a sequence range.
+    pub async fn list_segments(
+        &self,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> crate::Result<Vec<Segment>> {
+        match self {
+            Self::ReadWrite(log) => log.list_segments(seq_range).await,
+            Self::ReadOnly(reader) => reader.list_segments(seq_range).await,
+        }
+    }
+}
 
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
-    pub log: Arc<LogDb>,
+    pub log: LogBackend,
     pub metrics: Arc<Metrics>,
 }
 
@@ -207,9 +304,9 @@ pub async fn handle_list_segments(
     let seq_range = params.seq_range();
 
     let segments = state.log.list_segments(seq_range).await?;
-    let segment_entries: Vec<Segment> = segments
+    let segment_entries: Vec<ProtoSegment> = segments
         .into_iter()
-        .map(|s| Segment {
+        .map(|s| ProtoSegment {
             id: s.id,
             start_seq: s.start_seq,
             start_time_ms: s.start_time_ms,
@@ -293,7 +390,10 @@ mod tests {
         // given
         let log = Arc::new(LogDb::open(test_config()).await.unwrap());
         let metrics = Arc::new(Metrics::new());
-        let state = AppState { log, metrics };
+        let state = AppState {
+            log: LogBackend::ReadWrite(log),
+            metrics,
+        };
 
         // when
         let (status, body) = handle_ready(State(state)).await;
@@ -418,7 +518,10 @@ mod tests {
         let storage = Arc::new(ToggleFailStorage::new());
         let log = Arc::new(LogDb::new(storage.clone()).await.unwrap());
         let metrics = Arc::new(Metrics::new());
-        let state = AppState { log, metrics };
+        let state = AppState {
+            log: LogBackend::ReadWrite(log),
+            metrics,
+        };
 
         // Configure storage to fail after initialization
         storage.set_failing(true);

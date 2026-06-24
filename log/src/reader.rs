@@ -825,6 +825,20 @@ impl LogDbReader {
         })
     }
 
+    /// Verifies the storage backend is reachable with a single key lookup.
+    ///
+    /// Mirrors [`LogDb::check_storage`](crate::LogDb::check_storage) for the
+    /// read-only path: it reads the sequence block key, which confirms storage
+    /// is responding without scanning or listing data. Used by the HTTP
+    /// server's readiness probe when running as a read-only gateway.
+    #[cfg(feature = "http-server")]
+    pub(crate) async fn check_storage(&self) -> Result<()> {
+        let seq_key = Bytes::from_static(&crate::serde::SEQ_BLOCK_KEY);
+        let view = self.read_view.read().await;
+        let _ = view.storage.get(seq_key).await?;
+        Ok(())
+    }
+
     /// Closes the reader, stopping the background refresh task.
     ///
     /// This method consumes `self` and gracefully shuts down the background

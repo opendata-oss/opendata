@@ -9,8 +9,8 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use log::LogDb;
-use log::server::{CliArgs, LogServer, LogServerConfig};
+use log::server::{CliArgs, LogBackend, LogServer, LogServerConfig};
+use log::{LogDb, LogDbReader};
 
 #[tokio::main]
 async fn main() {
@@ -24,22 +24,30 @@ async fn main() {
     // Parse CLI arguments
     let args = CliArgs::parse();
 
-    // Create log configuration
-    let log_config = args.to_log_config();
     let server_config = LogServerConfig::from(&args);
 
     // Install the metrics-rs recorder early so that slatedb metrics registered
-    // during LogDb::open() are captured by the prometheus exporter.
+    // during open are captured by the prometheus exporter.
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics_handle = recorder.handle();
     let _ = metrics::set_global_recorder(recorder);
 
-    tracing::info!("Opening log with config: {:?}", log_config);
-
-    // Open the log
-    let log = LogDb::open(log_config).await.expect("Failed to open log");
+    // Open a read-only reader or a full read-write log depending on the flag.
+    let backend = if args.read_only {
+        let reader_config = args.to_reader_config();
+        tracing::info!("Opening log reader with config: {:?}", reader_config);
+        let reader = LogDbReader::open(reader_config)
+            .await
+            .expect("Failed to open log reader");
+        LogBackend::ReadOnly(Arc::new(reader))
+    } else {
+        let log_config = args.to_log_config();
+        tracing::info!("Opening log with config: {:?}", log_config);
+        let log = LogDb::open(log_config).await.expect("Failed to open log");
+        LogBackend::ReadWrite(Arc::new(log))
+    };
 
     // Create and run the server
-    let server = LogServer::new(Arc::new(log), server_config, metrics_handle);
+    let server = LogServer::new(backend, server_config, metrics_handle);
     server.run().await;
 }

@@ -6,7 +6,7 @@ use common::storage::config::{
     AwsObjectStoreConfig, LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
 };
 
-use crate::Config;
+use crate::{Config, ReaderConfig};
 
 /// CLI arguments for the log server.
 #[derive(Debug, Parser)]
@@ -32,12 +32,20 @@ pub struct CliArgs {
     /// AWS region for S3 storage.
     #[arg(long, default_value = "us-east-1")]
     pub s3_region: String,
+
+    /// Run as a read-only gateway backed by a `LogDbReader`.
+    ///
+    /// In this mode the server serves only read routes (scan, keys, segments,
+    /// count) and the append route is not registered.
+    #[arg(long, default_value = "false")]
+    pub read_only: bool,
 }
 
 impl CliArgs {
-    /// Convert CLI args to log configuration.
-    pub fn to_log_config(&self) -> Config {
-        let storage = if self.in_memory {
+    /// Build the storage configuration shared by the read-write and read-only
+    /// paths from the CLI flags.
+    fn build_storage_config(&self) -> StorageConfig {
+        if self.in_memory {
             StorageConfig::InMemory
         } else if let Some(bucket) = &self.s3_bucket {
             // S3 storage
@@ -62,10 +70,21 @@ impl CliArgs {
                 block_cache: None,
                 meta_cache: None,
             })
-        };
+        }
+    }
 
+    /// Convert CLI args to log configuration (read-write mode).
+    pub fn to_log_config(&self) -> Config {
         Config {
-            storage,
+            storage: self.build_storage_config(),
+            ..Default::default()
+        }
+    }
+
+    /// Convert CLI args to reader configuration (read-only mode).
+    pub fn to_reader_config(&self) -> ReaderConfig {
+        ReaderConfig {
+            storage: self.build_storage_config(),
             ..Default::default()
         }
     }
@@ -103,6 +122,7 @@ mod tests {
             in_memory: true,
             s3_bucket: None,
             s3_region: "us-east-1".to_string(),
+            read_only: false,
         };
 
         // when
@@ -121,6 +141,7 @@ mod tests {
             in_memory: false,
             s3_bucket: None,
             s3_region: "us-east-1".to_string(),
+            read_only: false,
         };
 
         // when
@@ -147,6 +168,7 @@ mod tests {
             in_memory: false,
             s3_bucket: Some("my-bucket".to_string()),
             s3_region: "us-west-2".to_string(),
+            read_only: false,
         };
 
         // when
@@ -174,6 +196,7 @@ mod tests {
             in_memory: true,
             s3_bucket: None,
             s3_region: "us-east-1".to_string(),
+            read_only: false,
         };
 
         // when

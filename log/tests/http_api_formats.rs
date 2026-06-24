@@ -15,7 +15,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use common::StorageConfig;
 use log::server::handlers::{
-    AppState, handle_append, handle_list_keys, handle_list_segments, handle_metrics, handle_scan,
+    AppState, LogBackend, handle_append, handle_list_keys, handle_list_segments, handle_metrics,
+    handle_scan,
 };
 use log::server::metrics::Metrics;
 use log::server::proto;
@@ -32,7 +33,7 @@ async fn setup_test_app() -> (Router, Arc<LogDb>) {
     let metrics = Arc::new(Metrics::new());
 
     let state = AppState {
-        log: log.clone(),
+        log: LogBackend::ReadWrite(log.clone()),
         metrics,
     };
 
@@ -872,7 +873,7 @@ async fn setup_slatedb_test_app() -> Router {
     let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(handle)));
 
     let state = AppState {
-        log: log.clone(),
+        log: LogBackend::ReadWrite(log.clone()),
         metrics,
     };
 

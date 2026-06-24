@@ -14,4 +14,5 @@ mod request;
 mod response;
 
 pub use config::{CliArgs, LogServerConfig};
+pub use handlers::LogBackend;
 pub use http::LogServer;
