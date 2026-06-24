@@ -5,7 +5,7 @@
 
 mod config;
 mod error;
-pub mod handlers;
+pub(crate) mod handlers;
 mod http;
 pub mod metrics;
 mod middleware;

@@ -10,16 +10,13 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use axum::routing::{get, post};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use common::StorageConfig;
-use log::server::handlers::{
-    AppState, handle_append, handle_list_keys, handle_list_segments, handle_metrics, handle_scan,
-};
-use log::server::metrics::Metrics;
 use log::server::proto;
+use log::server::{LogServer, LogServerConfig};
 use log::{Config, LogDb, Record};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use prost::Message;
 use tower::ServiceExt;
 
@@ -29,19 +26,11 @@ async fn setup_test_app() -> (Router, Arc<LogDb>) {
         ..Default::default()
     };
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
-    let metrics = Arc::new(Metrics::new());
 
-    let state = AppState {
-        log: log.clone(),
-        metrics,
-    };
-
-    let app = Router::new()
-        .route("/api/v1/log/append", post(handle_append))
-        .route("/api/v1/log/scan", get(handle_scan))
-        .route("/api/v1/log/keys", get(handle_list_keys))
-        .route("/api/v1/log/segments", get(handle_list_segments))
-        .with_state(state);
+    // Drive the real server router rather than a hand-built route table, so
+    // these tests track the routes the server actually serves.
+    let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+    let app = LogServer::new(log.clone(), LogServerConfig::default(), metrics_handle).into_router();
 
     (app, log)
 }
@@ -869,18 +858,8 @@ async fn setup_slatedb_test_app() -> Router {
 
     let handle = global_prometheus_handle();
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
-    let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(handle)));
 
-    let state = AppState {
-        log: log.clone(),
-        metrics,
-    };
-
-    Router::new()
-        .route("/api/v1/log/append", post(handle_append))
-        .route("/api/v1/log/scan", get(handle_scan))
-        .route("/metrics", get(handle_metrics))
-        .with_state(state)
+    LogServer::new(log, LogServerConfig::default(), handle).into_router()
 }
 
 #[tokio::test]

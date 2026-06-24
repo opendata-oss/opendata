@@ -3,6 +3,7 @@
 //! Per RFC 0004, handlers support both binary protobuf (`application/protobuf`)
 //! and ProtoJSON (`application/protobuf+json`) formats.
 
+use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,17 +16,113 @@ use axum::http::HeaderMap;
 use super::error::ApiError;
 use super::metrics::Metrics;
 use super::proto::{
-    AppendResponse, CountResponse, KeysResponse, ScanResponse, Segment, SegmentsResponse, Value,
+    AppendResponse, CountResponse, KeysResponse, ScanResponse, Segment as ProtoSegment,
+    SegmentsResponse, Value,
 };
 use super::request::{AppendRequest, CountParams, ListKeysParams, ListSegmentsParams, ScanParams};
 use super::response::{ApiResponse, ResponseFormat, to_api_response};
-use crate::LogDb;
+use crate::error::AppendError;
 use crate::reader::LogRead;
+use crate::{
+    AppendOutput, AppendResult, LogDb, LogDbReader, LogIterator, LogKeyIterator, Record, Segment,
+    SegmentId, Sequence,
+};
+
+/// Storage backend behind the HTTP server.
+///
+/// A full read-write [`LogDb`] exposes every route; a [`LogDbReader`] backs a
+/// read-only gateway where the append route is not registered (see
+/// [`LogServer`](super::http::LogServer)). Read methods delegate to the
+/// [`LogRead`] implementation shared by both variants; write methods are only
+/// meaningful on the read-write variant.
+#[derive(Clone)]
+pub(crate) enum LogBackend {
+    /// Full read-write log.
+    ReadWrite(Arc<LogDb>),
+    /// Read-only view that periodically discovers data written elsewhere.
+    ReadOnly(Arc<LogDbReader>),
+}
+
+impl LogBackend {
+    /// Appends records to the log.
+    ///
+    /// Errors on a read-only backend. The append route is not registered in
+    /// read-only mode, so this arm is a defensive guard rather than a reachable
+    /// code path.
+    pub async fn try_append(&self, records: Vec<Record>) -> AppendResult<AppendOutput> {
+        match self {
+            Self::ReadWrite(log) => log.try_append(records).await,
+            Self::ReadOnly(_) => Err(AppendError::Storage("log gateway is read-only".to_string())),
+        }
+    }
+
+    /// Flushes pending writes. A no-op on a read-only backend.
+    pub async fn flush(&self) -> crate::Result<()> {
+        match self {
+            Self::ReadWrite(log) => log.flush().await,
+            Self::ReadOnly(_) => Ok(()),
+        }
+    }
+
+    /// Verifies the storage backend is reachable (readiness probe).
+    pub async fn check_storage(&self) -> crate::Result<()> {
+        match self {
+            Self::ReadWrite(log) => log.check_storage().await,
+            Self::ReadOnly(reader) => reader.check_storage().await,
+        }
+    }
+
+    /// Scans entries for a key within a sequence range.
+    pub async fn scan(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> crate::Result<LogIterator> {
+        match self {
+            Self::ReadWrite(log) => log.scan(key, seq_range).await,
+            Self::ReadOnly(reader) => reader.scan(key, seq_range).await,
+        }
+    }
+
+    /// Counts entries for a key within a sequence range.
+    pub async fn count(
+        &self,
+        key: Bytes,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> crate::Result<u64> {
+        match self {
+            Self::ReadWrite(log) => log.count(key, seq_range).await,
+            Self::ReadOnly(reader) => reader.count(key, seq_range).await,
+        }
+    }
+
+    /// Lists distinct keys within a segment range.
+    pub async fn list_keys(
+        &self,
+        segment_range: impl RangeBounds<SegmentId> + Send,
+    ) -> crate::Result<LogKeyIterator> {
+        match self {
+            Self::ReadWrite(log) => log.list_keys(segment_range).await,
+            Self::ReadOnly(reader) => reader.list_keys(segment_range).await,
+        }
+    }
+
+    /// Lists segments overlapping a sequence range.
+    pub async fn list_segments(
+        &self,
+        seq_range: impl RangeBounds<Sequence> + Send,
+    ) -> crate::Result<Vec<Segment>> {
+        match self {
+            Self::ReadWrite(log) => log.list_segments(seq_range).await,
+            Self::ReadOnly(reader) => reader.list_segments(seq_range).await,
+        }
+    }
+}
 
 /// Shared application state.
 #[derive(Clone)]
-pub struct AppState {
-    pub log: Arc<LogDb>,
+pub(crate) struct AppState {
+    pub log: LogBackend,
     pub metrics: Arc<Metrics>,
 }
 
@@ -33,7 +130,7 @@ pub struct AppState {
 ///
 /// Supports both `Content-Type: application/protobuf` and `Content-Type: application/protobuf+json`.
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_append(
+pub(crate) async fn handle_append(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
@@ -70,7 +167,7 @@ pub async fn handle_append(
 ///
 /// Returns response in format matching the `Accept` header.
 /// Supports long-polling via `follow=true` and `timeout_ms` parameters.
-pub async fn handle_scan(
+pub(crate) async fn handle_scan(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<ScanParams>,
@@ -172,7 +269,7 @@ async fn scan_entries(
 /// Handle GET /api/v1/log/keys
 ///
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_list_keys(
+pub(crate) async fn handle_list_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<ListKeysParams>,
@@ -198,7 +295,7 @@ pub async fn handle_list_keys(
 /// Handle GET /api/v1/log/segments
 ///
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_list_segments(
+pub(crate) async fn handle_list_segments(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<ListSegmentsParams>,
@@ -207,9 +304,9 @@ pub async fn handle_list_segments(
     let seq_range = params.seq_range();
 
     let segments = state.log.list_segments(seq_range).await?;
-    let segment_entries: Vec<Segment> = segments
+    let segment_entries: Vec<ProtoSegment> = segments
         .into_iter()
-        .map(|s| Segment {
+        .map(|s| ProtoSegment {
             id: s.id,
             start_seq: s.start_seq,
             start_time_ms: s.start_time_ms,
@@ -223,7 +320,7 @@ pub async fn handle_list_segments(
 /// Handle GET /api/v1/log/count
 ///
 /// Returns response in format matching the `Accept` header.
-pub async fn handle_count(
+pub(crate) async fn handle_count(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<CountParams>,
@@ -239,14 +336,14 @@ pub async fn handle_count(
 }
 
 /// Handle GET /metrics
-pub async fn handle_metrics(State(state): State<AppState>) -> String {
+pub(crate) async fn handle_metrics(State(state): State<AppState>) -> String {
     state.metrics.encode()
 }
 
 /// Handle GET /-/healthy
 ///
 /// Returns 200 OK if the service is running.
-pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
+pub(crate) async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
     (axum::http::StatusCode::OK, "OK")
 }
 
@@ -254,7 +351,9 @@ pub async fn handle_healthy() -> (axum::http::StatusCode, &'static str) {
 ///
 /// Returns 200 OK if the service is ready to serve requests.
 /// Performs a lightweight storage check to verify the log backend is accessible.
-pub async fn handle_ready(State(state): State<AppState>) -> (axum::http::StatusCode, &'static str) {
+pub(crate) async fn handle_ready(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, &'static str) {
     // Verify storage is accessible with a lightweight read operation.
     // This reads the sequence block key, which verifies the storage backend
     // is responding without scanning or listing data.
@@ -293,7 +392,10 @@ mod tests {
         // given
         let log = Arc::new(LogDb::open(test_config()).await.unwrap());
         let metrics = Arc::new(Metrics::new());
-        let state = AppState { log, metrics };
+        let state = AppState {
+            log: LogBackend::ReadWrite(log),
+            metrics,
+        };
 
         // when
         let (status, body) = handle_ready(State(state)).await;
@@ -418,7 +520,10 @@ mod tests {
         let storage = Arc::new(ToggleFailStorage::new());
         let log = Arc::new(LogDb::new(storage.clone()).await.unwrap());
         let metrics = Arc::new(Metrics::new());
-        let state = AppState { log, metrics };
+        let state = AppState {
+            log: LogBackend::ReadWrite(log),
+            metrics,
+        };
 
         // Configure storage to fail after initialization
         storage.set_failing(true);
