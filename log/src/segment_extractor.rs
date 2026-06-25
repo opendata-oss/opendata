@@ -336,6 +336,7 @@ mod integration_tests {
     use slatedb::DbReader;
     use tempfile::TempDir;
 
+    use super::LogSegmentExtractor;
     use crate::config::{Config, SegmentConfig};
     use crate::log::{LogDb, LogDbBuilder};
     use crate::model::Record;
@@ -371,6 +372,7 @@ mod integration_tests {
     async fn manifest_segment_ids(slate: &SlateDbStorageConfig) -> Vec<u32> {
         let object_store = create_object_store(&slate.object_store).expect("object store");
         let reader = DbReader::builder(slate.path.clone(), object_store)
+            .with_segment_extractor(LogSegmentExtractor::shared())
             .build()
             .await
             .expect("open DbReader");
@@ -419,6 +421,7 @@ mod integration_tests {
         // then — reopen as a DbReader and verify the extractor name is persisted
         let object_store = create_object_store(&slate.object_store).expect("object store");
         let reader = DbReader::builder(slate.path.clone(), object_store)
+            .with_segment_extractor(LogSegmentExtractor::shared())
             .build()
             .await
             .expect("open DbReader");

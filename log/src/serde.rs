@@ -287,6 +287,31 @@ impl LogEntryKey {
         buf.freeze()
     }
 
+    /// Builds the sequence subrange to pair with [`Self::scan_prefix`].
+    ///
+    /// Every entry under a `(segment, key)` prefix differs only in its trailing
+    /// `var_u64(relative_seq)`, so the suffix range that selects `seq_range`
+    /// (inclusive start, exclusive end) is simply
+    /// `[var_u64(rel_start), var_u64(rel_end))`. `var_u64` is order-preserving,
+    /// so this lexicographic byte range matches the numeric sequence range.
+    /// Passing this alongside `scan_prefix` lets the backend bound the scan
+    /// natively rather than relying solely on client-side filtering.
+    pub fn scan_subrange(segment: &LogSegment, seq_range: Range<u64>) -> BytesRange {
+        BytesRange::new(
+            Bound::Included(Self::relative_seq_suffix(segment, seq_range.start)),
+            Bound::Excluded(Self::relative_seq_suffix(segment, seq_range.end)),
+        )
+    }
+
+    /// Encodes the trailing `var_u64(relative_seq)` suffix for `seq`, i.e. the
+    /// portion of a full entry key after [`Self::scan_prefix`].
+    fn relative_seq_suffix(segment: &LogSegment, seq: u64) -> Bytes {
+        let relative_seq = seq.saturating_sub(segment.meta().start_seq);
+        let mut buf = BytesMut::new();
+        var_u64::serialize(relative_seq, &mut buf);
+        buf.freeze()
+    }
+
     /// Builds a complete scan key with segment prefix and relative sequence.
     fn build_scan_key(segment: &LogSegment, key: &[u8], seq: u64) -> Bytes {
         let relative_seq = seq.saturating_sub(segment.meta().start_seq);

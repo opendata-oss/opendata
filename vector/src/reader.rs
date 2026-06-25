@@ -57,7 +57,11 @@ impl VectorDbReader {
         let storage = create_storage_read(
             &config.storage,
             runtime,
-            StorageSemantics::new().with_merge_operator(Arc::new(merge_op)),
+            StorageSemantics::new()
+                .with_merge_operator(Arc::new(merge_op))
+                .with_segment_extractor(
+                    crate::storage::segment_extractor::VectorSegmentExtractor::shared(),
+                ),
             slatedb::config::DbReaderOptions::default(),
         )
         .await?;

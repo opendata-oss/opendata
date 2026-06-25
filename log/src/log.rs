@@ -567,28 +567,33 @@ impl LogDbBuilder {
     pub async fn build(self) -> Result<LogDb> {
         self.config.validate_retention()?;
         self.config.validate_compaction()?;
-        let sb = StorageBuilder::new(&self.config.storage)
-            .await
-            .map_err(|e| Error::Storage(e.to_string()))?
-            .with_semantics(
-                StorageSemantics::new()
-                    .with_filter_policies(crate::filter_sequence::filter_policies()),
-            );
-        // Route every log record to a SlateDB segment keyed by the 6-byte
-        // routing prefix `[subsystem, version, segment_id]`. No-op for the
-        // in-memory backend; for slatedb-backed storage this installs the
-        // extractor on the underlying `DbBuilder` (see RFC 0024).
-        //
-        // The filter policies are an orthogonal slatedb axis (see RFC 0007):
-        // the `LogKeyPrefixExtractor` bloom hashes the logical `(segment,
-        // user_key)` prefix into per-SST bloom filters to prune SSTs that
-        // cannot contain the key (`whole_key_filtering=false` — the extracted
-        // prefix discriminates everything we probe), and the sequence-range
-        // filter prunes SSTs whose records for the key all sit below a scan's
-        // resume cursor. Writer, compactor, and reader must share the same set.
-        let sb = sb.map_slatedb(|db| {
-            db.with_segment_extractor(crate::segment_extractor::LogSegmentExtractor::shared())
-        });
+        let sb =
+            StorageBuilder::new(&self.config.storage)
+                .await
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .with_semantics(
+                    // Route every log record to a SlateDB segment keyed by the
+                    // 6-byte routing prefix `[subsystem, version, segment_id]`. No-op
+                    // for the in-memory backend; for slatedb-backed storage this
+                    // installs the extractor on both the writer's `DbBuilder` and any
+                    // standalone `DbReader` (see RFC 0024). SlateDB 0.14 persists the
+                    // extractor name and rejects a reader that doesn't match.
+                    //
+                    // The filter policies are an orthogonal slatedb axis (see RFC
+                    // 0007): the `LogKeyPrefixExtractor` bloom hashes the logical
+                    // `(segment, user_key)` prefix into per-SST bloom filters to
+                    // prune SSTs that cannot contain the key
+                    // (`whole_key_filtering=false` — the extracted prefix
+                    // discriminates everything we probe), and the sequence-range
+                    // filter prunes SSTs whose records for the key all sit below a
+                    // scan's resume cursor. Writer, compactor, and reader must share
+                    // the same set.
+                    StorageSemantics::new()
+                        .with_filter_policies(crate::filter_sequence::filter_policies())
+                        .with_segment_extractor(
+                            crate::segment_extractor::LogSegmentExtractor::shared(),
+                        ),
+                );
         // Install the LogDb compaction scheduler for every SlateDB-backed log.
         let compactor_view_cell: CompactorViewCell =
             Arc::new(ArcSwap::from_pointee(CompactorView {

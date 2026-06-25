@@ -95,6 +95,43 @@ impl BytesRange {
             end: Unbounded,
         }
     }
+
+    /// Builds the absolute key range for a prefix scan narrowed to `subrange`.
+    ///
+    /// `subrange` bounds are key *suffixes* interpreted relative to `prefix`: a
+    /// bound `s` selects the full key `prefix ++ s`. An unbounded subrange end
+    /// falls back to the prefix's natural upper bound (its lexicographic
+    /// successor), so `from_prefix_and_subrange(p, &BytesRange::unbounded())`
+    /// equals [`Self::prefix`].
+    ///
+    /// This mirrors SlateDB's own `scan_prefix` subrange semantics so the
+    /// in-memory fallback in [`StorageRead::scan_prefix_iter`] agrees with the
+    /// SlateDB path byte-for-byte.
+    ///
+    /// [`StorageRead::scan_prefix_iter`]: crate::storage::StorageRead::scan_prefix_iter
+    pub fn from_prefix_and_subrange(prefix: &[u8], subrange: &BytesRange) -> Self {
+        let concat = |suffix: &Bytes| -> Bytes {
+            let mut key = BytesMut::with_capacity(prefix.len() + suffix.len());
+            key.extend_from_slice(prefix);
+            key.extend_from_slice(suffix);
+            key.freeze()
+        };
+        let start = match &subrange.start {
+            Included(s) => Included(concat(s)),
+            Excluded(s) => Excluded(concat(s)),
+            Unbounded if prefix.is_empty() => Unbounded,
+            Unbounded => Included(Bytes::copy_from_slice(prefix)),
+        };
+        let end = match &subrange.end {
+            Included(e) => Included(concat(e)),
+            Excluded(e) => Excluded(concat(e)),
+            Unbounded => match lex_increment(prefix) {
+                Some(successor) => Excluded(successor),
+                None => Unbounded,
+            },
+        };
+        Self { start, end }
+    }
 }
 
 impl RangeBounds<Bytes> for BytesRange {
@@ -103,6 +140,17 @@ impl RangeBounds<Bytes> for BytesRange {
     }
     fn end_bound(&self) -> Bound<&Bytes> {
         self.end.as_ref()
+    }
+}
+
+/// SlateDB 0.14 scans are bounded by its own [`ByteRangeBounds`] trait rather
+/// than `std::ops::RangeBounds`, so we map our bounds onto byte slices.
+impl slatedb::ByteRangeBounds for BytesRange {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        self.start.as_ref().map(Bytes::as_ref)
+    }
+    fn end_bound(&self) -> Bound<&[u8]> {
+        self.end.as_ref().map(Bytes::as_ref)
     }
 }
 
