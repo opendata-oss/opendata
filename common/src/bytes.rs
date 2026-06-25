@@ -143,8 +143,8 @@ impl RangeBounds<Bytes> for BytesRange {
     }
 }
 
-/// SlateDB 0.14 scans are bounded by its own [`ByteRangeBounds`] trait rather
-/// than `std::ops::RangeBounds`, so we map our bounds onto byte slices.
+/// SlateDB 0.14 scans are bounded by its own [`slatedb::ByteRangeBounds`] trait
+/// rather than `std::ops::RangeBounds`, so we map our bounds onto byte slices.
 impl slatedb::ByteRangeBounds for BytesRange {
     fn start_bound(&self) -> Bound<&[u8]> {
         self.start.as_ref().map(Bytes::as_ref)
