@@ -91,11 +91,18 @@ pub(crate) trait LogStorageRead: StorageRead {
         seq_range: Range<u64>,
     ) -> Result<SegmentIterator> {
         let prefix = LogEntryKey::scan_prefix(segment, key);
+        // Bound the scan to the requested sequence window natively: the suffix
+        // subrange restricts the trailing relative-sequence bytes, so the
+        // backend stops at `seq_range.end` instead of leaning entirely on
+        // `SegmentIterator`'s client-side early-exit.
+        let subrange = LogEntryKey::scan_subrange(segment, seq_range.clone());
         let relative_cursor = seq_range.start.saturating_sub(segment.meta().start_seq);
         let filter_context = Some(crate::filter_sequence::sequence_filter_context(
             relative_cursor,
         ));
-        let inner = self.scan_prefix_iter(prefix, filter_context).await?;
+        let inner = self
+            .scan_prefix_iter(prefix, subrange, filter_context)
+            .await?;
         Ok(SegmentIterator::new(
             inner,
             seq_range,

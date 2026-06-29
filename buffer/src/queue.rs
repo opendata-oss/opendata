@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::{BufMut, Bytes, BytesMut};
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
-    Error as ObjectStoreError, ObjectStore, PutMode, PutPayload, UpdateVersion,
+    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
 };
 
 use crate::error::{Error, Result};

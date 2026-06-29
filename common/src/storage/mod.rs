@@ -243,7 +243,14 @@ pub trait StorageRead: Any + Send + Sync {
         range: BytesRange,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>>;
 
-    /// Returns an iterator over records whose key starts with `prefix`.
+    /// Returns an iterator over records whose key starts with `prefix`,
+    /// restricted to `subrange`.
+    ///
+    /// `subrange` bounds are key *suffixes* interpreted relative to `prefix`: a
+    /// bound `s` selects the full key `prefix ++ s`. Pass
+    /// [`BytesRange::unbounded`] to scan the prefix's entire keyspace. Callers
+    /// with a known sub-key ordering (e.g. the log's trailing sequence bytes)
+    /// use this to bound the scan natively instead of filtering client-side.
     ///
     /// Backends that support prefix-aware SST filters (e.g. SlateDB with a
     /// configured `PrefixExtractor` or custom `FilterPolicy`) consult those
@@ -258,14 +265,17 @@ pub trait StorageRead: Any + Send + Sync {
     /// [`slatedb::FilterContext`].
     ///
     /// The default implementation delegates to [`Self::scan_iter`] with the
-    /// range derived from the prefix, which preserves correctness for any
-    /// backend; backends that can do better should override this.
+    /// absolute range derived from `prefix` and `subrange`, which preserves
+    /// correctness for any backend; backends that can do better should override
+    /// this.
     async fn scan_prefix_iter(
         &self,
         prefix: Bytes,
+        subrange: BytesRange,
         _filter_context: Option<FilterContext>,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
-        self.scan_iter(BytesRange::prefix(prefix)).await
+        self.scan_iter(BytesRange::from_prefix_and_subrange(&prefix, &subrange))
+            .await
     }
 
     /// Collects all records in the range into a Vec.
