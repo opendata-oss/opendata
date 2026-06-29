@@ -572,22 +572,24 @@ impl LogDbBuilder {
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?
                 .with_semantics(
-                    // Route every log record to a SlateDB segment keyed by the
-                    // 6-byte routing prefix `[subsystem, version, segment_id]`. No-op
-                    // for the in-memory backend; for slatedb-backed storage this
-                    // installs the extractor on both the writer's `DbBuilder` and any
-                    // standalone `DbReader` (see RFC 0024). SlateDB 0.14 persists the
-                    // extractor name and rejects a reader that doesn't match.
+                    // Two orthogonal SlateDB axes, both of which the writer,
+                    // compactor, and reader must configure identically:
                     //
-                    // The filter policies are an orthogonal slatedb axis (see RFC
-                    // 0007): the `LogKeyPrefixExtractor` bloom hashes the logical
-                    // `(segment, user_key)` prefix into per-SST bloom filters to
-                    // prune SSTs that cannot contain the key
-                    // (`whole_key_filtering=false` — the extracted prefix
-                    // discriminates everything we probe), and the sequence-range
-                    // filter prunes SSTs whose records for the key all sit below a
-                    // scan's resume cursor. Writer, compactor, and reader must share
-                    // the same set.
+                    // 1. Segment extractor (RFC 0024): routes every log record to a
+                    //    SlateDB segment keyed by the 6-byte routing prefix
+                    //    `[subsystem, version, segment_id]`. No-op for the in-memory
+                    //    backend; for slatedb-backed storage it installs on both the
+                    //    writer's `DbBuilder` and any standalone `DbReader`. SlateDB
+                    //    0.14 persists the extractor name and rejects a reader whose
+                    //    extractor doesn't match.
+                    //
+                    // 2. Filter policies (RFC 0007): the `LogKeyPrefixExtractor` bloom
+                    //    hashes the logical `(segment, user_key)` prefix into per-SST
+                    //    bloom filters to prune SSTs that cannot contain the key
+                    //    (`whole_key_filtering=false` — the extracted prefix
+                    //    discriminates everything we probe), and the sequence-range
+                    //    filter prunes SSTs whose records for the key all sit below a
+                    //    scan's resume cursor.
                     StorageSemantics::new()
                         .with_filter_policies(crate::filter_sequence::filter_policies())
                         .with_segment_extractor(
