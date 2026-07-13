@@ -238,14 +238,10 @@ impl Scraper {
 mod tests {
     use super::*;
 
-    #[test]
-    fn should_create_scraper() {
+    #[tokio::test]
+    async fn should_create_scraper() {
         // given
-        let storage = Arc::new(
-            common::storage::in_memory::InMemoryStorage::with_merge_operator(Arc::new(
-                crate::storage::merge_operator::OpenTsdbMergeOperator,
-            )),
-        );
+        let storage = Arc::new(crate::storage::in_memory_storage().await);
         let tsdb = Arc::new(Tsdb::new(storage));
         let config = PrometheusConfig::default();
 

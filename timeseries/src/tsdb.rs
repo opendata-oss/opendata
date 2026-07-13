@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use common::{Storage, StorageRead};
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
 use moka::future::Cache;
@@ -21,7 +20,7 @@ use crate::model::{
     TimeBucket,
 };
 use crate::query::{BucketQueryReader, QueryReader};
-use crate::storage::OpenTsdbStorageReadExt;
+use crate::storage::{Storage, StorageRead, StorageSnapshot};
 use crate::tsdb_metrics;
 use crate::util::Result;
 
@@ -969,7 +968,7 @@ pub(crate) async fn discover_label_values<R: QueryReader>(
 /// Tsdb manages multiple MiniTsdb instances (one per time bucket) and provides
 /// a unified QueryReader interface that merges results across buckets.
 pub(crate) struct Tsdb {
-    storage: Arc<dyn Storage>,
+    storage: Arc<Storage>,
 
     /// TTI cache (15 min idle) for buckets being actively ingested into.
     /// Also used during queries so that unflushed data is visible.
@@ -989,11 +988,11 @@ pub(crate) struct Tsdb {
 }
 
 impl Tsdb {
-    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
+    pub(crate) fn new(storage: Arc<Storage>) -> Self {
         Self::with_retention(storage, None)
     }
 
-    pub(crate) fn with_retention(storage: Arc<dyn Storage>, retention: Option<Duration>) -> Self {
+    pub(crate) fn with_retention(storage: Arc<Storage>, retention: Option<Duration>) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
             .time_to_idle(Duration::from_secs(15 * 60))
@@ -1012,8 +1011,8 @@ impl Tsdb {
 
     /// Returns a read handle to the underlying storage, for background tasks
     /// like the cache warmer.
-    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
-        self.storage.clone() as Arc<dyn StorageRead>
+    pub(crate) fn storage_read(&self) -> Storage {
+        (*self.storage).clone()
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
@@ -1084,15 +1083,15 @@ impl Tsdb {
     /// available, otherwise constructs a reader directly from the snapshot.
     async fn build_readers(
         &self,
-        snapshot: &Arc<dyn common::storage::StorageSnapshot>,
+        snapshot: &StorageSnapshot,
         buckets: Vec<TimeBucket>,
-    ) -> Vec<(TimeBucket, MiniQueryReader)> {
+    ) -> Vec<(TimeBucket, MiniQueryReader<StorageSnapshot>)> {
         let mut readers = Vec::with_capacity(buckets.len());
         for bucket in buckets {
             let reader = if let Some(mini) = self.ingest_cache.get(&bucket).await {
                 mini.query_reader()
             } else {
-                MiniQueryReader::new(bucket, snapshot.clone() as Arc<dyn StorageRead>)
+                MiniQueryReader::new(bucket, snapshot.clone())
             };
             readers.push((bucket, reader));
         }
@@ -1299,15 +1298,6 @@ impl TsdbEngine {
     /// Returns `true` when the engine is read-only.
     pub(crate) fn is_read_only(&self) -> bool {
         matches!(self, Self::ReadOnly(_))
-    }
-
-    /// Returns a read handle to the underlying storage, for background tasks
-    /// like the cache warmer.
-    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
-        match self {
-            Self::ReadWrite(tsdb) => tsdb.storage_read(),
-            Self::ReadOnly(reader) => reader.storage_read(),
-        }
     }
 
     /// Returns a clone of the inner `Arc<Tsdb>` if this is a read-write engine.
@@ -1553,11 +1543,11 @@ impl From<Arc<crate::reader::TimeSeriesDbReader>> for TsdbEngine {
 /// QueryReader implementation that properly handles bucket-scoped series IDs.
 pub(crate) struct TsdbQueryReader {
     /// Map from bucket to MiniTsdb for efficient bucket queries
-    mini_readers: HashMap<TimeBucket, MiniQueryReader>,
+    mini_readers: HashMap<TimeBucket, MiniQueryReader<StorageSnapshot>>,
 }
 
 impl TsdbQueryReader {
-    pub fn new(mini_tsdbs: Vec<(TimeBucket, MiniQueryReader)>) -> Self {
+    pub fn new(mini_tsdbs: Vec<(TimeBucket, MiniQueryReader<StorageSnapshot>)>) -> Self {
         let bucket_minis = mini_tsdbs.into_iter().collect();
         Self {
             mini_readers: bucket_minis,
@@ -1652,9 +1642,7 @@ impl QueryReader for TsdbQueryReader {
 mod tests {
     use super::*;
     use crate::model::MetricType;
-    use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use common::storage::in_memory::InMemoryStorage;
-    use opendata_macros::storage_test;
+    use crate::storage::in_memory_storage;
 
     fn create_sample(
         metric_name: &str,
@@ -1684,8 +1672,9 @@ mod tests {
         }
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_create_tsdb_with_caches(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_create_tsdb_with_caches() {
+        let storage = Arc::new(in_memory_storage().await);
         // when
         let tsdb = Tsdb::new(storage);
 
@@ -1694,8 +1683,9 @@ mod tests {
         assert_eq!(tsdb.ingest_cache.entry_count(), 0);
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_get_or_create_bucket_for_ingest(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_get_or_create_bucket_for_ingest() {
+        let storage = Arc::new(in_memory_storage().await);
         // given
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(1000);
@@ -1710,8 +1700,9 @@ mod tests {
         assert_eq!(tsdb.ingest_cache.entry_count(), 1);
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_use_ingest_cache_during_queries(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_use_ingest_cache_during_queries() {
+        let storage = Arc::new(in_memory_storage().await);
         // given: a bucket in the ingest cache with ingested data
         let tsdb = Tsdb::new(storage);
         let bucket = TimeBucket::hour(60);
@@ -1729,8 +1720,9 @@ mod tests {
         assert_eq!(buckets.len(), 1);
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_ingest_and_query_single_bucket(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_ingest_and_query_single_bucket() {
+        let storage = Arc::new(in_memory_storage().await);
         // given
         let tsdb = Tsdb::new(storage);
 
@@ -1761,8 +1753,9 @@ mod tests {
         assert_eq!(series_ids.len(), 1);
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_query_across_multiple_buckets(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn should_query_across_multiple_buckets() {
+        let storage = Arc::new(in_memory_storage().await);
         use crate::test_utils::assertions::assert_approx_eq;
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -1932,13 +1925,12 @@ mod tests {
         }
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn should_query_across_multiple_buckets_with_different_series_id_mappings(
-        storage: Arc<dyn Storage>,
-    ) {
+    #[tokio::test]
+    async fn should_query_across_multiple_buckets_with_different_series_id_mappings() {
         use std::time::{Duration, UNIX_EPOCH};
 
         // given: Two time buckets with overlapping series but different series IDs
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
         // Bucket 1: hour 60 (covers 3,600,000-7,199,999 ms)
         let bucket1 = TimeBucket::hour(60);
@@ -2012,9 +2004,7 @@ mod tests {
     // ── Native read method tests ─────────────────────────────────────
 
     async fn create_tsdb_with_data() -> Tsdb {
-        let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        ))));
+        let tsdb = Tsdb::new(Arc::new(in_memory_storage().await));
 
         // Ingest two series into bucket at minute 60 (covers 3,600,000–7,199,999 ms)
         let series = vec![
@@ -2114,8 +2104,9 @@ mod tests {
         );
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn eval_query_should_return_scalar(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn eval_query_should_return_scalar() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
         let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
 
@@ -2143,8 +2134,9 @@ mod tests {
         }
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn eval_query_should_return_error_for_invalid_query(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn eval_query_should_return_error_for_invalid_query() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         let opts = QueryOptions::default();
@@ -2177,8 +2169,9 @@ mod tests {
         assert_eq!(results[1].labels.get("env"), Some("staging"));
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn eval_query_range_should_return_scalar(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn eval_query_range_should_return_scalar() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
         let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(160);
@@ -2197,8 +2190,9 @@ mod tests {
         assert_eq!(results[0].samples[1].1, 2.0);
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn eval_query_range_should_return_error_for_invalid_query(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn eval_query_range_should_return_error_for_invalid_query() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
         let end = std::time::UNIX_EPOCH + std::time::Duration::from_secs(200);
@@ -2236,8 +2230,9 @@ mod tests {
         assert_eq!(results[1].get("env"), Some("staging"));
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_series_should_error_on_empty_matchers(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_series_should_error_on_empty_matchers() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         let result = tsdb.find_series(&[], 0, i64::MAX).await;
@@ -2249,8 +2244,9 @@ mod tests {
         ));
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_series_should_dedup_across_buckets(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_series_should_dedup_across_buckets() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         // Same series in two different buckets
@@ -2292,8 +2288,9 @@ mod tests {
         assert!(results.contains(&"env".to_string()));
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_labels_should_return_empty_for_no_data(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_labels_should_return_empty_for_no_data() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         let results = tsdb.find_labels(None, 0, 100).await.unwrap();
@@ -2325,16 +2322,18 @@ mod tests {
         assert_eq!(results, vec!["prod"]);
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_label_values_should_return_empty_for_no_data(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_label_values_should_return_empty_for_no_data() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         let results = tsdb.find_label_values("env", None, 0, 100).await.unwrap();
         assert!(results.is_empty());
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_metadata_should_return_all(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_metadata_should_return_all() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         let mut series = create_sample("cpu", vec![("host", "a")], 4_000_000, 1.0);
@@ -2390,8 +2389,9 @@ mod tests {
         }
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn eval_query_with_offset_before_epoch_should_not_error(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn eval_query_with_offset_before_epoch_should_not_error() {
+        let storage = Arc::new(in_memory_storage().await);
         // Query at 100s with offset 1h → effective time = -3500s (before epoch).
         let tsdb = Tsdb::new(storage);
         let query_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
@@ -2408,8 +2408,9 @@ mod tests {
         );
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn eval_query_range_with_at_before_epoch_should_not_error(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn eval_query_range_with_at_before_epoch_should_not_error() {
+        let storage = Arc::new(in_memory_storage().await);
         // `@ 0 offset 1h` pins evaluation to t=0, then offset pushes to -3600.
         let tsdb = Tsdb::new(storage);
         let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
@@ -2457,8 +2458,9 @@ mod tests {
     // Multi-bucket dedup for labels and label_values
     // -----------------------------------------------------------------------
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_labels_should_dedup_across_buckets(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_labels_should_dedup_across_buckets() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         // Same series in two different buckets
@@ -2484,8 +2486,9 @@ mod tests {
         assert!(results.contains(&"host".to_string()));
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_label_values_should_dedup_across_buckets(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_label_values_should_dedup_across_buckets() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         // Same series in two different buckets
@@ -2508,8 +2511,9 @@ mod tests {
         );
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn find_metadata_should_filter_by_metric(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn find_metadata_should_filter_by_metric() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         tsdb.ingest_samples(
@@ -2530,8 +2534,9 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    #[storage_test(merge_operator = OpenTsdbMergeOperator)]
-    async fn eval_query_range_rejects_zero_step(storage: Arc<dyn Storage>) {
+    #[tokio::test]
+    async fn eval_query_range_rejects_zero_step() {
+        let storage = Arc::new(in_memory_storage().await);
         let tsdb = Tsdb::new(storage);
 
         tsdb.ingest_samples(vec![create_sample("cpu", vec![], 1_000_000, 1.0)], None)
@@ -2647,9 +2652,7 @@ mod tests {
         producer.close().await.unwrap();
 
         // Start the real BufferConsumer against the shared object store
-        let tsdb = Arc::new(Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(
-            Arc::new(OpenTsdbMergeOperator),
-        ))));
+        let tsdb = Arc::new(Tsdb::new(Arc::new(in_memory_storage().await)));
         let converter = Arc::new(crate::otel::OtelConverter::new(
             crate::otel::OtelConfig::default(),
         ));
@@ -2707,9 +2710,7 @@ mod tests {
         };
 
         async fn create_tsdb_with_counter() -> Tsdb {
-            let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-                OpenTsdbMergeOperator,
-            ))));
+            let tsdb = Tsdb::new(Arc::new(in_memory_storage().await));
             // Counter over bucket at minute 60 (covers 3.6M-7.2M ms).
             // Samples every 10s at 4_000_000, 4_010_000, 4_020_000.
             let series = vec![
@@ -3038,9 +3039,7 @@ mod tests {
         /// base_ts + step)` — two samples per series so `sum_over_time`
         /// has real values to aggregate inside the 10s sub-window.
         async fn create_tsdb_with_large_roster(metric: &str, n_series: usize) -> Tsdb {
-            let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-                OpenTsdbMergeOperator,
-            ))));
+            let tsdb = Tsdb::new(Arc::new(in_memory_storage().await));
             let mut samples = Vec::with_capacity(n_series * 2);
             for i in 0..n_series {
                 samples.push(create_sample(
@@ -3113,9 +3112,7 @@ mod tests {
             const N_SERIES: usize = 1500;
             const GROUPS: usize = 3;
             let tsdb = {
-                let tsdb = Tsdb::new(Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-                    OpenTsdbMergeOperator,
-                ))));
+                let tsdb = Tsdb::new(Arc::new(in_memory_storage().await));
                 let mut samples = Vec::with_capacity(N_SERIES);
                 for i in 0..N_SERIES {
                     samples.push(create_sample(
@@ -3355,10 +3352,8 @@ mod tests {
         /// counter spanning 3 samples, flush, and return both handles.
         async fn create_writer_and_reader_with_counter() -> (Tsdb, crate::reader::TimeSeriesDbReader)
         {
-            let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-                OpenTsdbMergeOperator,
-            )));
-            let tsdb = Tsdb::new(storage.clone());
+            let shared = crate::storage::in_memory_shared_storage().await;
+            let tsdb = Tsdb::new(shared.storage.clone());
             let series = vec![
                 create_sample("req_total", vec![("env", "prod")], 4_000_000, 10.0),
                 create_sample("req_total", vec![("env", "prod")], 4_010_000, 20.0),
@@ -3366,7 +3361,8 @@ mod tests {
             ];
             tsdb.ingest_samples(series, None).await.unwrap();
             tsdb.flush().await.unwrap();
-            let reader = crate::reader::TimeSeriesDbReader::from_storage(storage);
+            // Open the reader only after the flush so its view includes the data.
+            let reader = crate::reader::TimeSeriesDbReader::from_storage(shared.reader().await);
             (tsdb, reader)
         }
 

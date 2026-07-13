@@ -13,9 +13,8 @@ pub mod http;
 use std::sync::Arc;
 
 use common::storage::config::SlateDbStorageConfig;
-use common::{StorageBuilder, StorageConfig, StorageSemantics};
 
-use common::Storage;
+use crate::storage::Storage;
 
 /// Install a global metrics-rs recorder once for the test process.
 ///
@@ -36,7 +35,6 @@ pub fn ensure_metrics_recorder() -> metrics_exporter_prometheus::PrometheusHandl
 }
 
 use crate::model::Series;
-use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::Tsdb;
 
 // Re-export storage config types so benchmarks and integration tests
@@ -61,7 +59,7 @@ pub use crate::promql::response::{query_value_to_response, range_result_to_respo
 /// without the crate needing to expose `Tsdb` as a public type.
 pub struct TestTsdb {
     pub(crate) inner: Arc<Tsdb>,
-    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) storage: Arc<Storage>,
 }
 
 impl TestTsdb {
@@ -93,22 +91,14 @@ pub async fn create_test_tsdb_with_config(object_store: ObjectStoreConfig) -> Te
     #[cfg(feature = "http-server")]
     ensure_metrics_recorder();
 
-    let config = StorageConfig::SlateDb(SlateDbStorageConfig {
+    let config = SlateDbStorageConfig {
         path: "bench-data".to_string(),
         object_store,
         settings_path: None,
         block_cache: None,
         meta_cache: None,
-    });
-    let storage = StorageBuilder::new(&config)
-        .await
-        .unwrap()
-        .with_semantics(
-            StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-        )
-        .build()
-        .await
-        .unwrap();
+    };
+    let storage = Arc::new(Storage::try_new(&config).await.unwrap());
     TestTsdb {
         inner: Arc::new(Tsdb::new(storage.clone())),
         storage,

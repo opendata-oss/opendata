@@ -78,7 +78,7 @@ impl Benchmark for IngestBenchmark {
         let bucket_start_ms: i64 = 3_600_000;
 
         let config = Config {
-            storage: bench.spec().data().storage.clone(),
+            storage: bench.spec().data().to_slatedb_config(),
             ..Default::default()
         };
         let timeseries = TimeSeriesDb::open(config).await?;
