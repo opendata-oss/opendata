@@ -126,10 +126,10 @@ impl FtsDeleteTracker {
     ) {
         let mut state = self.state.lock().unwrap();
         match &*state {
-            FtsDeleteTrackerState::Compacted { manifest_id, .. } => {
-                if update_manifest_id >= *manifest_id {
-                    *state = FtsDeleteTrackerState::Accumulating(fields);
-                }
+            FtsDeleteTrackerState::Compacted { manifest_id, .. }
+                if update_manifest_id >= *manifest_id =>
+            {
+                *state = FtsDeleteTrackerState::Accumulating(fields);
             }
             FtsDeleteTrackerState::Accumulating(_) => {
                 *state = FtsDeleteTrackerState::Accumulating(fields);
