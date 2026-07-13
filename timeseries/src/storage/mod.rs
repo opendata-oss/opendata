@@ -20,7 +20,7 @@ pub(crate) mod slate;
 
 pub(crate) use slate::{
     Storage, StorageRead, StorageReader, StorageSnapshot, Store, insert_forward_index,
-    insert_series_id, merge_bucket_list, merge_inverted_index, merge_samples,
+    insert_series_id, merge_inverted_index, merge_samples,
 };
 
 #[cfg(any(test, feature = "testing"))]
@@ -31,24 +31,34 @@ pub(crate) use factory::{FailingStorage, SharedInMemoryStorage, in_memory_shared
 #[cfg(test)]
 mod tests {
     use crate::model::TimeBucket;
-    use crate::serde::bucket_list::BucketListValue;
-    use crate::serde::key::BucketListKey;
-    use crate::storage::{Storage, StorageRead, in_memory_storage, merge_bucket_list};
+    use crate::serde::key::SeriesDictionaryKey;
+    use crate::storage::{Storage, StorageRead, in_memory_storage};
     use common::Record;
-    use common::storage::{PutRecordOp, Ttl};
+    use common::storage::PutRecordOp;
     use std::sync::Arc;
 
     /// Create a SlateDb storage with the given hour-buckets pre-populated.
     /// Each entry in `bucket_starts` is the bucket start in minutes.
+    ///
+    /// One sentinel `SeriesDictionaryKey` per bucket is written so the
+    /// segment extractor registers each bucket in the segment list.
     async fn storage_with_buckets(bucket_starts: &[u32]) -> Arc<Storage> {
         let storage = Arc::new(in_memory_storage().await);
-        let buckets: Vec<(u8, u32)> = bucket_starts.iter().map(|&s| (1u8, s)).collect();
-        let key = BucketListKey.encode();
-        let value = BucketListValue { buckets }.encode();
-        storage
-            .put(vec![PutRecordOp::new(Record { key, value })])
-            .await
-            .unwrap();
+        let ops: Vec<PutRecordOp> = bucket_starts
+            .iter()
+            .map(|&start| {
+                let key = SeriesDictionaryKey {
+                    bucket: TimeBucket { start, size: 1 },
+                    series_fingerprint: 0,
+                }
+                .encode();
+                PutRecordOp::new(Record {
+                    key,
+                    value: bytes::Bytes::new(),
+                })
+            })
+            .collect();
+        storage.put(ops).await.unwrap();
         storage
     }
 
@@ -110,116 +120,5 @@ mod tests {
         let s = storage_with_buckets(&[0, 60]).await;
         let buckets = s.get_buckets_for_ranges(&[(3600, 7200)]).await.unwrap();
         assert_eq!(starts(&buckets), vec![60]);
-    }
-
-    // ── bucket_list_contains tests ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn should_return_true_when_bucket_in_list() {
-        // given
-        let storage = storage_with_buckets(&[0, 60, 120]).await;
-
-        // when
-        let present = storage
-            .bucket_list_contains(TimeBucket { size: 1, start: 60 })
-            .await
-            .unwrap();
-
-        // then
-        assert!(present);
-    }
-
-    #[tokio::test]
-    async fn should_return_false_when_bucket_absent() {
-        // given
-        let storage = storage_with_buckets(&[0, 60]).await;
-
-        // when
-        let present = storage
-            .bucket_list_contains(TimeBucket {
-                size: 1,
-                start: 180,
-            })
-            .await
-            .unwrap();
-
-        // then
-        assert!(!present);
-    }
-
-    #[tokio::test]
-    async fn should_return_false_when_bucket_list_key_missing() {
-        // given
-        let storage = Arc::new(in_memory_storage().await);
-
-        // when
-        let present = storage
-            .bucket_list_contains(TimeBucket { size: 1, start: 0 })
-            .await
-            .unwrap();
-
-        // then
-        assert!(!present);
-    }
-
-    #[tokio::test]
-    async fn should_distinguish_buckets_with_same_start_but_different_size() {
-        // given: only a size=1 bucket at start=60 is present
-        let storage = storage_with_buckets(&[60]).await;
-
-        // when
-        let size_one = storage
-            .bucket_list_contains(TimeBucket { size: 1, start: 60 })
-            .await
-            .unwrap();
-        let size_two = storage
-            .bucket_list_contains(TimeBucket { size: 2, start: 60 })
-            .await
-            .unwrap();
-
-        // then
-        assert!(size_one);
-        assert!(!size_two);
-    }
-
-    // ── coalesce_bucket_list tests ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn should_coalesce_bucket_list_preserving_merged_value() {
-        // given: several merge operands have accrued on the BucketList key
-        let storage = Arc::new(in_memory_storage().await);
-        let ops = vec![
-            merge_bucket_list(TimeBucket { size: 1, start: 0 }, Ttl::Default).unwrap(),
-            merge_bucket_list(TimeBucket { size: 1, start: 60 }, Ttl::Default).unwrap(),
-            merge_bucket_list(
-                TimeBucket {
-                    size: 1,
-                    start: 120,
-                },
-                Ttl::Default,
-            )
-            .unwrap(),
-        ];
-        storage.apply(ops).await.unwrap();
-
-        // when
-        storage.coalesce_bucket_list().await.unwrap();
-
-        // then: readable value still reflects the full merged list
-        let buckets = storage.get_buckets_in_range(None, None).await.unwrap();
-        assert_eq!(starts(&buckets), vec![0, 60, 120]);
-    }
-
-    #[tokio::test]
-    async fn should_be_noop_when_bucket_list_absent() {
-        // given
-        let storage = Arc::new(in_memory_storage().await);
-
-        // when
-        storage.coalesce_bucket_list().await.unwrap();
-
-        // then: key is still absent
-        let value = storage.get(BucketListKey.encode()).await.unwrap();
-        assert!(value.is_none());
     }
 }

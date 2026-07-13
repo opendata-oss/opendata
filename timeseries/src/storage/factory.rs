@@ -237,10 +237,6 @@ mod failing_storage {
             self.inner.load_series_dictionary(bucket, insert).await
         }
 
-        async fn bucket_list_contains(&self, bucket: TimeBucket) -> crate::util::Result<bool> {
-            self.inner.bucket_list_contains(bucket).await
-        }
-
         async fn get_label_values(
             &self,
             bucket: &TimeBucket,

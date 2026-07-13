@@ -10,8 +10,8 @@ use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::model::TimeBucket;
 use crate::storage::{
-    StorageSnapshot, Store, insert_forward_index, insert_series_id, merge_bucket_list,
-    merge_inverted_index, merge_samples,
+    StorageSnapshot, Store, insert_forward_index, insert_series_id, merge_inverted_index,
+    merge_samples,
 };
 use crate::tsdb_metrics;
 
@@ -81,18 +81,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         let start = std::time::Instant::now();
         let ttl = bucket_ttl(frozen.bucket, self.retention);
 
-        // Phase 1: bucket-list lookup. Skips the redundant BucketList merge
-        // operand on hot key when this bucket is already listed.
-        let lookup_start = std::time::Instant::now();
-        let bucket_announced = self
-            .storage
-            .bucket_list_contains(frozen.bucket)
-            .await
-            .map_err(|e| e.to_string())?;
-        ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_BUCKET_LIST_LOOKUP_DURATION_SECONDS)
-            .record(lookup_start.elapsed().as_secs_f64());
-
-        // Phase 2: build storage ops. Track estimated key+value bytes by
+        // Phase 1: build storage ops. Track estimated key+value bytes by
         // summing `Bytes::len()` on each produced op (cheap, no extra clone).
         let build_start = std::time::Instant::now();
         let mut ops = Vec::new();
@@ -101,13 +90,6 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
             *estimated += op_estimated_bytes(&op) as u64;
             ops.push(op);
         };
-        if !bucket_announced {
-            push_op(
-                &mut ops,
-                &mut estimated_bytes,
-                merge_bucket_list(frozen.bucket, ttl).map_err(|e| e.to_string())?,
-            );
-        }
 
         for (fingerprint, series_id) in &frozen.series_dict_delta {
             push_op(
@@ -164,7 +146,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_NEW_SERIES).record(new_series_count as f64);
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_SAMPLES).record(sample_count as f64);
 
-        // Phase 3: SlateDB apply. Time spent here reflects SlateDB write
+        // Phase 2: SlateDB apply. Time spent here reflects SlateDB write
         // backpressure (memtable full, WAL stall, etc.).
         let apply_start = std::time::Instant::now();
         let result = self.storage.apply(ops).await.map_err(|e| e.to_string());
@@ -187,7 +169,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
 
         result?;
 
-        // Phase 4: snapshot refresh.
+        // Phase 3: snapshot refresh.
         let snap_start = std::time::Instant::now();
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string());
         ::metrics::histogram!(tsdb_metrics::TSDB_FLUSH_STORAGE_SNAPSHOT_DURATION_SECONDS)
@@ -205,10 +187,7 @@ mod tests {
     use super::*;
     use crate::delta::TsdbContext;
     use crate::model::{Label, MetricType, Sample, Series, TimeBucket};
-    use crate::serde::bucket_list::BucketListValue;
-    use crate::serde::key::BucketListKey;
     use crate::storage::{FailingStorage, Storage, StorageRead, in_memory_storage};
-    use common::Record;
     use common::coordinator::Delta;
     use common::storage::StorageError;
     use std::collections::HashMap;
@@ -491,52 +470,6 @@ mod tests {
 
         // then: bucket appears exactly once
         let snapshot = storage.snapshot().await.unwrap();
-        let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
-        assert_eq!(buckets, vec![bucket]);
-    }
-
-    #[tokio::test]
-    async fn should_skip_bucket_list_merge_when_bucket_already_present() {
-        // given: storage pre-populated with the bucket in the BucketList
-        let storage = create_test_storage().await;
-        let bucket = create_test_bucket();
-        let pre_existing = BucketListValue {
-            buckets: vec![(bucket.size, bucket.start)],
-        }
-        .encode();
-        storage
-            .put(vec![common::storage::PutRecordOp::new(Record {
-                key: BucketListKey.encode(),
-                value: pre_existing,
-            })])
-            .await
-            .unwrap();
-
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-            retention: None,
-            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
-        };
-        let ctx = TsdbContext {
-            bucket,
-            series_dict: Arc::new(HashMap::new()),
-            next_series_id: 0,
-            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
-        };
-        let mut delta = TsdbWriteDelta::init(ctx);
-        delta
-            .apply(vec![create_test_series(
-                "m",
-                vec![("env", "prod")],
-                create_test_sample(),
-            )])
-            .unwrap();
-        let (frozen, _, _) = delta.freeze();
-
-        // when
-        let snapshot = flusher.flush_delta(frozen, &(1..2)).await.unwrap();
-
-        // then: list still has exactly one entry for this bucket
         let buckets = snapshot.get_buckets_in_range(None, None).await.unwrap();
         assert_eq!(buckets, vec![bucket]);
     }

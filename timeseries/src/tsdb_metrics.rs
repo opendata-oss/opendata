@@ -18,8 +18,6 @@ pub(crate) const TSDB_ACTIVE_SERIES: &str = "tsdb_active_series";
 // constants below split it into its phases so a slow flush can be attributed
 // to a specific phase (op-building vs. SlateDB apply vs. snapshot refresh).
 
-pub(crate) const TSDB_FLUSH_BUCKET_LIST_LOOKUP_DURATION_SECONDS: &str =
-    "tsdb_flush_bucket_list_lookup_duration_seconds";
 pub(crate) const TSDB_FLUSH_BUILD_OPS_DURATION_SECONDS: &str =
     "tsdb_flush_build_ops_duration_seconds";
 pub(crate) const TSDB_FLUSH_STORAGE_APPLY_DURATION_SECONDS: &str =
@@ -67,10 +65,6 @@ pub(crate) fn describe_engine_metrics() {
         TSDB_ACTIVE_SERIES,
         "Estimated number of unique series that have received data in the last ~15 minutes \
          (HyperLogLog-based, ~1.6% standard error)"
-    );
-    metrics::describe_histogram!(
-        TSDB_FLUSH_BUCKET_LIST_LOOKUP_DURATION_SECONDS,
-        "Time spent looking up the BucketList during a delta flush (seconds)"
     );
     metrics::describe_histogram!(
         TSDB_FLUSH_BUILD_OPS_DURATION_SECONDS,

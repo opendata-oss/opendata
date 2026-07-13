@@ -14,9 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::promql::config::CacheWarmerConfig;
 use crate::serde::TimeBucketScoped;
-use crate::serde::key::{
-    BucketListKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
-};
+use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey};
 use crate::storage::StorageRead;
 
 const LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -76,9 +74,6 @@ async fn warm<R: StorageRead>(
         .unwrap()
         .as_secs() as i64;
     let range_start = now_secs - config.warm_range.as_secs() as i64;
-
-    // Warm the bucket list key
-    let _ = storage.get(BucketListKey.encode()).await?;
 
     let buckets = storage
         .get_buckets_in_range(Some(range_start), Some(now_secs))

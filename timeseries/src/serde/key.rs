@@ -4,38 +4,7 @@ use super::*;
 use crate::model::{SeriesFingerprint, SeriesId, TimeBucket};
 use bytes::{Bytes, BytesMut};
 use common::BytesRange;
-use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
 use common::serde::terminated_bytes;
-
-/// BucketList key (global-scoped, 3-byte prefix). Slated for removal in a
-/// follow-up commit alongside the rest of the bucket-list bookkeeping.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BucketListKey;
-
-impl BucketListKey {
-    pub fn encode(&self) -> Bytes {
-        RecordType::BucketList.encode_prefix()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
-        KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
-        if buf.len() < KEY_PREFIX_LEN + 1 {
-            return Err(EncodingError {
-                message: "Buffer too short for BucketListKey".to_string(),
-            });
-        }
-        let record_type = RecordType::from_id(buf[KEY_PREFIX_LEN])?;
-        if record_type != RecordType::BucketList {
-            return Err(EncodingError {
-                message: format!(
-                    "invalid record type: expected BucketList, got {:?}",
-                    record_type
-                ),
-            });
-        }
-        Ok(BucketListKey)
-    }
-}
 
 /// SeriesDictionary key
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +27,7 @@ impl SeriesDictionaryKey {
                 message: "Buffer too short for SeriesDictionaryKey".to_string(),
             });
         }
-        let (bucket, record_type) = parse_bucket_record_type(buf)?;
+        let (bucket, record_type) = parse_time_bucket_and_record_type(buf)?;
         if record_type != RecordType::SeriesDictionary {
             return Err(EncodingError {
                 message: format!(
@@ -108,7 +77,7 @@ impl ForwardIndexKey {
                 message: "Buffer too short for ForwardIndexKey".to_string(),
             });
         }
-        let (bucket, record_type) = parse_bucket_record_type(buf)?;
+        let (bucket, record_type) = parse_time_bucket_and_record_type(buf)?;
         if record_type != RecordType::ForwardIndex {
             return Err(EncodingError {
                 message: format!(
@@ -168,7 +137,7 @@ impl InvertedIndexKey {
                 message: "Buffer too short for InvertedIndexKey".to_string(),
             });
         }
-        let (bucket, record_type) = parse_bucket_record_type(buf)?;
+        let (bucket, record_type) = parse_time_bucket_and_record_type(buf)?;
         if record_type != RecordType::InvertedIndex {
             return Err(EncodingError {
                 message: format!(
@@ -239,7 +208,7 @@ impl TimeSeriesKey {
                 message: "Buffer too short for TimeSeriesKey".to_string(),
             });
         }
-        let (bucket, record_type) = parse_bucket_record_type(buf)?;
+        let (bucket, record_type) = parse_time_bucket_and_record_type(buf)?;
         if record_type != RecordType::TimeSeries {
             return Err(EncodingError {
                 message: format!(
@@ -284,19 +253,6 @@ impl TimeBucketScoped for TimeSeriesKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn should_encode_and_decode_bucket_list_key() {
-        // given
-        let key = BucketListKey;
-
-        // when
-        let encoded = key.encode();
-        let decoded = BucketListKey::decode(&encoded).unwrap();
-
-        // then
-        assert_eq!(decoded, key);
-    }
 
     #[test]
     fn should_encode_and_decode_series_dictionary_key() {

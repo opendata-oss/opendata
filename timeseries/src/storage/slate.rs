@@ -41,15 +41,13 @@ use uuid::Uuid;
 use crate::index::{ForwardIndex, InvertedIndex, SeriesSpec};
 use crate::model::{Label, Sample, SeriesFingerprint, SeriesId, TimeBucket};
 use crate::serde::TimeBucketScoped;
-use crate::serde::bucket_list::BucketListValue;
 use crate::serde::dictionary::SeriesDictionaryValue;
 use crate::serde::forward_index::ForwardIndexValue;
 use crate::serde::inverted_index::InvertedIndexValue;
-use crate::serde::key::{
-    BucketListKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
-};
+use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey};
 use crate::serde::timeseries::TimeSeriesValue;
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
+use crate::storage::segment_extractor::{TimeseriesSegmentExtractor, parse_bucket};
 
 /// Private accessor that gives the blanket [`StorageRead`] impl access to a
 /// handle's [`StorageReaderInner`] without exposing the inner type outside
@@ -135,9 +133,6 @@ pub(crate) trait StorageRead: Send + Sync {
     where
         F: FnMut(SeriesFingerprint, SeriesId) + Send,
         Self: Sized;
-
-    /// Checks whether `bucket` is present in the stored `BucketList`.
-    async fn bucket_list_contains(&self, bucket: TimeBucket) -> crate::util::Result<bool>;
 
     /// Returns all values of `label_name` within `bucket`.
     async fn get_label_values(
@@ -227,10 +222,6 @@ impl<H: HasReader + Send + Sync> StorageRead for H {
         self.reader().load_series_dictionary(bucket, insert).await
     }
 
-    async fn bucket_list_contains(&self, bucket: TimeBucket) -> crate::util::Result<bool> {
-        self.reader().bucket_list_contains(bucket).await
-    }
-
     async fn get_label_values(
         &self,
         bucket: &TimeBucket,
@@ -258,6 +249,15 @@ pub(crate) trait Store: StorageRead {
     async fn flush(&self) -> StorageResult<()>;
 }
 
+/// Source of the segment prefixes visible to a storage handle.
+///
+/// `Db` and `DbReader` expose a live [`slatedb::DbStatus`] (via
+/// `DbMetadataOps::status`), so their listers re-read the current segment
+/// list on every call. `DbSnapshot` has no status accessor; its lister
+/// returns the writer's segment list captured when the snapshot was taken,
+/// which matches the snapshot's point-in-time semantics.
+type SegmentLister = Arc<dyn Fn() -> Vec<slatedb::SegmentPrefix> + Send + Sync>;
+
 /// The shared read side of the storage backend.
 ///
 /// Generic over [`DbReadOps`] so the same OpenTSDB read methods serve the
@@ -265,15 +265,16 @@ pub(crate) trait Store: StorageRead {
 ///
 /// Private to this module: callers go through the [`StorageRead`] methods on
 /// [`Storage`], [`StorageSnapshot`], and [`StorageReader`], which forward here.
-#[derive(Debug)]
 struct StorageReaderInner<T: DbReadOps + Send + Sync> {
     db: Arc<T>,
+    segments: SegmentLister,
 }
 
 impl<T: DbReadOps + Send + Sync> Clone for StorageReaderInner<T> {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
+            segments: Arc::clone(&self.segments),
         }
     }
 }
@@ -325,18 +326,9 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         let start_min = start_secs.map(|s| (s / 60) as u32);
         let end_min = end_secs.map(|e| (e / 60) as u32);
 
-        let value = self.get(BucketListKey.encode()).await?;
-        let bucket_list = match value {
-            Some(value) => BucketListValue::decode(value.as_ref())?,
-            None => BucketListValue {
-                buckets: Vec::new(),
-            },
-        };
-
-        let mut filtered_buckets: Vec<TimeBucket> = bucket_list
-            .buckets
+        let mut filtered_buckets: Vec<TimeBucket> = self
+            .list_buckets()
             .into_iter()
-            .map(|(size, start)| TimeBucket { size, start })
             .filter(|bucket| match (start_min, end_min) {
                 (None, None) => true,
                 (Some(start), None) => {
@@ -360,7 +352,7 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
     }
 
     /// Given a set of sorted, non-overlapping time ranges, return all buckets
-    /// that overlap any range. Reads the bucket list once.
+    /// that overlap any range.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn get_buckets_for_ranges(
         &self,
@@ -370,18 +362,9 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
             return Ok(Vec::new());
         }
 
-        let value = self.get(BucketListKey.encode()).await?;
-        let bucket_list = match value {
-            Some(value) => BucketListValue::decode(value.as_ref())?,
-            None => {
-                return Ok(Vec::new());
-            }
-        };
-
-        let mut filtered_buckets: Vec<TimeBucket> = bucket_list
-            .buckets
+        let mut filtered_buckets: Vec<TimeBucket> = self
+            .list_buckets()
             .into_iter()
-            .map(|(size, start)| TimeBucket { size, start })
             .filter(|bucket| {
                 let bucket_start_min = bucket.start as i64;
                 let bucket_end_min = bucket_start_min + bucket.size_in_mins() as i64;
@@ -561,20 +544,14 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
         Ok(max_series_id)
     }
 
-    /// Check whether `bucket` is already present in the stored `BucketList`.
-    ///
-    /// Used by the flush path to suppress redundant single-element merges
-    /// on a bucket that has already been announced. The `BucketListKey` is
-    /// a global singleton that stays hot in SlateDB's block cache (read on
-    /// every query and warmed at startup), so this is a cache hit in the
-    /// common case.
-    #[tracing::instrument(level = "trace", skip_all)]
-    async fn bucket_list_contains(&self, bucket: TimeBucket) -> crate::util::Result<bool> {
-        let Some(value) = self.get(BucketListKey.encode()).await? else {
-            return Ok(false);
-        };
-        let list = BucketListValue::decode(value.as_ref())?;
-        Ok(list.buckets.contains(&(bucket.size, bucket.start)))
+    /// Lists the timeseries buckets currently visible to this handle, by
+    /// projecting the segment prefixes reported by SlateDB (manifest plus
+    /// unflushed memtable segments) through the timeseries extractor.
+    fn list_buckets(&self) -> Vec<TimeBucket> {
+        (self.segments)()
+            .iter()
+            .filter_map(|seg| parse_bucket(&seg.prefix))
+            .collect()
     }
 
     /// Get all unique values for a specific label name within a bucket.
@@ -645,6 +622,7 @@ impl StorageReader {
         let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
             .with_options(reader_options)
             .with_merge_operator(Arc::new(adapter))
+            .with_segment_extractor(TimeseriesSegmentExtractor::shared())
             .with_metrics_recorder(Arc::new(MetricsRsRecorder));
 
         if let Some(checkpoint_id) = checkpoint_id {
@@ -661,9 +639,11 @@ impl StorageReader {
             StorageError::Storage(format!("Failed to create SlateDB reader: {}", e))
         })?;
 
+        let reader = Arc::new(reader);
         Ok(StorageReader {
             reader: StorageReaderInner {
-                db: Arc::new(reader),
+                db: reader.clone(),
+                segments: Arc::new(move || reader.status().list_segments()),
             },
         })
     }
@@ -720,9 +700,8 @@ impl HasReader for Storage {
 
 impl Storage {
     /// Opens the storage from configuration, wired with the OpenTSDB merge
-    /// operator, the metrics recorder, and (when configured) the foyer block
-    /// cache. Coalesces the bucket list before returning, while the freshly
-    /// fenced writer is still the only process that can write.
+    /// operator, the timeseries segment extractor, the metrics recorder, and
+    /// (when configured) the foyer block cache.
     pub(crate) async fn try_new(slate_config: &SlateDbStorageConfig) -> crate::util::Result<Self> {
         let object_store = create_object_store(&slate_config.object_store)?;
         Self::try_new_with_object_store(slate_config, object_store).await
@@ -744,6 +723,7 @@ impl Storage {
         let mut builder = DbBuilder::new(slate_config.path.clone(), object_store)
             .with_settings(settings)
             .with_merge_operator(Arc::new(adapter))
+            .with_segment_extractor(TimeseriesSegmentExtractor::shared())
             .with_metrics_recorder(Arc::new(MetricsRsRecorder));
 
         if let Some(cache) =
@@ -759,32 +739,17 @@ impl Storage {
                 .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?,
         );
 
-        let storage = Self::from_db(db);
-        storage.coalesce_bucket_list().await?;
-        Ok(storage)
+        Ok(Self::from_db(db))
     }
 
     fn from_db(db: Arc<Db>) -> Self {
         Self {
             db: db.clone(),
-            reader: StorageReaderInner { db },
+            reader: StorageReaderInner {
+                db: db.clone(),
+                segments: Arc::new(move || db.status().list_segments()),
+            },
         }
-    }
-
-    /// Read the current `BucketList` value and rewrite it as a single `Put`,
-    /// collapsing the merge chain that accrues across ingestion batches into
-    /// one flat record, so later reads don't have to replay operands scattered
-    /// across SSTs. Safe only when there are no concurrent writers, e.g. at
-    /// startup before ingestion begins.
-    #[tracing::instrument(level = "info", skip_all)]
-    pub(crate) async fn coalesce_bucket_list(&self) -> crate::util::Result<()> {
-        let key = BucketListKey.encode();
-        let Some(value) = self.reader.get(key.clone()).await? else {
-            return Ok(());
-        };
-        self.put(vec![PutRecordOp::new(Record { key, value })])
-            .await?;
-        Ok(())
     }
 
     // ── write path ───────────────────────────────────────────────────
@@ -866,14 +831,21 @@ impl Storage {
     // ── lifecycle ────────────────────────────────────────────────────
 
     /// Creates a point-in-time snapshot for consistent reads.
+    ///
+    /// `DbSnapshot` exposes no status, so the writer's segment list is
+    /// captured here and served unchanged for the snapshot's lifetime.
     pub(crate) async fn snapshot(&self) -> StorageResult<StorageSnapshot> {
         let snapshot = self
             .db
             .snapshot()
             .await
             .map_err(StorageError::from_storage)?;
+        let segments = self.db.status().list_segments();
         Ok(StorageSnapshot {
-            reader: StorageReaderInner { db: snapshot },
+            reader: StorageReaderInner {
+                db: snapshot,
+                segments: Arc::new(move || segments.clone()),
+            },
         })
     }
 
@@ -922,19 +894,6 @@ impl Store for Storage {
 //
 // Pure encoders from domain values to storage record operations; they touch
 // no storage state, so they are free functions rather than methods.
-
-pub(crate) fn merge_bucket_list(bucket: TimeBucket, ttl: Ttl) -> crate::util::Result<RecordOp> {
-    let key = BucketListKey.encode();
-    let value = BucketListValue {
-        buckets: vec![(bucket.size, bucket.start)],
-    }
-    .encode();
-
-    Ok(RecordOp::Merge(MergeRecordOp::new_with_ttl(
-        Record { key, value },
-        MergeOptions { ttl },
-    )))
-}
 
 pub(crate) fn insert_series_id(
     bucket: TimeBucket,
@@ -1037,9 +996,12 @@ mod tests {
     }
 
     fn reader_from_db_reader(reader: DbReader) -> StorageReader {
+        let reader = Arc::new(reader);
+        let status_reader = Arc::clone(&reader);
         StorageReader {
             reader: StorageReaderInner {
-                db: Arc::new(reader),
+                db: reader,
+                segments: Arc::new(move || status_reader.status().list_segments()),
             },
         }
     }

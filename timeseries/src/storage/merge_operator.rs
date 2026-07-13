@@ -1,9 +1,7 @@
-use crate::serde::bucket_list::BucketListValue;
 use crate::serde::inverted_index::InvertedIndexValue;
 use crate::serde::timeseries::merge_batch_time_series;
-use crate::serde::{EncodingError, RecordType, parse_bucket_record_type};
+use crate::serde::{EncodingError, RecordType, parse_time_bucket_and_record_type};
 use bytes::Bytes;
-use common::serde::key_prefix::KEY_PREFIX_LEN;
 use common::storage::default_merge_batch;
 
 /// Merge operator for OpenTSDB that handles merging of different record types.
@@ -14,34 +12,20 @@ pub(crate) struct OpenTsdbMergeOperator;
 
 impl common::storage::MergeOperator for OpenTsdbMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        let record_type = decode_record_type(key.as_ref()).expect("Failed to decode record type");
+        let (_, record_type) =
+            parse_time_bucket_and_record_type(key.as_ref()).expect("Failed to decode record type");
 
         match record_type {
             RecordType::InvertedIndex => merge_batch_inverted_index(existing_value, operands)
                 .expect("Failed to batch merge inverted index"),
             RecordType::TimeSeries => merge_batch_time_series(existing_value, operands)
                 .expect("Failed to batch merge time series"),
-            RecordType::BucketList => merge_batch_bucket_list(existing_value, operands)
-                .expect("Failed to batch merge bucket list"),
             _ => {
                 // For other record types (SeriesDictionary, ForwardIndex), just use new value for each pairwise merge.
                 // These should use Put, not Merge, but handle gracefully
                 default_merge_batch(key, existing_value, operands, |_k, _e, v| v)
             }
         }
-    }
-}
-
-/// Returns the record type encoded in `key`, supporting both the 3-byte
-/// `BucketList` global-scoped layout and the 8-byte bucket-scoped header.
-/// Dispatch is by key length — `BucketList` is exactly the prefix, every
-/// other record starts with the full bucket-scoped header.
-fn decode_record_type(key: &[u8]) -> Result<RecordType, EncodingError> {
-    if key.len() == KEY_PREFIX_LEN + 1 {
-        RecordType::from_id(key[KEY_PREFIX_LEN])
-    } else {
-        let (_, record_type) = parse_bucket_record_type(key)?;
-        Ok(record_type)
     }
 }
 
@@ -67,40 +51,11 @@ fn merge_batch_inverted_index(
     (InvertedIndexValue { postings: merged }).encode()
 }
 
-/// Batch merge bucket lists by collecting all unique buckets and sorting once.
-///
-/// Decodes every bucket list once, collects unique buckets, and produces a single
-/// sorted result, avoiding repeated decode/encode cycles.
-fn merge_batch_bucket_list(
-    existing: Option<Bytes>,
-    operands: &[Bytes],
-) -> Result<Bytes, EncodingError> {
-    let mut buckets = if let Some(existing) = existing {
-        BucketListValue::decode(existing.as_ref())?.buckets
-    } else {
-        Vec::new()
-    };
-
-    for operand in operands {
-        let other_buckets = BucketListValue::decode(operand.as_ref())?.buckets;
-        for bucket in other_buckets {
-            if !buckets.contains(&bucket) {
-                buckets.push(bucket);
-            }
-        }
-    }
-
-    // Sort by start time
-    buckets.sort_by_key(|b| b.1);
-
-    Ok(BucketListValue { buckets }.encode())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::Sample;
-    use crate::serde::key::{BucketListKey, InvertedIndexKey, TimeSeriesKey};
+    use crate::serde::key::{InvertedIndexKey, TimeSeriesKey};
     use crate::serde::timeseries::TimeSeriesValue;
     use bytes::Bytes;
     use common::storage::MergeOperator;
@@ -132,11 +87,6 @@ mod tests {
             series_id: 42,
         }
         .encode()
-    }
-
-    /// Helper to create a test key for BucketList
-    fn create_bucket_list_key() -> Bytes {
-        BucketListKey.encode()
     }
 
     /// Helper to create a test key for other record types (e.g., SeriesDictionary)
@@ -225,72 +175,6 @@ mod tests {
 
     #[rstest]
     #[case(
-        vec![(1, 100), (2, 200)],
-        vec![(3, 300), (4, 400)],
-        vec![(1, 100), (2, 200), (3, 300), (4, 400)],
-        "non-overlapping buckets"
-    )]
-    #[case(
-        vec![(1, 100), (2, 200), (3, 300)],
-        vec![(2, 200), (3, 300), (4, 400)],
-        vec![(1, 100), (2, 200), (3, 300), (4, 400)],
-        "overlapping buckets (deduplication)"
-    )]
-    #[case(
-        vec![],
-        vec![(1, 100), (2, 200)],
-        vec![(1, 100), (2, 200)],
-        "existing empty, new has buckets"
-    )]
-    #[case(
-        vec![(1, 100), (2, 200)],
-        vec![],
-        vec![(1, 100), (2, 200)],
-        "existing has buckets, new empty"
-    )]
-    #[case(
-        vec![],
-        vec![],
-        vec![],
-        "both empty"
-    )]
-    #[case(
-        vec![(2, 200), (1, 100), (4, 400)],
-        vec![(3, 300)],
-        vec![(1, 100), (2, 200), (3, 300), (4, 400)],
-        "unsorted buckets should be sorted by start time"
-    )]
-    fn should_merge_bucket_list(
-        #[case] existing_buckets: Vec<(u8, u32)>,
-        #[case] new_buckets: Vec<(u8, u32)>,
-        #[case] expected_buckets: Vec<(u8, u32)>,
-        #[case] description: &str,
-    ) {
-        // given
-        let existing_value = BucketListValue {
-            buckets: existing_buckets,
-        }
-        .encode();
-
-        let new_value = BucketListValue {
-            buckets: new_buckets,
-        }
-        .encode();
-
-        // when
-        let merged = merge_batch_bucket_list(Some(existing_value), &[new_value]).unwrap();
-        let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
-
-        // then
-        assert_eq!(
-            decoded.buckets, expected_buckets,
-            "Failed test case: {}",
-            description
-        );
-    }
-
-    #[rstest]
-    #[case(
         vec![(1000, 10.0), (2000, 20.0)],
         vec![(3000, 30.0), (4000, 40.0)],
         vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
@@ -371,7 +255,6 @@ mod tests {
     #[rstest]
     #[case(RecordType::InvertedIndex, create_inverted_index_key, "InvertedIndex")]
     #[case(RecordType::TimeSeries, create_time_series_key, "TimeSeries")]
-    #[case(RecordType::BucketList, create_bucket_list_key, "BucketList")]
     fn should_route_to_correct_merge_function(
         #[case] record_type: RecordType,
         #[case] key_fn: fn() -> Bytes,
@@ -437,17 +320,6 @@ mod tests {
                 .unwrap();
                 (existing, new)
             }
-            RecordType::BucketList => {
-                let existing = BucketListValue {
-                    buckets: vec![(1, 100), (2, 200)],
-                }
-                .encode();
-                let new = BucketListValue {
-                    buckets: vec![(3, 300), (4, 400)],
-                }
-                .encode();
-                (existing, new)
-            }
             _ => unreachable!(),
         };
 
@@ -455,7 +327,6 @@ mod tests {
         let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
 
         // then - verify the merge actually happened (not just returning new_value)
-        // For InvertedIndex, check it's a union
         if record_type == RecordType::InvertedIndex {
             let decoded = InvertedIndexValue::decode(merged.as_ref()).unwrap();
             assert_eq!(
@@ -464,24 +335,12 @@ mod tests {
                 "{} merge should union values",
                 description
             );
-        }
-        // For TimeSeries, check samples are merged
-        else if record_type == RecordType::TimeSeries {
+        } else if record_type == RecordType::TimeSeries {
             let decoded = TimeSeriesValue::decode(merged.as_ref()).unwrap();
             assert_eq!(
                 decoded.points.len(),
                 4,
                 "{} merge should combine samples",
-                description
-            );
-        }
-        // For BucketList, check buckets are merged
-        else if record_type == RecordType::BucketList {
-            let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
-            assert_eq!(
-                decoded.buckets.len(),
-                4,
-                "{} merge should union buckets",
                 description
             );
         }
@@ -605,57 +464,6 @@ mod tests {
             expected.insert(id);
         }
         assert_eq!(decoded.postings, expected);
-    }
-
-    #[test]
-    fn should_batch_merge_bucket_list() {
-        // given
-        let op0 = BucketListValue {
-            buckets: vec![(1, 100), (2, 200)],
-        }
-        .encode();
-        let op1 = BucketListValue {
-            buckets: vec![(2, 200), (3, 300)],
-        }
-        .encode();
-        let op2 = BucketListValue {
-            buckets: vec![(4, 400)],
-        }
-        .encode();
-
-        // when - no existing value
-        let merged = merge_batch_bucket_list(None, &[op0, op1, op2]).unwrap();
-        let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
-
-        // then - unique buckets sorted by start time
-        assert_eq!(
-            decoded.buckets,
-            vec![(1, 100), (2, 200), (3, 300), (4, 400)]
-        );
-    }
-
-    #[test]
-    fn should_batch_merge_bucket_list_with_existing() {
-        // given
-        let existing = BucketListValue {
-            buckets: vec![(1, 100)],
-        }
-        .encode();
-        let op0 = BucketListValue {
-            buckets: vec![(2, 200)],
-        }
-        .encode();
-        let op1 = BucketListValue {
-            buckets: vec![(1, 100), (3, 300)],
-        }
-        .encode();
-
-        // when
-        let merged = merge_batch_bucket_list(Some(existing), &[op0, op1]).unwrap();
-        let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
-
-        // then
-        assert_eq!(decoded.buckets, vec![(1, 100), (2, 200), (3, 300)]);
     }
 
     #[test]
@@ -783,7 +591,6 @@ mod tests {
     #[rstest]
     #[case(RecordType::InvertedIndex, create_inverted_index_key, "InvertedIndex")]
     #[case(RecordType::TimeSeries, create_time_series_key, "TimeSeries")]
-    #[case(RecordType::BucketList, create_bucket_list_key, "BucketList")]
     fn should_route_merge_batch_to_correct_function(
         #[case] record_type: RecordType,
         #[case] key_fn: fn() -> Bytes,
@@ -851,21 +658,6 @@ mod tests {
                 .unwrap();
                 (existing, o0, o1)
             }
-            RecordType::BucketList => {
-                let existing = BucketListValue {
-                    buckets: vec![(1, 100)],
-                }
-                .encode();
-                let o0 = BucketListValue {
-                    buckets: vec![(2, 200)],
-                }
-                .encode();
-                let o1 = BucketListValue {
-                    buckets: vec![(3, 300)],
-                }
-                .encode();
-                (existing, o0, o1)
-            }
             _ => unreachable!(),
         };
 
@@ -889,15 +681,6 @@ mod tests {
                     decoded.points.len(),
                     3,
                     "{} batch merge should combine all samples",
-                    description
-                );
-            }
-            RecordType::BucketList => {
-                let decoded = BucketListValue::decode(merged.as_ref()).unwrap();
-                assert_eq!(
-                    decoded.buckets.len(),
-                    3,
-                    "{} batch merge should union all buckets",
                     description
                 );
             }
