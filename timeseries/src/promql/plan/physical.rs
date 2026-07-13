@@ -1113,9 +1113,12 @@ where
     };
     let input_schema = static_schema(&child_op.schema().series)?.clone();
 
-    // topk/bottomk are filter-shaped: output schema == input schema.
+    // topk/bottomk/limitk are filter-shaped: output schema == input schema.
     // streaming kinds + quantile are reducer-shaped: one row per group.
-    let is_filter_shape = matches!(kind, AggregateKind::Topk(_) | AggregateKind::Bottomk(_));
+    let is_filter_shape = matches!(
+        kind,
+        AggregateKind::Topk(_) | AggregateKind::Bottomk(_) | AggregateKind::Limitk(_),
+    );
 
     let built = build_group_map(&input_schema, &grouping)?;
     let output_schema = if is_filter_shape {
