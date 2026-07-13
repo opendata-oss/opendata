@@ -3,7 +3,6 @@ use super::{BroadcastedView, WriteCommand};
 use super::{Delta, Durability, WriteError, WriteResult};
 use crate::StorageRead;
 use crate::coordinator::traits::EpochStamped;
-use crate::storage::StorageSnapshot;
 use futures::FutureExt;
 use futures::future::Shared;
 use std::sync::Arc;
@@ -27,7 +26,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 pub struct View<D: Delta> {
     pub current: D::DeltaView,
     pub frozen: Vec<EpochStamped<D::FrozenView>>,
-    pub snapshot: Arc<dyn StorageSnapshot>,
+    pub snapshot: D::Snapshot,
     pub last_written_delta: Option<EpochStamped<D::FrozenView>>,
 }
 

@@ -63,6 +63,7 @@ impl Delta for VectorDbOpDelta {
     type FrozenView = Arc<VectorDbDeltaView>;
     type ApplyResult = Arc<dyn Any + Send + Sync + 'static>;
     type DeltaView = Arc<std::sync::RwLock<VectorDbDeltaView>>;
+    type Snapshot = Arc<dyn common::storage::StorageSnapshot>;
 
     fn init(_context: Self::Context) -> Self {
         Self {
