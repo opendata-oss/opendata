@@ -27,7 +27,6 @@ enum FlushEvent<D: Delta> {
 
 // Internal use only
 use crate::StorageRead;
-use crate::storage::StorageSnapshot;
 use async_trait::async_trait;
 pub use handle::EpochWatcher;
 use std::sync::{Arc, Mutex};
@@ -86,7 +85,7 @@ impl<D: Delta, F: Flusher<D>> WriteCoordinator<D, F> {
         config: WriteCoordinatorConfig,
         channels: Vec<impl ToString>,
         initial_context: D::Context,
-        initial_snapshot: Arc<dyn StorageSnapshot>,
+        initial_snapshot: D::Snapshot,
         flusher: F,
     ) -> WriteCoordinator<D, F> {
         let (watermarks, watcher) = EpochWatermarks::new();
@@ -218,7 +217,7 @@ impl<D: Delta> WriteCoordinatorTask<D> {
     pub fn new(
         config: WriteCoordinatorConfig,
         initial_context: D::Context,
-        initial_snapshot: Arc<dyn StorageSnapshot>,
+        initial_snapshot: D::Snapshot,
         write_rxs: Vec<PausableReceiver<D>>,
         flush_tx: mpsc::Sender<FlushEvent<D>>,
         watermarks: Arc<EpochWatermarks>,
@@ -610,7 +609,7 @@ impl<D: Delta> BroadcastedView<D> {
         }
     }
 
-    fn update_flush_finished(&self, snapshot: Arc<dyn StorageSnapshot>, epoch_range: Range<u64>) {
+    fn update_flush_finished(&self, snapshot: D::Snapshot, epoch_range: Range<u64>) {
         self.inner
             .lock()
             .expect("lock poisoned")
@@ -639,11 +638,7 @@ struct BroadcastedViewInner<D: Delta> {
 }
 
 impl<D: Delta> BroadcastedViewInner<D> {
-    fn update_flush_finished(
-        &mut self,
-        snapshot: Arc<dyn StorageSnapshot>,
-        epoch_range: Range<u64>,
-    ) {
+    fn update_flush_finished(&mut self, snapshot: D::Snapshot, epoch_range: Range<u64>) {
         let mut new_frozen = self.view.frozen.clone();
         let last = new_frozen
             .pop()
@@ -800,6 +795,7 @@ mod tests {
         type Frozen = FrozenTestDelta;
         type FrozenView = Arc<HashMap<String, u64>>;
         type ApplyResult = ();
+        type Snapshot = Arc<dyn StorageSnapshot>;
 
         fn init(context: Self::Context) -> Self {
             Self {
