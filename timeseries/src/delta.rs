@@ -154,7 +154,7 @@ impl Delta for TsdbWriteDelta {
     type FrozenView = ();
     type ApplyResult = ();
     type DeltaView = ();
-    type Snapshot = Arc<dyn common::storage::StorageSnapshot>;
+    type Snapshot = crate::storage::StorageSnapshot;
 
     fn init(context: Self::Context) -> Self {
         Self {

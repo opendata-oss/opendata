@@ -8,13 +8,10 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use common::{StorageBuilder, StorageSemantics};
-
 use crate::config::Config;
 use crate::error::{QueryError, Result};
 use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
-use crate::storage::coalesce_bucket_list;
-use crate::storage::merge_operator::OpenTsdbMergeOperator;
+use crate::storage::Storage;
 use crate::tsdb::{
     Tsdb, TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
 };
@@ -29,10 +26,10 @@ use crate::tsdb::{
 ///
 /// ```
 /// # use timeseries::{TimeSeriesDb, Config, Series};
-/// # use common::StorageConfig;
+/// # use common::storage::config::SlateDbStorageConfig;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+/// let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
 /// let ts = TimeSeriesDb::open(config).await?;
 ///
 /// let series = Series::builder("http_requests_total")
@@ -68,26 +65,16 @@ impl TimeSeriesDb {
     ///
     /// ```
     /// # use timeseries::{TimeSeriesDb, Config};
-    /// # use common::StorageConfig;
+    /// # use common::storage::config::SlateDbStorageConfig;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
     /// let ts = TimeSeriesDb::open(config).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = StorageBuilder::new(&config.storage)
-            .await?
-            .with_semantics(
-                StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-            )
-            .build()
-            .await?;
-        // Flatten accumulated BucketList merge operands into a single Put so
-        // later reads don't have to replay them across SSTs. Runs before any
-        // writer is started, so no concurrent merges can race the Put.
-        coalesce_bucket_list(storage.as_ref()).await?;
+        let storage = Arc::new(Storage::try_new(&config.storage).await?);
         let tsdb = Tsdb::with_retention(storage, config.retention);
         Ok(Self { tsdb })
     }
@@ -119,10 +106,10 @@ impl TimeSeriesDb {
     ///
     /// ```no_run
     /// # use timeseries::{TimeSeriesDb, Config, Series};
-    /// # use common::StorageConfig;
+    /// # use common::storage::config::SlateDbStorageConfig;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
     /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
@@ -156,11 +143,11 @@ impl TimeSeriesDb {
     ///
     /// ```no_run
     /// # use timeseries::{TimeSeriesDb, Config, Series};
-    /// # use common::StorageConfig;
+    /// # use common::storage::config::SlateDbStorageConfig;
     /// # use std::time::Duration;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+    /// # let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
     /// # let ts = TimeSeriesDb::open(config).await?;
     /// let series = vec![
     ///     Series::builder("cpu_usage")
@@ -284,7 +271,6 @@ impl TimeSeriesDb {
 mod tests {
     use super::*;
     use crate::model::{Label, Sample, Series};
-    use common::StorageConfig;
     use common::storage::config::{
         LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
     };
@@ -292,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn close_without_explicit_flush_guarantees_durability() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage = SlateDbStorageConfig {
             path: "ts-data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
@@ -300,7 +286,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
-        });
+        };
 
         // Write a series and close without calling flush()
         {

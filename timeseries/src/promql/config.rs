@@ -5,9 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::util::Result;
-#[cfg(feature = "otel")]
-use common::ObjectStoreConfig;
-use common::storage::config::StorageConfig;
+use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
 use serde::{Deserialize, Deserializer};
 use slatedb::config::DbReaderOptions;
 use uuid::Uuid;
@@ -42,8 +40,8 @@ pub struct PrometheusConfig {
     #[cfg(feature = "otel")]
     #[serde(default)]
     pub buffer_consumer: Option<BufferConsumerConfig>,
-    #[serde(default)]
-    pub storage: StorageConfig,
+    #[serde(default = "default_storage")]
+    pub storage: SlateDbStorageConfig,
     /// Flush interval in seconds for persisting data to storage.
     /// Defaults to 5 seconds.
     #[serde(default = "default_flush_interval_secs")]
@@ -129,6 +127,20 @@ fn default_cache_capacity() -> u64 {
     crate::reader::DEFAULT_CACHE_CAPACITY
 }
 
+/// Default storage: a SlateDB on a local `.data` directory (matches the
+/// historical `StorageConfig::default()`).
+fn default_storage() -> SlateDbStorageConfig {
+    SlateDbStorageConfig {
+        path: "data".to_string(),
+        object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+            path: ".data".to_string(),
+        }),
+        settings_path: None,
+        block_cache: None,
+        meta_cache: None,
+    }
+}
+
 impl Default for PrometheusConfig {
     fn default() -> Self {
         Self {
@@ -137,7 +149,7 @@ impl Default for PrometheusConfig {
             otel: OtelServerConfig::default(),
             #[cfg(feature = "otel")]
             buffer_consumer: None,
-            storage: StorageConfig::default(),
+            storage: default_storage(),
             flush_interval_secs: default_flush_interval_secs(),
             read_only: false,
             reader: default_reader_options(),
@@ -534,7 +546,9 @@ scrape_configs:
         // given
         let yaml = r#"
 storage:
-  type: InMemory
+  path: data
+  object_store:
+    type: InMemory
 read_only: true
 cache_capacity: 200
 reader:

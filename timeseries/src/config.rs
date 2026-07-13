@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use common::StorageConfig;
+use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
 
 /// Configuration for opening a [`TimeSeriesDb`](crate::timeseries::TimeSeriesDb) database.
 ///
@@ -17,13 +17,13 @@ use common::StorageConfig;
 ///
 /// ```no_run
 /// use timeseries::Config;
-/// use common::StorageConfig;
+/// use common::storage::config::SlateDbStorageConfig;
 /// use std::time::Duration;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = Config {
-///     storage: StorageConfig::default(),
+///     storage: SlateDbStorageConfig::default(),
 ///     flush_interval: Duration::from_secs(30),
 ///     retention: Some(Duration::from_secs(86400 * 7)), // 7 days
 /// };
@@ -35,9 +35,9 @@ use common::StorageConfig;
 pub struct Config {
     /// Storage backend configuration.
     ///
-    /// Determines where and how time series data is persisted. See [`StorageConfig`]
-    /// for available options including in-memory and SlateDB backends.
-    pub storage: StorageConfig,
+    /// Determines where and how time series data is persisted. See
+    /// [`SlateDbStorageConfig`] for object-store and tuning options.
+    pub storage: SlateDbStorageConfig,
 
     /// How often to flush data to durable storage.
     ///
@@ -55,7 +55,18 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            storage: StorageConfig::default(),
+            // Local `.data` directory by default (matches the historical
+            // `StorageConfig::default()`; SlateDbStorageConfig::default() would
+            // use an in-memory object store instead).
+            storage: SlateDbStorageConfig {
+                path: "data".to_string(),
+                object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                    path: ".data".to_string(),
+                }),
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+            },
             flush_interval: Duration::from_secs(60),
             retention: None,
         }

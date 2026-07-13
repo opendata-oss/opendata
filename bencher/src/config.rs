@@ -37,6 +37,25 @@ pub struct DataConfig {
     pub storage: StorageConfig,
 }
 
+impl DataConfig {
+    /// The benchmark data storage as a TimeSeries SlateDB config.
+    ///
+    /// TimeSeries is SlateDB-only, so an `InMemory` data config maps to SlateDB
+    /// over an in-memory object store.
+    pub fn to_slatedb_config(&self) -> SlateDbStorageConfig {
+        match &self.storage {
+            StorageConfig::SlateDb(config) => config.clone(),
+            StorageConfig::InMemory => SlateDbStorageConfig {
+                path: "bench-data".to_string(),
+                object_store: ObjectStoreConfig::InMemory,
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+            },
+        }
+    }
+}
+
 /// Configuration for metrics reporting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReporterConfig {
@@ -52,14 +71,14 @@ fn default_interval() -> Duration {
 }
 
 impl ReporterConfig {
-    /// Convert to a StorageConfig for TimeSeries.
-    pub fn to_storage_config(&self) -> StorageConfig {
-        StorageConfig::SlateDb(SlateDbStorageConfig {
+    /// Convert to the SlateDB storage config used by the TimeSeries reporter.
+    pub fn to_storage_config(&self) -> SlateDbStorageConfig {
+        SlateDbStorageConfig {
             path: "bench-results".to_string(),
             object_store: self.object_store.clone(),
             settings_path: None,
             block_cache: None,
             meta_cache: None,
-        })
+        }
     }
 }
