@@ -446,7 +446,11 @@ pub async fn create_storage_read(
 ///
 /// SlateDB drives cache shutdown from `Db::close()` / `DbReader::close()`, so
 /// callers do not need to retain a handle to close the cache themselves.
-async fn build_split_cache(
+///
+/// Public so crates that build SlateDB directly (e.g. timeseries) can reuse
+/// the foyer plumbing rather than duplicating it; the returned cache is handed
+/// to SlateDB's `DbBuilder::with_db_cache`.
+pub async fn build_split_cache(
     data: &Option<BlockCacheConfig>,
     meta: &Option<BlockCacheConfig>,
 ) -> StorageResult<Option<Arc<dyn DbCache>>> {

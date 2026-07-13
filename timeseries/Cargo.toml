@@ -90,6 +90,8 @@ proptest.workspace = true
 rstest.workspace = true
 dashu-float.workspace = true
 tempfile.workspace = true
+slatedb = { workspace = true, features = ["test-util"] }
+slatedb-common = { workspace = true, features = ["test-util"] }
 opendata-macros.workspace = true
 
 
