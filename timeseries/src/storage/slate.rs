@@ -14,6 +14,7 @@
 //! `Ttl`/options → SlateDB conversions are all reused from `common::storage`;
 //! only the storage *handles* are native here.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -33,8 +34,10 @@ use slatedb::config::{
 };
 use slatedb::object_store::ObjectStore;
 use slatedb::{
-    Db, DbBuilder, DbIterator, DbReadOps, DbReader, DbSnapshot, IterationOrder, WriteBatch,
+    CacheTarget, Db, DbBuilder, DbCacheManagerOps, DbIterator, DbMetadataOps, DbReadOps, DbReader,
+    DbSnapshot, IterationOrder, WriteBatch,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
 
@@ -228,6 +231,42 @@ impl<H: HasReader + Send + Sync> StorageRead for H {
         label_name: &str,
     ) -> crate::util::Result<Vec<String>> {
         self.reader().get_label_values(bucket, label_name).await
+    }
+}
+
+/// Block-cache warming for the storage handles that own a SlateDB cache
+/// manager — the writer [`Storage`] and the read-only [`StorageReader`].
+///
+/// This is a separate trait from [`StorageRead`] because a [`StorageSnapshot`]
+/// (over a `DbSnapshot`) has no cache-manager handle and so cannot warm; the
+/// blanket impl below is gated on `Db: DbMetadataOps + DbCacheManagerOps`,
+/// which `Db` and `DbReader` satisfy but `DbSnapshot` does not.
+#[async_trait::async_trait]
+pub(crate) trait WarmStorage: StorageRead {
+    /// Warms the block cache for the SSTs backing the given buckets, including
+    /// the sample data blocks only when `include_samples` is set, and aborting
+    /// promptly if `cancel` fires. See [`StorageReaderInner::warm`].
+    async fn warm(
+        &self,
+        buckets: Vec<TimeBucket>,
+        include_samples: bool,
+        cancel: &CancellationToken,
+    ) -> StorageResult<()>;
+}
+
+#[async_trait::async_trait]
+impl<H> WarmStorage for H
+where
+    H: HasReader + Send + Sync,
+    H::Db: DbMetadataOps + DbCacheManagerOps,
+{
+    async fn warm(
+        &self,
+        buckets: Vec<TimeBucket>,
+        include_samples: bool,
+        cancel: &CancellationToken,
+    ) -> StorageResult<()> {
+        self.reader().warm(buckets, include_samples, cancel).await
     }
 }
 
@@ -584,6 +623,108 @@ impl<T: DbReadOps + Send + Sync> StorageReaderInner<T> {
 
         Ok(values)
     }
+}
+
+/// Cache-warming, available only on handles backed by a SlateDB cache manager
+/// (the writer `Db` and the read-only `DbReader`). A `DbSnapshot` exposes
+/// neither [`DbMetadataOps`] (the manifest) nor [`DbCacheManagerOps`]
+/// (`warm_sst`), so this impl deliberately does not cover it.
+impl<T> StorageReaderInner<T>
+where
+    T: DbReadOps + DbMetadataOps + DbCacheManagerOps + Send + Sync,
+{
+    /// Number of SSTs warmed concurrently. Each `warm_sst` issues object-store
+    /// reads for the SST's filters, index, and data blocks, so this bounds the
+    /// in-flight fetch fan-out.
+    const WARM_CONCURRENCY: usize = 16;
+
+    /// Warms the block cache for the SSTs backing `buckets`.
+    ///
+    /// Each timeseries bucket is its own SlateDB segment (RFC-0024). This
+    /// resolves the requested buckets to the SSTs currently live in the
+    /// manifest and warms, for each, the SST filters and index plus the data
+    /// blocks of the bucket's index record types (series dictionary, forward
+    /// index, inverted index). When `include_samples` is set the sample data
+    /// blocks are warmed too; otherwise they are skipped — the common case
+    /// where only the metadata needed to plan queries is wanted in cache.
+    ///
+    /// SSTs are warmed concurrently (see [`Self::WARM_CONCURRENCY`]). Warming
+    /// is a no-op for buckets with no live segment, and SlateDB itself treats
+    /// `warm_sst` as a no-op when no block cache is configured.
+    ///
+    /// If `cancel` fires the warm stops promptly, dropping (and thereby
+    /// cancelling) any in-flight per-SST warms, and returns `Ok(())` with
+    /// whatever was warmed so far — cancellation is an expected shutdown
+    /// signal, not an error.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn warm(
+        &self,
+        buckets: Vec<TimeBucket>,
+        include_samples: bool,
+        cancel: &CancellationToken,
+    ) -> StorageResult<()> {
+        use futures::stream::{StreamExt, TryStreamExt};
+
+        let wanted: HashSet<TimeBucket> = buckets.into_iter().collect();
+
+        let manifest = self.db.status().current_manifest;
+        let work: Vec<_> = manifest
+            .segments()
+            .iter()
+            .filter_map(|segment| {
+                let bucket = parse_bucket(segment.prefix())?;
+                if !wanted.contains(&bucket) {
+                    return None;
+                }
+                let targets: Arc<[CacheTarget]> =
+                    bucket_cache_targets(&bucket, include_samples).into();
+                let ids = segment
+                    .l0()
+                    .iter()
+                    .map(|view| view.sst.id)
+                    .chain(
+                        segment
+                            .compacted()
+                            .iter()
+                            .flat_map(|run| run.sst_views.iter().map(|view| view.sst.id)),
+                    )
+                    .map(move |id| (id, targets.clone()))
+                    .collect::<Vec<_>>();
+                Some(ids)
+            })
+            .flatten()
+            .collect();
+
+        futures::stream::iter(work)
+            .map(|(sst_id, targets)| async move { self.db.warm_sst(sst_id, &targets).await })
+            .buffer_unordered(Self::WARM_CONCURRENCY)
+            .take_until(cancel.cancelled())
+            .try_collect::<Vec<()>>()
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(())
+    }
+}
+
+/// Builds the [`CacheTarget`]s for warming one bucket's SSTs: the SST filters
+/// and index, the data blocks of the index record types (series dictionary,
+/// forward index, inverted index), and — only when `include_samples` — the
+/// sample data blocks. Each `Data` range is scoped to `bucket`, so these
+/// targets apply only to that bucket's segment.
+fn bucket_cache_targets(bucket: &TimeBucket, include_samples: bool) -> Vec<CacheTarget> {
+    let mut targets = vec![
+        CacheTarget::Filters,
+        CacheTarget::Index,
+        CacheTarget::data::<Bytes, _>(SeriesDictionaryKey::bucket_range(bucket)),
+        CacheTarget::data::<Bytes, _>(ForwardIndexKey::bucket_range(bucket)),
+        CacheTarget::data::<Bytes, _>(InvertedIndexKey::bucket_range(bucket)),
+    ];
+    if include_samples {
+        targets.push(CacheTarget::data::<Bytes, _>(TimeSeriesKey::bucket_range(
+            bucket,
+        )));
+    }
+    targets
 }
 
 /// Read-only storage using SlateDB's `DbReader`.
@@ -1297,6 +1438,77 @@ mod tests {
         let snapshot = storage.snapshot().await.unwrap();
         let value = snapshot.get(Bytes::from("k1")).await.unwrap();
         assert_eq!(value, Some(Bytes::from("v1")));
+
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_warm_buckets_resolved_from_segments() {
+        use crate::storage::in_memory_storage;
+        use slatedb::config::{FlushOptions, FlushType};
+
+        // given: a record in a known bucket. `in_memory_storage` wires the
+        // timeseries segment extractor, so the record lands in its own SlateDB
+        // segment. A memtable flush then writes it out as an L0 SST that
+        // appears in the manifest (a plain WAL flush would not).
+        let storage = in_memory_storage().await;
+        let bucket = TimeBucket {
+            start: 100,
+            size: 1,
+        };
+        let key = ForwardIndexKey {
+            bucket,
+            series_id: 1,
+        }
+        .encode();
+        storage
+            .put(vec![Record::new(key, Bytes::from_static(b"v")).into()])
+            .await
+            .unwrap();
+        storage
+            .db
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+
+        // the segment is in the manifest, so warm has an SST to resolve.
+        assert!(
+            !storage.db.status().current_manifest.segments().is_empty(),
+            "flush should have produced a segment in the manifest"
+        );
+
+        // the bucket is discoverable from the segment list.
+        let buckets = storage.get_buckets_in_range(None, None).await.unwrap();
+        assert!(buckets.contains(&bucket));
+
+        // when / then: warming the live bucket (with and without samples), an
+        // empty set, and an unknown bucket all succeed. Resolution and the
+        // per-SST fanout run; `warm_sst` itself no-ops because the in-memory
+        // config has no block cache.
+        let cancel = CancellationToken::new();
+        storage.warm(buckets.clone(), true, &cancel).await.unwrap();
+        storage.warm(buckets, false, &cancel).await.unwrap();
+        storage.warm(vec![], true, &cancel).await.unwrap();
+        storage
+            .warm(
+                vec![TimeBucket {
+                    start: 999_999,
+                    size: 1,
+                }],
+                false,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // an already-cancelled token short-circuits the warm and still
+        // returns Ok.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let buckets = storage.get_buckets_in_range(None, None).await.unwrap();
+        storage.warm(buckets, true, &cancelled).await.unwrap();
 
         storage.close().await.unwrap();
     }
