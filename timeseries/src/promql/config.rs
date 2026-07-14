@@ -260,6 +260,10 @@ where
 /// SlateDB's CacheManager is available.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheWarmerConfig {
+    /// Whether cache warming runs on startup. Defaults to true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// How far back to warm (e.g., "6h", "24h"). Defaults to 24h.
     #[serde(
         default = "default_warm_range",
@@ -279,6 +283,7 @@ fn default_warm_range() -> Duration {
 
 fn default_cache_warmer() -> Option<CacheWarmerConfig> {
     Some(CacheWarmerConfig {
+        enabled: true,
         warm_range: default_warm_range(),
         include_samples: true,
     })

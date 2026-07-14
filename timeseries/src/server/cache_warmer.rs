@@ -62,6 +62,14 @@ async fn warm<R: WarmStorage>(
     cancel: &CancellationToken,
 ) -> crate::util::Result<WarmStats> {
     let start = Instant::now();
+    if !config.enabled {
+        tracing::info!("Cache warming disabled");
+        return Ok(WarmStats {
+            buckets: 0,
+            elapsed: start.elapsed(),
+        });
+    }
+
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -116,6 +124,7 @@ mod tests {
         tsdb.flush().await.unwrap();
 
         let config = CacheWarmerConfig {
+            enabled: true,
             warm_range: Duration::from_secs(3600),
             include_samples: true,
         };
@@ -133,6 +142,7 @@ mod tests {
         // given
         let storage = create_storage().await;
         let config = CacheWarmerConfig {
+            enabled: true,
             warm_range: Duration::from_secs(3600),
             include_samples: true,
         };
@@ -166,6 +176,7 @@ mod tests {
         tsdb.flush().await.unwrap();
 
         let config = CacheWarmerConfig {
+            enabled: true,
             warm_range: Duration::from_secs(3600),
             include_samples: true,
         };
@@ -177,5 +188,39 @@ mod tests {
         // then — warming returns gracefully (the warm short-circuits on the
         // pre-cancelled token) rather than erroring or hanging
         warm(storage.as_ref(), &config, &cancel).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_skip_warming_when_disabled() {
+        // given: storage with data, but warming disabled
+        let storage = create_storage().await;
+        let tsdb = Tsdb::new(storage.clone());
+        let series = vec![
+            Series::builder("metric_a")
+                .label("env", "test")
+                .sample(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                    1.0,
+                )
+                .build(),
+        ];
+        tsdb.ingest_samples(series, None).await.unwrap();
+        tsdb.flush().await.unwrap();
+
+        let config = CacheWarmerConfig {
+            enabled: false,
+            warm_range: Duration::from_secs(3600),
+            include_samples: true,
+        };
+
+        // when
+        let cancel = CancellationToken::new();
+        let stats = warm(storage.as_ref(), &config, &cancel).await.unwrap();
+
+        // then — no buckets are discovered or warmed despite the stored data
+        assert_eq!(stats.buckets, 0);
     }
 }
