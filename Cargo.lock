@@ -3272,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "opendata-timeseries"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
