@@ -1,23 +1,18 @@
-//! Startup cache warmer that pre-populates the block cache by scanning
-//! recent time bucket key ranges through the normal storage read API.
+//! Startup cache warmer that pre-populates the block cache for recent time
+//! buckets.
 //!
-//! This is a temporary workaround until SlateDB's CacheManager
-//! (`set_warm_prefixes()` + `warm_current()`) is available. Delete this
-//! module when that lands.
+//! It discovers the buckets overlapping the configured recent window and hands
+//! them to [`WarmStorage::warm`], which drives SlateDB's cache manager
+//! (`warm_sst`) over the SSTs backing those buckets — pulling their filters,
+//! index, and (optionally) sample data blocks into the block cache.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::BytesRange;
-use common::storage::StorageError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::promql::config::CacheWarmerConfig;
-use crate::serde::TimeBucketScoped;
-use crate::serde::key::{ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey};
-use crate::storage::StorageRead;
-
-const LOG_INTERVAL: Duration = Duration::from_secs(30);
+use crate::storage::WarmStorage;
 
 pub(crate) struct CacheWarmerHandle {
     cancel: CancellationToken,
@@ -35,7 +30,7 @@ impl CacheWarmerHandle {
 
 /// Spawns a one-off cache warming task. Returns a handle that must be
 /// shut down before closing the database.
-pub(crate) fn start<R: StorageRead + 'static>(
+pub(crate) fn start<R: WarmStorage + 'static>(
     storage: R,
     config: CacheWarmerConfig,
 ) -> CacheWarmerHandle {
@@ -46,7 +41,6 @@ pub(crate) fn start<R: StorageRead + 'static>(
             match warm(&storage, &config, &cancel).await {
                 Ok(stats) => tracing::info!(
                     buckets = stats.buckets,
-                    records = stats.records,
                     elapsed = ?stats.elapsed,
                     "Cache warming complete"
                 ),
@@ -59,11 +53,10 @@ pub(crate) fn start<R: StorageRead + 'static>(
 
 struct WarmStats {
     buckets: usize,
-    records: u64,
     elapsed: Duration,
 }
 
-async fn warm<R: StorageRead>(
+async fn warm<R: WarmStorage>(
     storage: &R,
     config: &CacheWarmerConfig,
     cancel: &CancellationToken,
@@ -80,56 +73,14 @@ async fn warm<R: StorageRead>(
         .await?;
     let total = buckets.len();
 
-    let mut records: u64 = 0;
-    let mut last_log = Instant::now();
-
-    for (i, bucket) in buckets.iter().enumerate() {
-        if cancel.is_cancelled() {
-            tracing::info!("Cache warming cancelled");
-            break;
-        }
-
-        records += drain_scan(storage, ForwardIndexKey::bucket_range(bucket)).await?;
-        records += drain_scan(storage, InvertedIndexKey::bucket_range(bucket)).await?;
-        records += drain_scan(storage, SeriesDictionaryKey::bucket_range(bucket)).await?;
-
-        if config.include_samples {
-            records += drain_scan(storage, TimeSeriesKey::bucket_range(bucket)).await?;
-        }
-
-        if last_log.elapsed() >= LOG_INTERVAL {
-            tracing::info!(
-                bucket = i + 1,
-                total,
-                records,
-                elapsed = ?start.elapsed(),
-                "Cache warming progress"
-            );
-            last_log = Instant::now();
-        }
-    }
+    storage
+        .warm(buckets, config.include_samples, cancel)
+        .await?;
 
     Ok(WarmStats {
         buckets: total,
-        records,
         elapsed: start.elapsed(),
     })
-}
-
-/// Scan a key range, consuming all records to populate the block cache.
-/// Returns the number of records touched.
-async fn drain_scan<R: StorageRead>(storage: &R, range: BytesRange) -> crate::util::Result<u64> {
-    let mut iter = storage.scan(range).await?;
-    let mut count = 0u64;
-    while iter
-        .next()
-        .await
-        .map_err(StorageError::from_storage)?
-        .is_some()
-    {
-        count += 1;
-    }
-    Ok(count)
 }
 
 #[cfg(test)]
@@ -173,9 +124,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let stats = warm(storage.as_ref(), &config, &cancel).await.unwrap();
 
-        // then
+        // then — the recent bucket is discovered and warming succeeds
         assert!(stats.buckets > 0);
-        assert!(stats.records > 0);
     }
 
     #[tokio::test]
@@ -193,11 +143,10 @@ mod tests {
 
         // then
         assert_eq!(stats.buckets, 0);
-        assert_eq!(stats.records, 0);
     }
 
     #[tokio::test]
-    async fn should_stop_on_cancellation() {
+    async fn should_complete_when_cancelled() {
         // given
         let storage = create_storage().await;
         let tsdb = Tsdb::new(storage.clone());
@@ -224,9 +173,9 @@ mod tests {
         // when — cancel before starting
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let stats = warm(storage.as_ref(), &config, &cancel).await.unwrap();
 
-        // then — should have found buckets but processed none
-        assert_eq!(stats.records, 0);
+        // then — warming returns gracefully (the warm short-circuits on the
+        // pre-cancelled token) rather than erroring or hanging
+        warm(storage.as_ref(), &config, &cancel).await.unwrap();
     }
 }

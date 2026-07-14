@@ -23,6 +23,11 @@ pub(crate) use slate::{
     insert_series_id, merge_inverted_index, merge_samples,
 };
 
+// The cache warmer is the only consumer; featureless builds would flag an
+// unconditional re-export as unused.
+#[cfg(feature = "http-server")]
+pub(crate) use slate::WarmStorage;
+
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use factory::in_memory_storage;
 #[cfg(test)]
