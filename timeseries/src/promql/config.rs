@@ -63,8 +63,9 @@ pub struct PrometheusConfig {
     /// Maximum number of bucket readers to cache in memory.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
-    /// Startup cache warmer configuration. Scans recent buckets on startup
-    /// to pre-populate the block cache. Enabled by default (24h, with samples).
+    /// Startup cache warmer configuration. Warms the caches for recent
+    /// buckets on startup via SlateDB's cache manager. Enabled by default
+    /// (24h, with samples).
     #[serde(default = "default_cache_warmer")]
     pub cache_warmer: Option<CacheWarmerConfig>,
     /// Per-query tracing configuration. Controls whether each query collects
@@ -255,9 +256,11 @@ where
 
 /// Configuration for the startup cache warmer.
 ///
-/// When present, the server scans recent time bucket key ranges on startup
-/// to pre-populate the block cache. This is a temporary workaround until
-/// SlateDB's CacheManager is available.
+/// When present, the server discovers the time buckets overlapping the warm
+/// window on startup and drives SlateDB's cache manager over the SSTs backing
+/// them, loading each SST's filters and index — and, when `include_samples`
+/// is set, its sample data blocks — into the configured caches. See
+/// `server::cache_warmer`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheWarmerConfig {
     /// How far back to warm (e.g., "6h", "24h"). Defaults to 24h.
