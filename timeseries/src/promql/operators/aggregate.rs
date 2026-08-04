@@ -1,7 +1,7 @@
 //! `AggregateOp` implements PromQL's aggregation operators: `sum by (…)`,
 //! `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `group`, `topk`,
-//! `bottomk`, and `quantile`. One operator type handles all of them; the
-//! specific reduction is selected by an [`AggregateKind`] enum.
+//! `bottomk`, `limitk`, and `quantile`. One operator type handles all of
+//! them; the specific reduction is selected by an [`AggregateKind`] enum.
 //! (`count_values` has its own operator because its output labels depend on
 //! sample values, not just label matchers.)
 //!
@@ -23,22 +23,23 @@
 //! end-of-stream. Grid footprint is
 //! `O(step_count × output_groups × sizeof(Accumulator))`.
 //!
-//! # Breaker kinds — `Topk`, `Bottomk`, `Quantile`
+//! # Breaker kinds — `Topk`, `Bottomk`, `Limitk`, `Quantile`
 //!
 //! These buffer the whole step before emitting (K-selection and quantile
 //! interpolation need every input for the step, so they can't stream
 //! cell-by-cell like the reducer kinds — hence "breaker").
 //!
-//! | kind         | output schema  | per-step scratch        |
-//! |--------------|----------------|-------------------------|
-//! | `Topk(k)`    | input series   | `k × group_count` heap  |
-//! | `Bottomk(k)` | input series   | `k × group_count` heap  |
-//! | `Quantile(q)`| group series   | per-group sort buffer   |
+//! | kind         | output schema  | per-step scratch                     |
+//! |--------------|----------------|--------------------------------------|
+//! | `Topk(k)`    | input series   | `k × group_count` heap (eviction)    |
+//! | `Bottomk(k)` | input series   | `k × group_count` heap (eviction)    |
+//! | `Limitk(k)`  | input series   | `group_count` u32 counter            |
+//! | `Quantile(q)`| group series   | per-group sort buffer                |
 //!
-//! `topk` / `bottomk` filter (preserve input series, flip validity on
-//! unselected cells); `quantile` reduces (one cell per group). The planner
-//! picks the output schema; the operator debug-asserts its size matches the
-//! variant.
+//! `topk` / `bottomk` / `limitk` filter (preserve input series, flip
+//! validity on unselected cells); `quantile` reduces (one cell per group).
+//! The planner picks the output schema; the operator debug-asserts its
+//! size matches the variant.
 //!
 //! Tie-break for `topk` / `bottomk`: equal values go to the lower
 //! input-series index (deterministic). NaN inputs rank worst. `k < 1`
@@ -104,6 +105,9 @@ pub enum AggregateKind {
     Topk(i64),
     /// `bottomk(k, v)` — smallest-K counterpart to [`Self::Topk`].
     Bottomk(i64),
+    /// `limitk(k, v)` — first `k` series per group in fingerprint order,
+    /// regardless of sample value.
+    Limitk(i64),
     /// `quantile(q, v)` — per-group, per-step q-th quantile with linear
     /// interpolation between ranks. Shares the streaming output-schema
     /// shape (one cell per group). See `rollup_fns::quantile` in
@@ -117,7 +121,10 @@ impl AggregateKind {
     /// (pipeline breakers).
     #[inline]
     fn is_breaker(self) -> bool {
-        matches!(self, Self::Topk(_) | Self::Bottomk(_) | Self::Quantile(_))
+        matches!(
+            self,
+            Self::Topk(_) | Self::Bottomk(_) | Self::Limitk(_) | Self::Quantile(_),
+        )
     }
 
     /// True for variants whose output-series count equals the input
@@ -125,7 +132,7 @@ impl AggregateKind {
     /// (output-series count == group_count).
     #[inline]
     fn output_is_inputs(self) -> bool {
-        matches!(self, Self::Topk(_) | Self::Bottomk(_))
+        matches!(self, Self::Topk(_) | Self::Bottomk(_) | Self::Limitk(_))
     }
 }
 
@@ -619,13 +626,13 @@ impl<C: Operator> AggregateOp<C> {
             debug_assert_eq!(
                 group_map.input_series_count(),
                 output_schema.len(),
-                "topk/bottomk output schema must equal input series count",
+                "filter-shape output schema must equal input series count",
             );
         } else {
             debug_assert_eq!(
                 group_map.group_count,
                 output_schema.len(),
-                "streaming / quantile output schema must equal group_count",
+                "reducer-shape output schema must equal group_count",
             );
         }
 
@@ -633,8 +640,11 @@ impl<C: Operator> AggregateOp<C> {
         let schema = OperatorSchema::new(SchemaRef::Static(output_schema.clone()), grid);
         debug_assert!(
             param_child.is_none()
-                || matches!(kind, AggregateKind::Topk(_) | AggregateKind::Bottomk(_)),
-            "dynamic aggregate params are only supported for topk/bottomk",
+                || matches!(
+                    kind,
+                    AggregateKind::Topk(_) | AggregateKind::Bottomk(_) | AggregateKind::Limitk(_),
+                ),
+            "dynamic aggregate params are only supported for filter-shape k-aggregations",
         );
         if let Some(param_child) = &param_child {
             debug_assert_eq!(
@@ -695,6 +705,11 @@ impl<C: Operator> AggregateOp<C> {
                     .map(|_| BinaryHeap::with_capacity(cap))
                     .collect();
                 (Vec::new(), heaps, Vec::new(), bytes)
+            }
+            AggregateKind::Limitk(_) => {
+                // Per-step group counter is allocated locally inside
+                // finalise_limitk — no per-instance scratch needed.
+                (Vec::new(), Vec::new(), Vec::new(), 0)
             }
             AggregateKind::Quantile(_) => {
                 let bytes =
@@ -880,6 +895,7 @@ impl<C: Operator> AggregateOp<C> {
                     // `reduce_batch_breaker` and never visit this path.
                     AggregateKind::Topk(_)
                     | AggregateKind::Bottomk(_)
+                    | AggregateKind::Limitk(_)
                     | AggregateKind::Quantile(_) => {
                         unreachable!("breaker kind routed to streaming finaliser")
                     }
@@ -948,14 +964,14 @@ impl<C: Operator> AggregateOp<C> {
         }
     }
 
-    /// Finalise breaker output from the buffered full grid. Routes to
-    /// the kind-specific `finalise_topk_or_bottomk` / `finalise_quantile`
-    /// helpers, each of which runs its per-step selection / quantile
-    /// against the complete `(step_count × input_series_count)` grid.
+    /// Finalise breaker output from the buffered full grid. Dispatches
+    /// per kind; each branch runs its per-step selection against the
+    /// complete `(step_count × input_series_count)` grid.
     fn finalise_breaker(&mut self) -> Result<StepBatch, QueryError> {
         match self.kind {
             AggregateKind::Topk(k) => self.finalise_topk_or_bottomk(k, KOrder::SmallestFirst),
             AggregateKind::Bottomk(k) => self.finalise_topk_or_bottomk(k, KOrder::LargestFirst),
+            AggregateKind::Limitk(k) => self.finalise_limitk(k),
             AggregateKind::Quantile(q) => self.finalise_quantile(q),
             _ => unreachable!("non-breaker kind routed to finalise_breaker"),
         }
@@ -1015,6 +1031,72 @@ impl<C: Operator> AggregateOp<C> {
                     out.values[idx] = entry.value;
                     out.validity.set(idx);
                 }
+            }
+        }
+
+        let step_timestamps = self.breaker_step_timestamps.take().unwrap_or_else(|| {
+            Arc::from(
+                (0..step_count)
+                    .map(|i| grid.start_ms + (i as i64) * grid.step_ms)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        });
+        let (values, validity) = out.finish();
+        Ok(StepBatch::new(
+            step_timestamps,
+            0..step_count,
+            SchemaRef::Static(self.output_schema.clone()),
+            0..in_series_count,
+            values,
+            validity,
+        ))
+    }
+
+    /// Global-scope limitk: for each step, walk inputs in
+    /// fingerprint-sorted order and accept the first `k` valid cells per
+    /// group. Output shape = `(step_count × input_series_count)` filter
+    /// batch; selected cells carry the input value through unchanged.
+    fn finalise_limitk(&mut self, k: i64) -> Result<StepBatch, QueryError> {
+        let grid = self.schema.step_grid;
+        let step_count = grid.step_count;
+        let in_series_count = self.group_map.input_series_count();
+        let group_count = self.group_map.group_count;
+        let out_cells = step_count * in_series_count;
+
+        let mut out = OutBuffers::allocate(&self.reservation, out_cells)?;
+
+        let mut perm: Vec<u32> = (0..in_series_count as u32).collect();
+        let fps = self.output_schema.fingerprints_slice();
+        perm.sort_by_key(|&i| fps[i as usize]);
+
+        let mut counts = vec![0u32; group_count];
+
+        for global_step in 0..step_count {
+            let k_usize = self.k_for_step(global_step, in_series_count, k);
+            counts.fill(0);
+            if k_usize == 0 {
+                continue;
+            }
+            let grid_base = global_step * in_series_count;
+            let out_base = global_step * in_series_count;
+            for &series in &perm {
+                let series_us = series as usize;
+                let cell = grid_base + series_us;
+                if !self.breaker_validity.get(cell) {
+                    continue;
+                }
+                let group = match self.group_map.input_to_group[series_us] {
+                    Some(g) => g as usize,
+                    None => continue,
+                };
+                if (counts[group] as usize) >= k_usize {
+                    continue;
+                }
+                counts[group] += 1;
+                let out_idx = out_base + series_us;
+                out.values[out_idx] = self.breaker_values[cell];
+                out.validity.set(out_idx);
             }
         }
 
@@ -1110,6 +1192,11 @@ impl<C: Operator> AggregateOp<C> {
             AggregateKind::Topk(k) => self.reduce_topk_or_bottomk(input, k, KOrder::SmallestFirst),
             AggregateKind::Bottomk(k) => {
                 self.reduce_topk_or_bottomk(input, k, KOrder::LargestFirst)
+            }
+            AggregateKind::Limitk(_) => {
+                // limitk routes through absorb-then-finalise like the other breakers.
+                let _ = step_count;
+                unreachable!("limitk uses absorb-then-finalise; not the per-batch reducer")
             }
             AggregateKind::Quantile(q) => self.reduce_quantile(input, q),
             _ => {
@@ -2722,6 +2809,474 @@ mod tests {
         assert_eq!(b.get(0, 3), Some(5.0));
         assert_eq!(b.get(0, 4), Some(5.0));
         assert_eq!(b.get(0, 5), None);
+    }
+
+    // ---- limitk -------------------------------------------------------------
+    // `mk_schema` assigns fingerprints `0..n`, so fingerprint order equals
+    // series order. The fingerprint-sort test below builds its own schema
+    // with permuted fingerprints to exercise the sort.
+
+    #[test]
+    fn should_select_first_k_series_per_group_for_limitk() {
+        // given: 5 input series in one group with sequential fingerprints
+        // (0..5). limitk(2) walks fingerprint order and accepts the first
+        // two valid cells — series 0 and 1.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let valid = vec![true; 5];
+        let batch = mk_batch(in_schema.clone(), 1, 5, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        // when
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .expect("operator constructs");
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: filter shape (5 series); only s0 and s1 selected; values
+        // pass through unchanged.
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.series_count(), 5);
+        assert_eq!(b.get(0, 0), Some(10.0));
+        assert_eq!(b.get(0, 1), Some(20.0));
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), None);
+        assert_eq!(b.get(0, 4), None);
+    }
+
+    #[test]
+    fn should_apply_limitk_per_group() {
+        // given: 6 series split into 2 groups (0,1,2 → group A; 3,4,5 →
+        // group B). limitk(1) caps each group at 1 → s0 and s3 selected.
+        let in_schema = mk_schema("in", 6);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let valid = vec![true; 6];
+        let batch = mk_batch(in_schema.clone(), 1, 6, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(
+            vec![Some(0), Some(0), Some(0), Some(1), Some(1), Some(1)],
+            2,
+        );
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(1),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        // First series of each group survives — fingerprint-sorted means
+        // s0 (group A) and s3 (group B).
+        assert_eq!(b.get(0, 0), Some(10.0));
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), Some(40.0));
+        assert_eq!(b.get(0, 4), None);
+        assert_eq!(b.get(0, 5), None);
+    }
+
+    #[test]
+    fn should_select_nothing_when_limitk_zero() {
+        // given: 3 valid inputs, limitk(0) ⇒ empty selection.
+        let in_schema = mk_schema("in", 3);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![1.0, 2.0, 3.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(0),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.series_count(), 3);
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+    }
+
+    #[test]
+    fn should_handle_negative_limitk_as_empty() {
+        // given: Negative K ⇒ no rows (matches `coerce_k_size` semantics
+        // shared with topk/bottomk).
+        let in_schema = mk_schema("in", 3);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![1.0, 2.0, 3.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(-2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+    }
+
+    #[test]
+    fn should_select_all_when_limitk_exceeds_group_size() {
+        // given: 3 series in one group, limitk(1000) ⇒ everyone selected,
+        // values pass through unchanged.
+        let in_schema = mk_schema("in", 3);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![7.0, 3.0, 9.0];
+        let valid = vec![true; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(1000),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(7.0));
+        assert_eq!(b.get(0, 1), Some(3.0));
+        assert_eq!(b.get(0, 2), Some(9.0));
+    }
+
+    #[test]
+    fn should_skip_invalid_inputs_for_limitk() {
+        // given: 5 series; s0 and s2 invalid. limitk(2) walks fingerprint
+        // order, skips invalid cells, accepts s1 and s3.
+        let in_schema = mk_schema("in", 5);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let valid = vec![false, true, false, true, true];
+        let batch = mk_batch(in_schema.clone(), 1, 5, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 5], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), Some(20.0));
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), Some(40.0));
+        assert_eq!(b.get(0, 4), None);
+    }
+
+    #[test]
+    fn should_emit_no_rows_when_all_inputs_invalid_for_limitk() {
+        // given: 3 series, all invalid in a step. limitk(2) emits nothing.
+        let in_schema = mk_schema("in", 3);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![1.0, 2.0, 3.0];
+        let valid = vec![false; 3];
+        let batch = mk_batch(in_schema.clone(), 1, 3, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 3], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+    }
+
+    #[test]
+    fn should_apply_limitk_independently_per_step() {
+        // given: 4 series across 3 steps. Each step has different validity
+        // patterns. limitk(2) is independent per step — the K selected
+        // can shift step-to-step as validity changes.
+        //
+        //         step0   step1   step2
+        // s0:     v=1     v=2     v=3 (invalid)
+        // s1:     v=10    v=20 (invalid)  v=30
+        // s2:     v=100   v=200    v=300
+        // s3:     v=1000  v=2000   v=3000
+        let in_schema = mk_schema("in", 4);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(3);
+        // Row-major: step-major then series.
+        let values = vec![
+            // step 0: all valid
+            1.0, 10.0, 100.0, 1000.0, // step 1: s1 invalid
+            2.0, 20.0, 200.0, 2000.0, // step 2: s0 invalid
+            3.0, 30.0, 300.0, 3000.0,
+        ];
+        let valid = vec![
+            true, true, true, true, // step 0
+            true, false, true, true, // step 1: s1 invalid
+            false, true, true, true, // step 2: s0 invalid
+        ];
+        let batch = mk_batch(in_schema.clone(), 3, 4, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 4], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        // step 0: all valid → first two by fingerprint = s0, s1.
+        assert_eq!(b.get(0, 0), Some(1.0));
+        assert_eq!(b.get(0, 1), Some(10.0));
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), None);
+        // step 1: s1 invalid → first two valid = s0, s2.
+        assert_eq!(b.get(1, 0), Some(2.0));
+        assert_eq!(b.get(1, 1), None);
+        assert_eq!(b.get(1, 2), Some(200.0));
+        assert_eq!(b.get(1, 3), None);
+        // step 2: s0 invalid → first two valid = s1, s2.
+        assert_eq!(b.get(2, 0), None);
+        assert_eq!(b.get(2, 1), Some(30.0));
+        assert_eq!(b.get(2, 2), Some(300.0));
+        assert_eq!(b.get(2, 3), None);
+    }
+
+    #[test]
+    fn should_select_limitk_in_fingerprint_order_not_series_order() {
+        // given: 4 series whose **fingerprints are reverse-sorted** vs
+        // their series indices. limitk walks fingerprint order — so the
+        // series with the lowest fingerprint wins, not the lowest series
+        // index.
+        //
+        // series_idx: 0    1    2    3
+        // fp:         30   20   10   0    (reversed)
+        //
+        // limitk(2) should pick series 3 and 2 (lowest fingerprints),
+        // NOT series 0 and 1 (lowest indices). Output cells land at
+        // their respective series indices.
+        let labels: Vec<Labels> = (0..4)
+            .map(|i| {
+                Labels::new(vec![Label {
+                    name: "i".to_string(),
+                    value: i.to_string(),
+                }])
+            })
+            .collect();
+        let fps: Vec<u128> = vec![30, 20, 10, 0];
+        let in_schema = Arc::new(SeriesSchema::new(Arc::from(labels), Arc::from(fps)));
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![100.0, 200.0, 300.0, 400.0];
+        let valid = vec![true; 4];
+        let batch = mk_batch(in_schema.clone(), 1, 4, values, valid);
+
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 4], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: series 3 (fp=0) and series 2 (fp=10) selected. They
+        // emit at their original series-index positions in the output.
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), None);
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), Some(300.0));
+        assert_eq!(b.get(0, 3), Some(400.0));
+    }
+
+    #[test]
+    fn should_select_limitk_globally_across_multiple_series_tile_batches() {
+        // given: 6 series in one group, delivered in two tile batches in
+        // reverse order (s3..6 first, then s0..3). The breaker grid
+        // absorbs both before finalise runs the fingerprint-ordered
+        // selection. limitk(2) must pick s0 and s1 (lowest fingerprints)
+        // regardless of arrival order.
+        let in_schema = mk_schema("in", 6);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let batch_back = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            3..6,
+            vec![40.0, 50.0, 60.0],
+            vec![true; 3],
+        );
+        let batch_front = mk_batch_with_series_range(
+            in_schema.clone(),
+            1,
+            0..3,
+            vec![10.0, 20.0, 30.0],
+            vec![true; 3],
+        );
+        // Deliver tail tile FIRST to verify selection is independent of
+        // child tile arrival order.
+        let child = MockOp::new(in_schema, grid, vec![batch_back, batch_front]);
+        let gmap = GroupMap::new(vec![Some(0); 6], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(2),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        // then: series 0 and 1 (lowest fingerprints) win, regardless of
+        // which tile arrived first.
+        assert_eq!(outs.len(), 1);
+        let b = &outs[0];
+        assert_eq!(b.series_range, 0..6);
+        assert_eq!(b.get(0, 0), Some(10.0));
+        assert_eq!(b.get(0, 1), Some(20.0));
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), None);
+        assert_eq!(b.get(0, 4), None);
+        assert_eq!(b.get(0, 5), None);
+    }
+
+    #[test]
+    fn should_pass_nan_through_for_limitk() {
+        // given: 4 valid series with values [10, NaN, 30, NaN]. limitk(4)
+        // selects everyone (k >= n); NaN passes through unchanged. limitk
+        // doesn't rank by value, so NaN is not ordered "worst" the way
+        // topk/bottomk treat it.
+        let in_schema = mk_schema("in", 4);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(1);
+        let values = vec![10.0, f64::NAN, 30.0, f64::NAN];
+        let valid = vec![true; 4];
+        let batch = mk_batch(in_schema.clone(), 1, 4, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+        let gmap = GroupMap::new(vec![Some(0); 4], 1);
+
+        let mut op = AggregateOp::new(
+            child,
+            AggregateKind::Limitk(4),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        assert_eq!(b.get(0, 0), Some(10.0));
+        assert!(b.get(0, 1).unwrap().is_nan());
+        assert_eq!(b.get(0, 2), Some(30.0));
+        assert!(b.get(0, 3).unwrap().is_nan());
+    }
+
+    #[test]
+    fn should_apply_dynamic_k_per_step_for_limitk() {
+        // given: 4 input series across 2 steps. A scalar param child emits
+        // k=1 at step 0 and k=3 at step 1. limitk reads K per step.
+        let in_schema = mk_schema("in", 4);
+        let out_schema = in_schema.clone();
+        let grid = mk_grid(2);
+        let values = vec![
+            10.0, 20.0, 30.0, 40.0, // step 0
+            100.0, 200.0, 300.0, 400.0, // step 1
+        ];
+        let valid = vec![true; 8];
+        let batch = mk_batch(in_schema.clone(), 2, 4, values, valid);
+        let child = MockOp::new(in_schema, grid, vec![batch]);
+
+        // Scalar-shaped param child: 1 series, 2 steps, values [1, 3].
+        let param_schema = mk_schema("param", 1);
+        let param_batch = mk_batch(param_schema.clone(), 2, 1, vec![1.0, 3.0], vec![true; 2]);
+        let param_child = MockOp::new(param_schema, grid, vec![param_batch]);
+
+        let gmap = GroupMap::new(vec![Some(0); 4], 1);
+
+        // Static k is a placeholder when a param child is supplied — runtime
+        // reads from the param child instead.
+        let mut op = AggregateOp::new_with_param(
+            child,
+            Some(Box::new(param_child)),
+            AggregateKind::Limitk(0),
+            gmap,
+            out_schema,
+            MemoryReservation::new(1 << 20),
+        )
+        .unwrap();
+        let outs: Vec<StepBatch> = drive(&mut op).into_iter().map(|r| r.unwrap()).collect();
+
+        let b = &outs[0];
+        // step 0: k=1, only s0 selected (lowest fingerprint).
+        assert_eq!(b.get(0, 0), Some(10.0));
+        assert_eq!(b.get(0, 1), None);
+        assert_eq!(b.get(0, 2), None);
+        assert_eq!(b.get(0, 3), None);
+        // step 1: k=3, s0/s1/s2 selected.
+        assert_eq!(b.get(1, 0), Some(100.0));
+        assert_eq!(b.get(1, 1), Some(200.0));
+        assert_eq!(b.get(1, 2), Some(300.0));
+        assert_eq!(b.get(1, 3), None);
     }
 
     #[test]

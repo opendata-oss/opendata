@@ -398,6 +398,47 @@ eval instant at 50m topk(scalar(foo), http_requests)
 	http_requests{group="canary", instance="0", job="app-server"} 700
 	http_requests{group="production", instance="1", job="app-server"} 600
 
+# Tests for limitk.
+# Selection identity diverges from upstream (Blake3 vs xxhash labelset
+# fingerprint), so cardinality is asserted; labels only when output is
+# fully determined (k=0, k>=population).
+eval instant at 50m count(limitk(3, http_requests))
+	{} 3
+
+eval instant at 50m count(limitk by (group) (2, http_requests))
+	{} 4
+
+eval instant at 50m count by (group) (limitk by (group) (2, http_requests))
+	{group="canary"} 2
+	{group="production"} 2
+
+eval instant at 50m count(limitk(0, http_requests))
+	#empty
+
+# k > population: every series selected. 8 real + 1 NaN-only = 9.
+eval instant at 50m count(limitk(9999, http_requests))
+	{} 9
+
+eval instant at 50m count(limitk by (group) (1, http_requests))
+	{} 2
+
+# k=4 over the 4 canary series: everyone selected.
+eval instant at 50m limitk(4, http_requests{group="canary"})
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="canary", instance="1", job="app-server"} 800
+
+eval instant at 50m limitk(9999, http_requests{group="canary"})
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="canary", instance="1", job="app-server"} 800
+
+# scalar(foo) resolves to 3 at 50m (see topk fixture above).
+eval instant at 50m count(limitk(scalar(foo), http_requests))
+	{} 3
+
 ignore
 # Ignore reason: the promqltest DSL currently parses `eval instant ...` only;
 # `eval range ...` is not recognized yet. Remaining checks below also cover
