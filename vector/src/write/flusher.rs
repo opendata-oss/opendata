@@ -1,5 +1,6 @@
 use crate::db::LastAppliedSnapshot;
-use crate::write::delta::{VectorDbDeltaView, VectorDbWriteDelta};
+use crate::storage::VectorDbStorageReadExt;
+use crate::write::delta::{VectorDbDeltaView, VectorDbOpDelta};
 use crate::write::indexer::tree::centroids::{
     CachedCentroidReader, CentroidCache, LeveledCentroidIndex, StoredCentroidReader,
 };
@@ -55,7 +56,7 @@ impl VectorDbFlusher {
 }
 
 #[async_trait]
-impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
+impl Flusher<VectorDbOpDelta> for VectorDbFlusher {
     async fn flush_delta(
         &mut self,
         frozen: Arc<VectorDbDeltaView>,
@@ -70,7 +71,7 @@ impl Flusher<VectorDbWriteDelta> for VectorDbFlusher {
         let result = self
             .indexer
             .update_index(
-                frozen.writes.clone(),
+                frozen.ops.clone(),
                 update_epoch,
                 self.last_snapshot.clone(),
                 self.last_snapshot_epoch,
@@ -113,6 +114,11 @@ impl VectorDbFlusher {
 
         let snapshot = self.storage.snapshot().await.map_err(|e| e.to_string())?;
         self.validate(snapshot.clone()).await;
+        // Reload the in-memory deletions bitmap for the BM25 query path. The
+        // compaction scheduler's delete-pressure counters are maintained
+        // separately by the corpus-stats poller, not here (RFC-0006).
+        let fts_deletions = Arc::new(snapshot.get_deletions().await.map_err(|e| e.to_string())?);
+
         let stored_reader = StoredCentroidReader::new(
             self.opts.dimensions as usize,
             snapshot.clone(),
@@ -132,6 +138,7 @@ impl VectorDbFlusher {
             centroid_cache: index_outputs.centroid_cache,
             centroid_index: Arc::new(query_centroid_index),
             centroid_count: index_outputs.leaf_centroids,
+            fts_deletions,
         };
         self.last_snapshot = snapshot.clone();
         self.last_snapshot_epoch = snapshot_epoch;
@@ -157,6 +164,7 @@ mod tests {
     use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
     use crate::storage::merge_operator::VectorDbMergeOperator;
     use crate::write::delta::VectorDbDeltaView;
+    use crate::write::delta::VectorDbOp;
     use crate::write::delta::VectorWrite;
     use crate::write::indexer::tree::IndexerOpts;
     use crate::write::indexer::tree::centroids::TreeDepth;
@@ -234,7 +242,7 @@ mod tests {
             .await
             .unwrap();
         let centroid_cache = AllCentroidsCacheWriter::new(
-            Arc::new(PostingList::from_iter(vec![Posting::new(
+            Arc::new(PostingList::from_iter(vec![Posting::from_vec(
                 leaf_centroid_id(1),
                 vec![0.0; DIMS],
             )])),
@@ -281,6 +289,7 @@ mod tests {
                 split_threshold_vectors: usize::MAX,
                 split_search_neighbourhood: 4,
                 indexed_fields: HashSet::new(),
+                text_fields: HashSet::new(),
             },
             state,
         );
@@ -295,6 +304,7 @@ mod tests {
                 centroid_cache: cache,
                 centroid_index: query_centroid_index,
                 centroid_count: 1,
+                fts_deletions: Arc::new(crate::serde::vector_bitmap::VectorBitmap::new()),
             })),
         )
     }
@@ -307,13 +317,16 @@ mod tests {
                     external_id: format!("vec-{i}"),
                     values: values.clone(),
                     attributes: vec![("vector".to_string(), AttributeValue::Vector(values))],
+                    text_attribute_summaries: std::collections::HashMap::new(),
                 }
             })
             .collect()
     }
 
     fn make_frozen(writes: Vec<VectorWrite>) -> Arc<VectorDbDeltaView> {
-        Arc::new(VectorDbDeltaView { writes })
+        Arc::new(VectorDbDeltaView {
+            ops: vec![VectorDbOp::Write(writes)],
+        })
     }
 
     #[tokio::test]

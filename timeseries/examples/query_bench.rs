@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use clap::Parser;
-use common::StorageConfig;
+use common::storage::config::SlateDbStorageConfig;
 use serde::{Deserialize, Deserializer};
 use slatedb::config::DbReaderOptions;
 use timeseries::TimeSeriesDbReader;
@@ -83,7 +83,7 @@ struct Args {
 
 #[derive(Deserialize)]
 struct BenchConfig {
-    storage: StorageConfig,
+    storage: SlateDbStorageConfig,
     #[serde(
         default = "default_reader_options",
         deserialize_with = "deserialize_reader_options"

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 /// Top-level storage configuration.
 ///
 /// Defaults to `SlateDb` with a local `/tmp/opendata-storage` directory.
+// The `SlateDb` variant is large (it carries object-store and two cache
+// configs), but `StorageConfig` is constructed rarely at startup and never
+// moved in a hot path, so the size asymmetry with `InMemory` doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum StorageConfig {
@@ -25,6 +29,7 @@ impl Default for StorageConfig {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         })
     }
 }
@@ -46,20 +51,54 @@ pub struct SlateDbStorageConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings_path: Option<String>,
 
-    /// Optional block cache for SST block lookups.
+    /// Optional cache for SST *data* block lookups.
     ///
-    /// When configured, reduces object store reads by caching hot blocks
-    /// in memory and/or on local disk.
+    /// When configured, reduces object store reads by caching hot data blocks
+    /// in memory and/or on local disk. Maps to the `block_cache` side of
+    /// SlateDB's [`slatedb::db_cache::SplitCache`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_cache: Option<BlockCacheConfig>,
+
+    /// Optional cache for SST *metadata* — indexes, filters, and stats blocks.
+    ///
+    /// Maps to the `meta_cache` side of SlateDB's
+    /// [`slatedb::db_cache::SplitCache`]. Metadata blocks are small but
+    /// consulted on every read, so a dedicated cache keeps them resident
+    /// instead of competing with large data blocks for capacity. An in-memory
+    /// [`BlockCacheConfig::FoyerMemory`] is usually the right choice: size it
+    /// to comfortably hold the live index + filter set and it effectively
+    /// never evicts.
+    ///
+    /// When either `block_cache` or `meta_cache` is set, the two are combined
+    /// into a `SplitCache` that routes data blocks to `block_cache` and
+    /// index/filter/stats blocks to `meta_cache`. A side left unset simply
+    /// caches nothing for that class of block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_cache: Option<BlockCacheConfig>,
 }
 
-/// Block cache configuration for SlateDB.
+/// Cache configuration for SlateDB. Used for both the data-block cache
+/// (`block_cache`) and the metadata cache (`meta_cache`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum BlockCacheConfig {
     /// Two-tier cache using foyer: in-memory + on-disk (ideally NVMe).
     FoyerHybrid(FoyerHybridCacheConfig),
+    /// Single-tier in-memory cache using foyer. Lowest-latency option, with
+    /// no durable tier — contents are rebuilt on restart (cheap when paired
+    /// with cache warming). A good fit for the metadata cache.
+    FoyerMemory(FoyerMemoryCacheConfig),
+}
+
+/// Configuration for foyer's in-memory (single-tier) cache.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FoyerMemoryCacheConfig {
+    /// In-memory cache capacity in bytes.
+    pub capacity: u64,
+    /// Number of shards. When absent, foyer derives a default from the
+    /// available CPU count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<usize>,
 }
 
 /// Write policy for foyer's hybrid cache.
@@ -125,6 +164,7 @@ impl Default for SlateDbStorageConfig {
             object_store: ObjectStoreConfig::default(),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         }
     }
 }
@@ -142,6 +182,7 @@ impl StorageConfig {
                 object_store: config.object_store.clone(),
                 settings_path: config.settings_path.clone(),
                 block_cache: config.block_cache.clone(),
+                meta_cache: config.meta_cache.clone(),
             }),
         }
     }
@@ -311,6 +352,7 @@ object_store:
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         // when
@@ -320,9 +362,10 @@ object_store:
         assert!(yaml.contains("type: SlateDb"));
         assert!(yaml.contains("path: my-data"));
         assert!(yaml.contains("type: Local"));
-        // settings_path and block_cache should be omitted when None
+        // settings_path and caches should be omitted when None
         assert!(!yaml.contains("settings_path"));
         assert!(!yaml.contains("block_cache"));
+        assert!(!yaml.contains("meta_cache"));
     }
 
     #[test]
@@ -355,6 +398,7 @@ block_cache:
                         // effective buffer pool = memory_capacity / 32
                         assert_eq!(foyer.effective_buffer_pool_size(), 8589934592 / 32);
                     }
+                    other => panic!("expected FoyerHybrid, got {other:?}"),
                 }
             }
             _ => panic!("Expected SlateDb config"),
@@ -396,6 +440,7 @@ block_cache:
                         // explicit value overrides derivation
                         assert_eq!(foyer.effective_buffer_pool_size(), 134217728);
                     }
+                    other => panic!("expected FoyerHybrid, got {other:?}"),
                 }
             }
             _ => panic!("Expected SlateDb config"),
@@ -434,8 +479,76 @@ object_store:
         match config {
             StorageConfig::SlateDb(slate_config) => {
                 assert!(slate_config.block_cache.is_none());
+                assert!(slate_config.meta_cache.is_none());
             }
             _ => panic!("Expected SlateDb config"),
         }
+    }
+
+    #[test]
+    fn should_deserialize_split_cache_with_hybrid_data_and_memory_meta() {
+        // given: a data block_cache on disk-backed hybrid, plus a small
+        // in-memory meta_cache for index/filter/stats blocks.
+        let yaml = r#"
+type: SlateDb
+path: data
+object_store:
+  type: InMemory
+block_cache:
+  type: FoyerHybrid
+  memory_capacity: 536870912
+  disk_capacity: 10737418240
+  disk_path: /mnt/nvme/data-cache
+meta_cache:
+  type: FoyerMemory
+  capacity: 134217728
+"#;
+
+        // when
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        let StorageConfig::SlateDb(slate_config) = config else {
+            panic!("Expected SlateDb config");
+        };
+        match slate_config.block_cache.expect("block_cache should be set") {
+            BlockCacheConfig::FoyerHybrid(foyer) => {
+                assert_eq!(foyer.memory_capacity, 536870912);
+                assert_eq!(foyer.disk_path, "/mnt/nvme/data-cache");
+            }
+            other => panic!("expected FoyerHybrid data cache, got {other:?}"),
+        }
+        match slate_config.meta_cache.expect("meta_cache should be set") {
+            BlockCacheConfig::FoyerMemory(mem) => {
+                assert_eq!(mem.capacity, 134217728);
+                assert!(mem.shards.is_none());
+            }
+            other => panic!("expected FoyerMemory meta cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_roundtrip_split_cache_config() {
+        // given
+        let config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::InMemory,
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+                capacity: 64 * 1024 * 1024,
+                shards: Some(8),
+            })),
+            meta_cache: Some(BlockCacheConfig::FoyerMemory(FoyerMemoryCacheConfig {
+                capacity: 16 * 1024 * 1024,
+                shards: None,
+            })),
+        });
+
+        // when
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: StorageConfig = serde_yaml::from_str(&yaml).unwrap();
+
+        // then
+        assert_eq!(config, parsed);
     }
 }

@@ -7,7 +7,7 @@
 use crate::DistanceMetric;
 use crate::Result;
 use crate::serde::vector_id::{LEAF_LEVEL, VectorId};
-use crate::write::delta::VectorWrite;
+use crate::write::delta::VectorDbOp;
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, CentroidCache, TreeDepth, TreeLevel,
 };
@@ -40,6 +40,7 @@ mod vector;
 pub(crate) struct IndexerStats {
     pub(crate) inserts: usize,
     pub(crate) updates: usize,
+    pub(crate) deletes: usize,
     pub(crate) merges: HashMap<TreeLevel, usize>,
     pub(crate) splits: HashMap<TreeLevel, usize>,
     pub(crate) reassignments: HashMap<TreeLevel, usize>,
@@ -56,6 +57,15 @@ pub(crate) struct IndexerOpts {
     pub(crate) split_threshold_vectors: usize,
     pub(crate) split_search_neighbourhood: usize,
     pub(crate) indexed_fields: HashSet<String>,
+    /// Names of fields declared with `FieldType::Text` (RFC-0006).
+    ///
+    /// The Indexer drives FTS updates from each
+    /// `VectorWrite.text_attribute_summaries` (pre-populated by the write
+    /// path); this set lets it discover, without re-reading `CollectionMeta`,
+    /// whether the collection uses FTS at all. When empty, the `FtsIndexDelta`
+    /// freezes to a no-op so non-FTS collections don't pay the deletions
+    /// bitmap's storage overhead.
+    pub(crate) text_fields: HashSet<String>,
 }
 
 pub(crate) struct IndexUpdateResults {
@@ -135,35 +145,42 @@ impl Indexer {
 
     pub(crate) async fn update_index(
         &mut self,
-        updates: Vec<VectorWrite>,
+        ops: Vec<VectorDbOp>,
         update_epoch: u64,
         snapshot: Arc<dyn StorageRead>,
         snapshot_epoch: u64,
     ) -> Result<IndexUpdateResults> {
+        let op_count: usize = ops.iter().map(VectorDbOp::len).sum();
         let update_span = debug_span!(
             "update_index",
             update_epoch,
             snapshot_epoch,
-            write_count = updates.len(),
+            write_count = op_count,
             depth = self.state.centroids_meta().depth as u16
         );
         let update_start = Instant::now();
         let mut stats = IndexerStats::default();
-        let mut delta = VectorIndexDelta::new(&self.state);
+        // Gate FTS index emission on whether the collection actually declares
+        // text fields; without them the delta freezes to a no-op (see
+        // `FtsIndexDelta::freeze`), sparing non-FTS collections the deletions
+        // bitmap's storage overhead.
+        let mut delta = VectorIndexDelta::new(&self.state, !self.opts.text_fields.is_empty());
 
-        let write = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, updates);
-        let write_start = Instant::now();
-        let (inserts, updates) = write.execute(&self.state, &mut delta).await?;
+        let batch = WriteVectors::new(&self.opts, &snapshot, snapshot_epoch, ops);
+        let batch_start = Instant::now();
+        let (inserts, updates, deletes) = batch.execute(&self.state, &mut delta).await?;
         debug!(
             parent: &update_span,
             op = "write_vectors",
-            elapsed_ms = elapsed_ms(write_start),
+            elapsed_ms = elapsed_ms(batch_start),
             inserts,
             updates,
+            deletes,
             "completed"
         );
-        stats.inserts = inserts;
-        stats.updates = updates;
+        stats.inserts += inserts;
+        stats.updates += updates;
+        stats.deletes += deletes;
 
         let depth = TreeDepth::of(self.state.centroids_meta().depth);
         let mut next_level = TreeLevel::leaf(depth);

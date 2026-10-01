@@ -16,8 +16,8 @@ use crate::error::{Error, Result};
 /// Key format version.
 pub const KEY_VERSION: u8 = 0x01;
 
-/// Subsystem-specific key prefix for KeyValue.
-pub const SUBSYSTEM: u8 = 0x04;
+/// Subsystem byte for KeyValue storage (see [`common::serde::subsystem`]).
+pub const SUBSYSTEM: u8 = common::serde::subsystem::KEYVALUE;
 
 /// Record tag: type 0x1 in high 4 bits, reserved 0x0 in low 4 bits.
 pub const RECORD_TAG: u8 = 0x10;

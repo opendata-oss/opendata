@@ -1,5 +1,6 @@
 use crate::math::kmeans::Clustering;
 use crate::math::{distance, heuristics, kmeans};
+use crate::metric_names::INDEXER_ANN_SPLITS_TOTAL;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::vector_id::VectorId;
 use crate::write::indexer::drivers::AsyncBatchDriver;
@@ -386,6 +387,7 @@ impl SplitCentroids {
                             p.id(),
                             vec![c_id],
                             index_data.indexed_fields.clone(),
+                            index_data.fts_fields.clone(),
                         );
                     } else {
                         // if this is a non-leaf level, then the posting vectors are centroids,
@@ -416,6 +418,12 @@ impl SplitCentroids {
                 new_centroids,
             })
         }
+
+        metrics::counter!(
+            INDEXER_ANN_SPLITS_TOTAL,
+            "level" => self.level.level().to_string(),
+        )
+        .increment(splits.len() as u64);
 
         // return reassign set
         let reassignments: Vec<_> = reassignments.values().cloned().collect();
@@ -473,9 +481,9 @@ impl SplitCentroid {
             let d1 = distance::compute_distance(vector, &c1_vector, self.distance_metric);
 
             if d0 <= d1 {
-                c0_postings.push(Posting::new(*id, vector.clone()));
+                c0_postings.push(Posting::from_vec(*id, vector.clone()));
             } else {
-                c1_postings.push(Posting::new(*id, vector.clone()));
+                c1_postings.push(Posting::from_vec(*id, vector.clone()));
             }
         }
 
@@ -632,6 +640,7 @@ mod tests {
             split_threshold_vectors: SPLIT_THRESHOLD,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         })
     }
 
@@ -745,7 +754,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
         assert_eq!(result.splits.len(), 1);
@@ -769,7 +778,8 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let root_ids: HashSet<_> = root.iter().map(|p| p.id()).collect();
         assert!(root_ids.contains(&CENTROID_B));
         let mut all_posted_ids = HashSet::new();
@@ -786,6 +796,7 @@ mod tests {
                     .get_posting_list(*new_centroid_id, DIMS)
                     .await
                     .unwrap(),
+                false,
             );
             assert_eq!(posting.len(), 3);
             assert_eq!(
@@ -828,7 +839,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
         assert_eq!(result.splits.len(), 1);
@@ -842,7 +853,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         assert_eq!(root.len(), 2);
         let mut total = 0;
         for p in root.iter() {
@@ -892,6 +904,7 @@ mod tests {
             split_threshold_vectors: SPLIT_THRESHOLD,
             split_search_neighbourhood: 1,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         });
         let id_b1 = h.storage.lookup_internal_id("b1").await.unwrap().unwrap();
         let depth = TreeDepth::of(h.state.centroids_meta().depth);
@@ -899,7 +912,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
 
@@ -926,7 +939,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,
@@ -942,8 +955,10 @@ mod tests {
 
         // then
         assert!(h.storage.get_centroid_info(target).await.unwrap().is_none());
-        let parent_posting =
-            PostingList::from_value(h.storage.get_posting_list(parent, DIMS).await.unwrap());
+        let parent_posting = PostingList::from_value(
+            h.storage.get_posting_list(parent, DIMS).await.unwrap(),
+            false,
+        );
         let parent_ids: HashSet<_> = parent_posting.iter().map(|p| p.id()).collect();
         assert_eq!(parent_ids.len(), 2);
         let split_summary = &result.splits[0];
@@ -979,7 +994,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,
@@ -994,8 +1009,10 @@ mod tests {
         assert!(result.splits.is_empty());
         assert_eq!(result.imbalanced, vec![(target, 5)]);
         assert!(result.reassignments.is_empty());
-        let parent_posting =
-            PostingList::from_value(h.storage.get_posting_list(parent, DIMS).await.unwrap());
+        let parent_posting = PostingList::from_value(
+            h.storage.get_posting_list(parent, DIMS).await.unwrap(),
+            false,
+        );
         let parent_ids: HashSet<_> = parent_posting.iter().map(|p| p.id()).collect();
         assert_eq!(parent_ids, HashSet::from([target]));
         assert!(h.storage.get_centroid_info(target).await.unwrap().is_some());
@@ -1033,7 +1050,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new(&opts, level, &snapshot, 1);
         let result = split.execute(&h.state, &mut delta).await.unwrap();
         assert_eq!(result.splits.len(), 1);
@@ -1055,8 +1072,10 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let posting_b =
-            PostingList::from_value(h.storage.get_posting_list(CENTROID_B, DIMS).await.unwrap());
+        let posting_b = PostingList::from_value(
+            h.storage.get_posting_list(CENTROID_B, DIMS).await.unwrap(),
+            false,
+        );
         assert_eq!(posting_b.len(), 2);
     }
 
@@ -1072,6 +1091,7 @@ mod tests {
             split_threshold_vectors: 3,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         });
         let level = TreeLevel::inner(2, TreeDepth::of(4));
         let p0 = L2_CENTROID_A;
@@ -1083,7 +1103,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,
@@ -1104,7 +1124,8 @@ mod tests {
         assert!(h.storage.get_centroid_info(b).await.unwrap().is_some());
         assert!(h.storage.get_centroid_info(c).await.unwrap().is_some());
         assert!(h.storage.get_centroid_info(d).await.unwrap().is_some());
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let root_ids: HashSet<_> = root.iter().map(|p| p.id()).collect();
         assert_eq!(root_ids.len(), 3);
         assert!(root_ids.contains(&p1));
@@ -1148,7 +1169,7 @@ mod tests {
 
         // when
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         let split = SplitCentroids::new_with_max_splits_and_clustering(
             &opts,
             level,
@@ -1187,10 +1208,10 @@ mod tests {
         let depth = TreeDepth::of(h.state.centroids_meta().depth);
         let level = TreeLevel::leaf(depth);
         let mut posting = PostingList::with_capacity(4);
-        posting.push(Posting::new(data_id(1), vec![0.9, 0.1]));
-        posting.push(Posting::new(data_id(2), vec![0.8, 0.2]));
-        posting.push(Posting::new(data_id(3), vec![0.1, 0.9]));
-        posting.push(Posting::new(data_id(4), vec![0.2, 0.8]));
+        posting.push(Posting::from_vec(data_id(1), vec![0.9, 0.1]));
+        posting.push(Posting::from_vec(data_id(2), vec![0.8, 0.2]));
+        posting.push(Posting::from_vec(data_id(3), vec![0.1, 0.9]));
+        posting.push(Posting::from_vec(data_id(4), vec![0.2, 0.8]));
         let postings = HashMap::from([(CENTROID_ID, Arc::new(posting))]);
 
         let split = SplitCentroid {
@@ -1240,8 +1261,8 @@ mod tests {
         let c0_vector = vec![1.0, 0.0];
         let c1_vector = vec![0.0, 1.0];
         let mut postings = PostingList::with_capacity(2);
-        postings.push(Posting::new(data_id(10), vec![0.1, 0.1]));
-        postings.push(Posting::new(data_id(11), vec![0.9, 0.1]));
+        postings.push(Posting::from_vec(data_id(10), vec![0.1, 0.1]));
+        postings.push(Posting::from_vec(data_id(11), vec![0.9, 0.1]));
 
         let split = SplitCentroid {
             c: CENTROID_ID,
@@ -1284,8 +1305,8 @@ mod tests {
         let c1_vector = vec![0.0, 1.0];
         let neighbour_id = VectorId::centroid_id(1, 99);
         let mut neighbour_postings = PostingList::with_capacity(2);
-        neighbour_postings.push(Posting::new(data_id(20), vec![0.9, 0.1]));
-        neighbour_postings.push(Posting::new(data_id(21), vec![0.5, 0.5]));
+        neighbour_postings.push(Posting::from_vec(data_id(20), vec![0.9, 0.1]));
+        neighbour_postings.push(Posting::from_vec(data_id(21), vec![0.5, 0.5]));
         let postings = HashMap::from([(neighbour_id, Arc::new(neighbour_postings))]);
 
         let split = SplitCentroid {

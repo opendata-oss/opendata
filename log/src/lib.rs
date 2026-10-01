@@ -46,28 +46,41 @@
 //! # }
 //! ```
 
+mod compaction;
 mod config;
 mod error;
+mod filter_prefix;
+mod filter_sequence;
 mod listing;
 mod log;
 mod model;
 mod range;
 mod reader;
 mod segment;
+mod segment_extractor;
 mod serde;
 #[cfg(feature = "http-server")]
 pub mod server;
 mod storage;
+mod tree;
 mod view_tracker;
 mod writer;
 
-pub use config::{Config, CountOptions, ReadVisibility, ReaderConfig, ScanOptions, SegmentConfig};
+pub use config::{
+    Config, LogCompactionOptions, ReadVisibility, ReaderConfig, RetentionConfig, ScanOptions,
+    SegmentConfig,
+};
 pub use error::{AppendError, AppendResult, Error, Result};
 pub use listing::{LogKey, LogKeyIterator};
 pub use log::{LogDb, LogDbBuilder};
 pub use model::{AppendOutput, LogEntry, Record, Segment, SegmentId, Sequence};
 
-pub use reader::{LogDbReader, LogIterator, LogRead};
+pub use common::{L0Stats, SortedRunStats};
+pub use reader::{
+    Inspection, LogDbReader, LogIterator, LogRead, SegmentInspection, SegmentReadStats,
+};
+pub use slatedb::SstBlockSize;
+pub use tree::{LevelSummary, SegmentTree, TreeSummary};
 
 // Re-export proto types for use by clients
 #[cfg(feature = "http-server")]

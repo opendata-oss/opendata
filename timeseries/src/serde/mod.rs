@@ -1,14 +1,13 @@
-pub mod bucket_list;
 pub mod dictionary;
 pub mod forward_index;
 pub mod inverted_index;
 pub mod key;
 pub mod timeseries;
 
-use crate::model::{BucketSize, RecordTag, TimeBucket};
+use crate::model::{BucketSize, BucketStart, TimeBucket};
 use bytes::{BufMut, BytesMut};
 use common::BytesRange;
-use common::serde::key_prefix::KeyPrefix;
+use common::serde::key_prefix::{KEY_PREFIX_LEN, KeyPrefix};
 
 // Re-export encoding utilities from common
 pub use common::serde::encoding::{
@@ -93,20 +92,23 @@ pub fn decode_fixed_element_array<T: Decode>(
     Ok(items)
 }
 
-/// Key format version (currently 0x01)
-pub const KEY_VERSION: u8 = 0x01;
+/// Key format version (currently 0x02).
+pub const KEY_VERSION: u8 = 0x02;
 
-/// Subsystem-specific key prefix for timeseries storage.
-pub const SUBSYSTEM: u8 = 0x01;
+/// Subsystem byte for timeseries storage (see [`common::serde::subsystem`]).
+pub const SUBSYSTEM: u8 = common::serde::subsystem::TIMESERIES;
+
+/// Length of the bucket-scoped header: `[subsystem(1), version(1),
+/// time_bucket(4 BE), bucket_size(1), record_type(1)]`.
+pub const PREFIX_AND_RECORD_TYPE_LEN: usize = KEY_PREFIX_LEN + 4 + 1 + 1;
 
 /// Record type enumeration for timeseries storage.
 ///
-/// Record types are encoded in the high 4 bits of the record tag byte,
-/// following RFC 0001: Record Key Prefix. The low 4 bits are used for
-/// bucket size in bucket-scoped records.
+/// Encoded as a single byte at position 7 of every bucket-scoped key.
+/// `0x01` is reserved (formerly `BucketList`, now superseded by SlateDB
+/// segments).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
-    BucketList = 0x01,
     SeriesDictionary = 0x02,
     ForwardIndex = 0x03,
     InvertedIndex = 0x04,
@@ -114,7 +116,7 @@ pub enum RecordType {
 }
 
 impl RecordType {
-    /// Returns the record type ID (1-15).
+    /// Returns the record type ID.
     pub fn id(&self) -> u8 {
         *self as u8
     }
@@ -122,7 +124,6 @@ impl RecordType {
     /// Converts a record type ID back to a RecordType.
     pub fn from_id(id: u8) -> Result<Self, EncodingError> {
         match id {
-            0x01 => Ok(RecordType::BucketList),
             0x02 => Ok(RecordType::SeriesDictionary),
             0x03 => Ok(RecordType::ForwardIndex),
             0x04 => Ok(RecordType::InvertedIndex),
@@ -132,51 +133,50 @@ impl RecordType {
             }),
         }
     }
-
-    pub fn from_prefix(prefix: KeyPrefix) -> Result<Self, EncodingError> {
-        if prefix.subsystem() != SUBSYSTEM {
-            return Err(EncodingError {
-                message: format!(
-                    "invalid subsystem: expected 0x{:02x}, got 0x{:02x}",
-                    SUBSYSTEM,
-                    prefix.subsystem()
-                ),
-            });
-        }
-        RecordType::from_id((prefix.tag() & 0xF0) >> 4)
-    }
-
-    /// Creates a global-scoped RecordTag (reserved bits = 0).
-    pub fn tag(&self) -> RecordTag {
-        RecordTag::new(self.id(), 0)
-    }
-
-    /// Creates a bucket-scoped RecordTag with the given bucket size.
-    pub fn tag_with_bucket_size(&self, bucket_size: BucketSize) -> RecordTag {
-        RecordTag::new(self.id(), bucket_size)
-    }
-
-    /// Creates a global-scoped KeyPrefix with the current version.
-    pub fn prefix(&self) -> KeyPrefix {
-        KeyPrefix::new(SUBSYSTEM, KEY_VERSION, self.tag().as_byte())
-    }
-
-    /// Creates a bucket-scoped KeyPrefix with the current version.
-    pub fn prefix_with_bucket_size(&self, bucket_size: BucketSize) -> KeyPrefix {
-        KeyPrefix::new(
-            SUBSYSTEM,
-            KEY_VERSION,
-            self.tag_with_bucket_size(bucket_size).as_byte(),
-        )
-    }
 }
 
-/// Extracts the bucket size from a key prefix.
+/// Writes the 8-byte bucket-scoped header `[subsystem, version,
+/// time_bucket(4 BE), bucket_size, record_type]` to `buf`.
 ///
-/// Returns None if the reserved bits are 0 (global-scoped record).
-pub fn bucket_size_from_prefix(prefix: KeyPrefix) -> Option<BucketSize> {
-    let size = prefix.tag() & 0x0F;
-    if size == 0 { None } else { Some(size) }
+/// `bucket.size == 0` is reserved and panics.
+pub fn write_record_prefix(buf: &mut BytesMut, bucket: &TimeBucket, record_type: RecordType) {
+    assert!(bucket.size != 0, "bucket_size 0 is reserved");
+    KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(buf);
+    buf.put_u32(bucket.start);
+    buf.put_u8(bucket.size);
+    buf.put_u8(record_type.id());
+}
+
+/// Reads the bucket-scoped header from `buf`, validating subsystem, version,
+/// `bucket_size`, and the record type ID. Returns the parsed `TimeBucket` and
+/// `RecordType`.
+pub fn parse_time_bucket_and_record_type(
+    buf: &[u8],
+) -> Result<(TimeBucket, RecordType), EncodingError> {
+    KeyPrefix::from_bytes_with_validation(buf, SUBSYSTEM, KEY_VERSION)?;
+    if buf.len() < PREFIX_AND_RECORD_TYPE_LEN {
+        return Err(EncodingError {
+            message: format!(
+                "Buffer too short for bucket-scoped header: need {} bytes, got {}",
+                PREFIX_AND_RECORD_TYPE_LEN,
+                buf.len()
+            ),
+        });
+    }
+    let start = BucketStart::from_be_bytes([
+        buf[KEY_PREFIX_LEN],
+        buf[KEY_PREFIX_LEN + 1],
+        buf[KEY_PREFIX_LEN + 2],
+        buf[KEY_PREFIX_LEN + 3],
+    ]);
+    let size: BucketSize = buf[KEY_PREFIX_LEN + 4];
+    if size == 0 {
+        return Err(EncodingError {
+            message: "bucket_size 0 is reserved".to_string(),
+        });
+    }
+    let record_type = RecordType::from_id(buf[KEY_PREFIX_LEN + 5])?;
+    Ok((TimeBucket { start, size }, record_type))
 }
 
 /// Trait for record keys that have a record type
@@ -190,12 +190,11 @@ pub trait TimeBucketScoped: RecordKey {
     /// Returns the time bucket for this record
     fn bucket(&self) -> TimeBucket;
 
-    /// Decodes and validates the bucket-scoped prefix of a key.
-    /// Returns the TimeBucket if the record type matches the expected type.
+    /// Decodes and validates the bucket-scoped header of a key.
+    /// Returns the `TimeBucket` when the encoded record type matches
+    /// `Self::RECORD_TYPE`.
     fn decode_bucket_prefix(bytes: &[u8]) -> Result<TimeBucket, EncodingError> {
-        let prefix = KeyPrefix::from_bytes_with_validation(bytes, SUBSYSTEM, KEY_VERSION)?;
-        let record_type = RecordType::from_prefix(prefix)?;
-
+        let (bucket, record_type) = parse_time_bucket_and_record_type(bytes)?;
         if record_type != Self::RECORD_TYPE {
             return Err(EncodingError {
                 message: format!(
@@ -205,93 +204,69 @@ pub trait TimeBucketScoped: RecordKey {
                 ),
             });
         }
-
-        let bucket_size = bucket_size_from_prefix(prefix).ok_or_else(|| EncodingError {
-            message: "record should be bucket-scoped".to_string(),
-        })?;
-
-        if bytes.len() < 7 {
-            return Err(EncodingError {
-                message: "buffer too short for bucket prefix".to_string(),
-            });
-        }
-
-        let start_epoch_min = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
-
-        Ok(TimeBucket {
-            start: start_epoch_min,
-            size: bucket_size,
-        })
+        Ok(bucket)
     }
 
     /// Create a BytesRange that covers all records of this type
     /// for the given time bucket.
     fn bucket_range(bucket: &TimeBucket) -> BytesRange {
         let mut buf = BytesMut::new();
-        Self::RECORD_TYPE
-            .prefix_with_bucket_size(bucket.size)
-            .write_to(&mut buf);
-        buf.put_u32(bucket.start);
+        write_record_prefix(&mut buf, bucket, Self::RECORD_TYPE);
         BytesRange::prefix(buf.freeze())
     }
-}
-
-/// Helper function to write the bucket-scoped prefix to a buffer
-pub fn write_bucket_scoped_prefix<T: TimeBucketScoped>(buf: &mut BytesMut, record: &T) {
-    let bucket = record.bucket();
-    T::RECORD_TYPE
-        .prefix_with_bucket_size(bucket.size)
-        .write_to(buf);
-    buf.put_u32(bucket.start);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Extracts the RecordType from a RecordTag.
-    fn record_type_from_tag(tag: RecordTag) -> Result<RecordType, EncodingError> {
-        RecordType::from_id(tag.record_type())
-    }
+    #[test]
+    fn should_round_trip_bucket_scoped_header() {
+        // given
+        let bucket = TimeBucket {
+            start: 12345,
+            size: 1,
+        };
+        let mut buf = BytesMut::new();
 
-    fn bucket_size_from_tag(tag: RecordTag) -> Option<BucketSize> {
-        let size = tag.reserved();
-        if size == 0 { None } else { Some(size) }
+        // when
+        write_record_prefix(&mut buf, &bucket, RecordType::TimeSeries);
+        let (decoded_bucket, decoded_type) = parse_time_bucket_and_record_type(&buf).unwrap();
+
+        // then
+        assert_eq!(buf.len(), PREFIX_AND_RECORD_TYPE_LEN);
+        assert_eq!(decoded_bucket, bucket);
+        assert_eq!(decoded_type, RecordType::TimeSeries);
     }
 
     #[test]
-    fn should_encode_and_decode_record_tag_global_scoped() {
-        // given
-        let record_tag = RecordType::BucketList.tag();
-
-        // when
-        let encoded = record_tag.as_byte();
-        let decoded = RecordTag::from_byte(encoded).unwrap();
-
-        // then
-        assert_eq!(decoded.as_byte(), record_tag.as_byte());
-        assert_eq!(
-            record_type_from_tag(decoded).unwrap(),
-            RecordType::BucketList
+    #[should_panic(expected = "bucket_size 0 is reserved")]
+    fn should_panic_when_writing_zero_bucket_size() {
+        let mut buf = BytesMut::new();
+        write_record_prefix(
+            &mut buf,
+            &TimeBucket { start: 0, size: 0 },
+            RecordType::TimeSeries,
         );
-        assert_eq!(bucket_size_from_tag(decoded), None);
     }
 
     #[test]
-    fn should_encode_and_decode_record_tag_bucket_scoped() {
-        // given
-        let record_tag = RecordType::TimeSeries.tag_with_bucket_size(3);
+    fn parse_time_bucket_and_record_type_rejects_zero_bucket_size() {
+        let mut buf = BytesMut::new();
+        KeyPrefix::new(SUBSYSTEM, KEY_VERSION).write_to(&mut buf);
+        buf.put_u32(0);
+        buf.put_u8(0);
+        buf.put_u8(RecordType::TimeSeries.id());
 
-        // when
-        let encoded = record_tag.as_byte();
-        let decoded = RecordTag::from_byte(encoded).unwrap();
+        let err = parse_time_bucket_and_record_type(&buf).unwrap_err();
 
-        // then
-        assert_eq!(decoded.as_byte(), record_tag.as_byte());
-        assert_eq!(
-            record_type_from_tag(decoded).unwrap(),
-            RecordType::TimeSeries
-        );
-        assert_eq!(bucket_size_from_tag(decoded), Some(3));
+        assert!(err.message.contains("bucket_size 0 is reserved"));
+    }
+
+    #[test]
+    fn parse_time_bucket_and_record_type_rejects_short_buffer() {
+        let buf = [SUBSYSTEM, KEY_VERSION, 0, 0, 0, 0, 1];
+        let err = parse_time_bucket_and_record_type(&buf).unwrap_err();
+        assert!(err.message.contains("Buffer too short"));
     }
 }

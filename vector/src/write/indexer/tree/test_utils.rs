@@ -6,7 +6,7 @@ use crate::serde::key::{CentroidSeqBlockKey, SeqBlockKey};
 use crate::serde::vector_data::Field;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::delta::VectorWrite;
+use crate::write::delta::{VectorDbOp, VectorWrite};
 use crate::write::indexer::tree::centroids::AllCentroidsCacheWriter;
 use crate::write::indexer::tree::posting_list::PostingList;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState};
@@ -162,7 +162,7 @@ impl IndexerOpTestHarnessBuilder {
             centroid_cache,
         );
 
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
 
         let mut centroid_ids: Vec<_> = self.vectors.keys().copied().collect();
         centroid_ids.sort();
@@ -204,6 +204,7 @@ impl IndexerOpTestHarnessBuilder {
                                     Field::string(field_spec.name.clone(), field_value.clone())
                                 })
                                 .collect(),
+                            Vec::new(),
                         );
                         delta.search_index.add_to_posting(
                             *centroid_id,
@@ -302,10 +303,21 @@ impl IndexerOpTestHarness {
             assert_attributes_conform_to_schema(&self.vector_schema, &write.attributes);
         }
         let snapshot = self.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&self.state);
-        let wv = WriteVectors::new(opts, &snapshot, SNAPSHOT_EPOCH, writes);
+        let mut delta = VectorIndexDelta::new(&self.state, false);
+        let ops = vec![VectorDbOp::Write(writes)];
+        let wv = WriteVectors::new(opts, &snapshot, SNAPSHOT_EPOCH, ops);
         wv.execute(&self.state, &mut delta).await.unwrap();
         self.apply_delta(delta).await;
+    }
+
+    pub async fn delete_and_apply(&mut self, opts: &Arc<IndexerOpts>, ids: Vec<String>) -> usize {
+        let snapshot = self.snapshot().await;
+        let mut delta = VectorIndexDelta::new(&self.state, false);
+        let ops = vec![VectorDbOp::Delete(ids)];
+        let wv = WriteVectors::new(opts, &snapshot, SNAPSHOT_EPOCH, ops);
+        let (_inserts, _updates, deletes) = wv.execute(&self.state, &mut delta).await.unwrap();
+        self.apply_delta(delta).await;
+        deletes
     }
 
     pub async fn validate(&self) {

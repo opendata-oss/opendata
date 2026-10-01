@@ -5,16 +5,23 @@ use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
 use crate::serde::collection_meta::DistanceMetric;
+use crate::serde::deletions::DeletionsValue;
+use crate::serde::field_stats::FieldStatsValue;
 use crate::serde::key::{
-    CentroidInfoKey, CentroidStatsKey, CentroidsKey, PostingListKey, VectorDataKey,
+    CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey, DeletionsSentinelKey,
+    FieldStatsKey, PostingListKey, TermPostingsKey, TermStatsKey, VectorDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::term_postings::{PostingEntry, TermPostingsEncoder};
+use crate::serde::term_stats::TermStatsValue;
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_data::{Field, VectorDataValue};
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::serde::vector_index_data::VectorIndexDataValue;
 use crate::storage::record::put_vector_index_data;
 use crate::storage::{VectorDbStorageReadExt, record};
+use crate::write::delta::TextAttributeSummary;
 use crate::write::indexer::tree::centroids::{
     AllCentroidsCache, AllCentroidsCacheWriter, CachedCentroidReader, CentroidCache,
     CentroidReader, LeveledCentroidIndex, MaybeCached, StoredCentroidReader, TreeDepth, TreeLevel,
@@ -101,6 +108,7 @@ impl VectorIndexState {
 #[derive(Debug)]
 pub(crate) struct ForwardIndexDelta {
     dictionary_updates: HashMap<String, VectorId>,
+    dictionary_deletes: HashSet<String>,
     vector_updates: HashMap<VectorId, VectorDataValue>,
     vector_index_updates: HashMap<VectorId, VectorIndexDataValue>,
     vector_deletes: HashSet<VectorId>,
@@ -112,6 +120,7 @@ impl ForwardIndexDelta {
     pub(crate) fn new(initial_state: &VectorIndexState) -> Self {
         Self {
             dictionary_updates: HashMap::new(),
+            dictionary_deletes: HashSet::new(),
             vector_updates: HashMap::new(),
             vector_index_updates: HashMap::new(),
             vector_deletes: HashSet::new(),
@@ -139,6 +148,7 @@ impl ForwardIndexDelta {
             .collect();
         let value = VectorDataValue::new(external_id, fields);
         self.vector_updates.insert(vector_id, value);
+        self.dictionary_deletes.remove(external_id);
         self.dictionary_updates
             .insert(String::from(external_id), vector_id);
         vector_id
@@ -149,11 +159,12 @@ impl ForwardIndexDelta {
         vector_id: VectorId,
         postings: Vec<VectorId>,
         indexed_fields: Vec<Field>,
+        fts_fields: Vec<String>,
     ) {
         assert!(vector_id.is_data_vector());
         self.vector_index_updates.insert(
             vector_id,
-            VectorIndexDataValue::new(postings, indexed_fields),
+            VectorIndexDataValue::new(postings, indexed_fields, fts_fields),
         );
     }
 
@@ -162,9 +173,22 @@ impl ForwardIndexDelta {
         self.vector_index_updates.remove(&vector_id);
     }
 
+    pub(crate) fn delete_external_id_and_vector(
+        &mut self,
+        external_id: String,
+        vector_id: VectorId,
+    ) {
+        if let Some(pending_id) = self.dictionary_updates.remove(&external_id) {
+            self.vector_updates.remove(&pending_id);
+        }
+        self.dictionary_deletes.insert(external_id);
+        self.delete_vector(vector_id);
+    }
+
     pub(crate) fn freeze(self, state: &mut VectorIndexState, output_ops: &mut Vec<RecordOp>) {
         let ForwardIndexDelta {
             dictionary_updates,
+            dictionary_deletes,
             vector_updates,
             vector_index_updates,
             vector_deletes,
@@ -173,6 +197,9 @@ impl ForwardIndexDelta {
         } = self;
 
         // === Apply mutations to state ===
+        for external_id in &dictionary_deletes {
+            state.dictionary.remove(external_id);
+        }
         for (external_id, &internal_id) in &dictionary_updates {
             state.dictionary.insert(external_id.clone(), internal_id);
         }
@@ -182,6 +209,11 @@ impl ForwardIndexDelta {
 
         // === Construct record ops ===
         output_ops.extend(ops);
+
+        // Dictionary deletes (tombstones).
+        for external_id in &dictionary_deletes {
+            output_ops.push(record::delete_id_dictionary(external_id));
+        }
 
         // Dictionary puts
         for (external_id, &internal_id) in &dictionary_updates {
@@ -254,7 +286,7 @@ impl SearchIndexDelta {
         for new_c_vec in new_root_centroids {
             let (new_c_id, new_c) = self.add_centroid(new_level, new_c_vec, ROOT_VECTOR_ID);
             info!("writing new root centroid {}/{}", new_level, new_c_id);
-            new_root_postings.push(Posting::new(new_c_id, new_c.vector))
+            new_root_postings.push(Posting::from_vec(new_c_id, new_c.vector))
         }
         for p in &new_root_postings {
             assert_eq!(p.id().level(), depth.max_inner_level())
@@ -275,10 +307,8 @@ impl SearchIndexDelta {
         let depth = TreeDepth::of(self.centroids_meta.depth);
         assert_eq!(depth.max_inner_level(), centroid_id.level());
         assert!(centroid_id.is_centroid());
-        self.root_updates.push(PostingUpdate::Append {
-            id: centroid_id,
-            vector: Arc::new(vector),
-        });
+        self.root_updates
+            .push(PostingUpdate::append(centroid_id, vector));
         self.root_centroid_count += 1;
     }
 
@@ -569,17 +599,186 @@ impl SearchIndexDelta {
     }
 }
 
+/// Mutations to the full-text search index for a single batch (RFC-0006).
+///
+/// Accumulates per-(field, term) postings, per-term document-frequency
+/// deltas, and per-field corpus-stat deltas as the Indexer processes inserts.
+/// On freeze it emits merge operands so SlateDB concatenates new postings
+/// blocks in front of any existing ones and sums stat deltas.
+#[derive(Debug, Default)]
+pub(crate) struct FtsIndexDelta {
+    /// (field, term) -> postings appended in this batch.
+    term_postings: HashMap<(String, String), Vec<PostingEntry>>,
+    /// (field, term) -> signed delta to the term's document frequency.
+    term_doc_freq_delta: HashMap<(String, String), i64>,
+    /// field -> signed `(count, total_length, deletes)` corpus-stat delta. The
+    /// indexer only increments: inserts add `count +1` / `total_length +len`,
+    /// deletes (and the old side of an upsert) add `deletes +1`. The compaction
+    /// filter decrements all three when it applies the delete at the last sorted
+    /// run (RFC-0006).
+    field_stats_delta: HashMap<String, (i64, i64, i64)>,
+    /// Internal vector ids deleted or replaced in this batch. On freeze these
+    /// are merged into the singleton `Deletions` bitmap so the BM25 query path
+    /// can hide them without retracting postings/term-stats.
+    deleted_vector_ids: VectorBitmap,
+    /// Whether the collection declares any `FieldType::Text` field. Supplied at
+    /// construction from `IndexerOpts.text_fields`. When false, [`freeze`] emits
+    /// nothing: a collection with no text fields has no postings to hide, so
+    /// writing the deletions bitmap (the only record a non-FTS batch would
+    /// produce) is pure storage overhead.
+    ///
+    /// [`freeze`]: FtsIndexDelta::freeze
+    has_text_fields: bool,
+}
+
+impl FtsIndexDelta {
+    fn new(has_text_fields: bool) -> Self {
+        Self {
+            has_text_fields,
+            ..Default::default()
+        }
+    }
+
+    /// Append every `(field, term)` posting from a single document.
+    ///
+    /// Each `term` contributes one posting entry with the document's term
+    /// frequency in the field and a 1-byte length norm (length clamped to
+    /// `u8::MAX`; finer quantisation is deferred to a later milestone).
+    /// `term_doc_freq_delta` increments once per `(field, term)` even if the
+    /// term appears multiple times within the same document. Per-field
+    /// corpus stats receive `+1` to the document count and `+length` to the
+    /// total length once per field.
+    pub(crate) fn add_text_summaries(
+        &mut self,
+        vector_id: VectorId,
+        summaries: &HashMap<String, TextAttributeSummary>,
+    ) {
+        for (field, summary) in summaries {
+            let length = crate::math::norm::clamp_length(summary.length);
+            let norm = crate::math::norm::encode_length(length);
+            for (term, &freq) in &summary.terms {
+                let freq_u32 = freq.min(u32::MAX as usize) as u32;
+                let key = (field.clone(), term.clone());
+                self.term_postings
+                    .entry(key.clone())
+                    .or_default()
+                    .push(PostingEntry {
+                        id: vector_id,
+                        freq: freq_u32,
+                        norm,
+                    });
+                *self.term_doc_freq_delta.entry(key).or_default() += 1;
+            }
+            let entry = self.field_stats_delta.entry(field.clone()).or_default();
+            entry.0 += 1; // count
+            entry.1 += summary.length as i64; // total_length
+        }
+    }
+
+    /// Record an internal vector id as deleted or replaced. On freeze the
+    /// accumulated set is merged into the singleton `Deletions` bitmap.
+    pub(crate) fn add_deleted_vector_id(&mut self, vector_id: VectorId) {
+        self.deleted_vector_ids.insert(vector_id.id());
+    }
+
+    /// Record a `deletes +1` per-field `FieldStats` delta for a deleted (or
+    /// replaced) vector, given the set of FTS fields it populated (read from its
+    /// [`VectorIndexData`](crate::serde::vector_index_data::VectorIndexDataValue)).
+    ///
+    /// The indexer only ever *increments* `FieldStats` (count/total_length on
+    /// insert, deletes on delete); the compaction filter decrements all three
+    /// when it applies the delete at the last sorted run. So `count` here is
+    /// untouched — it tracks total documents written to the field and is
+    /// retired by the filter once the delete is compacted away (RFC-0006).
+    pub(crate) fn record_field_deletes(&mut self, fts_fields: &[String]) {
+        for field in fts_fields {
+            let entry = self.field_stats_delta.entry(field.clone()).or_default();
+            entry.2 += 1; // deletes
+        }
+    }
+
+    fn freeze(self, output_ops: &mut Vec<RecordOp>) {
+        // No text fields means no postings to hide on the query path, so there
+        // is nothing worth recording — not even the deletions bitmap. Skip all
+        // FTS emission to avoid imposing storage overhead on non-FTS users.
+        if !self.has_text_fields {
+            return;
+        }
+
+        let FtsIndexDelta {
+            term_postings,
+            term_doc_freq_delta,
+            field_stats_delta,
+            deleted_vector_ids,
+            has_text_fields: _,
+        } = self;
+
+        // Always emit the deletions sentinel (a tiny dummy Put), even with no
+        // deletes. It sorts before every other FTS key, so a last-run compaction
+        // always observes it first — co-located with the data being compacted —
+        // anchoring the filter's phase machine and proving the compaction was not
+        // resumed mid-stream. The deletions bitmap itself stays conditional below,
+        // keeping ingest cheap (RFC-0006).
+        output_ops.push(RecordOp::Put(
+            Record::new(
+                DeletionsSentinelKey::new().encode(),
+                Bytes::from_static(&[0u8]),
+            )
+            .into(),
+        ));
+
+        for ((field, term), entries) in term_postings {
+            let value = TermPostingsEncoder::from_postings(entries);
+            let key = TermPostingsKey::new(&field, &term).encode();
+            output_ops.push(RecordOp::Merge(
+                Record::new(key, value.encode_to_bytes()).into(),
+            ));
+        }
+
+        for ((field, term), delta) in term_doc_freq_delta {
+            if delta == 0 {
+                continue;
+            }
+            let key = TermStatsKey::new(&field, &term).encode();
+            let value = TermStatsValue::new(delta).encode_to_bytes();
+            output_ops.push(RecordOp::Merge(Record::new(key, value).into()));
+        }
+
+        for (field, (count, total_length, deletes)) in field_stats_delta {
+            if count == 0 && total_length == 0 && deletes == 0 {
+                continue;
+            }
+            let key = FieldStatsKey::new(&field).encode();
+            let value = FieldStatsValue::new(count, total_length, deletes).encode_to_bytes();
+            output_ops.push(RecordOp::Merge(Record::new(key, value).into()));
+        }
+
+        if !deleted_vector_ids.is_empty() {
+            let key = DeletionsKey::new().encode();
+            let value = DeletionsValue::new(deleted_vector_ids)
+                .encode_to_bytes()
+                .expect("Failed to serialize DeletionsValue");
+            output_ops.push(RecordOp::Merge(Record::new(key, value).into()));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct VectorIndexDelta {
     pub(crate) forward_index: ForwardIndexDelta,
     pub(crate) search_index: SearchIndexDelta,
+    pub(crate) fts_index: FtsIndexDelta,
 }
 
 impl VectorIndexDelta {
-    pub(crate) fn new(state: &VectorIndexState) -> Self {
+    /// `has_text_fields` records whether the collection declares any
+    /// `FieldType::Text` field; when false the FTS sub-delta freezes to a no-op
+    /// (see [`FtsIndexDelta::freeze`]).
+    pub(crate) fn new(state: &VectorIndexState, has_text_fields: bool) -> Self {
         Self {
             forward_index: ForwardIndexDelta::new(state),
             search_index: SearchIndexDelta::new(state),
+            fts_index: FtsIndexDelta::new(has_text_fields),
         }
     }
 
@@ -587,6 +786,7 @@ impl VectorIndexDelta {
         let mut ops = vec![];
         self.forward_index.freeze(state, &mut ops);
         self.search_index.freeze(epoch, state, &mut ops);
+        self.fts_index.freeze(&mut ops);
         ops
     }
 }
@@ -601,7 +801,7 @@ impl<'a> DirtyCentroidReader<'a> {
         posting_list: &PostingList,
         updates: &[PostingUpdate],
     ) -> Arc<PostingList> {
-        Arc::new(posting_list.update_in_place(updates.to_vec()))
+        Arc::new(posting_list.clone_with_updates(updates.to_vec(), false))
     }
 }
 
@@ -611,7 +811,7 @@ impl<'a> CentroidReader for DirtyCentroidReader<'a> {
             let mut root = root.clone();
             root.extend(self.delta.root_updates.iter().cloned());
             let root = PostingListValue::from_posting_updates(root).expect("unreachable");
-            MaybeCached::Value(Arc::new(PostingList::from_value(root)))
+            MaybeCached::Value(Arc::new(PostingList::from_value(root, false)))
         } else {
             let stored = self.reader.clone();
             let updates = self.delta.root_updates.clone();
@@ -675,6 +875,14 @@ impl<'a> VectorIndexView<'a> {
     pub(crate) fn vector_id(&self, external_id: &str) -> Option<VectorId> {
         if let Some(id) = self.delta.forward_index.dictionary_updates.get(external_id) {
             return Some(*id);
+        }
+        if self
+            .delta
+            .forward_index
+            .dictionary_deletes
+            .contains(external_id)
+        {
+            return None;
         }
         self.state.dictionary().get(external_id).cloned()
     }
@@ -827,6 +1035,79 @@ mod tests {
     const DIMS: usize = 2;
     const EPOCH: u64 = 1;
 
+    #[test]
+    fn should_emit_no_fts_ops_when_collection_has_no_text_fields() {
+        // given - a delta for a collection with no text fields, plus a delete
+        let mut delta = FtsIndexDelta::new(false);
+        delta.add_deleted_vector_id(VectorId::data_vector_id(7));
+
+        // when
+        let mut ops = Vec::new();
+        delta.freeze(&mut ops);
+
+        // then - freeze is a no-op: no deletions bitmap (or any FTS record)
+        assert!(ops.is_empty());
+    }
+
+    /// Returns the value of the first `Merge` op whose key matches, if any.
+    fn find_merge(ops: &[RecordOp], key: &[u8]) -> Option<Bytes> {
+        ops.iter().find_map(|op| match op {
+            RecordOp::Merge(m) if m.record.key.as_ref() == key => Some(m.record.value.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn should_emit_field_stats_on_insert() {
+        // given - one text doc indexed into field "body" (length 3)
+        let mut delta = FtsIndexDelta::new(true);
+        let mut summaries = HashMap::new();
+        summaries.insert(
+            "body".to_string(),
+            TextAttributeSummary {
+                terms: std::collections::BTreeMap::from([("fox".to_string(), 1usize)]),
+                length: 3,
+            },
+        );
+        delta.add_text_summaries(VectorId::data_vector_id(1), &summaries);
+
+        // when
+        let mut ops = Vec::new();
+        delta.freeze(&mut ops);
+
+        // then - FieldStats for "body": count +1, total_length +3, deletes 0
+        let body = find_merge(&ops, &FieldStatsKey::new("body").encode()).unwrap();
+        assert_eq!(
+            FieldStatsValue::decode_from_bytes(&body).unwrap(),
+            FieldStatsValue::new(1, 3, 0)
+        );
+    }
+
+    #[test]
+    fn should_emit_deletions_and_field_delete_deltas() {
+        // given - a deleted vector that populated fields "body" and "title"
+        let mut delta = FtsIndexDelta::new(true);
+        delta.add_deleted_vector_id(VectorId::data_vector_id(7));
+        delta.record_field_deletes(&["body".to_string(), "title".to_string()]);
+
+        // when
+        let mut ops = Vec::new();
+        delta.freeze(&mut ops);
+
+        // then - the deletions bitmap is emitted
+        assert!(find_merge(&ops, &DeletionsKey::new().encode()).is_some());
+        // and each field's FieldStats gains a pending delete; `count` is left to
+        // the compaction filter to retire when the delete is applied.
+        for field in ["body", "title"] {
+            let fs = find_merge(&ops, &FieldStatsKey::new(field).encode()).unwrap();
+            assert_eq!(
+                FieldStatsValue::decode_from_bytes(&fs).unwrap(),
+                FieldStatsValue::new(0, 0, 1),
+                "field {field}"
+            );
+        }
+    }
+
     async fn setup() -> (Arc<dyn Storage>, VectorIndexState) {
         setup_with_prefill(0, 1).await
     }
@@ -927,7 +1208,7 @@ mod tests {
     }
 
     fn make_index_value(postings: Vec<VectorId>) -> VectorIndexDataValue {
-        VectorIndexDataValue::new(postings, make_indexed_fields())
+        VectorIndexDataValue::new(postings, make_indexed_fields(), Vec::new())
     }
 
     fn make_indexed_fields() -> Vec<Field> {
@@ -970,7 +1251,7 @@ mod tests {
         let actual_storage = storage.get_root_posting_list(DIMS).await.unwrap();
         assert_eq!(actual_storage, expected_storage);
 
-        let expected_cache = PostingList::from_value(expected_storage);
+        let expected_cache = PostingList::from_value(expected_storage, false);
         let actual_cache = state.centroid_cache().root(u64::MAX).unwrap();
         assert_eq!(actual_cache.as_ref(), &expected_cache);
     }
@@ -1041,7 +1322,12 @@ mod tests {
 
         // when:
         let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1064,7 +1350,12 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut delta = ForwardIndexDelta::new(&state);
         let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        delta.update_vector_index_data(id, vec![leaf_centroid(1)], make_indexed_fields());
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         delta.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
@@ -1079,6 +1370,115 @@ mod tests {
         // then:
         assert!(storage.get_vector_data(id, DIMS).await.unwrap().is_none());
         assert!(storage.get_vector_index_data(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_external_id_should_tombstone_dictionary_and_remove_from_state() {
+        // given
+        let (storage, mut state) = setup().await;
+        let mut delta = ForwardIndexDelta::new(&state);
+        let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+        assert_eq!(state.dictionary().get("v1"), Some(&id));
+
+        // when
+        let mut delta = ForwardIndexDelta::new(&state);
+        delta.delete_external_id_and_vector("v1".to_string(), id);
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+
+        // then
+        assert!(state.dictionary().get("v1").is_none());
+        assert!(storage.lookup_internal_id("v1").await.unwrap().is_none());
+        assert!(storage.get_vector_data(id, DIMS).await.unwrap().is_none());
+        assert!(storage.get_vector_index_data(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn add_vector_within_same_delta_should_supersede_pending_delete() {
+        // given
+        let (storage, mut state) = setup().await;
+        let mut delta = ForwardIndexDelta::new(&state);
+        let old_id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
+        delta.update_vector_index_data(
+            old_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+        assert_eq!(state.dictionary().get("v1"), Some(&old_id));
+
+        // when
+        let mut delta = ForwardIndexDelta::new(&state);
+        delta.delete_external_id_and_vector("v1".to_string(), old_id);
+        let new_id = delta.add_vector("v1", &make_attributes(vec![3.0, 4.0]));
+        delta.update_vector_index_data(
+            new_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+
+        // then
+        assert_eq!(state.dictionary().get("v1"), Some(&new_id));
+        assert_eq!(
+            storage.lookup_internal_id("v1").await.unwrap(),
+            Some(new_id)
+        );
+        assert!(
+            storage
+                .get_vector_data(old_id, DIMS)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_vector_data(new_id, DIMS)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_external_id_within_same_delta_should_supersede_pending_add() {
+        // given
+        let (storage, mut state) = setup().await;
+
+        // when
+        let mut delta = ForwardIndexDelta::new(&state);
+        let id = delta.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
+        delta.update_vector_index_data(
+            id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
+        delta.delete_external_id_and_vector("v1".to_string(), id);
+        let mut ops = vec![];
+        delta.freeze(&mut state, &mut ops);
+        storage.apply(ops).await.unwrap();
+
+        // then
+        assert!(state.dictionary().get("v1").is_none());
+        assert!(storage.lookup_internal_id("v1").await.unwrap().is_none());
+        assert!(storage.get_vector_data(id, DIMS).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1154,7 +1554,8 @@ mod tests {
             Some(CentroidsValue::new(4))
         );
         assert_eq!(state.root_centroid_count(), 2);
-        let root = PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let expected = vec![
             (internal_centroid(2, 1), vec![1.0, 0.0]),
             (internal_centroid(2, 2), vec![0.0, 1.0]),
@@ -1204,7 +1605,8 @@ mod tests {
 
         // then:
         assert_eq!(state.root_centroid_count(), 1);
-        let posting = PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap());
+        let posting =
+            PostingList::from_value(storage.get_root_posting_list(DIMS).await.unwrap(), false);
         assert_eq!(
             posting
                 .iter()
@@ -1373,7 +1775,7 @@ mod tests {
 
         // then:
         let posting =
-            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap());
+            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap(), false);
         assert_eq!(
             posting
                 .iter()
@@ -1421,7 +1823,7 @@ mod tests {
 
         // then:
         let posting =
-            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap());
+            PostingList::from_value(storage.get_posting_list(parent, DIMS).await.unwrap(), false);
         assert!(posting.is_empty());
         let cached = state.centroid_cache().posting(parent, u64::MAX).unwrap();
         assert_eq!(cached.as_ref(), &posting);
@@ -1651,12 +2053,17 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let stored_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(stored_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            stored_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
         let delta_id = VectorId::data_vector_id(99);
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
         delta
             .forward_index
             .dictionary_updates
@@ -1676,11 +2083,16 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let stored_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(stored_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            stored_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
-        let delta = VectorIndexDelta::new(&state);
+        let delta = VectorIndexDelta::new(&state, false);
         let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
@@ -1694,11 +2106,16 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
         delta.forward_index.delete_vector(vector_id);
         let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
@@ -1713,11 +2130,16 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
         delta
             .forward_index
             .vector_updates
@@ -1738,11 +2160,16 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
-        let delta = VectorIndexDelta::new(&state);
+        let delta = VectorIndexDelta::new(&state, false);
         let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
@@ -1759,11 +2186,16 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
         delta.forward_index.delete_vector(vector_id);
         let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
@@ -1778,15 +2210,21 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
         delta.forward_index.update_vector_index_data(
             vector_id,
             vec![leaf_centroid(2), leaf_centroid(3)],
             make_indexed_fields(),
+            Vec::new(),
         );
         let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
@@ -1804,11 +2242,16 @@ mod tests {
         let (storage, mut state) = setup().await;
         let mut seed = ForwardIndexDelta::new(&state);
         let vector_id = seed.add_vector("v1", &make_attributes(vec![1.0, 2.0]));
-        seed.update_vector_index_data(vector_id, vec![leaf_centroid(1)], make_indexed_fields());
+        seed.update_vector_index_data(
+            vector_id,
+            vec![leaf_centroid(1)],
+            make_indexed_fields(),
+            Vec::new(),
+        );
         let mut ops = vec![];
         seed.freeze(&mut state, &mut ops);
         storage.apply(ops).await.unwrap();
-        let delta = VectorIndexDelta::new(&state);
+        let delta = VectorIndexDelta::new(&state, false);
         let snapshot: Arc<dyn StorageRead> = storage.snapshot().await.unwrap();
         let view = vector_index_view(&delta, &state, &snapshot);
 
@@ -1831,7 +2274,7 @@ mod tests {
         state
             .centroid_counts
             .insert(level.level(), HashMap::from([(existing, 5), (deleted, 2)]));
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
         delta
             .search_index
             .centroid_count_deltas
@@ -1853,7 +2296,7 @@ mod tests {
         let (storage, state) = setup().await;
         let vector_id = VectorId::data_vector_id(42);
         let centroid_id = leaf_centroid(7);
-        let mut delta = VectorIndexDelta::new(&state);
+        let mut delta = VectorIndexDelta::new(&state, false);
         delta
             .search_index
             .current_posting

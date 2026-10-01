@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError};
-use common::storage::StorageSnapshot;
-use common::{Storage, StorageRead};
+
+use crate::storage::{Storage, StorageRead, StorageSnapshot};
 
 const WRITE_CHANNEL: &str = "write";
 
+use crate::active_series::ActiveSeriesTracker;
 use crate::delta::{TsdbContext, TsdbWriteDelta};
 use crate::error::Error;
 use crate::flusher::TsdbFlusher;
@@ -17,16 +18,18 @@ use crate::model::{Label, Sample, Series, SeriesId, TimeBucket};
 use crate::query::BucketQueryReader;
 use crate::serde::key::TimeSeriesKey;
 use crate::serde::timeseries::TimeSeriesIterator;
-use crate::storage::OpenTsdbStorageReadExt;
 use crate::util::Result;
 
-pub(crate) struct MiniQueryReader {
+/// Per-bucket query reader over any storage read handle — a
+/// [`StorageSnapshot`] on the write path, a
+/// [`crate::storage::StorageReader`] on the read-only path.
+pub(crate) struct MiniQueryReader<R: StorageRead> {
     bucket: TimeBucket,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: R,
 }
 
-impl MiniQueryReader {
-    pub(crate) fn new(bucket: TimeBucket, storage: Arc<dyn StorageRead>) -> Self {
+impl<R: StorageRead> MiniQueryReader<R> {
+    pub(crate) fn new(bucket: TimeBucket, storage: R) -> Self {
         Self {
             bucket,
             snapshot: storage,
@@ -35,7 +38,7 @@ impl MiniQueryReader {
 }
 
 #[async_trait]
-impl BucketQueryReader for MiniQueryReader {
+impl<R: StorageRead> BucketQueryReader for MiniQueryReader<R> {
     async fn forward_index(
         &self,
         series_ids: &[SeriesId],
@@ -119,26 +122,25 @@ impl BucketQueryReader for MiniQueryReader {
         end_ms: i64,
     ) -> Result<Vec<Sample>> {
         let storage_key = TimeSeriesKey {
-            time_bucket: self.bucket.start,
-            bucket_size: self.bucket.size,
+            bucket: self.bucket,
             metric_name: metric_name.to_string(),
             series_id,
         };
-        let record = io_trace_async(
+        let value = io_trace_async(
             IoKindLocal::SamplesFetch,
             self.snapshot.get(storage_key.encode()),
         )
         .await?;
 
-        match record {
-            Some(record) => {
+        match value {
+            Some(value) => {
                 crate::promql::trace::record_bytes(
                     crate::promql::trace::IoKind::SamplesFetch,
-                    record.value.len() as u64,
+                    value.len() as u64,
                 );
-                let raw_len = record.value.len() as u64;
+                let raw_len = value.len() as u64;
                 let samples = io_trace_sync(IoKindLocal::Deserialize, || {
-                    let iter = TimeSeriesIterator::new(record.value.as_ref()).ok_or_else(|| {
+                    let iter = TimeSeriesIterator::new(value.as_ref()).ok_or_else(|| {
                         Error::Internal("Invalid timeseries data in storage".into())
                     })?;
                     let samples: Vec<Sample> = iter
@@ -187,7 +189,7 @@ impl MiniTsdb {
     }
 
     /// Create a query reader for read operations.
-    pub(crate) fn query_reader(&self) -> MiniQueryReader {
+    pub(crate) fn query_reader(&self) -> MiniQueryReader<StorageSnapshot> {
         let view = self.write_coordinator.view();
         MiniQueryReader {
             bucket: self.bucket,
@@ -197,8 +199,9 @@ impl MiniTsdb {
 
     pub(crate) async fn load(
         bucket: TimeBucket,
-        storage: Arc<dyn Storage>,
+        storage: Arc<Storage>,
         retention: Option<Duration>,
+        active_series: Arc<ActiveSeriesTracker>,
     ) -> Result<Self> {
         let snapshot = storage.snapshot().await?;
 
@@ -213,14 +216,16 @@ impl MiniTsdb {
             bucket,
             series_dict: Arc::new(series_dict),
             next_series_id,
+            active_series: active_series.clone(),
         };
 
         let flusher = TsdbFlusher {
             storage: storage.clone(),
             retention,
+            active_series,
         };
 
-        let initial_snapshot: Arc<dyn StorageSnapshot> = storage
+        let initial_snapshot: StorageSnapshot = storage
             .snapshot()
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -344,11 +349,12 @@ fn map_write_error(e: WriteError) -> Error {
 mod tests {
     use super::*;
     use crate::model::{Label, Sample, Series};
+    use crate::storage::in_memory_storage;
 
     /// Create a MiniTsdb with a custom queue capacity.
     async fn load_with_config(
         bucket: TimeBucket,
-        storage: Arc<dyn Storage>,
+        storage: Arc<Storage>,
         queue_capacity: usize,
     ) -> MiniTsdb {
         let snapshot = storage.snapshot().await.unwrap();
@@ -361,18 +367,21 @@ mod tests {
             .await
             .unwrap();
 
+        let active_series = Arc::new(ActiveSeriesTracker::new(0));
         let context = TsdbContext {
             bucket,
             series_dict: Arc::new(series_dict),
             next_series_id,
+            active_series: active_series.clone(),
         };
 
         let flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
+            active_series,
         };
 
-        let initial_snapshot: Arc<dyn StorageSnapshot> = storage.snapshot().await.unwrap();
+        let initial_snapshot: StorageSnapshot = storage.snapshot().await.unwrap();
 
         let config = WriteCoordinatorConfig {
             queue_capacity,
@@ -402,19 +411,8 @@ mod tests {
         )
     }
 
-    async fn test_storage() -> Arc<dyn Storage> {
-        use crate::storage::merge_operator::OpenTsdbMergeOperator;
-        use common::{StorageBuilder, StorageConfig, StorageSemantics};
-
-        StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .with_semantics(
-                StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-            )
-            .build()
-            .await
-            .unwrap()
+    async fn test_storage() -> Arc<Storage> {
+        Arc::new(in_memory_storage().await)
     }
 
     #[tokio::test]

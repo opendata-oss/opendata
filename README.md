@@ -5,7 +5,20 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289DA?style=flat-square&logo=discord)](https://discord.gg/CsAQJ2AJGU)
 [![GitHub License](https://img.shields.io/github/license/opendata-oss/opendata?style=flat-square)](LICENSE)
 
-OpenData is a collection of open source databases built on a common, object-native storage and infrastructure 
+Object storage is the most durable, scalable, and cost-effective storage system in the cloud. OpenData builds first-class open-source databases on top of it.
+
+Today OpenData includes:
+
+- **[Buffer](buffer/README.md)**: high-throughput write-path buffering and ingestion pipelines
+- **[Log](log/README.md)**: replayable event streams and durable data movement
+- **[Timeseries](timeseries/README.md)**: Prometheus-compatible metrics storage
+- **[Vector](vector/README.md)**: large-scale semantic search and retrieval
+
+Every OpenData database inherits the durability, scalability, and economics of object storage.
+
+# Architecture
+
+Our collection of open source databases built on a common, object-native storage and infrastructure 
 foundation. This shared foundation means every database has a virtually identical operational profile, which makes
 our database fleet materially easier and cheaper to operate than alternatives. 
 
@@ -23,14 +36,6 @@ and testing frameworks.
 Taken together, with OpenData there is only one storage engine and one set of operational tooling to learn across all
 systems. By inheriting these key components, individual databases focus only on the unique query semantics, data 
 layout and optimizations.
-
-# OpenData Databases
-
-- **[Buffer](buffer/README.md)**: Stateless write-path buffer. Producers flush batched data files to object storage; a manifest-backed queue coordinates consumers.
-- **[KeyValue](keyvalue/README.md)**: Object-store-native key-value database.
-- **[Log](log/README.md)**: Event streaming with a replayable log per key.
-- **[Timeseries](timeseries/README.md)**: Object-store-native timeseries. Prometheus remote-write compatible. Accepts OpenTelemetry metrics.
-- **[Vector](vector/README.md)**: SPANN-style ANN search. Centroids in memory, posting lists on disk.
 
 # Roadmap
 

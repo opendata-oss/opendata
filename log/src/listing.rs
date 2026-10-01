@@ -154,18 +154,9 @@ mod tests {
         }
 
         #[storage_test]
-        async fn should_return_empty_for_empty_range(storage: Arc<dyn Storage>) {
-            // when
-            let keys = storage.list_keys(0..0).await.unwrap();
-
-            // then
-            assert!(keys.is_empty());
-        }
-
-        #[storage_test]
         async fn should_return_empty_when_no_listing_entries(storage: Arc<dyn Storage>) {
             // when
-            let keys = storage.list_keys(0..10).await.unwrap();
+            let keys = storage.list_keys_in_segment(1).await.unwrap();
 
             // then
             assert!(keys.is_empty());
@@ -174,12 +165,17 @@ mod tests {
         #[storage_test]
         async fn should_iterate_keys_in_single_segment(storage: Arc<dyn Storage>) {
             // given
-            write_listing_entry(&*storage, 0, b"key-a").await;
-            write_listing_entry(&*storage, 0, b"key-b").await;
-            write_listing_entry(&*storage, 0, b"key-c").await;
+            write_listing_entry(&*storage, 1, b"key-a").await;
+            write_listing_entry(&*storage, 1, b"key-b").await;
+            write_listing_entry(&*storage, 1, b"key-c").await;
 
             // when
-            let keys: Vec<Bytes> = storage.list_keys(0..1).await.unwrap().into_iter().collect();
+            let keys: Vec<Bytes> = storage
+                .list_keys_in_segment(1)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
 
             // then - keys returned in lexicographic order
             assert_eq!(keys.len(), 3);
@@ -189,60 +185,66 @@ mod tests {
         }
 
         #[storage_test]
-        async fn should_iterate_keys_across_multiple_segments(storage: Arc<dyn Storage>) {
-            // given
-            write_listing_entry(&*storage, 0, b"key-a").await;
-            write_listing_entry(&*storage, 1, b"key-b").await;
-            write_listing_entry(&*storage, 2, b"key-c").await;
+        async fn should_isolate_listings_to_their_segment(storage: Arc<dyn Storage>) {
+            // given — listing entries in multiple segments
+            write_listing_entry(&*storage, 1, b"in-segment-1").await;
+            write_listing_entry(&*storage, 2, b"in-segment-2").await;
 
             // when
-            let keys = storage.list_keys(0..3).await.unwrap();
+            let seg1 = storage.list_keys_in_segment(1).await.unwrap();
+            let seg2 = storage.list_keys_in_segment(2).await.unwrap();
 
-            // then
-            assert_eq!(keys.len(), 3);
+            // then — each segment scan returns only its own listing entries
+            assert_eq!(seg1.len(), 1);
+            assert!(seg1.contains(&Bytes::from("in-segment-1")));
+            assert_eq!(seg2.len(), 1);
+            assert!(seg2.contains(&Bytes::from("in-segment-2")));
         }
 
         #[storage_test]
-        async fn should_deduplicate_keys_across_segments(storage: Arc<dyn Storage>) {
-            // given - same key in multiple segments
-            write_listing_entry(&*storage, 0, b"shared-key").await;
-            write_listing_entry(&*storage, 1, b"shared-key").await;
-            write_listing_entry(&*storage, 2, b"shared-key").await;
+        async fn should_skip_log_entries_when_scanning_listings(storage: Arc<dyn Storage>) {
+            use crate::segment::LogSegment;
+            use crate::serde::LogEntryKey;
+            use crate::serde::SegmentMeta;
+
+            // given — listing records alongside log entries in the same segment
+            let segment_id = 1u32;
+            let segment = LogSegment::new(segment_id, SegmentMeta::new(0, 1000));
+            write_listing_entry(&*storage, segment_id, b"alpha").await;
+            // Write a log entry that would lex-sort before listings (tag 0x10 < 0x40).
+            let entry_key = LogEntryKey::new(segment_id, Bytes::from("alpha"), 1).serialize(0);
+            storage
+                .put_with_options(
+                    vec![common::Record::new(entry_key, Bytes::from("v")).into()],
+                    common::WriteOptions::default(),
+                )
+                .await
+                .unwrap();
+            // Anchor used for the segment metadata so deserialization is sane.
+            let _ = segment;
 
             // when
-            let keys = storage.list_keys(0..3).await.unwrap();
+            let keys = storage.list_keys_in_segment(segment_id).await.unwrap();
 
-            // then - only one instance of the key
+            // then — listing scan only sees listing records, not log entries
             assert_eq!(keys.len(), 1);
-            assert!(keys.contains(&Bytes::from("shared-key")));
-        }
-
-        #[storage_test]
-        async fn should_respect_segment_range(storage: Arc<dyn Storage>) {
-            // given
-            write_listing_entry(&*storage, 0, b"key-0").await;
-            write_listing_entry(&*storage, 1, b"key-1").await;
-            write_listing_entry(&*storage, 2, b"key-2").await;
-            write_listing_entry(&*storage, 3, b"key-3").await;
-
-            // when - only query segments 1..3
-            let keys: Vec<Bytes> = storage.list_keys(1..3).await.unwrap().into_iter().collect();
-
-            // then - only keys from segments 1 and 2
-            assert_eq!(keys.len(), 2);
-            assert_eq!(keys[0], Bytes::from("key-1"));
-            assert_eq!(keys[1], Bytes::from("key-2"));
+            assert!(keys.contains(&Bytes::from("alpha")));
         }
 
         #[storage_test]
         async fn should_return_keys_in_lexicographic_order(storage: Arc<dyn Storage>) {
             // given - keys inserted out of order
-            write_listing_entry(&*storage, 0, b"zebra").await;
-            write_listing_entry(&*storage, 0, b"apple").await;
-            write_listing_entry(&*storage, 0, b"mango").await;
+            write_listing_entry(&*storage, 1, b"zebra").await;
+            write_listing_entry(&*storage, 1, b"apple").await;
+            write_listing_entry(&*storage, 1, b"mango").await;
 
             // when
-            let keys: Vec<Bytes> = storage.list_keys(0..1).await.unwrap().into_iter().collect();
+            let keys: Vec<Bytes> = storage
+                .list_keys_in_segment(1)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
 
             // then - keys returned in lexicographic order
             assert_eq!(keys[0], Bytes::from("apple"));

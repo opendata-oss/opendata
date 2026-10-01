@@ -4,15 +4,19 @@ pub mod in_memory;
 pub mod loader;
 pub mod metrics_recorder;
 pub mod slate;
+pub mod sst_blocks;
 pub mod util;
 
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use slatedb::FilterContext;
 use uuid::Uuid;
 
 use crate::BytesRange;
+use crate::storage::slate::SlateReadHandle;
 
 /// Identifies a checkpoint of a storage backend at a point in time.
 ///
@@ -224,7 +228,7 @@ pub trait StorageIterator {
 /// access and point-in-time snapshots. By extracting these common operations,
 /// we can write code that works with both storage types.
 #[async_trait]
-pub trait StorageRead: Send + Sync {
+pub trait StorageRead: Any + Send + Sync {
     /// Retrieves a single record by exact key.
     ///
     /// Returns `Ok(None)` if the key is not present.
@@ -239,6 +243,41 @@ pub trait StorageRead: Send + Sync {
         range: BytesRange,
     ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>>;
 
+    /// Returns an iterator over records whose key starts with `prefix`,
+    /// restricted to `subrange`.
+    ///
+    /// `subrange` bounds are key *suffixes* interpreted relative to `prefix`: a
+    /// bound `s` selects the full key `prefix ++ s`. Pass
+    /// [`BytesRange::unbounded`] to scan the prefix's entire keyspace. Callers
+    /// with a known sub-key ordering (e.g. the log's trailing sequence bytes)
+    /// use this to bound the scan natively instead of filtering client-side.
+    ///
+    /// Backends that support prefix-aware SST filters (e.g. SlateDB with a
+    /// configured `PrefixExtractor` or custom `FilterPolicy`) consult those
+    /// filters here, allowing SSTs that contain no matching keys — or, with
+    /// `filter_context`, no keys past a caller-supplied cursor — to be skipped
+    /// without a block read. Backends without such filters fall back to a range
+    /// scan over the prefix.
+    ///
+    /// `filter_context` is an opaque payload forwarded to the backend's custom
+    /// filter policies (ignored by built-in filters and by backends without
+    /// filter support); a scan parametrizes its filters through it. See
+    /// [`slatedb::FilterContext`].
+    ///
+    /// The default implementation delegates to [`Self::scan_iter`] with the
+    /// absolute range derived from `prefix` and `subrange`, which preserves
+    /// correctness for any backend; backends that can do better should override
+    /// this.
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        _filter_context: Option<FilterContext>,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        self.scan_iter(BytesRange::from_prefix_and_subrange(&prefix, &subrange))
+            .await
+    }
+
     /// Collects all records in the range into a Vec.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn scan(&self, range: BytesRange) -> StorageResult<Vec<Record>> {
@@ -248,6 +287,18 @@ pub trait StorageRead: Send + Sync {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Returns a handle to this backend's slatedb resources (a manifest
+    /// snapshot + an `SstReader`) for the SST-walk count path, or `None` when
+    /// the backend isn't slatedb or has no SST reader attached.
+    ///
+    /// This is a deliberate, single-method leak of slatedb internals rather
+    /// than a storage-neutral abstraction: counting via the manifest needs
+    /// concrete slatedb types, and callers that don't get a handle fall back
+    /// to a plain scan. See [`SlateReadHandle`].
+    fn slate_read(&self) -> Option<SlateReadHandle> {
+        None
     }
 
     /// Closes the storage, releasing any resources.

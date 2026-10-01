@@ -24,16 +24,15 @@ use common::{StorageIterator, StorageRead};
 /// Automatically available on all `StorageRead` types via a blanket impl.
 #[async_trait]
 pub(crate) trait LogStorageRead: StorageRead {
-    /// Returns keys present in the given segment range.
+    /// Returns the keys present in a single segment.
     ///
-    /// Keys are deduplicated and returned in a sorted `BTreeSet`.
-    /// The segment range is half-open: [start, end).
-    async fn list_keys(&self, segment_range: Range<SegmentId>) -> Result<BTreeSet<Bytes>> {
-        if segment_range.start >= segment_range.end {
-            return Ok(BTreeSet::new());
-        }
-
-        let scan_range = ListingEntryKey::scan_range(segment_range);
+    /// Listing records are interleaved with log entries across segment
+    /// boundaries in the key layout, so cross-segment listing scans aren't
+    /// safe at the storage layer. Callers wanting to enumerate keys across
+    /// multiple segments stitch per-segment results together using the
+    /// segment cache. See [`crate::reader::LogReadView::list_keys`].
+    async fn list_keys_in_segment(&self, segment_id: SegmentId) -> Result<BTreeSet<Bytes>> {
+        let scan_range = ListingEntryKey::scan_range_for_segment(segment_id);
         let mut iter = self
             .scan_iter(scan_range)
             .await
@@ -72,19 +71,61 @@ pub(crate) trait LogStorageRead: StorageRead {
     /// Scans log entries for a key within a segment and sequence range.
     ///
     /// Returns an iterator that yields `LogEntry` values in sequence order.
+    ///
+    /// Issues a prefix scan over the `(segment, key)` prefix rather than a
+    /// bounded range so that backends with prefix-aware SST filters can skip
+    /// tables for this `(segment, key)`: slatedb's `BloomFilterPolicy` with
+    /// `LogKeyPrefixExtractor` skips SSTs that contain no entries for the key,
+    /// and the sequence-range filter skips SSTs whose entries for the key all
+    /// sit below the scan's resume cursor. The cursor is relativized to this
+    /// segment (the filter stores relative sequences — see
+    /// [`crate::filter_sequence`]) and passed as the filter context.
+    ///
+    /// The seq range is still enforced client-side by [`SegmentIterator`],
+    /// which early-exits once `sequence >= seq_range.end`; filter pruning only
+    /// drops whole SSTs, so the iterator remains the source of exactness.
     async fn scan_entries(
         &self,
         segment: &LogSegment,
         key: &Bytes,
         seq_range: Range<u64>,
     ) -> Result<SegmentIterator> {
-        let scan_range = LogEntryKey::scan_range(segment, key, seq_range.clone());
-        let inner = self.scan_iter(scan_range).await?;
+        let prefix = LogEntryKey::scan_prefix(segment, key);
+        // Bound the scan to the requested sequence window natively: the suffix
+        // subrange restricts the trailing relative-sequence bytes, so the
+        // backend stops at `seq_range.end` instead of leaning entirely on
+        // `SegmentIterator`'s client-side early-exit.
+        let subrange = LogEntryKey::scan_subrange(segment, seq_range.clone());
+        let relative_cursor = seq_range.start.saturating_sub(segment.meta().start_seq);
+        let filter_context = Some(crate::filter_sequence::sequence_filter_context(
+            relative_cursor,
+        ));
+        let inner = self
+            .scan_prefix_iter(prefix, subrange, filter_context)
+            .await?;
         Ok(SegmentIterator::new(
             inner,
             seq_range,
             segment.meta().start_seq,
         ))
+    }
+
+    /// Counts log entries for a key within a segment and sequence range by
+    /// scanning every record and tallying. Use this as a fallback when no
+    /// [`SlateReadHandle`](common::SlateReadHandle) is available.
+    async fn count_entries(
+        &self,
+        segment: &LogSegment,
+        key: &Bytes,
+        seq_range: Range<u64>,
+    ) -> Result<u64> {
+        let byte_range = LogEntryKey::scan_range(segment, key, seq_range);
+        let mut iter = self.scan_iter(byte_range).await?;
+        let mut total = 0u64;
+        while iter.next().await?.is_some() {
+            total = total.saturating_add(1);
+        }
+        Ok(total)
     }
 }
 
@@ -175,10 +216,9 @@ pub(crate) trait LogStorageWrite: Storage {
         Ok(())
     }
 
-    /// Writes a SeqBlock record to storage.
+    /// Writes a SeqBlock record to storage at the canonical [`crate::serde::SEQ_BLOCK_KEY`].
     async fn write_seq_block(&self, block: &common::SeqBlock) -> Result<()> {
-        use crate::serde::{KEY_VERSION, RecordType};
-        let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
+        let key = Bytes::from_static(&crate::serde::SEQ_BLOCK_KEY);
         let value = block.serialize();
         self.put(vec![common::Record::new(key, value).into()])
             .await?;
@@ -224,34 +264,16 @@ mod tests {
 
     #[storage_test]
     async fn should_scan_segments_in_order(storage: Arc<dyn Storage>) {
-        // given
-        let seg0 = LogSegment::new(0, SegmentMeta::new(0, 100));
-        let seg1 = LogSegment::new(1, SegmentMeta::new(100, 200));
-        let seg2 = LogSegment::new(2, SegmentMeta::new(200, 300));
-        storage.write_segment(&seg0).await.unwrap();
-        storage.write_segment(&seg2).await.unwrap(); // write out of order
+        // given — user segments start at id 1
+        let seg1 = LogSegment::new(1, SegmentMeta::new(0, 100));
+        let seg2 = LogSegment::new(2, SegmentMeta::new(100, 200));
+        let seg3 = LogSegment::new(3, SegmentMeta::new(200, 300));
         storage.write_segment(&seg1).await.unwrap();
+        storage.write_segment(&seg3).await.unwrap(); // write out of order
+        storage.write_segment(&seg2).await.unwrap();
 
         // when
-        let segments = storage.scan_segments(0..u32::MAX).await.unwrap();
-
-        // then
-        assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].id(), 0);
-        assert_eq!(segments[1].id(), 1);
-        assert_eq!(segments[2].id(), 2);
-    }
-
-    #[storage_test]
-    async fn should_scan_segments_with_range(storage: Arc<dyn Storage>) {
-        // given
-        for i in 0u32..5 {
-            let seg = LogSegment::new(i, SegmentMeta::new(i as u64 * 100, i as i64 * 100));
-            storage.write_segment(&seg).await.unwrap();
-        }
-
-        // when
-        let segments = storage.scan_segments(1..4).await.unwrap();
+        let segments = storage.scan_segments(1..u32::MAX).await.unwrap();
 
         // then
         assert_eq!(segments.len(), 3);
@@ -261,9 +283,27 @@ mod tests {
     }
 
     #[storage_test]
+    async fn should_scan_segments_with_range(storage: Arc<dyn Storage>) {
+        // given
+        for i in 1u32..=5 {
+            let seg = LogSegment::new(i, SegmentMeta::new(i as u64 * 100, i as i64 * 100));
+            storage.write_segment(&seg).await.unwrap();
+        }
+
+        // when
+        let segments = storage.scan_segments(2..5).await.unwrap();
+
+        // then
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].id(), 2);
+        assert_eq!(segments[1].id(), 3);
+        assert_eq!(segments[2].id(), 4);
+    }
+
+    #[storage_test]
     async fn should_scan_entries_for_key(storage: Arc<dyn Storage>) {
         // given
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
+        let segment = LogSegment::new(1, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
         let key = Bytes::from("key1");
@@ -296,7 +336,7 @@ mod tests {
     #[storage_test]
     async fn should_filter_entries_by_sequence_range(storage: Arc<dyn Storage>) {
         // given
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
+        let segment = LogSegment::new(1, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
         let key = Bytes::from("key1");
@@ -325,7 +365,7 @@ mod tests {
     #[storage_test]
     async fn should_return_empty_iterator_for_unknown_key(storage: Arc<dyn Storage>) {
         // given
-        let segment = LogSegment::new(0, SegmentMeta::new(0, 100));
+        let segment = LogSegment::new(1, SegmentMeta::new(0, 100));
         storage.write_segment(&segment).await.unwrap();
 
         // when
@@ -347,8 +387,7 @@ mod tests {
         storage.write_seq_block(&block).await.unwrap();
 
         // then
-        use crate::serde::{KEY_VERSION, RecordType};
-        let key = Bytes::from(vec![KEY_VERSION, RecordType::SeqBlock.id()]);
+        let key = Bytes::from_static(&crate::serde::SEQ_BLOCK_KEY);
         let record = storage.get(key).await.unwrap().unwrap();
         let read_block = common::SeqBlock::deserialize(&record.value).unwrap();
         assert_eq!(read_block.base_sequence, 1000);

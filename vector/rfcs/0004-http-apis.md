@@ -82,6 +82,15 @@ message UpsertVectorsResponse {
   int32 vectors_upserted = 2;
 }
 
+message DeleteRequest {
+  repeated string ids = 1;
+}
+
+message DeleteVectorsResponse {
+  string status = 1;
+  int32 vectors_deleted = 2;
+}
+
 message ComparisonFilter {
   string field = 1;
   AttributeValueMessage value = 2;
@@ -229,6 +238,7 @@ Both represent the same logical write request.
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/v1/vector/write` | POST | Write or upsert vectors |
+| `/api/v1/vector/delete` | POST | Delete vectors by external ID |
 | `/api/v1/vector/search` | POST | Search for nearest neighbors |
 | `/api/v1/vector/vectors/{id}` | GET | Fetch a vector by external ID |
 | `/-/healthy` | GET | Liveness probe |
@@ -290,6 +300,36 @@ Request Body:
 
 **Error Responses:**
 - `400` - Invalid body, missing `id`, missing `vector`, or schema/type mismatch
+- `500` - Storage write failure
+
+#### Delete
+
+`POST /api/v1/vector/delete`
+
+Delete vectors by external ID. Unknown IDs are silently skipped during indexing.
+`vectorsDeleted` reports the count of IDs accepted in the request — the underlying
+write is asynchronous, so the precise count actually removed is not available at
+response time.
+
+Request Body:
+
+```json
+{
+  "ids": ["doc-1", "doc-2"]
+}
+```
+
+**Success Response (200):**
+
+```json
+{
+  "status": "success",
+  "vectorsDeleted": 1
+}
+```
+
+**Error Responses:**
+- `400` - Invalid body or missing `ids`
 - `500` - Storage write failure
 
 #### Search

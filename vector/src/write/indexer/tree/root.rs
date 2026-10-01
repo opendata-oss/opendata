@@ -1,4 +1,6 @@
 use crate::Result;
+use crate::metric_names::INDEXER_ANN_SPLITS_TOTAL;
+use crate::serde::vector_id::ROOT_LEVEL;
 use crate::write::indexer::tree::IndexerOpts;
 use crate::write::indexer::tree::centroids::SearchResult;
 use crate::write::indexer::tree::state::{VectorIndexDelta, VectorIndexState, VectorIndexView};
@@ -35,6 +37,12 @@ impl SplitRoot {
         if view.root_count() < self.opts.root_threshold_vectors as u64 {
             return Ok(());
         }
+
+        metrics::counter!(
+            INDEXER_ANN_SPLITS_TOTAL,
+            "level" => ROOT_LEVEL.to_string(),
+        )
+        .increment(1);
 
         let original_root_postings = view.root_posting_list(self.opts.dimensions).get().await?;
         let root_vecs: Vec<_> = original_root_postings
@@ -114,6 +122,7 @@ mod tests {
             split_threshold_vectors: usize::MAX,
             split_search_neighbourhood: 4,
             indexed_fields: HashSet::new(),
+            text_fields: HashSet::new(),
         })
     }
 
@@ -137,7 +146,7 @@ mod tests {
         let original_root_count = h.state.root_centroid_count();
 
         // when
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
         SplitRoot::new(&opts, &snapshot, 1)
             .execute(&mut delta, &h.state)
             .await
@@ -147,7 +156,8 @@ mod tests {
         // then
         assert_eq!(h.state.centroids_meta().depth, original_depth);
         assert_eq!(h.state.root_centroid_count(), original_root_count);
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         let root_ids: HashSet<_> = root.iter().map(|p| p.id()).collect();
         assert_eq!(root_ids, HashSet::from([C0, C1]));
     }
@@ -164,7 +174,7 @@ mod tests {
         .await;
         let opts = create_opts(4);
         let snapshot = h.snapshot().await;
-        let mut delta = VectorIndexDelta::new(&h.state);
+        let mut delta = VectorIndexDelta::new(&h.state, false);
 
         // when:
         SplitRoot::new(&opts, &snapshot, 1)
@@ -176,7 +186,8 @@ mod tests {
         // then
         assert_eq!(h.state.centroids_meta().depth, 4);
         assert_eq!(h.state.root_centroid_count(), 2);
-        let root = PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap());
+        let root =
+            PostingList::from_value(h.storage.get_root_posting_list(DIMS).await.unwrap(), false);
         assert_eq!(root.len(), 2);
         let new_root_ids: Vec<_> = root.iter().map(|p| p.id()).collect();
         assert!(new_root_ids.iter().all(|id| id.level() == 2));
@@ -187,6 +198,7 @@ mod tests {
                     .get_posting_list(*new_root_id, DIMS)
                     .await
                     .unwrap(),
+                false,
             );
             assert!(!posting.is_empty());
             for child in posting.iter() {

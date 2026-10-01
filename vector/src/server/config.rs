@@ -102,9 +102,8 @@ metadata_fields:
         assert!(matches!(config.storage, StorageConfig::InMemory));
         assert_eq!(config.dimensions, 2);
         assert_eq!(config.flush_interval, std::time::Duration::from_secs(60));
-        assert_eq!(config.split_threshold_vectors, 2_000);
-        assert_eq!(config.merge_threshold_vectors, 500);
-        assert_eq!(config.chunk_target, 4096);
+        assert_eq!(config.split_threshold_vectors, 150);
+        assert_eq!(config.merge_threshold_vectors, 50);
     }
 
     #[test]

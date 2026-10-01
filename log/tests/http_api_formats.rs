@@ -10,16 +10,13 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use axum::routing::{get, post};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use common::StorageConfig;
-use log::server::handlers::{
-    AppState, handle_append, handle_list_keys, handle_list_segments, handle_metrics, handle_scan,
-};
-use log::server::metrics::Metrics;
 use log::server::proto;
+use log::server::{LogServer, LogServerConfig};
 use log::{Config, LogDb, Record};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use prost::Message;
 use tower::ServiceExt;
 
@@ -29,19 +26,11 @@ async fn setup_test_app() -> (Router, Arc<LogDb>) {
         ..Default::default()
     };
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
-    let metrics = Arc::new(Metrics::new());
 
-    let state = AppState {
-        log: log.clone(),
-        metrics,
-    };
-
-    let app = Router::new()
-        .route("/api/v1/log/append", post(handle_append))
-        .route("/api/v1/log/scan", get(handle_scan))
-        .route("/api/v1/log/keys", get(handle_list_keys))
-        .route("/api/v1/log/segments", get(handle_list_segments))
-        .with_state(state);
+    // Drive the real server router rather than a hand-built route table, so
+    // these tests track the routes the server actually serves.
+    let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+    let app = LogServer::new(log.clone(), LogServerConfig::default(), metrics_handle).into_router();
 
     (app, log)
 }
@@ -176,6 +165,51 @@ async fn test_scan_json_response() {
         .decode(values[1]["value"].as_str().unwrap())
         .unwrap();
     assert_eq!(value_decoded, b"event-2");
+
+    // The response carries the resume cursor: two records consumed and the
+    // scan drained, so the next sequence to fetch is 2.
+    assert_eq!(json["nextSequence"], 2);
+}
+
+#[tokio::test]
+async fn test_scan_idle_key_resumes_at_frontier() {
+    // A scan of a key with no records should still report the global frontier
+    // as its resume cursor, so an idle follower advances with the log instead
+    // of re-scanning from 0 forever (RFC 0007 cross-key lift over the wire).
+    let (app, log) = setup_test_app().await;
+
+    log.try_append(vec![
+        Record {
+            key: Bytes::from("hot"),
+            value: Bytes::from("v0"),
+        },
+        Record {
+            key: Bytes::from("hot"),
+            value: Bytes::from("v1"),
+        },
+    ])
+    .await
+    .unwrap();
+    log.flush().await.unwrap();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/log/scan?key=cold")
+        .header(header::ACCEPT, "application/protobuf+json")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["status"], "success");
+    assert_eq!(json["values"].as_array().unwrap().len(), 0);
+    assert_eq!(json["nextSequence"], 2);
 }
 
 #[tokio::test]
@@ -257,8 +291,8 @@ async fn test_list_segments_json_response() {
     let segments = json["segments"].as_array().unwrap();
     assert_eq!(segments.len(), 1);
 
-    // Check camelCase field names
-    assert_eq!(segments[0]["id"], 0);
+    // Check camelCase field names — first user segment is id 1 (id 0 is reserved system segment)
+    assert_eq!(segments[0]["id"], 1);
     assert_eq!(segments[0]["startSeq"], 0);
     assert!(segments[0]["startTimeMs"].as_i64().unwrap() > 0);
 }
@@ -492,7 +526,8 @@ async fn test_list_segments_protobuf_response() {
 
     assert_eq!(proto_response.status, "success");
     assert_eq!(proto_response.segments.len(), 1);
-    assert_eq!(proto_response.segments[0].id, 0);
+    // First user segment is id 1; id 0 is the reserved system segment.
+    assert_eq!(proto_response.segments[0].id, 1);
     assert_eq!(proto_response.segments[0].start_seq, 0);
     assert!(proto_response.segments[0].start_time_ms > 0);
 }
@@ -745,6 +780,48 @@ async fn test_scan_follow_at_poll_boundary_returns_empty() {
     );
 }
 
+#[tokio::test]
+async fn test_scan_follow_returns_data_that_arrives_during_poll() {
+    let (app, log) = setup_test_app().await;
+
+    // Follow an initially-empty key, so the request enters the long-poll loop
+    // rather than returning from the first scan.
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/log/scan?key=events&follow=true&timeout_ms=5000")
+        .header(header::ACCEPT, "application/protobuf+json")
+        .body(Body::empty())
+        .unwrap();
+    let handle = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+
+    // While the loop is polling, append a record; the next poll should pick it
+    // up and return it (rather than timing out empty).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    log.try_append(vec![Record {
+        key: Bytes::from("events"),
+        value: Bytes::from("event-0"),
+    }])
+    .await
+    .expect("Failed to append");
+
+    let response = handle.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let values = json["values"].as_array().unwrap();
+    assert_eq!(
+        values.len(),
+        1,
+        "follow should return the record that arrived"
+    );
+    assert_eq!(values[0]["sequence"], 0);
+    // The resume cursor advances one past the returned record.
+    assert_eq!(json["nextSequence"], 1);
+}
+
 // ============================================================================
 // SlateDB Metrics Tests
 // ============================================================================
@@ -774,24 +851,15 @@ async fn setup_slatedb_test_app() -> Router {
             object_store: ObjectStoreConfig::InMemory,
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         }),
         ..Default::default()
     };
 
     let handle = global_prometheus_handle();
     let log = Arc::new(LogDb::open(config).await.expect("Failed to open log"));
-    let metrics = Arc::new(Metrics::with_metrics_rs_handle(Some(handle)));
 
-    let state = AppState {
-        log: log.clone(),
-        metrics,
-    };
-
-    Router::new()
-        .route("/api/v1/log/append", post(handle_append))
-        .route("/api/v1/log/scan", get(handle_scan))
-        .route("/metrics", get(handle_metrics))
-        .with_state(state)
+    LogServer::new(log, LogServerConfig::default(), handle).into_router()
 }
 
 #[tokio::test]

@@ -8,11 +8,17 @@ use axum::Router;
 use axum::routing::{get, post};
 use tokio::signal;
 
+#[cfg(feature = "buffer")]
+use super::buffer_consumer::{BufferConsumer, ConsumerHandle};
 use super::config::VectorServerConfig;
 use super::handlers::{
-    AppState, handle_get_vector, handle_healthy, handle_ready, handle_search, handle_write,
+    AppState, handle_delete, handle_get_vector, handle_healthy, handle_ready, handle_search,
+    handle_write,
 };
-use super::middleware::TracingLayer;
+use super::metrics::{MetricsState, handle_metrics};
+use super::middleware::{MetricsLayer, TracingLayer};
+#[cfg(feature = "buffer")]
+use crate::model::BufferConsumerConfig;
 use crate::{FieldType, MetadataFieldSpec, VectorDb};
 
 /// HTTP server for the vector service (read-write).
@@ -20,6 +26,9 @@ pub struct VectorServer {
     db: Arc<VectorDb>,
     config: VectorServerConfig,
     metadata_fields: Vec<MetadataFieldSpec>,
+    metrics: MetricsState,
+    #[cfg(feature = "buffer")]
+    buffer_consumer: Option<Arc<BufferConsumer>>,
 }
 
 impl VectorServer {
@@ -28,12 +37,24 @@ impl VectorServer {
         db: Arc<VectorDb>,
         config: VectorServerConfig,
         metadata_fields: Vec<MetadataFieldSpec>,
+        metrics: MetricsState,
     ) -> Self {
         Self {
             db,
             config,
             metadata_fields,
+            metrics,
+            #[cfg(feature = "buffer")]
+            buffer_consumer: None,
         }
+    }
+
+    /// Attach a buffer consumer that will be started alongside the HTTP server
+    /// and stopped before the server shuts down.
+    #[cfg(feature = "buffer")]
+    pub fn with_buffer_consumer(mut self, config: BufferConsumerConfig) -> Self {
+        self.buffer_consumer = Some(Arc::new(BufferConsumer::new(self.db.clone(), config)));
+        self
     }
 
     /// Run the HTTP server.
@@ -42,14 +63,34 @@ impl VectorServer {
             db,
             config,
             metadata_fields,
+            metrics,
+            #[cfg(feature = "buffer")]
+            buffer_consumer,
         } = self;
         let state = AppState {
             db,
             metadata_fields: metadata_fields_by_name(&metadata_fields),
         };
 
+        #[cfg(feature = "buffer")]
+        let consumer_handle: Option<ConsumerHandle> = match buffer_consumer {
+            Some(consumer) => match consumer.run().await {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    tracing::error!("Failed to start vector buffer consumer: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+
+        let metrics_router = Router::new()
+            .route("/metrics", get(handle_metrics))
+            .with_state(metrics);
+
         let app = Router::new()
             .route("/api/v1/vector/write", post(handle_write))
+            .route("/api/v1/vector/delete", post(handle_delete))
             .route("/api/v1/vector/search", post(handle_search::<VectorDb>))
             .route(
                 "/api/v1/vector/vectors/{id}",
@@ -57,8 +98,10 @@ impl VectorServer {
             )
             .route("/-/healthy", get(handle_healthy))
             .route("/-/ready", get(handle_ready))
-            .layer(TracingLayer::new())
-            .with_state(state);
+            .with_state(state)
+            .merge(metrics_router)
+            .layer(MetricsLayer::new())
+            .layer(TracingLayer::new());
 
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         tracing::info!("Starting Vector HTTP server on {}", addr);
@@ -68,6 +111,11 @@ impl VectorServer {
             .with_graceful_shutdown(shutdown_signal())
             .await
             .unwrap();
+
+        #[cfg(feature = "buffer")]
+        if let Some(handle) = consumer_handle {
+            handle.shutdown().await;
+        }
 
         tracing::info!("Server shut down gracefully");
     }

@@ -61,6 +61,17 @@ impl VectorBitmap {
         self.vector_ids.contains(vector_id)
     }
 
+    /// Check if any vector ID in `min..=max` is in the bitmap.
+    pub fn contains_in_range(&self, min: u64, max: u64) -> bool {
+        debug_assert!(min <= max);
+        // Seek-based probe: `advance_to` is an O(log containers) seek,
+        // whereas `rank` sums container lengths linearly and would make a
+        // per-block scan O(blocks x containers).
+        let mut iter = self.vector_ids.iter();
+        iter.advance_to(min);
+        iter.next().is_some_and(|v| v <= max)
+    }
+
     /// Returns the number of vector IDs in the bitmap.
     pub fn len(&self) -> u64 {
         self.vector_ids.len()
@@ -249,5 +260,36 @@ mod tests {
 
         // then
         assert_eq!(ids, vec![1, 2, 3]); // Sorted order
+    }
+
+    /// Table-driven edges for the range probe: it gates whether the
+    /// compaction filter skips a postings block entirely, so an off-by-one
+    /// here silently resurrects deleted documents.
+    #[test]
+    fn contains_in_range_edges() {
+        let empty = VectorBitmap::new();
+        assert!(!empty.contains_in_range(0, u64::MAX));
+
+        let mut bitmap = VectorBitmap::new();
+        for id in [0u64, 10, 100, u64::MAX] {
+            bitmap.insert(id);
+        }
+        // min == 0 with id 0 present.
+        assert!(bitmap.contains_in_range(0, 0));
+        assert!(bitmap.contains_in_range(0, 5));
+        // Single-id ranges.
+        assert!(bitmap.contains_in_range(10, 10));
+        assert!(!bitmap.contains_in_range(9, 9));
+        assert!(!bitmap.contains_in_range(11, 11));
+        // Sole hit exactly at the lower inclusive bound.
+        assert!(bitmap.contains_in_range(10, 99));
+        // Sole hit exactly at the upper inclusive bound.
+        assert!(bitmap.contains_in_range(11, 100));
+        // Empty interior ranges.
+        assert!(!bitmap.contains_in_range(11, 99));
+        assert!(!bitmap.contains_in_range(1, 9));
+        // u64::MAX edges.
+        assert!(bitmap.contains_in_range(u64::MAX, u64::MAX));
+        assert!(!bitmap.contains_in_range(101, u64::MAX - 1));
     }
 }

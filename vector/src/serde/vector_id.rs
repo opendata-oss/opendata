@@ -57,6 +57,10 @@ impl VectorId {
         vector_id
     }
 
+    pub const fn from_raw(id: u64) -> Self {
+        Self { id }
+    }
+
     pub(crate) fn encode_level_prefix(buf: &mut BytesMut, level: u8) {
         buf.put_u8(level);
     }

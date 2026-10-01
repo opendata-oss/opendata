@@ -14,6 +14,8 @@ include = [
     "opendata_log_iterator_t",
     "opendata_log_key_iterator_t",
     "opendata_log_object_store_t",
+    "opendata_log_subscription_t",
+    "opendata_log_durable_callback_t",
     "opendata_log_config_t",
     "opendata_log_reader_config_t",
     "opendata_log_seq_bound_t",

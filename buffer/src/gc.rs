@@ -93,7 +93,7 @@ impl GarbageCollector {
         let mut failed: u64 = 0;
         if !to_delete.is_empty() {
             tracing::debug!(count = to_delete.len(), "GC deleting orphaned batch files");
-            let locations = stream::iter(to_delete.iter().cloned().map(Ok));
+            let locations = stream::iter(to_delete.into_iter().map(Ok));
             let mut results = self.object_store.delete_stream(locations.boxed());
             while let Some(result) = results.next().await {
                 match result {
@@ -169,8 +169,8 @@ mod tests {
     use crate::queue::QueueProducer;
     use bytes::Bytes;
     use common::ObjectStoreConfig;
-    use slatedb::object_store::PutPayload;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::{ObjectStoreExt, PutPayload};
     use std::time::Duration;
 
     const TEST_MANIFEST_PATH: &str = "test/manifest";

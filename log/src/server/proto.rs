@@ -75,15 +75,20 @@ pub struct ScanResponse {
     pub key: Option<bytes::Bytes>,
     #[prost(message, repeated, tag = "3")]
     pub values: Vec<Value>,
+    /// Exclusive global sequence to resume from — pass back as the next scan's
+    /// start to skip the already-observed (and empty) range. See RFC 0007.
+    #[prost(uint64, tag = "4")]
+    pub next_sequence: u64,
 }
 
 impl ScanResponse {
     /// Create a successful scan response.
-    pub fn success(key: bytes::Bytes, values: Vec<Value>) -> Self {
+    pub fn success(key: bytes::Bytes, values: Vec<Value>, next_sequence: u64) -> Self {
         Self {
             status: "success".to_string(),
             key: Some(key),
             values,
+            next_sequence,
         }
     }
 }
@@ -243,6 +248,7 @@ mod tests {
                 sequence: 10,
                 value: bytes::Bytes::from("my-value"),
             }],
+            next_sequence: 11,
         };
 
         // when
@@ -255,6 +261,7 @@ mod tests {
         assert_eq!(decoded.values.len(), 1);
         assert_eq!(decoded.values[0].sequence, 10);
         assert_eq!(decoded.values[0].value, bytes::Bytes::from("my-value"));
+        assert_eq!(decoded.next_sequence, 11);
     }
 
     #[test]

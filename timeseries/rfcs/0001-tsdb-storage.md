@@ -89,37 +89,30 @@ Examples of this convention:
 
 ### Standard Key Prefix
 
-All records use a standard, 2-byte prefix: a single `u8` for the record version
-and another `u8` for the record tag. The record tag is encoded as two 4-bit
-fields. The high 4 bits are the record type. The lower 4 bits depend on the
-scope of the record. Globally scoped records set the lower 4 bits to 0x00 for
-future use and bucket scoped records set the lower 4 bits to encode the
-`TimeBucketSize` allowing different time granularities to coexist (in the initial
-implementation, we will only support 1 hour time buckets).
-
-```
-record_tag byte layout (global-scoped):
-┌────────────┬────────────┐
-│  bits 7-4  │  bits 3-0  │
-│ record type│  reserved  │
-│   (1-15)   │     (0)    │
-└────────────┴────────────┘
-
-record_tag byte layout (bucket-scoped):
-┌────────────┬────────────┐
-│  bits 7-4  │  bits 3-0  │
-│ record type│ bucket size│
-│   (1-15)   │   (1-15)   │
-└────────────┴────────────┘
-```
-
-### Time Bucket Encoding
-
 Data in the system is divided into time buckets, which represent all of the data
-received within a specific window of time. The time bucket is encoded into the
-record key as a `u32` representing number of minutes since the UNIX epoch. The
-byte ordering must be big-endian to be consistent with lexicographic ordering
+received within a specific window of time.
+
+All records use a 8-byte prefix:
+- `u8` for the timeseries subsystem identifier `0x01`,
+- `u8` for the key version
+- `u8` for the record type.
+- `u32` for the time bucket start time encoded as a 4-byte unsigned integer
+  representing the number minutes since the UNIX epoch,
+- `u8` time bucket size is encoded as a 1-byte unsigned integer representing hours.
+
+Subsystem identifier and key version are defined in [RFC 0001: Record Key Prefix](rfcs/0001-record-key-prefix.md).
+In the initial implementation, we will only support 1 hour time buckets.
+The byte ordering must be big-endian to be consistent with lexicographic ordering
 from SlateDB.
+
+```
+key prefix  byte layout:
+┌───────────┬─────────┬─────────────┬─────────────┬─────────────┐
+│ subsystem │ version │ record type │ time bucket │ time bucket │
+│           │         │             │    start    │    size     │
+│  1 byte   │ 1 byte  │   1 byte    │   4 bytes   │   1 byte    │
+└───────────┴─────────┴─────────────┴─────────────┴─────────────┘
+```
 
 OpenData-timeseries will eventually support windows of time at different granularities.
 Recent data will likely be fine-grained buckets (every hour in our prototype).
@@ -156,63 +149,15 @@ architectures (x86, ARM).
 |   ID    |        Name         |                        Description                        |
 |---------|---------------------|-----------------------------------------------------------|
 | `0x00`  | *(reserved)*        | Reserved for future use                                   |
-| `0x01`  | `BucketList`        | Lists the available time buckets                          |
 | `0x02`  | `SeriesDictionary`  | Stores the mapping of series to series IDs                |
 | `0x03`  | `ForwardIndex`      | Stores the canonical label set for each series            |
 | `0x04`  | `InvertedIndex`     | Maps label/value pairs to posting lists of series IDs     |
 | `0x05`  | `TimeSeries`        | Holds the raw time-series payloads                        |
 
+ID `0x01` was used by obsolete record type `BucketList` which has been replaced by
+SlateDB's segments.
+
 ## Record Definitions & Schemas
-
-### `BucketList` (`RecordType::BucketList` = `0x01`)
-
-The buckets list is used to discover within each namespace the set of time
-buckets that are available (i.e. have data). In addition to enumerating each
-bucket, the listing also indicates its granularity. When data is rolled up into
-coarser buckets as part of the compaction process, the old finer-grained buckets
-will be replaced by the new coarse buckets in the listing.
-
-**Key Layout:**
-
-```
-┌─────────┬─────────────┐
-│ version | record_tag  │
-│ 1 byte  │   8 bits    │
-└─────────┴─────────────┘
-```
-
-- `version` (u8): Key format version (currently `0x01`)
-- `record_tag` (u8): Record tag encoding the record type and bucket size
-  - `bits 7-4` (u4): Record type (`0x01` for `BucketList`)
-  - `bits 3-0` (u4): Bucket size (`0x00` reserved for future use)
-
-**Value Schema:**
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    BucketsListValue                     │
-├─────────────────────────────────────────────────────────┤
-│  FixedElementArray<(bucket_size: u8, time_bucket: u32)> │
-└─────────────────────────────────────────────────────────┘
-```
-
-- `bucket_size` (u8): The size of the time bucket in hours
-- `time_bucket` (u32): The number of minutes since the UNIX epoch
-
-**Write Protocol:**
-
-Updates go through the merge operator so concurrent ingesters can register new
-buckets without coordination. To keep the merge stream small, flushers read the
-current `BucketList` first and only emit a single-element merge when their
-bucket is not already present. The merge operator deduplicates, so concurrent
-first-sightings from independent flushers remain correct. The singleton key
-stays hot in SlateDB's block cache (it is read on every query), so the pre-check
-is effectively free.
-
-On startup, before ingestion begins, the materialized `BucketList` is written
-back as a single `Put`. This flattens any merge operands accumulated in prior
-process lifetimes into one record so later reads don't have to replay them
-across SSTs.
 
 ### `SeriesDictionary` (`RecordType::SeriesDictionary` = `0x02`)
 
@@ -222,19 +167,20 @@ query execution to map series IDs back to their label sets when needed.
 
 **Key Layout:**
 ```
-┌─────────┬─────────────┬─────────────┬─────────────────────┐
-│ version | record_tag  | time_bucket │ series_fingerprint  │
-│ 1 byte  │   8 bits    │   4 bytes   │   16 bytes          │
-└─────────┴─────────────┴─────────────┴─────────────────────┘
+┌───────────┬─────────┬─────────────┬─────────────┬─────────────┬─────────────┐
+│ subsystem │ version │ record type │ time bucket │ time bucket │    series   │
+│           │         │             │    start    │    size     │ fingerprint │
+│  1 byte   │ 1 byte  │   1 byte    │   4 bytes   │   1 byte    │   16 bytes  │
+└───────────┴─────────┴─────────────┴─────────────┴─────────────┴─────────────┘
 ```
 
 **Key Fields:**
 
-- `version` (u8): Key format version (currently `0x01`)
-- `record_tag` (u8): Record tag encoding the record type and bucket size
-  - `bits 7-4` (u4): Record type (`0x02` for `SeriesDictionary`)
-  - `bits 3-0` (u4): Bucket size in hours
-- `time_bucket` (u32): The number of minutes since the UNIX epoch
+- `subsystem` (u8): Timeseries subsystem identifier (`0x01`)
+- `version` (u8): Key format version (currently `0x02`)
+- `record type` (u8): Record type
+- `time bucket start` (u32): The number of minutes since the UNIX epoch
+- `time bucket size` (u8): Bucket size in hours
 - `series_fingerprint` (u128): The fingerprint of the label set, computed as a hash of the labels
 
 The series fingerprint is computed using the labels of the series. The value
@@ -268,20 +214,21 @@ define it so that they can be returned to the user.
 
 **Key Layout:**
 ```
-┌─────────┬─────────────┬─────────────┬──────────────┐
-│ version | record_tag  | time_bucket │  series_id   │
-│ 1 byte  │   8 bits    │   4 bytes   │   4 bytes    │
-└─────────┴─────────────┴─────────────┴──────────────┘
+┌───────────┬─────────┬─────────────┬─────────────┬─────────────┬─────────────┐
+│ subsystem │ version │ record type │ time bucket │ time bucket │    series   │
+│           │         │             │    start    │    size     │      id     │
+│  1 byte   │ 1 byte  │   1 byte    │   4 bytes   │   1 byte    │   4 bytes   │
+└───────────┴─────────┴─────────────┴─────────────┴─────────────┴─────────────┘
 ```
 
 **Key Fields:**
 
-- `version` (u8): Key format version (currently `0x01`)
-- `record_tag` (u8): Record tag encoding the record type and bucket size
-  - `bits 7-4` (u4): Record type (`0x03` for `ForwardIndex`)
-  - `bits 3-0` (u4): Bucket size in hours
-- `time_bucket` (u32): The number of minutes since the UNIX epoch
-- `series_id` (u32): The series ID, unique within the time bucket
+- `subsystem` (u8): Timeseries subsystem identifier (`0x01`)
+- `version` (u8): Key format version (currently `0x02`)
+- `record type` (u8): Record type
+- `time bucket start` (u32): The number of minutes since the UNIX epoch
+- `time bucket size` (u8): Bucket size in hours
+- `series id` (u32): The series ID, unique within the time bucket
 
 **Value Schema:**
 
@@ -338,18 +285,19 @@ and similarly for `B=2`.
 
 **Key Layout:**
 ```
-┌─────────┬──────────────┬─────────────┬──────────────────┬─────────────┐
-│ version │  record_tag  │ time_bucket │      label       │   value     │
-│ 1 byte  │   8 bits     │   4 bytes   │ terminated bytes │  raw utf8   │
-└─────────┴──────────────┴─────────────┴──────────────────┴─────────────┘
+┌───────────┬─────────┬─────────────┬─────────────┬─────────────┬──────────────────┬──────────┐
+│ subsystem │ version │ record type │ time bucket │ time bucket │       label      │   value  │
+│           │         │             │    start    │    size     │                  │          │
+│  1 byte   │ 1 byte  │   1 byte    │   4 bytes   │   1 byte    │ terminated bytes │ raw utf8 │
+└───────────┴─────────┴─────────────┴─────────────┴─────────────┴──────────────────┴──────────┘
 ```
 
 **Key Fields:**
-- `version` (u8): Key format version (currently `0x01`)
-- `record_tag` (u8): Record tag encoding the record type and bucket size
-  - `bits 7-4` (u4): Record type (`0x04` for `InvertedIndex`)
-  - `bits 3-0` (u4): Bucket size in hours
-- `time_bucket` (u32): The number of minutes since the UNIX epoch (big-endian)
+- `subsystem` (u8): Timeseries subsystem identifier (`0x01`)
+- `version` (u8): Key format version (currently `0x02`)
+- `record type` (u8): Record type
+- `time bucket start` (u32): The number of minutes since the UNIX epoch
+- `time bucket size` (u8): Bucket size in hours
 - `label` (terminated bytes): Label name encoded using `terminated_bytes::serialize`,
   which escapes `0x00` and `0x01` bytes and appends a `0x00` terminator. This
   preserves lexicographical ordering and unambiguously separates the label from
@@ -398,22 +346,23 @@ PromQL range queries on the cold path.
 
 **Key Layout:**
 ```
-┌─────────┬──────────────┬─────────────┬─────────────────────────┬──────────────┐
-│ version │  record_tag  │ time_bucket │      metric_name        │  series_id   │
-│ 1 byte  │   8 bits     │   4 bytes   │  terminated bytes (var) │   4 bytes    │
-└─────────┴──────────────┴─────────────┴─────────────────────────┴──────────────┘
+┌───────────┬─────────┬─────────────┬─────────────┬─────────────┬──────────────────┬───────────┐
+│ subsystem │ version │ record type │ time bucket │ time bucket │   metric name    │ series id │
+│           │         │             │    start    │    size     │                  │           │
+│  1 byte   │ 1 byte  │   1 byte    │   4 bytes   │   1 byte    │ terminated bytes │  4 bytes  │
+└───────────┴─────────┴─────────────┴─────────────┴─────────────┴──────────────────┴───────────┘
 ```
 
 **Key Fields:**
-- `version` (u8): Key format version (currently `0x01`)
-- `record_tag` (u8): Record tag encoding the record type and bucket size
-  - `bits 7-4` (u4): Record type (`0x05` for `TimeSeries`)
-  - `bits 3-0` (u4): Bucket size in hours
-- `time_bucket` (u32): The number of minutes since the UNIX epoch
-- `metric_name` (variable): The `__name__` label value, encoded with a
+- `subsystem` (u8): Timeseries subsystem identifier (`0x01`)
+- `version` (u8): Key format version (currently `0x02`)
+- `record type` (u8): Record type
+- `time bucket start` (u32): The number of minutes since the UNIX epoch
+- `time bucket size` (u8): Bucket size in hours
+- `metric name` (variable): The `__name__` label value, encoded with a
   `0x00`-terminated byte encoding so that it sorts lexicographically and
   delimits cleanly from the trailing `series_id`
-- `series_id` (u32): The series ID, unique within the time bucket
+- `series id` (u32): The series ID, unique within the time bucket
 
 **Value Schema:**
 
@@ -542,9 +491,10 @@ This was rejected in favor of separate deployments per namespace:
 
 ## Updates
 
-| Date       | Description |
-|------------|-------------|
-| 2025-12-17 | Initial draft |
-| 2026-01-18 | Updated InvertedIndex key encoding: attribute uses terminated bytes, value uses raw UTF-8 (backward incompatible) |
-| 2026-04-01 | Added metric_name to TimeSeries key: layout changed from `<bucket, series_id>` to `<bucket, metric_name, series_id>` for storage locality (backward incompatible, #349) |
+| Date       | Description                                                                                                                                                                                   |
+|------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 2025-12-17 | Initial draft                                                                                                                                                                                 |
+| 2026-01-18 | Updated InvertedIndex key encoding: attribute uses terminated bytes, value uses raw UTF-8 (backward incompatible)                                                                             |
+| 2026-04-01 | Added metric_name to TimeSeries key: layout changed from `<bucket, series_id>` to `<bucket, metric_name, series_id>` for storage locality (backward incompatible, #349)                       |
 | 2026-04-19 | Documented BucketList write protocol: flushers read-check before emitting a merge to avoid per-flush merge churn on the hot singleton key; startup coalesces merge operands into a single Put |
+| 2026-07-14 | Updated the key format to `0x02`                                                                                                                                                               |

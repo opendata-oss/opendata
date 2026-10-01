@@ -4,11 +4,15 @@
 //! record type encoded in the key.
 
 use crate::serde::centroid_stats::CentroidStatsValue;
+use crate::serde::deletions::merge_batch_deletions;
+use crate::serde::field_stats::merge_batch_field_stats;
+use crate::serde::key::{TERM_POSTINGS_DISCRIMINATOR, TERM_STATS_DISCRIMINATOR};
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::merge_batch_posting_list;
-use crate::serde::{EncodingError, KEY_VERSION, RecordType, SUBSYSTEM};
+use crate::serde::term_postings::merge_batch_term_postings;
+use crate::serde::term_stats::merge_batch_term_stats;
+use crate::serde::{EncodingError, RecordType, parse_record_tag};
 use bytes::Bytes;
-use common::serde::key_prefix::KeyPrefix;
 use common::storage::default_merge_batch;
 
 /// Merge operator for vector database that handles merging of different record types.
@@ -29,10 +33,9 @@ impl VectorDbMergeOperator {
 
 impl common::storage::MergeOperator for VectorDbMergeOperator {
     fn merge_batch(&self, key: &Bytes, existing_value: Option<Bytes>, operands: &[Bytes]) -> Bytes {
-        let prefix = KeyPrefix::from_bytes_with_validation(key, SUBSYSTEM, KEY_VERSION)
-            .expect("Failed to decode key prefix");
+        let tag = parse_record_tag(key).expect("Failed to parse key prefix");
         let record_type =
-            RecordType::from_prefix(prefix).expect("Failed to get record type from record tag");
+            RecordType::from_id(tag.record_type()).expect("Failed to decode record type");
 
         match record_type {
             RecordType::MetadataIndex => merge_batch_metadata_index(existing_value, operands)
@@ -41,6 +44,15 @@ impl common::storage::MergeOperator for VectorDbMergeOperator {
                 merge_batch_posting_list(existing_value, operands, self.dimensions)
             }
             RecordType::CentroidStats => merge_batch_centroid_stats(existing_value, operands),
+            RecordType::Deletions => merge_batch_deletions(existing_value, operands),
+            RecordType::FtsTerm => match key.last().copied() {
+                Some(TERM_POSTINGS_DISCRIMINATOR) => {
+                    merge_batch_term_postings(existing_value, operands)
+                }
+                Some(TERM_STATS_DISCRIMINATOR) => merge_batch_term_stats(existing_value, operands),
+                _ => default_merge_batch(key, existing_value, operands, |_k, _e, v| v),
+            },
+            RecordType::FtsFieldStats => merge_batch_field_stats(existing_value, operands),
             _ => {
                 // For other record types (IdDictionary, VectorData, VectorMeta, etc.), just use new value
                 // for each pairwise merge. These should use Put, not Merge, but handle gracefully
@@ -110,9 +122,13 @@ fn merge_batch_centroid_stats(existing: Option<Bytes>, operands: &[Bytes]) -> By
 mod tests {
     use super::*;
     use crate::serde::FieldValue;
-    use crate::serde::key::{CentroidStatsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey};
+    use crate::serde::deletions::DeletionsValue;
+    use crate::serde::key::{
+        CentroidStatsKey, DeletionsKey, IdDictionaryKey, MetadataIndexKey, PostingListKey,
+    };
     use crate::serde::metadata_index::MetadataIndexValue;
     use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+    use crate::serde::vector_bitmap::VectorBitmap;
     use crate::serde::vector_id::VectorId;
     use common::storage::MergeOperator;
     use roaring::RoaringTreemap;
@@ -334,6 +350,35 @@ mod tests {
         // then
         let decoded = CentroidStatsValue::decode_from_bytes(&merged).unwrap();
         assert_eq!(decoded.num_vectors, 12);
+    }
+
+    #[test]
+    fn should_route_deletions_to_bitmap_union_merge() {
+        // given
+        let operator = VectorDbMergeOperator::new(3);
+        let key = DeletionsKey::new().encode();
+
+        let mut existing_bitmap = VectorBitmap::new();
+        existing_bitmap.insert(1);
+        existing_bitmap.insert(2);
+        let existing_value = DeletionsValue::new(existing_bitmap)
+            .encode_to_bytes()
+            .unwrap();
+
+        let mut new_bitmap = VectorBitmap::new();
+        new_bitmap.insert(2);
+        new_bitmap.insert(3);
+        let new_value = DeletionsValue::new(new_bitmap).encode_to_bytes().unwrap();
+
+        // when
+        let merged = operator.merge_batch(&key, Some(existing_value), &[new_value]);
+
+        // then - union of {1,2} and {2,3} is {1,2,3}
+        let decoded = DeletionsValue::decode_from_bytes(&merged).unwrap();
+        assert_eq!(decoded.0.len(), 3);
+        for id in [1, 2, 3] {
+            assert!(decoded.0.contains(id), "missing {}", id);
+        }
     }
 
     #[test]

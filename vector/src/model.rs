@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[cfg(feature = "buffer")]
+use common::ObjectStoreConfig;
 use common::StorageConfig;
 use serde::{Deserialize, Serialize};
 
@@ -214,20 +216,6 @@ pub struct Config {
     /// Number of neighboring centroids to scan for reassignment candidates after a split.
     pub split_search_neighbourhood: usize,
 
-    /// The maximum number of centroids that require rebalancing before which backpressure
-    /// is applied by pausing ingestion of new vector writes.
-    pub max_pending_and_running_rebalance_tasks: usize,
-
-    /// After backpressure is applied, ingestion resumes after the total number of centroids
-    /// requiring rebalance drops below this value.
-    pub rebalance_backpressure_resume_threshold: usize,
-
-    /// The maximum number of rebalance tasks that the rebalancer will run concurrently.
-    pub max_rebalance_tasks: usize,
-
-    /// Target number of centroids per chunk.
-    pub chunk_target: u16,
-
     /// Query-aware dynamic pruning epsilon (ε₂ from SPANN paper).
     ///
     /// When set, a posting list is searched only if its centroid's distance
@@ -245,6 +233,30 @@ pub struct Config {
     /// attribute names or type mismatches will fail. If empty, any attribute
     /// names are accepted with types inferred from the first write.
     pub metadata_fields: Vec<MetadataFieldSpec>,
+
+    /// Fraction of outstanding FTS deletes (relative to live vectors) above
+    /// which a major compaction of the FTS segment is forced (RFC-0006).
+    ///
+    /// The custom compaction scheduler watches the in-memory deletions-bitmap
+    /// cardinality versus the live-vector count; once the ratio reaches this
+    /// threshold it triggers a full compaction of the FTS segment to apply the
+    /// accumulated deletes and shrink the in-memory bitmap. Defaults to `0.20`
+    /// (20%). Only affects SlateDB storage with compaction enabled.
+    #[serde(default = "default_delete_compaction_threshold")]
+    pub delete_compaction_threshold: f64,
+
+    /// How often the FieldStats poller refreshes the FTS compaction scheduler's
+    /// in-memory per-field delete-pressure tracker from the persisted
+    /// `FieldStats` records (RFC-0006). Defaults to 5s. Only affects SlateDB
+    /// storage with compaction enabled.
+    #[serde(default = "default_fts_stats_poll_interval", with = "duration_secs")]
+    pub fts_stats_poll_interval: Duration,
+
+    /// Buffer consumer configuration. When `Some`, the server starts a
+    /// background task that ingests vectors from an `opendata-buffer` queue.
+    #[cfg(feature = "buffer")]
+    #[serde(default)]
+    pub buffer_consumer: Option<BufferConsumerConfig>,
 }
 
 impl Default for Config {
@@ -254,17 +266,84 @@ impl Default for Config {
             dimensions: 0, // Must be set explicitly
             distance_metric: DistanceMetric::L2,
             flush_interval: Duration::from_secs(60),
-            split_threshold_vectors: 2_000,
-            merge_threshold_vectors: 500,
+            split_threshold_vectors: 150,
+            merge_threshold_vectors: 50,
             split_search_neighbourhood: 0,
-            max_pending_and_running_rebalance_tasks: 16,
-            rebalance_backpressure_resume_threshold: 8,
-            max_rebalance_tasks: 8,
-            chunk_target: 4096,
             query_pruning_factor: None,
             metadata_fields: Vec::new(),
+            delete_compaction_threshold: default_delete_compaction_threshold(),
+            fts_stats_poll_interval: default_fts_stats_poll_interval(),
+            #[cfg(feature = "buffer")]
+            buffer_consumer: None,
         }
     }
+}
+
+/// Default fraction of outstanding FTS deletes that triggers a major
+/// compaction of the FTS segment (RFC-0006, 20%).
+pub(crate) fn default_delete_compaction_threshold() -> f64 {
+    0.20
+}
+
+/// Default FTS field-stats poll interval (RFC-0006, 5s).
+pub(crate) fn default_fts_stats_poll_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// Configuration for the embedded buffer consumer task.
+///
+/// Mirrors [`buffer::ConsumerConfig`], plus a poll interval used by the
+/// vector consumer when the queue is empty.
+#[cfg(feature = "buffer")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferConsumerConfig {
+    /// Object store where the buffer queue lives. Must match the producer.
+    pub object_store: ObjectStoreConfig,
+
+    /// Path to the queue manifest in object storage. Must match the producer.
+    #[serde(default = "default_buffer_manifest_path")]
+    pub manifest_path: String,
+
+    /// Path prefix for data batch objects. Must match the producer.
+    #[serde(default = "default_buffer_data_path_prefix")]
+    pub data_path_prefix: String,
+
+    /// Poll interval when the queue is empty.
+    #[serde(default = "default_buffer_poll_interval", with = "duration_secs")]
+    pub poll_interval: Duration,
+
+    /// How often the garbage collector runs.
+    #[serde(default = "default_buffer_gc_interval", with = "duration_secs")]
+    pub gc_interval: Duration,
+
+    /// Minimum age before an unreferenced batch file is deleted.
+    #[serde(default = "default_buffer_gc_grace_period", with = "duration_secs")]
+    pub gc_grace_period: Duration,
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_manifest_path() -> String {
+    "ingest/manifest".to_string()
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_data_path_prefix() -> String {
+    "ingest".to_string()
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_poll_interval() -> Duration {
+    Duration::from_millis(100)
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_gc_interval() -> Duration {
+    Duration::from_secs(300)
+}
+
+#[cfg(feature = "buffer")]
+fn default_buffer_gc_grace_period() -> Duration {
+    Duration::from_secs(600)
 }
 
 /// Options for search operations.
@@ -272,6 +351,30 @@ impl Default for Config {
 pub struct SearchOptions {
     /// Number of centroids to probe during search.
     pub nprobe: Option<usize>,
+    /// BM25 scoring algorithm override (default: [`Bm25Scorer::BlockMax`]).
+    pub bm25_scorer: Option<Bm25Scorer>,
+}
+
+/// Which scoring algorithm the BM25 query path uses.
+///
+/// `BlockMax` (the default) prunes non-competitive documents with
+/// BlockMaxScore (RFC-0006 Milestone 3). `Exhaustive` scores every document
+/// in the union of the query terms' posting lists; it exists as a reference
+/// implementation and for benchmarking the pruned path against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bm25Scorer {
+    /// Score every candidate document (RFC-0006 Milestone 0 path).
+    Exhaustive,
+    /// Skip non-competitive documents using BlockMaxScore, accumulating
+    /// essential clauses in a dense doc-id-indexed window buffer. Fastest
+    /// when doc ids are dense.
+    #[default]
+    BlockMax,
+    /// BlockMaxScore with posting-count-sized windows and sort-merge
+    /// accumulation. Holds up when the doc id space is sparse (heavy
+    /// delete/update churn leaves permanent id gaps), where `BlockMax`'s
+    /// dense window buffer degrades.
+    BlockMaxSparse,
 }
 
 /// Configuration for a read-only vector database client.
@@ -368,20 +471,38 @@ impl From<Vec<String>> for FieldSelection {
     }
 }
 
+/// Parameters for a BM25 full-text-search query (RFC-0006).
+#[derive(Debug, Clone)]
+pub struct Bm25Query {
+    /// Text field to search against. Must be declared as `FieldType::Text`.
+    pub field: String,
+    /// Query text. Tokenized with the same tokenizer used at write time.
+    pub query: String,
+}
+
+/// How a query should score documents.
+#[derive(Debug, Clone)]
+pub enum ScoreBy {
+    /// Approximate-nearest-neighbour search on the embedding vector.
+    Ann(Vec<f32>),
+    /// BM25 full-text search on a `FieldType::Text` field.
+    Bm25(Bm25Query),
+}
+
 /// Query specification for vector search.
 ///
 /// Constructed using the builder pattern:
 ///
 /// ```ignore
-/// let query = Query::new(embedding)
+/// let ann = Query::ann(embedding)
 ///     .with_limit(10)
-///     .with_filter(Filter::eq("category", "shoes"))
-///     .with_fields(vec!["category", "price"]);
+///     .with_filter(Filter::eq("category", "shoes"));
+/// let bm25 = Query::bm25("body", "fox jumps").with_limit(5);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Query {
-    /// Query vector (required).
-    pub vector: Vec<f32>,
+    /// Method used to score documents (ANN or BM25).
+    pub score_by: ScoreBy,
     /// Maximum number of results to return (default: 10).
     pub limit: usize,
     /// Optional metadata filter.
@@ -391,10 +512,31 @@ pub struct Query {
 }
 
 impl Query {
-    /// Creates a new query with the given vector.
+    /// Creates a new ANN query with the given vector.
+    ///
+    /// Alias for [`Query::ann`]; kept for ergonomics so existing call sites
+    /// that read as `Query::new(vec)` continue to work.
     pub fn new(vector: Vec<f32>) -> Self {
+        Self::ann(vector)
+    }
+
+    /// Creates a new ANN query with the given vector.
+    pub fn ann(vector: Vec<f32>) -> Self {
         Self {
-            vector,
+            score_by: ScoreBy::Ann(vector),
+            limit: 10,
+            filter: None,
+            include_fields: FieldSelection::All,
+        }
+    }
+
+    /// Creates a new BM25 query for the given text field.
+    pub fn bm25(field: impl Into<String>, query: impl Into<String>) -> Self {
+        Self {
+            score_by: ScoreBy::Bm25(Bm25Query {
+                field: field.into(),
+                query: query.into(),
+            }),
             limit: 10,
             filter: None,
             include_fields: FieldSelection::All,
@@ -419,6 +561,14 @@ impl Query {
     pub fn with_fields(mut self, fields: impl Into<FieldSelection>) -> Self {
         self.include_fields = fields.into();
         self
+    }
+
+    /// Returns the ANN query vector, if this query scores by ANN.
+    pub fn ann_vector(&self) -> Option<&Vec<f32>> {
+        match &self.score_by {
+            ScoreBy::Ann(v) => Some(v),
+            ScoreBy::Bm25(_) => None,
+        }
     }
 }
 
@@ -464,6 +614,24 @@ impl Filter {
     /// Combines filters with logical OR.
     pub fn or(filters: Vec<Filter>) -> Self {
         Filter::Or(filters)
+    }
+
+    /// Evaluate this filter against an attribute map (CPU-side reference
+    /// semantics). Useful for computing filtered ground truth without going
+    /// through the index.
+    ///
+    /// Semantics for well-formed metadata (every row carries the indexed
+    /// fields): `Eq` matches when the field is present and equal; `Neq`
+    /// matches when the field is absent or not equal; `In` matches when the
+    /// field is present and its value is in the set; `And`/`Or` combine.
+    pub fn matches(&self, attributes: &HashMap<String, AttributeValue>) -> bool {
+        match self {
+            Filter::Eq(field, value) => attributes.get(field) == Some(value),
+            Filter::Neq(field, value) => attributes.get(field) != Some(value),
+            Filter::In(field, values) => attributes.get(field).is_some_and(|v| values.contains(v)),
+            Filter::And(filters) => filters.iter().all(|f| f.matches(attributes)),
+            Filter::Or(filters) => filters.iter().any(|f| f.matches(attributes)),
+        }
     }
 }
 

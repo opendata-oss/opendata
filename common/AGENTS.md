@@ -10,7 +10,8 @@ Shared encoding/decoding patterns used across all databases:
 
 | Module | Description |
 |--------|-------------|
-| `key_prefix.rs` | Standard 2-byte key prefix (version + record_tag) |
+| `key_prefix.rs` | Standard 2-byte key prefix (subsystem + version) — see RFC 0001 |
+| `record_tag.rs` | Optional 4+4 bit tag-byte encoding (record type + reserved); subsystems choose where to place it |
 | `terminated_bytes.rs` | Variable-length byte encoding with 0x00 terminator |
 | `sortable.rs` | Lexicographically sortable numeric encodings (sign-bit flip + big-endian) |
 | `encoding.rs` | Common value encodings (Utf8, Array, etc.) |
@@ -54,7 +55,7 @@ All databases follow this pattern for record types:
 // In database crate's src/serde/
 use common::serde::{key_prefix, terminated_bytes, encoding};
 
-// Key: version | tag | ... (big-endian)
+// Key: subsystem | version | ... subsystem-defined fields (big-endian)
 // Value: ... (little-endian)
 ```
 

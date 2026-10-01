@@ -21,10 +21,10 @@
 //!
 //! ```
 //! # use timeseries::{TimeSeriesDb, Config, Series};
-//! # use common::StorageConfig;
+//! # use common::storage::config::SlateDbStorageConfig;
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = Config { storage: StorageConfig::InMemory, ..Default::default() };
+//! let config = Config { storage: SlateDbStorageConfig::default(), ..Default::default() };
 //! let ts = TimeSeriesDb::open(config).await?;
 //!
 //! let series = Series::builder("http_requests_total")
@@ -43,6 +43,7 @@
 #![allow(dead_code)]
 
 // Internal modules
+mod active_series;
 mod delta;
 mod flusher;
 mod index;

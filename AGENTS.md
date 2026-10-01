@@ -19,7 +19,7 @@ OpenData is a collection of deployable database systems that share common infras
 
 All databases follow these patterns (see RFCs in each crate's `rfcs/` directory):
 
-1. **Key encoding**: 2-byte prefix (version u8 + record_tag u8), big-endian for lexicographic ordering
+1. **Key encoding**: 2-byte common prefix (subsystem u8 + version u8) followed by subsystem-defined fields, big-endian for lexicographic ordering
 2. **Value encoding**: Little-endian for performance on common architectures
 3. **Common types**: `Utf8`, `Array<T>`, `FixedElementArray<T>`, `TerminatedBytes`, `RoaringBitmap/Treemap`
 4. **Sequence allocation**: Block-based `SeqBlock` for crash-safe ID generation (see `common/src/sequence.rs`)

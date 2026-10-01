@@ -84,12 +84,13 @@ mod tests {
         }];
 
         // when
-        let response = proto::ScanResponse::success(Bytes::from("key"), values);
+        let response = proto::ScanResponse::success(Bytes::from("key"), values, 1);
 
         // then
         assert_eq!(response.status, "success");
         assert_eq!(*response.key.as_ref().unwrap(), Bytes::from("key"));
         assert_eq!(response.values.len(), 1);
+        assert_eq!(response.next_sequence, 1);
     }
 
     #[test]
@@ -101,6 +102,7 @@ mod tests {
                 sequence: 42,
                 value: Bytes::from("test-value"),
             }],
+            43,
         );
 
         // when

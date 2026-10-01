@@ -1,6 +1,5 @@
 use crate::StorageRead;
 use crate::coordinator::WriteCommand;
-use crate::storage::StorageSnapshot;
 use async_trait::async_trait;
 use std::ops::Range;
 use std::sync::Arc;
@@ -52,6 +51,12 @@ pub trait Delta: Sized + Send + Sync + 'static {
     /// is up to the delta implementation. It is up to the implementation to provide
     /// the APIs required for a given database, including support for snapshot isolation
     type DeltaView: Clone + Send + Sync + 'static;
+    /// A point-in-time view of flushed storage, produced by the [`Flusher`] and
+    /// broadcast to readers via [`View`](super::View). The coordinator treats it
+    /// as opaque — it only stores, clones, and rebroadcasts it — so the bound is
+    /// deliberately minimal. Each database plugs in its own backend's snapshot
+    /// type (e.g. a trait object over the storage layer, or a concrete handle).
+    type Snapshot: Clone + Send + Sync + 'static;
 
     /// Create a new delta initialized from a snapshot context.
     /// The delta takes ownership of the context while it is mutable.
@@ -101,7 +106,7 @@ pub trait Flusher<D: Delta>: Send + Sync + 'static {
         &mut self,
         frozen: D::Frozen,
         epoch_range: &Range<u64>,
-    ) -> Result<Arc<dyn StorageSnapshot>, String>;
+    ) -> Result<D::Snapshot, String>;
 
     /// Ensure storage durability (e.g. call storage.flush()).
     async fn flush_storage(&self) -> Result<(), String>;

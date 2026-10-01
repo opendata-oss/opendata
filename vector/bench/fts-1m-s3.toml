@@ -1,0 +1,15 @@
+# 1M-document FTS (BM25) benchmark against SlateDB backed by S3.
+#
+#   cargo run -p vector-bench --release -- --config vector/bench/fts-1m-s3.toml --benchmark fts
+
+[data.storage]
+type = "SlateDb"
+path = "fts-bench-m3"
+
+[data.storage.object_store]
+type = "Aws"
+region = "us-west-2"
+bucket = "opendata-vector-bench"
+
+[[params.fts]]
+num_docs = "1000000"

@@ -13,6 +13,7 @@
 
 use crate::VectorDbReader;
 use crate::error::{Error, Result};
+use crate::metric_names::{VECTOR_DELETES_TOTAL, VECTOR_UPSERTS_TOTAL};
 use crate::model::{
     AttributeValue, Config, Query, SearchOptions, SearchResult, VECTOR_FIELD_NAME, Vector,
     attributes_to_map,
@@ -26,10 +27,11 @@ use crate::serde::key::{
     SeqBlockKey,
 };
 use crate::serde::posting_list::{PostingListValue, PostingUpdate};
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_id::{LEAF_LEVEL, ROOT_VECTOR_ID, VectorId};
 use crate::storage::VectorDbStorageReadExt;
-use crate::storage::merge_operator::VectorDbMergeOperator;
-use crate::write::delta::{VectorDbWrite, VectorDbWriteDelta, VectorWrite};
+use crate::text;
+use crate::write::delta::{TextAttributeSummary, VectorDbOp, VectorDbOpDelta, VectorWrite};
 use crate::write::flusher::VectorDbFlusher;
 use crate::write::indexer::tree::Indexer;
 use crate::write::indexer::tree::IndexerOpts;
@@ -42,9 +44,9 @@ use crate::write::indexer::tree::state::VectorIndexState;
 use async_trait::async_trait;
 use common::Record;
 use common::SequenceAllocator;
+use common::StorageBuilder;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
-use common::{StorageBuilder, StorageSemantics};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -120,6 +122,9 @@ pub(crate) struct LastAppliedSnapshot {
     pub(crate) centroid_index: Arc<LeveledCentroidIndex<'static>>,
     pub(crate) centroid_cache: Arc<AllCentroidsCache>,
     pub(crate) centroid_count: usize,
+    /// FTS deletions bitmap loaded from storage after the last flush, used by
+    /// the BM25 query path to hide deleted/replaced docs without a per-query read.
+    pub(crate) fts_deletions: Arc<VectorBitmap>,
 }
 
 /// Vector database for storing and querying embedding vectors.
@@ -132,18 +137,43 @@ pub struct VectorDb {
     storage: Arc<dyn Storage>,
 
     /// The WriteCoordinator itself (stored to keep it alive).
-    write_coordinator: WriteCoordinator<VectorDbWriteDelta, VectorDbFlusher>,
+    write_coordinator: WriteCoordinator<VectorDbOpDelta, VectorDbFlusher>,
 
     /// snapshot state for queries
     last_applied_snapshot: Arc<Mutex<LastAppliedSnapshot>>,
+
+    /// Background task that refreshes the FTS compaction scheduler's
+    /// delete-pressure tracker from the persisted per-field `FieldStats`
+    /// (RFC-0006). Wrapped so it is aborted when the database is dropped — it
+    /// holds an `Arc<dyn Storage>` clone and would otherwise keep polling.
+    /// `VectorDb` deliberately does *not* implement `Drop` itself (that would
+    /// forbid the field moves in `close`); the guard's own `Drop` handles it.
+    fts_stats_poller: AbortOnDrop,
+}
+
+/// Aborts the wrapped background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl VectorDb {
     pub(crate) fn indexer_opts(config: &Config) -> IndexerOpts {
+        // Text fields use the FTS path, never the inverted index — drop them
+        // from `indexed_fields` even if a caller set `indexed: true`.
         let indexed_fields: HashSet<String> = config
             .metadata_fields
             .iter()
-            .filter(|s| s.indexed)
+            .filter(|s| s.indexed && s.field_type != crate::serde::FieldType::Text)
+            .map(|s| s.name.clone())
+            .collect();
+        let text_fields: HashSet<String> = config
+            .metadata_fields
+            .iter()
+            .filter(|s| s.field_type == crate::serde::FieldType::Text)
             .map(|s| s.name.clone())
             .collect();
         IndexerOpts {
@@ -154,6 +184,7 @@ impl VectorDb {
             split_threshold_vectors: config.split_threshold_vectors,
             split_search_neighbourhood: config.split_search_neighbourhood,
             indexed_fields,
+            text_fields,
         }
     }
 
@@ -193,14 +224,20 @@ impl VectorDb {
         centroids: Vec<Vec<f32>>,
         builder: StorageBuilder,
     ) -> Result<Self> {
-        let merge_op = VectorDbMergeOperator::new(config.dimensions as usize);
-        let storage = builder
-            .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(merge_op)))
-            .build()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))?;
+        // In-memory FTS delete-pressure counters, shared between the custom
+        // compaction scheduler (which reads them to decide when to force a major
+        // FTS compaction) and the flusher (which refreshes them after each
+        // flush). The writer drives the scheduler, so the tracker is passed to
+        // `build_vector_storage` to enable it. RFC-0006.
+        let fts_delete_tracker = crate::storage::compaction_scheduler::FtsDeleteTracker::shared();
+        let storage = crate::storage::build_vector_storage(
+            &config,
+            builder,
+            Some(fts_delete_tracker.clone()),
+        )
+        .await?;
 
-        Self::load_or_init_db(storage, config, centroids).await
+        Self::load_or_init_db(storage, config, centroids, fts_delete_tracker).await
     }
 
     /// Create a vector database with the given storage, configuration, and centroids.
@@ -213,6 +250,7 @@ impl VectorDb {
         storage: Arc<dyn Storage>,
         config: Config,
         centroids: Vec<Vec<f32>>,
+        fts_delete_tracker: Arc<crate::storage::compaction_scheduler::FtsDeleteTracker>,
     ) -> Result<Self> {
         let seq_key = SeqBlockKey.encode();
         let id_allocator = SequenceAllocator::load(storage.as_ref(), seq_key).await?;
@@ -239,11 +277,13 @@ impl VectorDb {
             config.distance_metric,
         )
         .await?;
+        let fts_deletions = Arc::new(snapshot.get_deletions().await?);
         let last_applied_snapshot = Arc::new(Mutex::new(LastAppliedSnapshot {
             snapshot: snapshot.clone(),
             centroid_cache: Arc::new(loaded_tree.centroid_cache.cache()),
             centroid_index: loaded_tree.query_centroid_index,
             centroid_count: loaded_tree.num_leaf_centroids,
+            fts_deletions,
         }));
 
         let _ = id_allocator.freeze();
@@ -260,6 +300,18 @@ impl VectorDb {
             0,
             indexer,
             last_applied_snapshot.clone(),
+        );
+
+        // Poll the persisted per-field FieldStats into the scheduler's in-memory
+        // delete-pressure tracker (RFC-0006). Kept separate from the flush path
+        // so the scheduler's view is refreshed even when no writes are flowing
+        // (e.g. while a forced compaction is draining deletes).
+        let fts_stats_poller = AbortOnDrop(
+            crate::storage::compaction_scheduler::spawn_fts_field_stats_poller(
+                Arc::clone(&storage),
+                fts_delete_tracker,
+                config.fts_stats_poll_interval,
+            ),
         );
 
         let coordinator_config = WriteCoordinatorConfig {
@@ -281,6 +333,7 @@ impl VectorDb {
             storage,
             write_coordinator,
             last_applied_snapshot,
+            fts_stats_poller,
         })
     }
 
@@ -372,7 +425,7 @@ impl VectorDb {
             .await?
             .ok_or_else(|| Error::Storage("missing centroid tree metadata".to_string()))?;
         let root_posting_list =
-            PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?);
+            PostingList::from_value(snapshot.get_root_posting_list(dimensions).await?, true);
         let centroids: HashMap<VectorId, CentroidInfoValue> = snapshot
             .scan_all_centroid_info()
             .await?
@@ -391,7 +444,10 @@ impl VectorDb {
                 assert_ne!(centroid_id, ROOT_VECTOR_ID);
                 centroids.get(&centroid_id).map(|centroid| {
                     assert!(centroid.level > LEAF_LEVEL);
-                    (centroid_id, Arc::new(PostingList::from_value(posting_list)))
+                    (
+                        centroid_id,
+                        Arc::new(PostingList::from_value(posting_list, true)),
+                    )
                 })
             })
             .collect();
@@ -462,10 +518,8 @@ impl VectorDb {
         snapshot: &dyn StorageRead,
     ) -> Result<HashMap<String, VectorId>> {
         // Create prefix for all IdDictionary records
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::IdDictionary
-            .prefix()
-            .write_to(&mut prefix_buf);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
+        crate::serde::RecordType::IdDictionary.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         // Scan all IdDictionary records
@@ -535,11 +589,13 @@ impl VectorDb {
             writes.push(self.prepare_vector_write(vector)?);
         }
 
+        metrics::counter!(VECTOR_UPSERTS_TOTAL).increment(writes.len() as u64);
+
         // Send all writes to coordinator in a single batch and wait to be applied
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .write(VectorDbWrite::Write(writes))
+            .write(VectorDbOp::Write(writes))
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
@@ -584,11 +640,13 @@ impl VectorDb {
             writes.push(self.prepare_vector_write(vector)?);
         }
 
+        metrics::counter!(VECTOR_UPSERTS_TOTAL).increment(writes.len() as u64);
+
         // Send all writes to coordinator in a single batch and wait to be applied
         let mut write_handle = self
             .write_coordinator
             .handle(WRITE_CHANNEL)
-            .write_timeout(VectorDbWrite::Write(writes), timeout)
+            .write_timeout(VectorDbOp::Write(writes), timeout)
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
         write_handle
@@ -650,6 +708,9 @@ impl VectorDb {
             self.validate_attributes(&attributes)?;
         }
 
+        // Tokenize any FieldType::Text attributes for FTS indexing.
+        let text_attribute_summaries = self.build_text_summaries(&attributes)?;
+
         // Convert attributes to vec of tuples for VectorWrite
         let attributes_vec: Vec<(String, AttributeValue)> = attributes.into_iter().collect();
 
@@ -657,7 +718,47 @@ impl VectorDb {
             external_id: vector.id,
             values,
             attributes: attributes_vec,
+            text_attribute_summaries,
         })
+    }
+
+    /// Walk `Text` schema fields, validate they're strings, and produce
+    /// `TextAttributeSummary` for each via the shared tokenizer (RFC-0006).
+    fn build_text_summaries(
+        &self,
+        attributes: &HashMap<String, AttributeValue>,
+    ) -> Result<HashMap<String, TextAttributeSummary>> {
+        let mut summaries = HashMap::new();
+        for spec in &self.config.metadata_fields {
+            if spec.field_type != crate::serde::FieldType::Text {
+                continue;
+            }
+            let Some(value) = attributes.get(&spec.name) else {
+                continue;
+            };
+            let text_value = match value {
+                AttributeValue::String(s) => s,
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "Text field '{}' must have type String, got {:?}",
+                        spec.name, other
+                    )));
+                }
+            };
+            let tokens = text::tokenize(text_value);
+            let mut terms = std::collections::BTreeMap::new();
+            for token in &tokens {
+                *terms.entry(token.clone()).or_insert(0usize) += 1;
+            }
+            summaries.insert(
+                spec.name.clone(),
+                TextAttributeSummary {
+                    terms,
+                    length: tokens.len(),
+                },
+            );
+        }
+        Ok(summaries)
     }
 
     /// Validates attributes against the configured schema.
@@ -679,7 +780,7 @@ impl VectorDb {
 
             match schema.get(field_name.as_str()) {
                 Some(expected_type) => {
-                    // Validate type matches
+                    // Validate type matches. Text fields accept String values.
                     let actual_type = match value {
                         AttributeValue::String(_) => crate::serde::FieldType::String,
                         AttributeValue::Int64(_) => crate::serde::FieldType::Int64,
@@ -688,7 +789,10 @@ impl VectorDb {
                         AttributeValue::Vector(_) => crate::serde::FieldType::Vector,
                     };
 
-                    if actual_type != *expected_type {
+                    let compatible = actual_type == *expected_type
+                        || (*expected_type == crate::serde::FieldType::Text
+                            && actual_type == crate::serde::FieldType::String);
+                    if !compatible {
                         return Err(Error::InvalidInput(format!(
                             "Type mismatch for field '{}': expected {:?}, got {:?}",
                             field_name, expected_type, actual_type
@@ -705,6 +809,58 @@ impl VectorDb {
             }
         }
 
+        Ok(())
+    }
+
+    /// Delete vectors by external ID.
+    ///
+    /// Removes the specified vectors from the database. Deleted vectors will
+    /// no longer appear in search results or `get` lookups.
+    ///
+    /// # Atomicity
+    ///
+    /// This operation is atomic: either all deletions in the batch are
+    /// accepted, or none are.
+    ///
+    /// # Idempotency
+    ///
+    /// Deleting an external ID that does not exist is not an error. Duplicate
+    /// IDs within a single call are silently deduplicated.
+    ///
+    /// # Validation
+    ///
+    /// External IDs must be at most 64 bytes UTF-8. Oversized IDs cause the
+    /// entire call to be rejected with `Error::InvalidInput` before any work
+    /// is queued.
+    pub async fn delete<I, S>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut collected: Vec<String> = Vec::new();
+        for id in ids {
+            let id: String = id.into();
+            if id.len() > 64 {
+                return Err(Error::InvalidInput(format!(
+                    "External ID too long: {} bytes (max 64)",
+                    id.len()
+                )));
+            }
+            collected.push(id);
+        }
+
+        metrics::counter!(VECTOR_DELETES_TOTAL).increment(collected.len() as u64);
+
+        let mut handle = self
+            .write_coordinator
+            .handle(WRITE_CHANNEL)
+            .write(VectorDbOp::Delete(collected))
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
         Ok(())
     }
 
@@ -744,6 +900,10 @@ impl VectorDb {
     /// closed. For SlateDB-backed storage, this also releases the database
     /// fence.
     pub async fn close(self) -> Result<()> {
+        // Stop the FieldStats poller before closing storage so it can't issue a
+        // read against a closing/fenced db (the guard's Drop would also abort it,
+        // but only after `storage.close()`).
+        self.fts_stats_poller.0.abort();
         self.flush().await?;
         self.write_coordinator
             .stop()
@@ -776,16 +936,20 @@ impl VectorDb {
 
     /// Create a QueryEngine from the current snapshot for executing queries.
     pub(crate) fn query_engine(&self) -> QueryEngine {
-        let (snapshot, centroid_index) = {
+        let (snapshot, centroid_index, deletions) = {
             let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
-            (guard.snapshot.clone(), guard.centroid_index.clone())
+            (
+                guard.snapshot.clone(),
+                guard.centroid_index.clone(),
+                guard.fts_deletions.clone(),
+            )
         };
         let options = QueryEngineOptions {
             dimensions: self.config.dimensions,
             distance_metric: self.config.distance_metric,
             query_pruning_factor: self.config.query_pruning_factor,
         };
-        QueryEngine::new(options, centroid_index, snapshot)
+        QueryEngine::new(options, centroid_index, snapshot, deletions)
     }
 
     /// Search using brute-force centroid lookup (for diagnostics).
@@ -798,7 +962,25 @@ impl VectorDb {
     }
 
     pub async fn snapshot(&self) -> Box<dyn VectorDbRead> {
-        Box::new(VectorDbReader::new(self.query_engine())) as Box<dyn VectorDbRead>
+        let (snapshot, centroid_index, deletions) = {
+            let guard = self.last_applied_snapshot.lock().expect("lock poisoned");
+            (
+                guard.snapshot.clone(),
+                guard.centroid_index.clone(),
+                guard.fts_deletions.clone(),
+            )
+        };
+        let options = QueryEngineOptions {
+            dimensions: self.config.dimensions,
+            distance_metric: self.config.distance_metric,
+            query_pruning_factor: self.config.query_pruning_factor,
+        };
+        Box::new(VectorDbReader::new(
+            options,
+            centroid_index,
+            snapshot,
+            deletions,
+        )) as Box<dyn VectorDbRead>
     }
 }
 
@@ -828,6 +1010,7 @@ mod tests {
     use crate::serde::key::{IdDictionaryKey, VectorDataKey};
     use crate::serde::vector_data::VectorDataValue;
     use crate::serde::vector_id::VectorId;
+    use crate::storage::merge_operator::VectorDbMergeOperator;
     use common::StorageConfig;
     use opendata_macros::storage_test;
     use std::time::Duration;
@@ -845,7 +1028,6 @@ mod tests {
             split_threshold_vectors: 10_000,
             merge_threshold_vectors: 200,
             split_search_neighbourhood: 8,
-            chunk_target: 4096,
             metadata_fields: vec![
                 MetadataFieldSpec::new("category", FieldType::String, true),
                 MetadataFieldSpec::new("price", FieldType::Int64, true),
@@ -879,9 +1061,14 @@ mod tests {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
-            .await
-            .unwrap();
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
 
         let vectors = vec![
             Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -920,9 +1107,14 @@ mod tests {
         // given
         let config = create_test_config();
         let centroids = create_test_centroids(3);
-        let db = VectorDb::load_or_init_db(Arc::clone(&storage), config, centroids)
-            .await
-            .unwrap();
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
 
         // First write
         let vector1 = Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
@@ -996,10 +1188,14 @@ mod tests {
         let centroids = create_test_centroids(3);
 
         {
-            let db =
-                VectorDb::load_or_init_db(Arc::clone(&storage), config.clone(), centroids.clone())
-                    .await
-                    .unwrap();
+            let db = VectorDb::load_or_init_db(
+                Arc::clone(&storage),
+                config.clone(),
+                centroids.clone(),
+                crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+            )
+            .await
+            .unwrap();
             let vectors = vec![
                 Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
                     .attribute("category", "shoes")
@@ -1015,9 +1211,14 @@ mod tests {
         }
 
         // when - reopen database (centroids should be loaded from storage)
-        let db2 = VectorDb::load_or_init_db(Arc::clone(&storage), config, vec![])
-            .await
-            .unwrap();
+        let db2 = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            vec![],
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
 
         // then - should be able to search (dictionary and centroids loaded from storage)
         let results = db2
@@ -1041,6 +1242,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         let config = Config {
@@ -1088,6 +1290,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         });
 
         let config = Config {
@@ -1326,5 +1529,403 @@ mod tests {
             }
             other => panic!("expected Vector attribute, got {:?}", other),
         }
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_delete_existing_vector(storage: Arc<dyn Storage>) {
+        use crate::model::Filter;
+        use crate::serde::FieldValue;
+
+        // given
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
+        db.write(vec![
+            Vector::builder("vec-1", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 99i64)
+                .build(),
+            Vector::builder("vec-2", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 149i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // The single bootstrap leaf centroid all data vectors land in.
+        let leaf = VectorId::centroid_id(1, 1);
+        let vec1_id = storage
+            .lookup_internal_id("vec-1")
+            .await
+            .unwrap()
+            .expect("vec-1 should have a dictionary entry pre-delete");
+
+        // when
+        db.delete(vec!["vec-1"]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // then
+        assert!(
+            storage
+                .get(IdDictionaryKey::new("vec-1").encode())
+                .await
+                .unwrap()
+                .is_none(),
+            "expected IdDictionary entry for vec-1 to be tombstoned"
+        );
+        assert!(
+            storage
+                .get(VectorDataKey::new(vec1_id).encode())
+                .await
+                .unwrap()
+                .is_none(),
+            "expected VectorData for vec-1 to be tombstoned"
+        );
+        assert!(
+            storage
+                .get_vector_index_data(vec1_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "expected VectorIndexData for vec-1 to be tombstoned"
+        );
+        let posting_list = storage.get_posting_list(leaf, 3).await.unwrap();
+        let has_delete = posting_list
+            .iter()
+            .any(|p| p.is_delete() && p.id() == vec1_id);
+        assert!(
+            has_delete,
+            "expected posting list at leaf centroid {:?} to contain a Delete entry for {:?}",
+            leaf, vec1_id
+        );
+        let cat_idx = storage
+            .get_metadata_index("category", FieldValue::String("shoes".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            cat_idx.excluded.contains(vec1_id.id()),
+            "expected vec-1 to be in the excluded bitmap of metadata index ('category', 'shoes')"
+        );
+        let price_idx = storage
+            .get_metadata_index("price", FieldValue::Int64(99))
+            .await
+            .unwrap();
+        assert!(
+            price_idx.excluded.contains(vec1_id.id()),
+            "expected vec-1 to be in the excluded bitmap of metadata index ('price', 99)"
+        );
+
+        // get() / search() / filtered search() reflect the deletion
+        assert!(db.get("vec-1").await.unwrap().is_none());
+        assert!(db.get("vec-2").await.unwrap().is_some());
+
+        let q = Query::new(vec![1.0, 0.0, 0.0]).with_limit(10);
+        let ids: Vec<String> = db
+            .search(&q)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.vector.id)
+            .collect();
+        assert_eq!(ids, vec!["vec-2".to_string()]);
+
+        let filtered = Query::new(vec![1.0, 0.0, 0.0])
+            .with_limit(10)
+            .with_filter(Filter::eq("category", "shoes"));
+        let filtered_ids: Vec<String> = db
+            .search(&filtered)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.vector.id)
+            .collect();
+        assert!(
+            filtered_ids.is_empty(),
+            "expected filtered search by category='shoes' to be empty after deleting vec-1, got {:?}",
+            filtered_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn should_be_idempotent() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+
+        // (1) unknown ID — no error, single or repeated
+        db.delete(vec!["does-not-exist"]).await.unwrap();
+        db.delete(vec!["does-not-exist"]).await.unwrap();
+
+        // (2) existing ID, two separate delete batches
+        db.write(vec![
+            Vector::builder("id-2", vec![1.0, 0.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.delete(vec!["id-2"]).await.unwrap();
+        db.flush().await.unwrap();
+        assert!(db.get("id-2").await.unwrap().is_none());
+        // re-deleting the now-absent ID must still succeed
+        db.delete(vec!["id-2"]).await.unwrap();
+        db.flush().await.unwrap();
+        assert!(db.get("id-2").await.unwrap().is_none());
+
+        // (3) same ID twice in a single batch
+        db.write(vec![
+            Vector::builder("id-3", vec![0.0, 1.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 2i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.delete(vec!["id-3", "id-3"]).await.unwrap();
+        db.flush().await.unwrap();
+        assert!(db.get("id-3").await.unwrap().is_none());
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_be_atomic_when_validation_fails(storage: Arc<dyn Storage>) {
+        // given
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
+        db.write(vec![
+            Vector::builder("a", vec![1.0, 0.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 1i64)
+                .build(),
+            Vector::builder("b", vec![0.0, 1.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 2i64)
+                .build(),
+            Vector::builder("c", vec![0.0, 0.0, 1.0])
+                .attribute("category", "x")
+                .attribute("price", 3i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        let oversized = "x".repeat(65);
+        let result = db
+            .delete(vec!["a".to_string(), oversized, "c".to_string()])
+            .await;
+        db.flush().await.unwrap();
+
+        // then - error returned
+        let err = result.expect_err("expected InvalidInput");
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+
+        // and crucially, none of the valid IDs were deleted
+        assert!(
+            db.get("a").await.unwrap().is_some(),
+            "a should not be deleted"
+        );
+        assert!(
+            db.get("b").await.unwrap().is_some(),
+            "b should not be deleted"
+        );
+        assert!(
+            db.get("c").await.unwrap().is_some(),
+            "c should not be deleted"
+        );
+    }
+
+    #[storage_test(merge_operator = VectorDbMergeOperator::new(3))]
+    async fn should_allow_id_reuse_after_delete(storage: Arc<dyn Storage>) {
+        // given
+        let config = create_test_config();
+        let centroids = create_test_centroids(3);
+        let db = VectorDb::load_or_init_db(
+            Arc::clone(&storage),
+            config,
+            centroids,
+            crate::storage::compaction_scheduler::FtsDeleteTracker::shared(),
+        )
+        .await
+        .unwrap();
+        db.write(vec![
+            Vector::builder("id-1", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 99i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.delete(vec!["id-1".to_string()]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        db.write(vec![
+            Vector::builder("id-1", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 199i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // then
+        let v = db.get("id-1").await.unwrap().expect("expected id-1");
+        let vector_attr = v
+            .attributes
+            .iter()
+            .find(|a| a.name == VECTOR_FIELD_NAME)
+            .expect("missing vector attribute");
+        match &vector_attr.value {
+            AttributeValue::Vector(values) => assert_eq!(*values, vec![0.0, 1.0, 0.0]),
+            other => panic!("expected Vector attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_persist_delete_across_reopen() {
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        });
+        let config = Config {
+            storage: storage_config.clone(),
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+
+        // Write, delete, flush, drop
+        {
+            let db = VectorDb::open(config.clone()).await.unwrap();
+            db.write(vec![
+                Vector::new("vec-1", vec![1.0, 0.0, 0.0]),
+                Vector::new("vec-2", vec![0.0, 1.0, 0.0]),
+            ])
+            .await
+            .unwrap();
+            db.flush().await.unwrap();
+            db.delete(vec!["vec-1".to_string()]).await.unwrap();
+            db.close().await.unwrap();
+        }
+
+        // Reopen and verify the deletion survived
+        let db2 = VectorDb::open(config).await.unwrap();
+        assert!(db2.get("vec-1").await.unwrap().is_none());
+        assert!(db2.get("vec-2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn should_reject_oversized_id_in_delete() {
+        // given
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        let too_long = "x".repeat(65);
+
+        // when
+        let result = db.delete(vec![too_long]).await;
+
+        // then
+        let err = result.expect_err("expected InvalidInput");
+        assert!(
+            err.to_string().contains("too long"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_then_delete_in_same_window_should_end_deleted() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![1.0, 0.0, 0.0])
+                .attribute("category", "x")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.delete(vec!["foo"]).await.unwrap();
+        db.flush().await.unwrap();
+
+        assert!(db.get("foo").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_then_write_in_same_window_should_end_present() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![1.0, 0.0, 0.0])
+                .attribute("category", "shoes")
+                .attribute("price", 1i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        db.delete(vec!["foo"]).await.unwrap();
+        db.write(vec![
+            Vector::builder("foo", vec![0.0, 1.0, 0.0])
+                .attribute("category", "boots")
+                .attribute("price", 2i64)
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        let v = db.get("foo").await.unwrap().expect("foo should be present");
+        let cat = v
+            .attributes
+            .iter()
+            .find(|a| a.name == "category")
+            .expect("category attribute");
+        match &cat.value {
+            AttributeValue::String(s) => assert_eq!(s, "boots"),
+            other => panic!("expected String attribute, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_accept_str_iter() {
+        let db = VectorDb::open(create_test_config()).await.unwrap();
+        // Vec<&str>
+        db.delete(vec!["a", "b"]).await.unwrap();
+        // Array of &str
+        db.delete(["c"]).await.unwrap();
+        // Vec<String>
+        db.delete(vec!["d".to_string()]).await.unwrap();
     }
 }

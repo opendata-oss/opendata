@@ -14,20 +14,126 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       vector: ${{ steps.filter.outputs.vector }}
+      full_check: ${{ steps.scope.outputs.full_check }}
+      package_args: ${{ steps.scope.outputs.package_args }}
+      package_summary: ${{ steps.scope.outputs.package_summary }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
+            full:
+              - '.github/**'
+              - '.cargo/**'
+              - 'common/**'
+              - 'macros/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - 'rustfmt.toml'
+              - 'clippy.toml'
+              - '*.md'
+            bencher:
+              - 'bencher/**'
+            buffer:
+              - 'buffer/**'
+            keyvalue:
+              - 'keyvalue/**'
+            log:
+              - 'log/**'
+            timeseries:
+              - 'timeseries/**'
             vector:
               - 'common/**'
               - 'macros/**'
               - 'vector/**'
               - '.github/**'
               - '*'
+      - name: Select cargo check scope
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ steps.filter.outputs.full }}" == "true" ]]; then
+            echo "full_check=true" >> "$GITHUB_OUTPUT"
+            echo "package_args=" >> "$GITHUB_OUTPUT"
+            echo "package_summary=workspace" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          packages=()
+          add_package() {
+            local package="$1"
+            for existing in "${packages[@]}"; do
+              if [[ "$existing" == "$package" ]]; then
+                return
+              fi
+            done
+            packages+=("$package")
+          }
+
+          if [[ "${{ steps.filter.outputs.bencher }}" == "true" ]]; then
+            add_package "bencher"
+            add_package "log-bench"
+            add_package "timeseries-bench"
+            add_package "vector-bench"
+          fi
+
+          if [[ "${{ steps.filter.outputs.buffer }}" == "true" ]]; then
+            add_package "opendata-buffer"
+            # These crates depend on buffer when all features are enabled.
+            add_package "opendata-timeseries"
+            add_package "opendata-vector"
+          fi
+
+          if [[ "${{ steps.filter.outputs.keyvalue }}" == "true" ]]; then
+            add_package "opendata-keyvalue"
+          fi
+
+          if [[ "${{ steps.filter.outputs.log }}" == "true" ]]; then
+            add_package "opendata-log"
+            add_package "opendata-log-c"
+            add_package "log-bench"
+          fi
+
+          if [[ "${{ steps.filter.outputs.timeseries }}" == "true" ]]; then
+            add_package "opendata-timeseries"
+            add_package "timeseries-bench"
+            add_package "bencher"
+          fi
+
+          if [[ "${{ steps.filter.outputs.vector }}" == "true" ]]; then
+            add_package "opendata-vector"
+            add_package "vector-bench"
+          fi
+
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            # Unknown path pattern: prefer correctness over skipping checks.
+            echo "full_check=true" >> "$GITHUB_OUTPUT"
+            echo "package_args=" >> "$GITHUB_OUTPUT"
+            echo "package_summary=workspace" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          package_args=""
+          package_summary=""
+          for package in "${packages[@]}"; do
+            package_args+=" -p $package"
+            if [[ -z "$package_summary" ]]; then
+              package_summary="$package"
+            else
+              package_summary+=", $package"
+            fi
+          done
+
+          echo "full_check=false" >> "$GITHUB_OUTPUT"
+          echo "package_args=${package_args# }" >> "$GITHUB_OUTPUT"
+          echo "package_summary=$package_summary" >> "$GITHUB_OUTPUT"
 
   test:
+    needs: changes
     runs-on: ubuntu-latest
 
     steps:
@@ -49,25 +155,60 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Report check scope
+        run: |
+          if [[ "${{ needs.changes.outputs.full_check }}" == "true" ]]; then
+            echo "Running workspace checks"
+          else
+            echo "Running package checks: ${{ needs.changes.outputs.package_summary }}"
+          fi
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        if: needs.changes.outputs.full_check == 'true'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Run clippy
+        if: needs.changes.outputs.full_check != 'true'
+        run: cargo clippy ${{ needs.changes.outputs.package_args }} --all-targets --all-features -- -D warnings
+
       - name: Build
+        if: needs.changes.outputs.full_check == 'true'
         run: cargo build --all-targets
 
+      - name: Build
+        if: needs.changes.outputs.full_check != 'true'
+        run: cargo build ${{ needs.changes.outputs.package_args }} --all-targets
+
       - name: Run tests
+        if: needs.changes.outputs.full_check == 'true'
         run: cargo test --all --all-features
 
+      - name: Run tests
+        if: needs.changes.outputs.full_check != 'true'
+        run: cargo test ${{ needs.changes.outputs.package_args }} --all-features
+
       - name: Check documentation builds
+        if: needs.changes.outputs.full_check == 'true'
         run: cargo doc --all --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      - name: Check documentation builds
+        if: needs.changes.outputs.full_check != 'true'
+        run: cargo doc ${{ needs.changes.outputs.package_args }} --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
       - name: Run doc tests
+        if: needs.changes.outputs.full_check == 'true'
         run: cargo test --doc --all
+
+      - name: Run doc tests
+        if: needs.changes.outputs.full_check != 'true'
+        run: cargo test --doc ${{ needs.changes.outputs.package_args }}
 
   quickstart-vector-smoke-test:
     needs: changes

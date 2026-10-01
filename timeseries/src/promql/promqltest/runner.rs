@@ -2,11 +2,11 @@ use crate::promql::promqltest::assert::assert_results;
 use crate::promql::promqltest::dsl::*;
 use crate::promql::promqltest::evaluator::eval_instant;
 use crate::promql::promqltest::loader::load_series;
-use crate::storage::merge_operator::OpenTsdbMergeOperator;
+use crate::storage::in_memory_storage;
 use crate::tsdb::Tsdb;
-use common::storage::in_memory::InMemoryStorage;
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -42,9 +42,10 @@ async fn run_builtin_tests() -> Result<(), String> {
 }
 
 /// Run all tests with custom storage factory (matches Prometheus RunBuiltinTestsWithStorage)
-async fn run_builtin_tests_with_storage<F>(storage_factory: F) -> Result<(), String>
+async fn run_builtin_tests_with_storage<F, Fut>(storage_factory: F) -> Result<(), String>
 where
-    F: Fn() -> Tsdb,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Tsdb>,
 {
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
@@ -76,16 +77,17 @@ pub async fn run_test(name: &str, content: &str) -> Result<(), String> {
 }
 
 /// Run a single test file with custom storage (matches Prometheus RunTestWithStorage)
-async fn run_test_with_storage<F>(
+async fn run_test_with_storage<F, Fut>(
     name: &str,
     content: &str,
     storage_factory: &F,
 ) -> Result<(), String>
 where
-    F: Fn() -> Tsdb,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Tsdb>,
 {
     let commands = parse_test_file(content)?;
-    let mut tsdb = storage_factory();
+    let mut tsdb = storage_factory().await;
     let mut eval_count = 0;
     let mut ignoring = false;
 
@@ -93,7 +95,7 @@ where
         match cmd {
             Command::Clear(_) => {
                 // Create fresh TSDB instance - clears all state including caches and snapshots
-                tsdb = storage_factory();
+                tsdb = storage_factory().await;
             }
 
             Command::Ignore(_) => {
@@ -134,10 +136,8 @@ where
 // Storage Factory
 // ============================================================================
 
-fn new_test_storage() -> Tsdb {
-    let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-        OpenTsdbMergeOperator,
-    )));
+async fn new_test_storage() -> Tsdb {
+    let storage = Arc::new(in_memory_storage().await);
     Tsdb::new(storage)
 }
 
@@ -149,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn should_load_series_into_storage() {
         // given
-        let tsdb = new_test_storage();
+        let tsdb = new_test_storage().await;
         let series = vec![SeriesLoad {
             labels: HashMap::from([
                 ("__name__".to_string(), "test_metric".to_string()),
@@ -174,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn should_evaluate_query_at_specific_time() {
         // given
-        let tsdb = new_test_storage();
+        let tsdb = new_test_storage().await;
         let series = vec![SeriesLoad {
             labels: HashMap::from([("__name__".to_string(), "metric".to_string())]),
             values: vec![(0, 10.0), (1, 20.0), (2, 30.0)],
@@ -215,7 +215,7 @@ eval instant at 10m
     #[tokio::test]
     async fn should_reject_negative_step_index() {
         // given
-        let tsdb = new_test_storage();
+        let tsdb = new_test_storage().await;
         let series = vec![SeriesLoad {
             labels: HashMap::from([("__name__".to_string(), "metric".to_string())]),
             values: vec![(-1, 10.0)], // Negative step

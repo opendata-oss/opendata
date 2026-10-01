@@ -98,6 +98,33 @@ impl UpsertVectorsResponse {
     }
 }
 
+/// DeleteRequest is the request body for POST /api/v1/vector/delete.
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub(crate) ids: Vec<String>,
+}
+
+/// DeleteVectorsResponse is the response for POST /api/v1/vector/delete.
+#[derive(Clone, PartialEq, Message, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteVectorsResponse {
+    #[prost(string, tag = "1")]
+    pub(crate) status: String,
+    #[prost(int32, tag = "2")]
+    pub(crate) vectors_deleted: i32,
+}
+
+impl DeleteVectorsResponse {
+    pub(crate) fn success(vectors_deleted: i32) -> Self {
+        Self {
+            status: "success".to_string(),
+            vectors_deleted,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct ComparisonFilter {
     #[prost(string, tag = "1")]
@@ -141,6 +168,8 @@ pub(crate) enum FilterKind {
 }
 
 /// SearchRequest is the request body for POST /api/v1/vector/search.
+///
+/// Exactly one of `vector` (ANN) or `bm25` (full-text search) must be set.
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct SearchRequest {
     #[prost(float, repeated, tag = "1")]
@@ -153,6 +182,17 @@ pub(crate) struct SearchRequest {
     pub(crate) filter: Option<FilterMessage>,
     #[prost(string, repeated, tag = "5")]
     pub(crate) include_fields: Vec<String>,
+    #[prost(message, optional, tag = "6")]
+    pub(crate) bm25: Option<Bm25QueryMessage>,
+}
+
+/// Bm25QueryMessage selects BM25 full-text search on a `FieldType::Text` field.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct Bm25QueryMessage {
+    #[prost(string, tag = "1")]
+    pub(crate) field: String,
+    #[prost(string, tag = "2")]
+    pub(crate) query: String,
 }
 
 /// SearchResponse is the response for POST /api/v1/vector/search.
@@ -270,6 +310,47 @@ mod tests {
     }
 
     #[test]
+    fn should_encode_and_decode_delete_request() {
+        // given
+        let request = DeleteRequest {
+            ids: vec!["doc-1".to_string(), "doc-2".to_string()],
+        };
+
+        // when
+        let encoded = request.encode_to_vec();
+        let decoded = DeleteRequest::decode(encoded.as_slice()).unwrap();
+
+        // then
+        assert_eq!(decoded.ids, request.ids);
+    }
+
+    #[test]
+    fn should_encode_and_decode_delete_vectors_response() {
+        // given
+        let response = DeleteVectorsResponse::success(3);
+
+        // when
+        let encoded = response.encode_to_vec();
+        let decoded = DeleteVectorsResponse::decode(encoded.as_slice()).unwrap();
+
+        // then
+        assert_eq!(decoded.status, "success");
+        assert_eq!(decoded.vectors_deleted, 3);
+    }
+
+    #[test]
+    fn should_serialize_delete_response_with_camel_case() {
+        // given
+        let response = DeleteVectorsResponse::success(2);
+
+        // when
+        let json = serde_json::to_string(&response).unwrap();
+
+        // then
+        assert!(json.contains(r#""vectorsDeleted":2"#));
+    }
+
+    #[test]
     fn should_encode_and_decode_search_request() {
         // given
         let request = SearchRequest {
@@ -285,6 +366,7 @@ mod tests {
                 })),
             }),
             include_fields: vec![],
+            bm25: None,
         };
 
         // when

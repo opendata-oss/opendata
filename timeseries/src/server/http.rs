@@ -199,13 +199,22 @@ impl TimeSeriesHttpServer {
                 .cache_warmer
                 .as_ref()
                 .map(|warmer_config| {
-                    let storage = self.tsdb.storage_read();
                     tracing::info!(
                         warm_range = ?warmer_config.warm_range,
                         include_samples = warmer_config.include_samples,
                         "Starting cache warmer"
                     );
-                    super::cache_warmer::start(storage, warmer_config.clone())
+                    // The writer and the read-only reader expose different
+                    // SlateDB read handles, so dispatch to the generic warmer
+                    // per engine variant.
+                    match self.tsdb.as_ref() {
+                        TsdbEngine::ReadWrite(tsdb) => {
+                            super::cache_warmer::start(tsdb.storage_read(), warmer_config.clone())
+                        }
+                        TsdbEngine::ReadOnly(reader) => {
+                            super::cache_warmer::start(reader.storage_read(), warmer_config.clone())
+                        }
+                    }
                 });
 
         // Build router with metrics middleware

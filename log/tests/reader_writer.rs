@@ -3,12 +3,15 @@
 //! These tests verify that a LogDbReader can discover data written by a
 //! separate LogDb instance when using persistent storage.
 
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::StorageConfig;
 use common::storage::config::{LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig};
-use log::{Config, LogDb, LogDbReader, LogRead, ReaderConfig, Record};
+use log::{
+    Config, LogDb, LogDbReader, LogRead, ReaderConfig, Record, RetentionConfig, SegmentConfig,
+};
 use tempfile::TempDir;
 
 fn local_storage_config(dir: &TempDir) -> StorageConfig {
@@ -19,7 +22,27 @@ fn local_storage_config(dir: &TempDir) -> StorageConfig {
         }),
         settings_path: None,
         block_cache: None,
+        meta_cache: None,
     })
+}
+
+async fn wait_until<F, Fut>(timeout: Duration, interval: Duration, mut predicate: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate().await {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "condition was not satisfied within {:?}",
+            timeout
+        );
+        tokio::time::sleep(interval).await;
+    }
 }
 
 #[tokio::test]
@@ -143,6 +166,211 @@ async fn reader_discovers_new_data_after_initial_open() {
     assert_eq!(entry.value, Bytes::from("event-1"));
 
     // Clean up
+    reader.close().await;
+    writer.close().await.expect("Failed to close writer");
+}
+
+#[tokio::test]
+async fn reader_drops_expired_segments_after_retention_deletes_metadata() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let storage = local_storage_config(&temp_dir);
+
+    let writer = LogDb::open(Config {
+        storage: storage.clone(),
+        segmentation: SegmentConfig {
+            seal_interval: Some(Duration::from_millis(100)),
+            ..Default::default()
+        },
+        retention: RetentionConfig {
+            retention: Some(Duration::from_millis(100)),
+            check_interval: Duration::from_millis(20),
+        },
+        ..Default::default()
+    })
+    .await
+    .expect("Failed to open writer");
+
+    let key = Bytes::from("retained-key");
+    writer
+        .try_append(vec![Record {
+            key: key.clone(),
+            value: Bytes::from("value-0"),
+        }])
+        .await
+        .expect("Failed to append first record");
+    writer.flush().await.expect("Failed to flush first record");
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    writer
+        .try_append(vec![Record {
+            key: key.clone(),
+            value: Bytes::from("value-1"),
+        }])
+        .await
+        .expect("Failed to append second record");
+    writer.flush().await.expect("Failed to flush second record");
+
+    let reader = LogDbReader::open(ReaderConfig {
+        storage,
+        refresh_interval: Duration::from_millis(20),
+    })
+    .await
+    .expect("Failed to open reader");
+
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+        || async {
+            reader
+                .list_segments(..)
+                .await
+                .map(|segments| segments.len() == 2)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let mut iter = reader
+        .scan(key.clone(), ..)
+        .await
+        .expect("Failed to scan before retention");
+    let first = iter
+        .next()
+        .await
+        .expect("Failed to read first entry")
+        .expect("Expected first entry");
+    let second = iter
+        .next()
+        .await
+        .expect("Failed to read second entry")
+        .expect("Expected second entry");
+    assert_eq!(first.value, Bytes::from("value-0"));
+    assert_eq!(second.value, Bytes::from("value-1"));
+    assert!(iter.next().await.expect("Failed to finish scan").is_none());
+
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+        || async {
+            reader
+                .list_segments(..)
+                .await
+                .map(|segments| segments.len() == 1)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let mut iter = reader
+        .scan(key, ..)
+        .await
+        .expect("Failed to scan after retention");
+    let remaining = iter
+        .next()
+        .await
+        .expect("Failed to read retained entry")
+        .expect("Expected retained entry");
+    assert_eq!(remaining.sequence, 1);
+    assert_eq!(remaining.value, Bytes::from("value-1"));
+    assert!(
+        iter.next()
+            .await
+            .expect("Failed to finish retained scan")
+            .is_none()
+    );
+
+    reader.close().await;
+    writer.close().await.expect("Failed to close writer");
+}
+
+#[tokio::test]
+async fn reader_idle_key_resumes_at_sealed_frontier() {
+    // A standalone reader has no writer watermark, so its scan of an idle key
+    // resumes at the sealed-segment boundary (RFC 0007): the start of the
+    // active segment, below which everything lives in sealed segments. This
+    // lets an idle follower skip sealed history instead of rescanning from 0.
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let storage = local_storage_config(&temp_dir);
+
+    let writer = LogDb::open(Config {
+        storage: storage.clone(),
+        segmentation: SegmentConfig {
+            seal_interval: Some(Duration::from_millis(50)),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .expect("Failed to open writer");
+
+    // Three records land in the first segment (seq 0, 1, 2).
+    writer
+        .try_append(vec![
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v0"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v1"),
+            },
+            Record {
+                key: Bytes::from("hot"),
+                value: Bytes::from("v2"),
+            },
+        ])
+        .await
+        .expect("Failed to append first batch");
+    writer.flush().await.expect("Failed to flush first batch");
+
+    // Past the seal interval, the next append seals the first segment and
+    // starts a second one at seq 3 — the sealed boundary.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    writer
+        .try_append(vec![Record {
+            key: Bytes::from("hot"),
+            value: Bytes::from("v3"),
+        }])
+        .await
+        .expect("Failed to append second batch");
+    writer.flush().await.expect("Failed to flush second batch");
+
+    let reader = LogDbReader::open(ReaderConfig {
+        storage,
+        refresh_interval: Duration::from_millis(20),
+    })
+    .await
+    .expect("Failed to open reader");
+
+    // Wait until the reader has discovered both segments.
+    wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+        || async {
+            reader
+                .list_segments(..)
+                .await
+                .map(|segments| segments.len() == 2)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let mut iter = reader
+        .scan(Bytes::from("cold"), ..)
+        .await
+        .expect("Failed to scan idle key");
+    assert!(
+        iter.next().await.expect("Failed to scan").is_none(),
+        "the cold key has no records"
+    );
+    assert_eq!(
+        iter.next_sequence(),
+        3,
+        "idle-key scan resumes at the sealed boundary (start of the active segment)"
+    );
+
     reader.close().await;
     writer.close().await.expect("Failed to close writer");
 }

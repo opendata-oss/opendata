@@ -1,17 +1,29 @@
+mod ann;
+mod bm25;
+mod collectors;
+mod filter;
+mod lookup;
+mod operator;
+mod project;
+mod types;
+
+use crate::Vector;
 use crate::error::{Error, Result};
-use crate::math::distance;
-use crate::model::{FieldSelection, Filter, Query, SearchOptions, SearchResult};
+use crate::metric_names::QUERY_SEARCH_DURATION_SECONDS;
+use crate::model::{Bm25Query, Bm25Scorer, Query, ScoreBy, SearchOptions, SearchResult};
+use crate::query_engine::ann::{ANNOperator, ExhaustiveNNOperator};
+use crate::query_engine::bm25::{BM25Operator, BM25Score, BlockMaxBM25Operator, EssentialStrategy};
+use crate::query_engine::filter::PreparedFilter;
+use crate::query_engine::lookup::LookupOperator;
+use crate::query_engine::operator::{BoxedOperator, Operator};
+use crate::query_engine::project::ProjectOperator;
+use crate::query_engine::types::ScoredVectorId;
 use crate::serde::collection_meta::DistanceMetric;
-use crate::serde::vector_data::VectorDataValue;
-use crate::serde::vector_id::VectorId;
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::storage::VectorDbStorageReadExt;
-use crate::write::indexer::tree::centroids::{LeveledCentroidIndex, search_centroids};
-use crate::write::indexer::tree::posting_list::{Posting, PostingList};
-use crate::{Attribute, Vector};
+use crate::write::indexer::tree::centroids::LeveledCentroidIndex;
 use common::storage::StorageRead;
-use roaring::RoaringTreemap;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
@@ -36,6 +48,9 @@ pub(crate) struct QueryEngine {
     options: QueryEngineOptions,
     centroid_index: Arc<LeveledCentroidIndex<'static>>,
     storage: Arc<dyn StorageRead>,
+    /// FTS deletions bitmap published by the flusher, used by the BM25 query
+    /// path to hide deleted/replaced docs without a per-query storage read.
+    deletions: Arc<VectorBitmap>,
 }
 
 impl QueryEngine {
@@ -43,20 +58,14 @@ impl QueryEngine {
         options: QueryEngineOptions,
         centroid_index: Arc<LeveledCentroidIndex<'static>>,
         storage: Arc<dyn StorageRead>,
+        deletions: Arc<VectorBitmap>,
     ) -> Self {
         Self {
             options,
             centroid_index,
             storage,
+            deletions,
         }
-    }
-
-    /// Normalize the query vector if required by distance metric.
-    /// Returns a (possibly normalized) copy of the query vector.
-    fn normalize_query_if_needed(&self, query: &[f32]) -> Vec<f32> {
-        let mut v = query.to_vec();
-        self.options.distance_metric.normalize_if_needed(&mut v);
-        v
     }
 
     pub(crate) async fn get(&self, id: &str) -> Result<Option<Vector>> {
@@ -79,18 +88,7 @@ impl QueryEngine {
             return Ok(None);
         };
 
-        Ok(Some(Self::vector_data_to_vector(&vector_data)))
-    }
-
-    fn vector_data_to_vector(vector_data: &VectorDataValue) -> Vector {
-        let attributes = vector_data
-            .fields()
-            .map(|field| Attribute::new(field.field_name.clone(), field.value.clone().into()))
-            .collect();
-        Vector {
-            id: vector_data.external_id().to_string(),
-            attributes,
-        }
+        Ok(Some(lookup::vector_data_to_vector(&vector_data)))
     }
 
     pub(crate) async fn search_exact_nprobe(
@@ -98,50 +96,36 @@ impl QueryEngine {
         query: &Query,
         nprobe: usize,
     ) -> Result<Vec<SearchResult>> {
-        if query.vector.len() != self.options.dimensions as usize {
-            return Err(Error::InvalidInput(format!(
-                "Query dimension mismatch: expected {}, got {}",
-                self.options.dimensions,
-                query.vector.len()
-            )));
-        }
-
-        // Normalize query vector if required.
-        let query_vector = self.normalize_query_if_needed(&query.vector);
-
-        // Brute-force: compute distance from query to every live centroid
-        let centroid_candidates = self.search_centroids(&query_vector, usize::MAX).await?;
-        let centroid_ids: Vec<VectorId> = centroid_candidates
-            .iter()
-            .take(nprobe)
-            .map(|posting| posting.id())
-            .collect();
-
-        if centroid_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let centroid_ids = self.prune_centroids(
-            &centroid_candidates
-                .into_iter()
-                .take(nprobe)
-                .collect::<Vec<_>>(),
-            &query_vector,
+        let ann_vector = match &query.score_by {
+            ScoreBy::Ann(v) => v,
+            ScoreBy::Bm25(_) => {
+                return Err(Error::InvalidInput(
+                    "search_exact_nprobe only supports ANN queries".to_string(),
+                ));
+            }
+        };
+        let filter = PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
+        let source = ExhaustiveNNOperator::new(
+            self.storage.clone(),
+            self.centroid_index.clone(),
+            self.options.clone(),
+            ann_vector.clone(),
+            filter,
+            nprobe,
+            query.limit,
         );
-
-        let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
-        if sorted_lists.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Apply metadata filter
-        if let Some(filter) = &query.filter {
-            Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
-        }
-
-        let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
-        Self::apply_field_selection(&mut results, &query.include_fields);
-        Ok(results)
+        let lookup = LookupOperator::new(
+            self.storage.clone(),
+            self.options.dimensions as usize,
+            Box::new(source),
+        );
+        let project = ProjectOperator::new(query.include_fields.clone(), Box::new(lookup));
+        Ok(project
+            .execute()
+            .await?
+            .into_iter()
+            .map(SearchResult::from)
+            .collect())
     }
 
     pub(crate) async fn search_with_options(
@@ -149,379 +133,144 @@ impl QueryEngine {
         query: &Query,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        let nprobe = options.nprobe.unwrap_or_else(|| query.limit.clamp(10, 100));
-        // 1. Validate query dimensions
-        if query.vector.len() != self.options.dimensions as usize {
-            return Err(Error::InvalidInput(format!(
-                "Query dimension mismatch: expected {}, got {}",
-                self.options.dimensions,
-                query.vector.len()
-            )));
-        }
+        let search_start = Instant::now();
+        let result = self.search_with_options_inner(query, options).await;
+        metrics::histogram!(QUERY_SEARCH_DURATION_SECONDS)
+            .record(search_start.elapsed().as_secs_f64());
+        result
+    }
 
-        // 2. Normalize query vector if required.
-        let query_vector = self.normalize_query_if_needed(&query.vector);
-
-        // 3. Search HNSW for nearest centroids
-        let num_centroids = nprobe;
+    async fn search_with_options_inner(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
         let t = Instant::now();
-        let centroid_candidates = self.search_centroids(&query_vector, num_centroids).await?;
-        debug!(
-            "searched for {} centroids, found: {}, elapsed_ms: {:?}",
-            num_centroids,
-            centroid_candidates.len(),
-            t.elapsed().as_millis()
-        );
-
-        if centroid_candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
-        let original_ncentroids = centroid_candidates.len();
-        let centroid_ids = self.prune_centroids(&centroid_candidates, &query_vector);
-        debug!(
-            "before pruning: {} centroids, after dynamic pruning: {} centroids",
-            original_ncentroids,
-            centroid_ids.len()
-        );
-
-        // 5. Load posting lists and score candidates
-        let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
-
-        if sorted_lists.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 6. Apply metadata filter (if provided)
-        if let Some(filter) = &query.filter {
-            Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
-        }
-
-        // 7. K-way merge and resolve top-k forward index lookups
-        let mut results = self.resolve_top_k(sorted_lists, query.limit).await?;
-        Self::apply_field_selection(&mut results, &query.include_fields);
+        let plan = self.plan(query, options).await?;
+        let results = plan.execute().await?;
         debug!(
             op = "search_with_options",
-            elapsed_ms = t.elapsed().as_millis()
+            elapsed_ms = t.elapsed().as_millis() as u64
         );
         Ok(results)
     }
 
-    /// Apply query-aware dynamic pruning
-    /// (SPANN §3.2: https://arxiv.org/pdf/2111.08566).
-    ///
-    /// Given candidate centroid IDs (already sorted closest-first), computes
-    /// the raw distance from the query to each centroid and keeps only those
-    /// satisfying `dist(q, c) <= (1 + epsilon) * dist(q, closest)`.
-    ///
-    /// Returns the pruned centroid IDs. If pruning is disabled (`None`), returns
-    /// the input unchanged.
-    pub(crate) fn prune_centroids(&self, centroid_ids: &[Posting], query: &[f32]) -> Vec<VectorId> {
-        let epsilon = match self.options.query_pruning_factor {
-            Some(e) => e,
-            None => return centroid_ids.iter().map(|posting| posting.id()).collect(),
-        };
-
-        let metric = self.options.distance_metric;
-
-        // Compute raw distance (lower = closer) from query to each centroid.
-        let mut scored: Vec<(VectorId, f32)> = centroid_ids
-            .iter()
-            .map(|posting| {
-                (
-                    posting.id(),
-                    distance::raw_distance(query, posting.vector(), metric),
-                )
-            })
-            .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        if scored.is_empty() {
-            return Vec::new();
-        }
-
-        let closest_dist = scored[0].1;
-        // Skip pruning when closest distance is non-positive (can happen with
-        // DotProduct metric) since the multiplicative threshold is meaningless.
-        if closest_dist < 0.0 {
-            return scored.into_iter().map(|(id, _)| id).collect();
-        }
-
-        let threshold = match metric {
-            // raw_distance uses squared L2, so preserve epsilon semantics in
-            // Euclidean space by squaring the multiplicative factor.
-            DistanceMetric::L2 | DistanceMetric::Cosine => (1.0 + epsilon).powi(2) * closest_dist,
-            DistanceMetric::DotProduct => (1.0 + epsilon) * closest_dist,
-        };
-        scored
-            .into_iter()
-            .take_while(|&(_, d)| d <= threshold)
-            .map(|(id, _)| id)
-            .collect()
-    }
-
-    async fn search_centroids(&self, query: &[f32], k: usize) -> Result<Vec<Posting>> {
-        search_centroids(self.centroid_index.as_ref(), query, k).await
-    }
-
-    /// Spawn a task per centroid to load its posting list and score all candidates
-    /// against the query vector. Returns per-centroid sorted candidate lists.
-    async fn load_and_score(
+    async fn plan(
         &self,
-        centroid_ids: &[VectorId],
-        query: &[f32],
-    ) -> Result<Vec<Vec<ScoredCandidate>>> {
-        let dimensions = self.options.dimensions as usize;
-        let metric = self.options.distance_metric;
-        let query_vec: Vec<f32> = query.to_vec();
-
-        let t = Instant::now();
-        let mut handles = Vec::with_capacity(centroid_ids.len());
-        for &cid in centroid_ids {
-            let snap = self.storage.clone();
-            let q = query_vec.clone();
-            handles.push(tokio::spawn(async move {
-                let posting_list =
-                    PostingList::from_value(snap.get_posting_list(cid, dimensions).await?);
-                let mut scored: Vec<ScoredCandidate> = posting_list
-                    .iter()
-                    .map(|posting| {
-                        let d = distance::compute_distance(&q, posting.vector(), metric);
-                        ScoredCandidate {
-                            internal_id: posting.id(),
-                            distance: d,
-                        }
-                    })
-                    .collect();
-                scored.sort_unstable_by_key(|a| a.distance);
-                Ok::<_, Error>(scored)
-            }));
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<BoxedOperator<Vec<SearchResult>>> {
+        match &query.score_by {
+            ScoreBy::Ann(vector) => self.plan_ann(vector, query, options).await,
+            ScoreBy::Bm25(bm25) => self.plan_bm25(bm25, query, options).await,
         }
+    }
 
-        let results = futures::future::join_all(handles).await;
-        let elapsed = t.elapsed();
-        debug!(
-            op = "search/load_and_score/load",
-            elapsed_ms = elapsed.as_millis()
+    async fn plan_ann(
+        &self,
+        ann_vector: &[f32],
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<BoxedOperator<Vec<SearchResult>>> {
+        let nprobe = options.nprobe.unwrap_or_else(|| query.limit.clamp(10, 100));
+        // Chain: ann -> lookup -> project. The source validates the query,
+        // probes the `nprobe` nearest centroids (with dynamic pruning), and
+        // ranks the candidates; lookup/project then materialize the results.
+        // TODO: defer filter resolution to execution time
+        let filter = PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
+        let source = ANNOperator::new(
+            self.storage.clone(),
+            self.centroid_index.clone(),
+            self.options.clone(),
+            ann_vector.to_vec(),
+            filter,
+            nprobe,
+            query.limit,
         );
-        let mut sorted_lists: Vec<Vec<ScoredCandidate>> = Vec::with_capacity(results.len());
-        for result in results {
-            let scored =
-                result.map_err(|e| Error::Internal(format!("task join error: {}", e)))??;
-            if !scored.is_empty() {
-                sorted_lists.push(scored);
-            }
-        }
-
-        Ok(sorted_lists)
+        let lookup = LookupOperator::new(
+            self.storage.clone(),
+            self.options.dimensions as usize,
+            Box::new(source),
+        );
+        let project = ProjectOperator::new(query.include_fields.clone(), Box::new(lookup));
+        let plan = LeafOperator::new(project);
+        Ok(Box::new(plan))
     }
 
-    /// K-way merge the per-centroid sorted lists and resolve top-k forward
-    /// index lookups. Only merges as far into the lists as needed to produce
-    /// k results, deduplicating by `internal_id` along the way.
-    async fn resolve_top_k(
+    /// BM25 search path (RFC-0006).
+    ///
+    /// Assembles the operator chain `bm25 -> lookup -> project` and runs it.
+    /// The BM25 source scores and ranks ids (metadata filtering and FTS delete
+    /// resolution happen there, before collection); lookup/project then
+    /// materialize the forward-index data and apply field selection. The
+    /// source defaults to the BlockMaxScore scorer; `options.bm25_scorer`
+    /// selects the exhaustive reference scorer instead (Milestone 0 path).
+    async fn plan_bm25(
         &self,
-        sorted_lists: Vec<Vec<ScoredCandidate>>,
-        k: usize,
-    ) -> Result<Vec<SearchResult>> {
-        let dimensions = self.options.dimensions as usize;
-
-        // Seed the min-heap with the first element of each sorted list.
-        let mut heap = BinaryHeap::new();
-        for list in sorted_lists {
-            let mut iter = list.into_iter();
-            if let Some(first) = iter.next() {
-                heap.push(Reverse(MergeEntry(first, iter)));
-            }
-        }
-
-        let mut results = Vec::with_capacity(k);
-        let mut seen = HashSet::new();
-
-        // Pop candidates from the heap in score order, batch-resolve k at a
-        // time, and stop as soon as we have k results.
-        loop {
-            // Drain up to k unique candidates from the merge heap.
-            let mut batch = Vec::with_capacity(k - results.len());
-            while batch.len() < k - results.len() {
-                let Some(Reverse(MergeEntry(candidate, mut iter))) = heap.pop() else {
-                    break;
-                };
-                if let Some(next) = iter.next() {
-                    heap.push(Reverse(MergeEntry(next, iter)));
-                }
-                if seen.insert(candidate.internal_id) {
-                    batch.push(candidate);
-                }
-            }
-
-            if batch.is_empty() {
-                break;
-            }
-
-            // Resolve forward index lookups for the batch concurrently.
-            let t = Instant::now();
-            let futures: Vec<_> = batch
-                .iter()
-                .map(|sr| self.storage.get_vector_data(sr.internal_id, dimensions))
-                .collect();
-            let loaded = futures::future::join_all(futures).await;
-            let elapsed = t.elapsed();
-            debug!(
-                op = "query/resolve_top_k/load",
-                elapsed_ms = elapsed.as_millis() as u64,
-            );
-
-            for (sr, vector_data) in batch.iter().zip(loaded) {
-                let Some(vector_data) = vector_data? else {
-                    continue;
-                };
-                results.push(SearchResult {
-                    score: sr.distance.score(),
-                    vector: Self::vector_data_to_vector(&vector_data),
-                });
-
-                if results.len() == k {
-                    return Ok(results);
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Apply field projection to search results.
-    fn apply_field_selection(results: &mut [SearchResult], selection: &FieldSelection) {
-        match selection {
-            FieldSelection::All => {}
-            FieldSelection::None => {
-                for result in results.iter_mut() {
-                    result.vector.attributes.clear();
-                }
-            }
-            FieldSelection::Fields(names) => {
-                for result in results.iter_mut() {
-                    result
-                        .vector
-                        .attributes
-                        .retain(|attr| names.contains(&attr.name));
-                }
-            }
-        }
-    }
-
-    /// Apply a metadata filter to scored candidate lists.
-    ///
-    /// Collects all candidate IDs into a bitmap, evaluates the filter against
-    /// the inverted index, then retains only candidates that pass the filter.
-    async fn apply_filter(
-        sorted_lists: &mut [Vec<ScoredCandidate>],
-        filter: &Filter,
-        storage: &dyn StorageRead,
-    ) -> Result<()> {
-        // Collect all candidate internal IDs
-        let mut candidates = RoaringTreemap::new();
-        for list in sorted_lists.iter() {
-            for candidate in list {
-                candidates.insert(candidate.internal_id.id());
-            }
-        }
-
-        // Evaluate filter to get allowed IDs
-        let allowed = Self::evaluate_filter(filter, &candidates, storage).await?;
-
-        // Filter each list
-        for list in sorted_lists.iter_mut() {
-            list.retain(|c| allowed.contains(c.internal_id.id()));
-        }
-
-        Ok(())
-    }
-
-    /// Recursively evaluate a filter against the metadata inverted index.
-    ///
-    /// Returns a bitmap of vector IDs that match the filter.
-    /// For Neq, the `candidates` bitmap is used as the universe for complement.
-    fn evaluate_filter<'a>(
-        filter: &'a Filter,
-        candidates: &'a RoaringTreemap,
-        storage: &'a dyn StorageRead,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoaringTreemap>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            match filter {
-                Filter::Eq(field, value) => {
-                    let field_value: crate::serde::FieldValue = value.clone().into();
-                    let bitmap = storage.get_metadata_index(field, field_value).await?;
-                    Ok(bitmap.effective_vector_ids())
-                }
-                Filter::Neq(field, value) => {
-                    let field_value: crate::serde::FieldValue = value.clone().into();
-                    let bitmap = storage.get_metadata_index(field, field_value).await?;
-                    let mut result = candidates.clone();
-                    result -= &bitmap.effective_vector_ids();
-                    Ok(result)
-                }
-                Filter::In(field, values) => {
-                    let mut result = RoaringTreemap::new();
-                    for value in values {
-                        let field_value: crate::serde::FieldValue = value.clone().into();
-                        let bitmap = storage.get_metadata_index(field, field_value).await?;
-                        result |= &bitmap.effective_vector_ids();
-                    }
-                    Ok(result)
-                }
-                Filter::And(filters) => {
-                    if filters.is_empty() {
-                        return Ok(candidates.clone());
-                    }
-                    let mut result =
-                        Self::evaluate_filter(&filters[0], candidates, storage).await?;
-                    for f in &filters[1..] {
-                        let sub = Self::evaluate_filter(f, candidates, storage).await?;
-                        result &= &sub;
-                    }
-                    Ok(result)
-                }
-                Filter::Or(filters) => {
-                    let mut result = RoaringTreemap::new();
-                    for f in filters {
-                        let sub = Self::evaluate_filter(f, candidates, storage).await?;
-                        result |= &sub;
-                    }
-                    Ok(result)
-                }
-            }
-        })
+        bm25: &Bm25Query,
+        query: &Query,
+        options: SearchOptions,
+    ) -> Result<BoxedOperator<Vec<SearchResult>>> {
+        // TODO: defer filter resolution to execution time
+        let filter = PreparedFilter::build(query.filter.as_ref(), self.storage.as_ref()).await?;
+        let source: BoxedOperator<Vec<ScoredVectorId<BM25Score>>> =
+            match options.bm25_scorer.unwrap_or_default() {
+                Bm25Scorer::Exhaustive => Box::new(BM25Operator::new(
+                    self.storage.clone(),
+                    bm25.clone(),
+                    filter,
+                    self.deletions.clone(),
+                    query.limit,
+                )),
+                Bm25Scorer::BlockMax => Box::new(BlockMaxBM25Operator::new(
+                    self.storage.clone(),
+                    bm25.clone(),
+                    filter,
+                    self.deletions.clone(),
+                    query.limit,
+                    EssentialStrategy::DenseWindow,
+                )),
+                Bm25Scorer::BlockMaxSparse => Box::new(BlockMaxBM25Operator::new(
+                    self.storage.clone(),
+                    bm25.clone(),
+                    filter,
+                    self.deletions.clone(),
+                    query.limit,
+                    EssentialStrategy::SortMerge,
+                )),
+            };
+        let lookup = LookupOperator::new(
+            self.storage.clone(),
+            self.options.dimensions as usize,
+            source,
+        );
+        let project = ProjectOperator::new(query.include_fields.clone(), Box::new(lookup));
+        let plan = LeafOperator::new(project);
+        Ok(Box::new(plan))
     }
 }
 
-struct ScoredCandidate {
-    internal_id: VectorId,
-    distance: distance::VectorDistance,
+struct LeafOperator<T: Into<SearchResult>, O: Operator<Vec<T>>> {
+    child: O,
+    phantom: PhantomData<T>,
 }
 
-/// Entry for k-way merge of sorted scored candidate lists.
-struct MergeEntry(ScoredCandidate, std::vec::IntoIter<ScoredCandidate>);
-
-impl PartialEq for MergeEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.distance == other.0.distance
+impl<T: Into<SearchResult>, O: Operator<Vec<T>>> LeafOperator<T, O> {
+    fn new(child: O) -> Self {
+        Self {
+            child,
+            phantom: PhantomData,
+        }
     }
 }
 
-impl Eq for MergeEntry {}
-
-impl PartialOrd for MergeEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MergeEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.distance.cmp(&other.0.distance)
+#[async_trait::async_trait]
+impl<T: Into<SearchResult> + Send + Sync + 'static, O: Operator<Vec<T>> + Send + Sync + 'static>
+    Operator<Vec<SearchResult>> for LeafOperator<T, O>
+{
+    async fn execute(&self) -> Result<Vec<SearchResult>> {
+        let results = self.child.execute().await?;
+        Ok(results.into_iter().map(|r| r.into()).collect())
     }
 }
 
@@ -531,13 +280,7 @@ mod tests {
     use crate::db::{VectorDb, VectorDbRead};
     use crate::model::{Config, Query, VECTOR_FIELD_NAME, Vector};
     use crate::serde::collection_meta::DistanceMetric;
-    use crate::serde::vector_id::VectorId;
-    use crate::write::indexer::tree::posting_list::Posting;
     use common::{StorageBuilder, StorageConfig};
-
-    fn data_id(id: u64) -> VectorId {
-        VectorId::data_vector_id(id)
-    }
 
     fn create_config(dimensions: u16, metric: DistanceMetric) -> Config {
         Config {
@@ -547,113 +290,6 @@ mod tests {
             metadata_fields: vec![],
             ..Default::default()
         }
-    }
-
-    // --- Prune tests ---
-
-    #[tokio::test]
-    async fn should_prune_centroids_beyond_epsilon_threshold() {
-        // given - 4 centroids at known L2 distances from query [0,0,0]:
-        //   c0 = [1,0,0]  -> dist = 1.0
-        //   c1 = [1.4,0,0] -> dist = 1.4
-        //   c2 = [2,0,0]  -> dist = 2.0
-        //   c3 = [5,0,0]  -> dist = 5.0
-        // epsilon = 0.5 => threshold = 1.5 * 1.0 = 1.5
-        // Expected: c0 (1.0) and c1 (1.4) survive; c2 (2.0) and c3 (5.0) pruned.
-        let config = Config {
-            query_pruning_factor: Some(0.5),
-            ..create_config(3, DistanceMetric::L2)
-        };
-        let centroids = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![1.4, 0.0, 0.0],
-            vec![2.0, 0.0, 0.0],
-            vec![5.0, 0.0, 0.0],
-        ];
-        let db = {
-            let sb = StorageBuilder::new(&config.storage).await.unwrap();
-            VectorDb::open_with_centroids(config, centroids, sb)
-        }
-        .await
-        .unwrap();
-
-        let query = [0.0, 0.0, 0.0];
-        let engine = db.query_engine();
-        let all_centroids = vec![
-            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
-            Posting::new(data_id(2), vec![1.4, 0.0, 0.0]),
-            Posting::new(data_id(3), vec![2.0, 0.0, 0.0]),
-            Posting::new(data_id(4), vec![5.0, 0.0, 0.0]),
-        ];
-
-        // when
-        let pruned = engine.prune_centroids(&all_centroids, &query);
-
-        // then
-        assert_eq!(pruned.len(), 2);
-        assert_eq!(pruned[0], data_id(1)); // closest
-        assert_eq!(pruned[1], data_id(2)); // within threshold
-    }
-
-    #[tokio::test]
-    async fn should_skip_pruning_when_epsilon_is_none() {
-        // given - no pruning configured
-        let config = create_config(3, DistanceMetric::L2);
-        let centroids = vec![vec![1.0, 0.0, 0.0], vec![100.0, 0.0, 0.0]];
-        let db = {
-            let sb = StorageBuilder::new(&config.storage).await.unwrap();
-            VectorDb::open_with_centroids(config, centroids, sb)
-        }
-        .await
-        .unwrap();
-
-        let query = [0.0, 0.0, 0.0];
-        let engine = db.query_engine();
-        let all_centroids = vec![
-            Posting::new(data_id(1), vec![1.0, 0.0, 0.0]),
-            Posting::new(data_id(2), vec![100.0, 0.0, 0.0]),
-        ];
-
-        // when
-        let result = engine.prune_centroids(&all_centroids, &query);
-
-        // then - all centroids returned regardless of distance
-        assert_eq!(result.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn should_prune_centroids_returns_sorted_by_distance() {
-        // given - pass centroid IDs in non-distance order
-        let config = Config {
-            query_pruning_factor: Some(10.0), // large epsilon, keeps all
-            ..create_config(3, DistanceMetric::L2)
-        };
-        let centroids = vec![
-            vec![5.0, 0.0, 0.0], // c0: far
-            vec![1.0, 0.0, 0.0], // c1: close
-            vec![3.0, 0.0, 0.0], // c2: medium
-        ];
-        let db = {
-            let sb = StorageBuilder::new(&config.storage).await.unwrap();
-            VectorDb::open_with_centroids(config, centroids, sb)
-        }
-        .await
-        .unwrap();
-
-        let query = [0.0, 0.0, 0.0];
-        let engine = db.query_engine();
-        // pass centroids in reverse distance order: far, medium, close
-        let ids = vec![
-            Posting::new(data_id(1), vec![5.0, 0.0, 0.0]),
-            Posting::new(data_id(3), vec![3.0, 0.0, 0.0]),
-            Posting::new(data_id(2), vec![1.0, 0.0, 0.0]),
-        ];
-
-        // when
-        let result = engine.prune_centroids(&ids, &query);
-
-        // then - sorted by ascending distance: c1 (1.0), c2 (3.0), c0 (5.0)
-        assert_eq!(result, vec![data_id(2), data_id(3), data_id(1)]);
     }
 
     // --- Search tests ---
@@ -1296,5 +932,49 @@ mod tests {
                 results[i].score
             );
         }
+    }
+
+    #[tokio::test]
+    async fn should_search_bm25_end_to_end() {
+        // given - a text field and a few documents
+        let config = Config {
+            storage: StorageConfig::InMemory,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            metadata_fields: vec![MetadataFieldSpec::new("body", FieldType::Text, false)],
+            ..Default::default()
+        };
+        let db = VectorDb::open(config).await.unwrap();
+        db.write(vec![
+            Vector::builder("d1", vec![0.0; 3])
+                .attribute("body", "the quick brown fox")
+                .build(),
+            Vector::builder("d2", vec![0.0; 3])
+                .attribute("body", "a fox and another fox")
+                .build(),
+            Vector::builder("d3", vec![0.0; 3])
+                .attribute("body", "completely unrelated text")
+                .build(),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        // when - run a BM25 query through the full project -> lookup -> bm25 chain
+        let results = db
+            .search(&Query::bm25("body", "fox").with_limit(10))
+            .await
+            .unwrap();
+
+        // then - only matching docs, with the denser match ranked first
+        let ids: Vec<&str> = results.iter().map(|r| r.vector.id.as_str()).collect();
+        assert_eq!(ids, vec!["d2", "d1"]);
+        // scores are non-increasing
+        assert!(results[0].score >= results[1].score);
+        // the text field is materialized in the result by default
+        assert_eq!(
+            results[0].vector.attribute("body"),
+            Some(&AttributeValue::String("a fox and another fox".to_string()))
+        );
     }
 }

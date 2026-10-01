@@ -158,7 +158,8 @@ async fn test_list_segments_returns_all_segments() {
     let segments = log.list_segments(..).await.unwrap();
 
     assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].id, 0);
+    // First user segment is id 1; id 0 is reserved system segment.
+    assert_eq!(segments[0].id, 1);
     assert_eq!(segments[0].start_seq, 0);
 }
 
@@ -199,7 +200,7 @@ async fn test_list_keys_empty_when_no_keys_in_segment_range() {
 async fn test_list_keys_in_specific_segment_range() {
     let log = setup_test_log().await;
 
-    // Append records to segment 0
+    // Append records to the first user segment (id 1)
     log.try_append(vec![
         Record {
             key: Bytes::from("key-a"),
@@ -214,8 +215,8 @@ async fn test_list_keys_in_specific_segment_range() {
     .unwrap();
     log.flush().await.unwrap();
 
-    // List keys only in segment 0
-    let mut iter = log.list_keys(0..1).await.unwrap();
+    // List keys only in segment 1
+    let mut iter = log.list_keys(1..2).await.unwrap();
     let mut keys = Vec::new();
     while let Some(key_entry) = iter.next().await.unwrap() {
         keys.push(key_entry.key);
@@ -279,6 +280,7 @@ async fn setup_test_log_with_segment_interval(interval: Duration) -> Arc<LogDb> 
         storage: StorageConfig::InMemory,
         segmentation: SegmentConfig {
             seal_interval: Some(interval),
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -367,7 +369,7 @@ async fn test_list_keys_only_first_segment() {
     // Use a very short seal interval to force multiple segments
     let log = setup_test_log_with_segment_interval(Duration::from_millis(1)).await;
 
-    // Append key-a to segment 0
+    // Append key-a to the first user segment (id 1)
     log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
@@ -379,7 +381,7 @@ async fn test_list_keys_only_first_segment() {
     // Wait to exceed seal interval
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Append key-b to segment 1
+    // Append key-b to segment 2
     log.try_append(vec![Record {
         key: Bytes::from("key-b"),
         value: Bytes::from("value-b"),
@@ -388,14 +390,14 @@ async fn test_list_keys_only_first_segment() {
     .unwrap();
     log.flush().await.unwrap();
 
-    // List keys only from segment 0
-    let mut iter = log.list_keys(0..1).await.unwrap();
+    // List keys only from segment 1
+    let mut iter = log.list_keys(1..2).await.unwrap();
     let mut keys = Vec::new();
     while let Some(key_entry) = iter.next().await.unwrap() {
         keys.push(key_entry.key);
     }
 
-    // Should only have key-a from segment 0
+    // Should only have key-a from segment 1
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0], Bytes::from("key-a"));
 }
@@ -405,7 +407,7 @@ async fn test_list_segments_filters_by_sequence_range() {
     // Use a very short seal interval to force multiple segments
     let log = setup_test_log_with_segment_interval(Duration::from_millis(1)).await;
 
-    // Append to create segment 0 (sequences start at 0)
+    // Append to create the first user segment, id 1 (sequence 0)
     log.try_append(vec![Record {
         key: Bytes::from("key-a"),
         value: Bytes::from("value-a"),
@@ -417,7 +419,7 @@ async fn test_list_segments_filters_by_sequence_range() {
     // Wait to exceed seal interval
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Append to create segment 1 (sequences start at 1)
+    // Append to create segment 2 (sequence 1)
     log.try_append(vec![Record {
         key: Bytes::from("key-b"),
         value: Bytes::from("value-b"),
@@ -433,7 +435,7 @@ async fn test_list_segments_filters_by_sequence_range() {
     // List segments overlapping only the first sequence
     let segments = log.list_segments(0..1).await.unwrap();
 
-    // Should only include segment 0
+    // Should only include segment 1 (the first user segment)
     assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].id, 0);
+    assert_eq!(segments[0].id, 1);
 }

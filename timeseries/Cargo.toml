@@ -1,6 +1,6 @@
 [package]
 name = "opendata-timeseries"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 description = "Prometheus-compatible time series database built on SlateDB"
 license = "MIT"
@@ -90,6 +90,8 @@ proptest.workspace = true
 rstest.workspace = true
 dashu-float.workspace = true
 tempfile.workspace = true
+slatedb = { workspace = true, features = ["test-util"] }
+slatedb-common = { workspace = true, features = ["test-util"] }
 opendata-macros.workspace = true
 
 

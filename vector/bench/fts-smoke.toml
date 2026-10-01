@@ -1,0 +1,16 @@
+# Small local smoke test for the FTS (BM25) benchmark.
+#
+#   cargo run -p vector-bench --release -- --config vector/bench/fts-smoke.toml --benchmark fts
+
+[data.storage]
+type = "SlateDb"
+path = "fts-smoke"
+
+[data.storage.object_store]
+type = "Local"
+path = "/tmp/fts-bench-smoke"
+
+[[params.fts]]
+num_docs = "20000"
+vocab_size = "20000"
+num_queries = "100"

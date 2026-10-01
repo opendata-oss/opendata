@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use common::clock::Clock;
 use slatedb::object_store::path::Path;
-use slatedb::object_store::{ObjectStore, PutPayload};
+use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -421,8 +421,8 @@ mod tests {
     use bytes::Bytes;
     use common::ObjectStoreConfig;
     use common::clock::{MockClock, SystemClock};
-    use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::{ObjectStore, ObjectStoreExt};
     use std::time::UNIX_EPOCH;
 
     async fn read_manifest_entries(store: &Arc<dyn ObjectStore>, path: &str) -> Vec<QueueEntry> {

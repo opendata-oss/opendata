@@ -9,7 +9,7 @@ mod queue;
 mod util;
 
 pub use config::{ConsumerConfig, ProducerConfig};
-pub use consumer::{ConsumedBatch, Consumer};
+pub use consumer::{BatchDescriptor, ConsumedBatch, Consumer, ConsumerFetchHandle};
 pub use error::{Error, Result};
 pub use model::CompressionType;
 pub use producer::{DurabilityWatcher, Producer, WriteHandle};

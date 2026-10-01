@@ -5,6 +5,7 @@ pub mod key_prefix;
 pub mod record_tag;
 pub mod seq_block;
 pub mod sortable;
+pub mod subsystem;
 pub mod terminated_bytes;
 pub mod varint;
 

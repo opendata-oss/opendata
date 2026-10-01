@@ -1,25 +1,36 @@
 use async_trait::async_trait;
-use common::{BytesRange, StorageRead};
+use common::storage::slate::SlateDbStorage;
+use common::{
+    BytesRange, StorageBuilder, StorageRead, StorageSemantics, new_slatedb_compactor_builder,
+};
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::model::Config;
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
+use crate::serde::deletions::DeletionsValue;
+use crate::serde::field_stats::FieldStatsValue;
 use crate::serde::id_dictionary::IdDictionaryValue;
 use crate::serde::key::{
-    CentroidInfoKey, CentroidStatsKey, CentroidsKey, IdDictionaryKey, MetadataIndexKey,
-    PostingListKey, VectorDataKey, VectorIndexDataKey,
+    CentroidInfoKey, CentroidStatsKey, CentroidsKey, DeletionsKey, FieldStatsKey, IdDictionaryKey,
+    MetadataIndexKey, PostingListKey, VectorDataKey, VectorIndexDataKey,
 };
 use crate::serde::metadata_index::MetadataIndexValue;
 use crate::serde::posting_list::PostingListValue;
+use crate::serde::vector_bitmap::VectorBitmap;
 use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::serde::vector_index_data::VectorIndexDataValue;
 use bytes::{BufMut, BytesMut};
 use std::ops::Bound::Included;
 
+pub(crate) mod compaction_filter;
+pub(crate) mod compaction_scheduler;
 pub(crate) mod merge_operator;
 pub(crate) mod record;
+pub(crate) mod segment_extractor;
 
 /// Extension trait for StorageRead that provides vector database-specific loading methods.
 ///
@@ -155,10 +166,8 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     /// Returns a list of `(level, centroid_id)` to accumulated vector count.
     #[allow(dead_code)]
     async fn scan_all_centroid_stats(&self) -> Result<Vec<(VectorId, CentroidStatsValue)>> {
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::CentroidStats
-            .prefix()
-            .write_to(&mut prefix_buf);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
+        crate::serde::RecordType::CentroidStats.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         let range = common::BytesRange::prefix(prefix);
@@ -177,10 +186,8 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
     }
 
     async fn scan_all_centroid_info(&self) -> Result<Vec<(VectorId, CentroidInfoValue)>> {
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::CentroidInfo
-            .prefix()
-            .write_to(&mut prefix_buf);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
+        crate::serde::RecordType::CentroidInfo.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         let range = common::BytesRange::prefix(prefix);
@@ -199,10 +206,8 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
         &self,
         dimensions: usize,
     ) -> Result<Vec<(VectorId, PostingListValue)>> {
-        let mut prefix_buf = bytes::BytesMut::with_capacity(3);
-        crate::serde::RecordType::PostingList
-            .prefix()
-            .write_to(&mut prefix_buf);
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
+        crate::serde::RecordType::PostingList.write_prefix(&mut prefix_buf);
         let prefix = prefix_buf.freeze();
 
         let range = common::BytesRange::prefix(prefix);
@@ -252,10 +257,114 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
             None => Ok(MetadataIndexValue::new()),
         }
     }
+
+    /// Load the singleton FTS deletions bitmap.
+    ///
+    /// Returns a bitmap of internal vector IDs that have been deleted or
+    /// replaced. Returns an empty bitmap if the record does not exist yet.
+    async fn get_deletions(&self) -> Result<VectorBitmap> {
+        let key = DeletionsKey::new().encode();
+        let record = self.get(key).await?;
+        match record {
+            Some(record) => {
+                let value = DeletionsValue::decode_from_bytes(&record.value).map_err(|e| {
+                    Error::Encoding(format!("failed to decode DeletionsValue: {e}"))
+                })?;
+                Ok(value.0)
+            }
+            None => Ok(VectorBitmap::new()),
+        }
+    }
+
+    /// Scan all per-field [`FieldStatsValue`] records, returning
+    /// `(field name, stats)` pairs. Used by the FieldStats poller to feed the
+    /// custom compaction scheduler's in-memory per-field tracker (RFC-0006).
+    async fn scan_field_stats(&self) -> Result<Vec<(String, FieldStatsValue)>> {
+        let mut prefix_buf = bytes::BytesMut::with_capacity(crate::serde::PREFIX_AND_TAG_LEN);
+        crate::serde::RecordType::FtsFieldStats.write_prefix(&mut prefix_buf);
+        let prefix = prefix_buf.freeze();
+
+        let range = common::BytesRange::prefix(prefix);
+        let records = self.scan(range).await?;
+
+        let mut stats = Vec::with_capacity(records.len());
+        for record in records {
+            let key = FieldStatsKey::decode(&record.key)?;
+            let value = FieldStatsValue::decode_from_bytes(&record.value)
+                .map_err(|e| Error::Encoding(format!("failed to decode FieldStatsValue: {e}")))?;
+            stats.push((key.field, value));
+        }
+        Ok(stats)
+    }
 }
 
 // Implement the trait for all types that implement StorageRead
 impl<T: ?Sized + StorageRead> VectorDbStorageReadExt for T {}
+
+/// Builds the storage backing a vector database, installing the shared vector
+/// wiring used by both [`VectorDb`](crate::VectorDb) and
+/// [`VectorDbAdmin`](crate::VectorDbAdmin):
+///
+/// - the per-segment routing extractor (Default/ANN/FTS each get their own
+///   SlateDB segment so the FTS segment can be compacted independently);
+/// - the merge operator (on both the `DbBuilder` write path and the compactor);
+/// - for SlateDB with compaction enabled, a compactor carrying the FTS
+///   delete-cleanup filter and — when `fts_delete_tracker` is `Some` — the
+///   custom scheduler that forces a major FTS compaction once outstanding
+///   deletes cross `config.delete_compaction_threshold` (RFC-0006).
+///
+/// Pass `Some(tracker)` for the writer, whose flusher refreshes the tracker
+/// after each flush; pass `None` for clients with no flusher (e.g.
+/// `VectorDbAdmin`), which then keep SlateDB's default size-tiered scheduler —
+/// the filter still runs on whatever compactions size-tiered schedules.
+///
+/// All compaction wiring is a no-op for the in-memory backend and when
+/// compaction is disabled.
+pub(crate) async fn build_vector_storage(
+    config: &Config,
+    builder: StorageBuilder,
+    fts_delete_tracker: Option<Arc<compaction_scheduler::FtsDeleteTracker>>,
+) -> Result<Arc<dyn common::Storage>> {
+    let merge_op: Arc<merge_operator::VectorDbMergeOperator> = Arc::new(
+        merge_operator::VectorDbMergeOperator::new(config.dimensions as usize),
+    );
+    // Route each vector segment into its own SlateDB segment.
+    let builder = segment_extractor::builder_with_vector_segments(builder);
+    // Build the FTS-aware compactor and install it via the `map_slatedb` escape
+    // hatch. `new_slatedb_compactor_builder` returns `None` for the in-memory
+    // backend and when compaction is disabled, leaving the builder untouched.
+    let builder = match new_slatedb_compactor_builder(&config.storage)
+        .map_err(|e| Error::Storage(format!("Failed to create compactor: {e}")))?
+    {
+        Some(compactor_builder) => {
+            let mut compactor_builder = compactor_builder.with_compaction_filter_supplier(
+                compaction_filter::VectorCompactionFilterSupplier::shared(),
+            );
+            if let Some(tracker) = fts_delete_tracker {
+                compactor_builder = compactor_builder.with_scheduler_supplier(
+                    compaction_scheduler::VectorCompactionSchedulerSupplier::shared(
+                        tracker,
+                        config.delete_compaction_threshold,
+                    ),
+                );
+            }
+            // The merge operator lets the compactor apply vector merges. (SlateDB
+            // also propagates the DbBuilder's merge operator onto the compactor,
+            // so this is belt-and-suspenders, but keeps the compactor builder
+            // self-contained.)
+            let compactor_builder = compactor_builder.with_merge_operator(Arc::new(
+                SlateDbStorage::merge_operator_adapter(merge_op.clone()),
+            ));
+            builder.map_slatedb(move |db| db.with_compactor_builder(compactor_builder))
+        }
+        None => builder,
+    };
+    builder
+        .with_semantics(StorageSemantics::new().with_merge_operator(merge_op))
+        .build()
+        .await
+        .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))
+}
 
 #[cfg(test)]
 mod tests {
@@ -268,7 +377,6 @@ mod tests {
     use crate::write::indexer::tree::posting_list::PostingList;
     use common::Storage;
     use common::storage::in_memory::InMemoryStorage;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn should_read_and_write_vector_data() {
@@ -343,6 +451,7 @@ mod tests {
                 "indexed_color",
                 "blue",
             )],
+            vec!["body".to_string()],
         );
 
         // when
@@ -371,7 +480,7 @@ mod tests {
 
         // then - read
         let result = storage.get_posting_list(centroid_id, 3).await.unwrap();
-        let result: Vec<_> = PostingList::from_value(result).into_iter().collect();
+        let result: Vec<_> = PostingList::from_value(result, false).into_iter().collect();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].id(), VectorId::data_vector_id(1));
         assert_eq!(result[1].id(), VectorId::data_vector_id(2));

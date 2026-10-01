@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::storage::factory::OwnedHybridCache;
+use crate::storage::sst_blocks;
 use crate::storage::{MergeOptions, PutOptions};
 use crate::{
     BytesRange, CheckpointInfo, Record, StorageError, StorageIterator, StorageRead, StorageResult,
@@ -14,12 +14,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::IterationOrder;
 use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
+use slatedb::manifest::VersionedManifest;
 use slatedb::{
-    Db, DbIterator, DbReader, DbSnapshot, MergeOperator as SlateDbMergeOperator,
-    MergeOperatorError, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
+    Db, DbIterator, DbReader, DbSnapshot, FilterContext, MergeOperator as SlateDbMergeOperator,
+    MergeOperatorError, SstReader, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
 use tokio::sync::watch;
-use tracing::warn;
 
 /// Adapter that wraps our `MergeOperator` trait to implement SlateDB's `MergeOperator` trait.
 ///
@@ -66,6 +66,61 @@ fn default_scan_options() -> ScanOptions {
         cache_blocks: true,
         max_fetch_tasks: 4,
         order: IterationOrder::Ascending,
+        filter_context: None,
+    }
+}
+
+/// Where a [`SlateReadHandle`] reads its manifest from. Both variants expose a
+/// live `manifest()`, so each count reflects the latest flushed state.
+enum ManifestSource {
+    /// The writer's `Db` — the manifest is always current.
+    Db(Arc<Db>),
+    /// A reader's `DbReader` — the manifest reflects its last poll.
+    Reader(Arc<DbReader>),
+}
+
+impl ManifestSource {
+    fn manifest(&self) -> VersionedManifest {
+        match self {
+            ManifestSource::Db(db) => db.manifest(),
+            ManifestSource::Reader(reader) => reader.manifest(),
+        }
+    }
+}
+
+/// Self-contained slatedb resources for the SST-walk count path, returned by
+/// [`StorageRead::slate_read`].
+///
+/// Owns a manifest source (a live `Db`/`DbReader`) plus an [`SstReader`] pinned
+/// to the same path + object store. This is a deliberate, single-method leak of
+/// slatedb internals: the count path needs a manifest and an SST reader,
+/// neither of which belongs on the storage-neutral trait. The handle is
+/// `'static`, so callers can hold it for the lifetime of a read view rather
+/// than re-deriving it per call.
+///
+/// Each [`count_in_range`](SlateReadHandle::count_in_range) reads the manifest
+/// fresh from the live source, so counts reflect the latest flushed state
+/// without a second polling handle to keep in sync.
+pub struct SlateReadHandle {
+    source: ManifestSource,
+    sst_reader: Arc<SstReader>,
+}
+
+impl SlateReadHandle {
+    /// Counts physical write operations in `range` by walking the live
+    /// manifest's persisted SSTs. See [`sst_blocks::count_in_range`].
+    pub async fn count_in_range(
+        &self,
+        range: &BytesRange,
+    ) -> StorageResult<sst_blocks::CountResult> {
+        sst_blocks::count_in_range(&self.source.manifest(), &self.sst_reader, range).await
+    }
+
+    /// Returns the live manifest snapshot for metadata-only inspection — e.g.
+    /// summarizing how data is distributed across the LSM tree. Reads no SST
+    /// files; each call reflects the latest flushed state of the live source.
+    pub fn manifest(&self) -> VersionedManifest {
+        self.source.manifest()
     }
 }
 
@@ -77,24 +132,16 @@ pub struct SlateDbStorage {
     pub(super) db: Arc<Db>,
     durable_tx: watch::Sender<u64>,
     durable_bridge_abort: tokio::task::AbortHandle,
-    // TODO(slatedb 0.13): remove once DbCache exposes a close() hook and
-    // SlateDb::close() drives cache shutdown itself.
-    managed_cache: Option<OwnedHybridCache>,
+    /// SST reader for the [`StorageRead::slate_read`] count path. Built by the
+    /// production constructors ([`crate::StorageBuilder`]); `None` for the bare
+    /// `new` used in tests that only exercise get/scan, where `slate_read`
+    /// falls back to `None`. `Arc` so the handle can outlive a borrow of `self`.
+    sst_reader: Option<Arc<SstReader>>,
 }
 
 impl SlateDbStorage {
     /// Creates a new SlateDbStorage instance wrapping the given SlateDB database.
     pub fn new(db: Arc<Db>) -> Self {
-        Self::new_with_managed_cache(db, None)
-    }
-
-    /// Creates a new SlateDbStorage that will explicitly close the given foyer
-    /// hybrid cache during [`StorageRead::close`]. See [`OwnedHybridCache`] for
-    /// why this exists.
-    pub(crate) fn new_with_managed_cache(
-        db: Arc<Db>,
-        managed_cache: Option<OwnedHybridCache>,
-    ) -> Self {
         let slate_rx = db.subscribe();
         let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
         let task = tokio::spawn({
@@ -103,9 +150,13 @@ impl SlateDbStorage {
                 let mut slate_rx = slate_rx;
                 while slate_rx.changed().await.is_ok() {
                     let durable_seq = slate_rx.borrow_and_update().durable_seq;
-                    if tx.send(durable_seq).is_err() {
-                        break;
-                    }
+                    // Use send_replace rather than send: SlateDB may publish
+                    // a DbStatus change during `open` (e.g. manifest write)
+                    // before any consumer has subscribed, and `send` would
+                    // return Err on zero receivers — killing the bridge
+                    // permanently. send_replace doesn't care about receiver
+                    // count, so late subscribers still get future updates.
+                    tx.send_replace(durable_seq);
                 }
             }
         });
@@ -114,8 +165,21 @@ impl SlateDbStorage {
             db,
             durable_tx,
             durable_bridge_abort: task.abort_handle(),
-            managed_cache,
+            sst_reader: None,
         }
+    }
+
+    /// Attaches an [`SstReader`] so [`StorageRead::slate_read`] can serve the
+    /// SST-walk count path. Built against the same path + object store as `db`.
+    pub fn with_sst_reader(mut self, sst_reader: SstReader) -> Self {
+        self.sst_reader = Some(Arc::new(sst_reader));
+        self
+    }
+
+    /// Returns the underlying SlateDB instance. Useful for callers that need to access
+    /// slatedb-specific features like `DbStatus`
+    pub fn db(&self) -> &Arc<Db> {
+        &self.db
     }
 
     /// Creates a SlateDB `MergeOperator` from our common `MergeOperator` trait.
@@ -170,19 +234,40 @@ impl StorageRead for SlateDbStorage {
         Ok(Box::new(SlateDbIterator { iter }))
     }
 
+    /// Slatedb consults its SST-level filters on `scan_prefix` but not on
+    /// `scan`, so routing prefix scans through this path is what lets a
+    /// configured `PrefixExtractor` (and custom `FilterPolicy`, parametrized by
+    /// `filter_context`) actually skip SSTs.
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<FilterContext>,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = default_scan_options().with_filter_context(filter_context);
+        let iter = self
+            .db
+            .scan_prefix_with_options(prefix, subrange, &options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    fn slate_read(&self) -> Option<SlateReadHandle> {
+        self.sst_reader.as_ref().map(|sst_reader| SlateReadHandle {
+            // Live writer manifest: reflects everything flushed so far.
+            source: ManifestSource::Db(Arc::clone(&self.db)),
+            sst_reader: Arc::clone(sst_reader),
+        })
+    }
+
     async fn close(&self) -> StorageResult<()> {
         // Stop durable bridge first so no status subscriber outlives DB close.
         self.durable_bridge_abort.abort();
+        // `Db::close()` drives block-cache shutdown (including flushing any
+        // hybrid disk tier), so we don't manage the cache lifecycle here.
         self.db.close().await.map_err(StorageError::from_storage)?;
-        // Close the cache after SlateDB so no inserts race the flushers. Log
-        // and swallow errors: cache flush failures only cost cache warmth, not
-        // durability, and we'd rather not fail shutdown over it.
-        // TODO(slatedb 0.13): remove once DbCache owns its close lifecycle.
-        if let Some(cache) = &self.managed_cache
-            && let Err(e) = cache.close().await
-        {
-            warn!(error = ?e, "foyer hybrid cache close failed");
-        }
         Ok(())
     }
 }
@@ -237,6 +322,22 @@ impl StorageRead for SlateDbStorageSnapshot {
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
     }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<FilterContext>,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = default_scan_options().with_filter_context(filter_context);
+        let iter = self
+            .snapshot
+            .scan_prefix_with_options(prefix, subrange, &options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
 }
 
 #[async_trait]
@@ -263,6 +364,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -285,6 +387,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -307,6 +410,7 @@ impl Storage for SlateDbStorage {
         }
         let slate_options = SlateDbWriteOptions {
             await_durable: options.await_durable,
+            ..SlateDbWriteOptions::default()
         };
         let write_handle = self
             .db
@@ -391,27 +495,26 @@ impl From<MergeOptions> for slatedb::config::MergeOptions {
 /// allowing multiple readers to coexist with a single writer.
 pub struct SlateDbStorageReader {
     reader: Arc<DbReader>,
-    // TODO(slatedb 0.13): remove once DbCache exposes a close() hook and
-    // DbReader::close() drives cache shutdown itself.
-    managed_cache: Option<OwnedHybridCache>,
+    /// SST reader for the [`StorageRead::slate_read`] count path; see
+    /// [`SlateDbStorage::sst_reader`].
+    sst_reader: Option<Arc<SstReader>>,
 }
 
 impl SlateDbStorageReader {
     /// Creates a new SlateDbStorageReader wrapping the given DbReader.
     pub fn new(reader: Arc<DbReader>) -> Self {
-        Self::new_with_managed_cache(reader, None)
-    }
-
-    /// Creates a reader that will explicitly close the given foyer hybrid
-    /// cache during [`StorageRead::close`].
-    pub(crate) fn new_with_managed_cache(
-        reader: Arc<DbReader>,
-        managed_cache: Option<OwnedHybridCache>,
-    ) -> Self {
         Self {
             reader,
-            managed_cache,
+            sst_reader: None,
         }
+    }
+
+    /// Attaches an [`SstReader`] so [`StorageRead::slate_read`] can serve the
+    /// SST-walk count path. Built against the same path + object store as the
+    /// `DbReader`.
+    pub fn with_sst_reader(mut self, sst_reader: SstReader) -> Self {
+        self.sst_reader = Some(Arc::new(sst_reader));
+        self
     }
 }
 
@@ -444,18 +547,37 @@ impl StorageRead for SlateDbStorageReader {
         Ok(Box::new(SlateDbIterator { iter }))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn scan_prefix_iter(
+        &self,
+        prefix: Bytes,
+        subrange: BytesRange,
+        filter_context: Option<FilterContext>,
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
+        let options = default_scan_options().with_filter_context(filter_context);
+        let iter = self
+            .reader
+            .scan_prefix_with_options(prefix, subrange, &options)
+            .await
+            .map_err(StorageError::from_storage)?;
+        Ok(Box::new(SlateDbIterator { iter }))
+    }
+
+    fn slate_read(&self) -> Option<SlateReadHandle> {
+        self.sst_reader.as_ref().map(|sst_reader| SlateReadHandle {
+            // The DbReader's last-polled manifest. Scans on this same handle
+            // read the same view, so count and scan stay consistent.
+            source: ManifestSource::Reader(Arc::clone(&self.reader)),
+            sst_reader: Arc::clone(sst_reader),
+        })
+    }
+
     async fn close(&self) -> StorageResult<()> {
+        // `DbReader::close()` drives block-cache shutdown itself.
         self.reader
             .close()
             .await
             .map_err(StorageError::from_storage)?;
-        // Close the cache after the reader so no inserts race the flushers.
-        // TODO(slatedb 0.13): remove once DbCache owns its close lifecycle.
-        if let Some(cache) = &self.managed_cache
-            && let Err(e) = cache.close().await
-        {
-            warn!(error = ?e, "foyer hybrid cache close failed");
-        }
         Ok(())
     }
 }
@@ -491,7 +613,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and verify data
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let record = storage_reader.get(Bytes::from("key1")).await.unwrap();
@@ -531,7 +656,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader and scan data
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         let mut iter = storage_reader
@@ -573,7 +701,10 @@ mod tests {
         storage.flush().await.unwrap();
 
         // Create reader while writer is still open - this should NOT cause fencing error
-        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+        let reader = DbReader::builder(path, object_store.clone())
+            .build()
+            .await
+            .unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
 
         // Reader can read the data
@@ -600,7 +731,7 @@ mod tests {
         let path = "/test/ttl_db";
         let clock = Arc::new(MockSystemClock::new());
 
-        let db = DbBuilder::new(path, object_store)
+        let db = DbBuilder::new(path, object_store.clone())
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()
@@ -677,7 +808,7 @@ mod tests {
 
         let merge_op: Arc<dyn MergeOperator> = Arc::new(ConcatMergeOperator);
         let slate_merge_op = SlateDbStorage::merge_operator_adapter(merge_op);
-        let db = DbBuilder::new(path, object_store)
+        let db = DbBuilder::new(path, object_store.clone())
             .with_settings(Settings {
                 default_ttl: Some(30_000),
                 ..Default::default()
