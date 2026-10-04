@@ -199,6 +199,9 @@ pub enum ObjectStoreConfig {
     /// AWS S3 object store.
     Aws(AwsObjectStoreConfig),
 
+    /// Google Cloud Storage object store.
+    Gcs(GcsObjectStoreConfig),
+
     /// Local filesystem object store.
     Local(LocalObjectStoreConfig),
 }
@@ -210,6 +213,13 @@ pub struct AwsObjectStoreConfig {
     pub region: String,
 
     /// S3 bucket name.
+    pub bucket: String,
+}
+
+/// Google Cloud Storage object store configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GcsObjectStoreConfig {
+    /// GCS bucket name.
     pub bucket: String,
 }
 
@@ -310,6 +320,37 @@ settings_path: slatedb.toml
                     slate_config.object_store,
                     ObjectStoreConfig::Aws(AwsObjectStoreConfig {
                         region: "us-west-2".to_string(),
+                        bucket: "my-bucket".to_string()
+                    })
+                );
+                assert_eq!(slate_config.settings_path, Some("slatedb.toml".to_string()));
+            }
+            _ => panic!("Expected SlateDb config"),
+        }
+    }
+
+    #[test]
+    fn should_deserialize_slatedb_config_with_gcs_object_store() {
+        // given
+        let yaml = r#"
+type: SlateDb
+path: my-data
+object_store:
+  type: Gcs
+  bucket: my-bucket
+settings_path: slatedb.toml
+"#;
+
+        // when
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // then
+        match config {
+            StorageConfig::SlateDb(slate_config) => {
+                assert_eq!(slate_config.path, "my-data");
+                assert_eq!(
+                    slate_config.object_store,
+                    ObjectStoreConfig::Gcs(GcsObjectStoreConfig {
                         bucket: "my-bucket".to_string()
                     })
                 );

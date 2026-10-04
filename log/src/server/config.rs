@@ -3,7 +3,8 @@
 use clap::Parser;
 use common::StorageConfig;
 use common::storage::config::{
-    AwsObjectStoreConfig, LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+    AwsObjectStoreConfig, GcsObjectStoreConfig, LocalObjectStoreConfig, ObjectStoreConfig,
+    SlateDbStorageConfig,
 };
 
 use crate::{Config, ReaderConfig};
@@ -33,6 +34,10 @@ pub struct CliArgs {
     #[arg(long, default_value = "us-east-1")]
     pub s3_region: String,
 
+    /// GCS bucket name (enables Google Cloud Storage when set).
+    #[arg(long, conflicts_with_all = ["s3_bucket", "in_memory"])]
+    pub gcs_bucket: Option<String>,
+
     /// Run as a read-only gateway backed by a `LogDbReader`.
     ///
     /// In this mode the server serves only read routes (scan, keys, segments,
@@ -53,6 +58,16 @@ impl CliArgs {
                 path: "data".to_string(),
                 object_store: ObjectStoreConfig::Aws(AwsObjectStoreConfig {
                     region: self.s3_region.clone(),
+                    bucket: bucket.clone(),
+                }),
+                settings_path: None,
+                block_cache: None,
+                meta_cache: None,
+            })
+        } else if let Some(bucket) = &self.gcs_bucket {
+            StorageConfig::SlateDb(SlateDbStorageConfig {
+                path: "data".to_string(),
+                object_store: ObjectStoreConfig::Gcs(GcsObjectStoreConfig {
                     bucket: bucket.clone(),
                 }),
                 settings_path: None,
@@ -111,6 +126,8 @@ impl From<&CliArgs> for LogServerConfig {
 
 #[cfg(test)]
 mod tests {
+    use clap::error::ErrorKind;
+
     use super::*;
 
     #[test]
@@ -122,6 +139,7 @@ mod tests {
             in_memory: true,
             s3_bucket: None,
             s3_region: "us-east-1".to_string(),
+            gcs_bucket: None,
             read_only: false,
         };
 
@@ -141,6 +159,7 @@ mod tests {
             in_memory: false,
             s3_bucket: None,
             s3_region: "us-east-1".to_string(),
+            gcs_bucket: None,
             read_only: false,
         };
 
@@ -168,6 +187,7 @@ mod tests {
             in_memory: false,
             s3_bucket: Some("my-bucket".to_string()),
             s3_region: "us-west-2".to_string(),
+            gcs_bucket: None,
             read_only: false,
         };
 
@@ -188,6 +208,52 @@ mod tests {
     }
 
     #[test]
+    fn should_create_gcs_slatedb_config() {
+        // given
+        let args = CliArgs {
+            port: 9090,
+            data_dir: ".data".to_string(),
+            in_memory: false,
+            s3_bucket: None,
+            s3_region: "us-east-1".to_string(),
+            gcs_bucket: Some("my-bucket".to_string()),
+            read_only: false,
+        };
+
+        // when
+        let config = args.to_log_config();
+
+        // then
+        match config.storage {
+            StorageConfig::SlateDb(slate_config) => match slate_config.object_store {
+                ObjectStoreConfig::Gcs(gcs_config) => {
+                    assert_eq!(gcs_config.bucket, "my-bucket");
+                }
+                _ => panic!("Expected Gcs object store"),
+            },
+            _ => panic!("Expected SlateDb config"),
+        }
+    }
+
+    #[test]
+    fn should_reject_gcs_and_s3_buckets_together() {
+        // given
+        let args = [
+            "opendata-log",
+            "--gcs-bucket",
+            "my-gcs-bucket",
+            "--s3-bucket",
+            "my-s3-bucket",
+        ];
+
+        // when
+        let result = CliArgs::try_parse_from(args);
+
+        // then
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn should_create_server_config_from_cli_args() {
         // given
         let args = CliArgs {
@@ -196,6 +262,7 @@ mod tests {
             in_memory: true,
             s3_bucket: None,
             s3_region: "us-east-1".to_string(),
+            gcs_bucket: None,
             read_only: false,
         };
 

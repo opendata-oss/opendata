@@ -45,6 +45,53 @@ Other endpoints: `GET /api/v1/log/keys`, `GET /api/v1/log/segments`,
 `GET /api/v1/log/count`, and `/-/ready`. See [RFC 0004](rfcs/0004-http-apis.md)
 for the full HTTP surface.
 
+## Google Cloud Storage
+
+Use an existing GCS bucket instead of local storage or S3:
+
+```bash
+cargo run -p opendata-log --features http-server -- --gcs-bucket my-log-bucket
+```
+
+Data is stored under the `data` prefix. No region is needed. Add `--read-only`
+to run a reader gateway. `--gcs-bucket` cannot be combined with `--s3-bucket` or
+`--in-memory`.
+
+Credentials are read from the environment, in this order:
+
+- `GOOGLE_SERVICE_ACCOUNT` (or `GOOGLE_SERVICE_ACCOUNT_PATH`): path to a service
+  account JSON file.
+- `GOOGLE_APPLICATION_CREDENTIALS`: path to an Application Default Credentials
+  file.
+- Local credentials from `gcloud auth application-default login`.
+- The GCP metadata server, when running on GCP.
+
+Required bucket permissions:
+
+- Writers: object read, list, create, update, and delete.
+- Read-only gateways: object read, list, and create. SlateDB writes reader
+  checkpoints even in read-only mode.
+
+For embedded Rust usage, configure the same shared storage backend:
+
+```rust
+use common::storage::config::{GcsObjectStoreConfig, SlateDbStorageConfig};
+use common::{ObjectStoreConfig, StorageConfig};
+use log::{Config, LogDb};
+
+let config = Config {
+    storage: StorageConfig::SlateDb(SlateDbStorageConfig {
+        path: "data".to_string(),
+        object_store: ObjectStoreConfig::Gcs(GcsObjectStoreConfig {
+            bucket: "my-log-bucket".to_string(),
+        }),
+        ..Default::default()
+    }),
+    ..Default::default()
+};
+let log = LogDb::open(config).await?;
+```
+
 ## Data Model
 
 A **record** is the unit you append: a `key` and a `value`. The key identifies a

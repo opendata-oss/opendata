@@ -340,6 +340,13 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
                 })?;
             Ok(Arc::new(store))
         }
+        ObjectStoreConfig::Gcs(gcs_config) => {
+            let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(&gcs_config.bucket)
+                .build()
+                .map_err(|e| StorageError::Storage(format!("Failed to create GCS store: {}", e)))?;
+            Ok(Arc::new(store))
+        }
         ObjectStoreConfig::Local(local_config) => {
             std::fs::create_dir_all(&local_config.path).map_err(|e| {
                 StorageError::Storage(format!(
