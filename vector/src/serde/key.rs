@@ -460,6 +460,14 @@ impl MetadataIndexKey {
         BytesRange::prefix(buf.freeze())
     }
 
+    pub fn type_range(field: &str, kind: super::FieldType) -> BytesRange {
+        let mut buf = BytesMut::new();
+        Self::RECORD_TYPE.write_prefix(&mut buf);
+        terminated_bytes::serialize(field.as_bytes(), &mut buf);
+        buf.extend_from_slice(&[kind as u8]);
+        BytesRange::prefix(buf.freeze())
+    }
+
     /// Returns a range covering all metadata index keys.
     pub fn all_indexes_range() -> BytesRange {
         let mut buf = BytesMut::with_capacity(PREFIX_AND_TAG_LEN);

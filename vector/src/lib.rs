@@ -40,6 +40,7 @@ pub mod math;
 pub mod metric_names;
 pub mod model;
 pub(crate) mod query_engine;
+mod range;
 pub mod reader;
 pub mod serde;
 #[cfg(feature = "http-server")]
@@ -58,7 +59,7 @@ pub use db::{VectorDb, VectorDbRead};
 pub use error::{Error, Result};
 pub use model::{
     Attribute, AttributeValue, Bm25Query, Bm25Scorer, Config, DistanceMetric, FieldSelection,
-    FieldType, Filter, MetadataFieldSpec, Query, ReaderConfig, ScoreBy, SearchOptions,
+    FieldType, Filter, MetadataFieldSpec, Query, Range, ReaderConfig, ScoreBy, SearchOptions,
     SearchResult, Vector, VectorBuilder,
 };
 pub use reader::VectorDbReader;

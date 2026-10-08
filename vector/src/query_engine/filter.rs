@@ -86,6 +86,10 @@ impl PreparedFilter {
                     positive: Some(load_eq(field, value, storage).await?),
                     negative: Vec::new(),
                 }),
+                Filter::Range(range) => Ok(Self {
+                    positive: Some(storage.get_metadata_range(range).await?),
+                    negative: Vec::new(),
+                }),
                 Filter::In(field, values) => {
                     let mut set = RoaringTreemap::new();
                     for value in values {

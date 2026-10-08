@@ -36,6 +36,8 @@ See `rfcs/0001-storage.md` for the complete storage design and `rfcs/0002-write-
 
 ### Query Path
 
+- Ordered metadata ranges scan only the admitted field/type key interval and merge effective postings before ANN/BM25 ranking. Stream postings; never filter an already limited result page or scan document payloads to implement a range.
+
 1. Search centroid HNSW for k nearest centroids
 2. Load posting lists for those centroids
 3. Load deleted bitmap (centroid_id=0), subtract from candidates

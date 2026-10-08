@@ -278,9 +278,10 @@ impl<T: Into<SearchResult> + Send + Sync + 'static, O: Operator<Vec<T>> + Send +
 mod tests {
     use crate::AttributeValue;
     use crate::db::{VectorDb, VectorDbRead};
-    use crate::model::{Config, Query, VECTOR_FIELD_NAME, Vector};
+    use crate::model::{Config, Query, Range, VECTOR_FIELD_NAME, Vector};
     use crate::serde::collection_meta::DistanceMetric;
     use common::{StorageBuilder, StorageConfig};
+    use std::ops::Bound::{Excluded, Included, Unbounded};
 
     fn create_config(dimensions: u16, metric: DistanceMetric) -> Config {
         Config {
@@ -293,6 +294,156 @@ mod tests {
     }
 
     // --- Search tests ---
+
+    #[tokio::test]
+    async fn should_filter_metadata_ranges_before_ann_and_bm25_limits_and_survive_replacement() {
+        let db = VectorDb::open(Config {
+            storage: StorageConfig::InMemory,
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            metadata_fields: vec![
+                MetadataFieldSpec::new("date", FieldType::String, true),
+                MetadataFieldSpec::new("body", FieldType::Text, true),
+                MetadataFieldSpec::new("price", FieldType::Int64, true),
+                MetadataFieldSpec::new("score", FieldType::Float64, true),
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let document = |id: &str, date: &str, distance: f32, price: i64, score: f64| {
+            Vector::builder(id, vec![distance, 0.0, 0.0])
+                .attribute("date", date)
+                .attribute(
+                    "body",
+                    if id == "outside" {
+                        "music"
+                    } else {
+                        "music catalogue"
+                    },
+                )
+                .attribute("price", price)
+                .attribute("score", score)
+                .build()
+        };
+        db.write(vec![
+            document("outside", "2019-01-01", 0.0, -10, -1.0),
+            document("first", "2023-05-19", 1.0, 0, -0.0),
+            document("last", "2023-05-25", 2.0, 10, 0.0),
+            document("later", "2024-01-01", 3.0, 20, 1.0),
+        ])
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        let filter = |lower, upper| Filter::Range(Range::new("date", lower, upper).unwrap());
+        let window = filter(Included("2023-05-19".into()), Excluded("2023-05-26".into()));
+        for query in [
+            Query::new(vec![0.0, 0.0, 0.0]),
+            Query::bm25("body", "music"),
+        ] {
+            let outside = db.search(&query.clone().with_limit(1)).await.unwrap();
+            assert_eq!(outside[0].vector.id, "outside");
+            let results = db
+                .search(&query.with_limit(1).with_filter(window.clone()))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert!(["first", "last"].contains(&results[0].vector.id.as_str()));
+        }
+        let cases = [
+            (
+                Included("2023-05-19".into()),
+                Included("2023-05-25".into()),
+                vec!["first", "last"],
+            ),
+            (
+                Excluded("2023-05-19".into()),
+                Included("2023-05-25".into()),
+                vec!["last"],
+            ),
+            (
+                Included("2023-05-19".into()),
+                Excluded("2023-05-25".into()),
+                vec!["first"],
+            ),
+            (
+                Excluded("2023-05-19".into()),
+                Excluded("2023-05-25".into()),
+                vec![],
+            ),
+            (Unbounded, Excluded("2023-05-19".into()), vec!["outside"]),
+            (Excluded("2023-05-25".into()), Unbounded, vec!["later"]),
+            (
+                Excluded("2023-05-19".into()),
+                Included("2023-05-19".into()),
+                vec![],
+            ),
+        ];
+        for (lower, upper, expected) in cases {
+            let query = Query::bm25("body", "music")
+                .with_limit(10)
+                .with_filter(filter(lower, upper));
+            assert_eq!(result_ids(&db.search(&query).await.unwrap()), expected);
+        }
+        for field in ["date_typo", "body", "price"] {
+            let query = Query::bm25("body", "music")
+                .with_limit(10)
+                .with_filter(Filter::Range(
+                    Range::new(field, Included("2023-05-19".into()), Unbounded).unwrap(),
+                ));
+            assert!(db.search(&query).await.unwrap().is_empty());
+        }
+        let zeros = Filter::Range(
+            Range::new("score", Included((-0.0).into()), Included(0.0.into())).unwrap(),
+        );
+        let query = Query::bm25("body", "music")
+            .with_limit(10)
+            .with_filter(zeros);
+        assert_eq!(
+            result_ids(&db.search(&query).await.unwrap()),
+            vec!["first", "last"]
+        );
+        let negative =
+            Filter::Range(Range::new("price", Unbounded, Excluded(0i64.into())).unwrap());
+        assert_eq!(
+            result_ids(
+                &db.search(&Query::bm25("body", "music").with_filter(negative))
+                    .await
+                    .unwrap()
+            ),
+            vec!["outside"]
+        );
+        db.delete(["first"]).await.unwrap();
+        db.write(vec![document("last", "2024-01-02", 2.0, 10, 0.0)])
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+        assert!(
+            db.search(&Query::bm25("body", "music").with_filter(window))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.close().await.unwrap();
+    }
+
+    #[test]
+    fn should_reject_invalid_metadata_range_bounds_without_panicking() {
+        for (lower, upper) in [
+            (Unbounded, Unbounded),
+            (Included(10i64.into()), Included(0i64.into())),
+            (Included(1i64.into()), Included("1".into())),
+            (Included(true.into()), Unbounded),
+            (Included(f64::NAN.into()), Unbounded),
+            (Unbounded, Included(f64::INFINITY.into())),
+            (
+                Included(crate::AttributeValue::Vector(vec![1.0])),
+                Unbounded,
+            ),
+        ] {
+            assert!(Range::new("date", lower, upper).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn should_query_vectors() {

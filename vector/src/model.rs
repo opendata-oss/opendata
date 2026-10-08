@@ -4,6 +4,7 @@
 //! The API is designed to be simple and ergonomic while enforcing necessary constraints
 //! like dimension matching and metadata schema validation.
 
+pub use crate::range::Range;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -584,6 +585,8 @@ pub enum Filter {
     Neq(String, AttributeValue),
     /// Field is in set of values.
     In(String, Vec<AttributeValue>),
+    /// Ordered metadata interval, applied before ranking.
+    Range(Range),
     /// All filters must match (logical AND).
     And(Vec<Filter>),
     /// Any filter must match (logical OR).
@@ -629,6 +632,9 @@ impl Filter {
             Filter::Eq(field, value) => attributes.get(field) == Some(value),
             Filter::Neq(field, value) => attributes.get(field) != Some(value),
             Filter::In(field, values) => attributes.get(field).is_some_and(|v| values.contains(v)),
+            Filter::Range(range) => attributes
+                .get(range.field())
+                .is_some_and(|v| range.matches(v)),
             Filter::And(filters) => filters.iter().all(|f| f.matches(attributes)),
             Filter::Or(filters) => filters.iter().any(|f| f.matches(attributes)),
         }

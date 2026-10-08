@@ -6,7 +6,7 @@ use common::{
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::model::Config;
+use crate::model::{AttributeValue, Config};
 use crate::serde::centroid_info::CentroidInfoValue;
 use crate::serde::centroid_stats::CentroidStatsValue;
 use crate::serde::centroids::CentroidsValue;
@@ -24,7 +24,7 @@ use crate::serde::vector_data::VectorDataValue;
 use crate::serde::vector_id::{ROOT_VECTOR_ID, VectorId};
 use crate::serde::vector_index_data::VectorIndexDataValue;
 use bytes::{BufMut, BytesMut};
-use std::ops::Bound::Included;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 
 pub(crate) mod compaction_filter;
 pub(crate) mod compaction_scheduler;
@@ -256,6 +256,64 @@ pub(crate) trait VectorDbStorageReadExt: StorageRead {
             }
             None => Ok(MetadataIndexValue::new()),
         }
+    }
+
+    /// Scan only this field's ordered value interval and combine effective postings.
+    async fn get_metadata_range(
+        &self,
+        range: &crate::model::Range,
+    ) -> Result<roaring::RoaringTreemap> {
+        let bound = |value: &std::ops::Bound<AttributeValue>, lower: bool| {
+            let encode = |value: &AttributeValue, inclusive: bool| {
+                // Numeric comparison treats signed zero as equal; sortable keys distinguish it.
+                let value = match value {
+                    AttributeValue::Float64(value) if *value == 0.0 => {
+                        AttributeValue::Float64(if lower == inclusive { -0.0 } else { 0.0 })
+                    }
+                    value => value.clone(),
+                };
+                MetadataIndexKey::new(range.field(), value.into()).encode()
+            };
+            match value {
+                Included(value) => Included(encode(value, true)),
+                Excluded(value) => Excluded(encode(value, false)),
+                Unbounded => Unbounded,
+            }
+        };
+        let first = match range.lower() {
+            Included(value) | Excluded(value) => value,
+            Unbounded => match range.upper() {
+                Included(value) | Excluded(value) => value,
+                Unbounded => return Err(Error::InvalidInput("metadata range is unbounded".into())),
+            },
+        };
+        let prefix = MetadataIndexKey::type_range(
+            range.field(),
+            crate::serde::FieldValue::from(first.clone()).field_type(),
+        );
+        let start = match bound(range.lower(), true) {
+            Unbounded => prefix.start,
+            value => value,
+        };
+        let end = match bound(range.upper(), false) {
+            Unbounded => prefix.end,
+            value => value,
+        };
+        let mut ids = roaring::RoaringTreemap::new();
+        // Empty exclusive intervals need no storage scan.
+        if matches!((&start, &end), (Included(a), Excluded(b)) | (Excluded(a), Included(b)) | (Excluded(a), Excluded(b)) if a >= b)
+        {
+            return Ok(ids);
+        }
+        let mut records = self.scan_iter(BytesRange::new(start, end)).await?;
+        while let Some(record) = records.next().await? {
+            if matches!(MetadataIndexKey::decode(&record.key)?.value, crate::serde::FieldValue::Float64(value) if !value.is_finite())
+            {
+                continue;
+            }
+            ids |= MetadataIndexValue::decode_from_bytes(&record.value)?.effective_vector_ids();
+        }
+        Ok(ids)
     }
 
     /// Load the singleton FTS deletions bitmap.
